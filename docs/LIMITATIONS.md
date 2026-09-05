@@ -36,7 +36,7 @@
 
 ## Pyramid rasteriser forward pass (v0.1.0)
 
-- **The MPS forward is not differentiable.** `blend_fwd.metal` is forward-only; `trippy.raster.pyramid.render_pyramid` detaches the fragment alphas and features before handing them to the kernel, so a render on `device="mps"` produces no gradients. Emission, sorting and segmentation are ordinary torch, so gradients will flow the moment `blend_bwd` lands (v0.2.0). Until then, gradcheck and any autograd work must run on CPU, where `render_pyramid` dispatches to `trippy.raster.ref_torch` (which *is* differentiable, in float64).
+- **~~The MPS forward is not differentiable.~~ Resolved (v0.2.0, `blend_bwd`).** `render_pyramid` on `device="mps"` now returns tensors connected to autograd; `xyz`, `size`, `conf`, `feat`, `bg` and an optional SE(3) `pose_delta` all receive gradients. See the "Pyramid rasteriser backward pass" section below for what the backward still does *not* cover.
 
 - **Fragments below `RASTER_ALPHA_MIN` (1e-5) are dropped at emission.** TRIPS keeps every in-bounds bilinear corner. We drop the negligible ones because each costs a slot in the 16-deep per-pixel list; the composite changes by at most 1e-5 × the feature magnitude. All three implementations (numpy, torch, Metal) apply the identical rule, so the references stay comparable, but a bit-exact TRIPS comparison would need it set to 0.
 
@@ -53,6 +53,26 @@
 - **Composite sort key caps the pyramid at 2^31 layer-pixels.** The key packs `layer_pixel << 32 | float32_bits(depth)` into an int64. Beyond ~2.1 G layer-pixels (far above any realistic frame) `sort_fragments` raises and the `two_pass` fallback must be used; it has no such limit.
 
 - **Depth is compared at float32 resolution in both sort paths**, because the composite key has only 32 bits for it. Two fragments whose depths differ only below float32 resolution are ordered by point index, not by true depth.
+
+## Pyramid rasteriser backward pass (v0.2.0)
+
+- **`aux["depth_sum"]` carries no gradient on MPS.** `blend_bwd.metal` differentiates the composited colour and the final transmittance only; the depth moment is returned detached (`ctx.mark_non_differentiable`), so backpropagating through it raises instead of silently producing zeros. The CPU reference *is* differentiable in `depth_sum`, so a depth-supervision loss written and validated on CPU will fail on MPS until the kernel gains a `d_depth` output. `aux["n_used"]` is an integer count and carries no gradient anywhere.
+
+- **Fragment ordering carries no gradient**, exactly as in TRIPS. The sort permutation and the segment offsets are discrete functions of depth; they are applied with `index_select` on integer indices. The rendered image is therefore piecewise smooth, not smooth: at a depth crossing, at an image border, at `alpha == RASTER_ALPHA_MIN`, at `size_px == 2**k` (where `layer_bounds`' `floor/ceil` switches), at the 16-fragment cap and at the transmittance cutoff, the gradient is a one-sided derivative. This is why `tests/test_raster_bwd_scenes.py` is a hand-built fixture rather than a random scene: gradcheck's finite differences straddle those switches on a random scene and report failures that are not gradient bugs.
+
+- **Fragments outside the composited prefix get exactly zero gradient.** The backward is handed the forward's `n_used`, so anything the forward skipped (past the 16-fragment cap, or after transmittance fell below `RASTER_T_CUTOFF`) contributes nothing. This is the correct derivative of the function actually computed, but note that the function actually computed is not the true volume-rendering integral — a point hidden behind a saturated pixel receives no gradient and cannot learn its way to the front.
+
+- **No `1 / (1 - alpha)` guard, by design.** TRIPS divides by `1 - alpha + 1e-9` when back-propagating the transmittance dependency (`RenderBackward.cu:290`). We instead carry two division-free suffix recurrences (see docs/ARCHITECTURE.md "Backward pass"), which are exact for every `alpha` in `[0, 1]` including `alpha == 1`. There is therefore no epsilon to tune and no accuracy cliff for large alpha; `tests/test_raster_bwd_src.py::test_kernel_never_divides_by_one_minus_alpha` pins the absence of the division.
+
+- **No camera-intrinsics or distortion gradients.** TRIPS computes `g_k` (5 params) and `g_dis` (8 params) alongside the pose gradient (`RenderBackward.cu:384-465`). trippy computes neither: `K` is treated as a constant. Pose refinement is supported through `pose_delta`; intrinsics refinement is not, and adding it means extending `trippy.geom.xform_b.project_pinhole`'s graph, not the kernel.
+
+- **`pose_delta` must not be initialised at exactly zero if rotation is to be learned.** `trippy.geom.xform_b.se3_exp` builds its rotation as `a * |phi| * skew(phi / max(|phi|, 1e-8))`, which is second order in `phi` at the origin, so autograd returns an exactly zero gradient for `delta[3:]` there while the true derivative is the SO(3) generator (magnitude 1). Translation (`delta[:3]`) is correct at the origin. Verified and pinned by `tests/test_raster_bwd_ref.py::test_pose_delta_rotation_gradient_vanishes_at_zero`; gradcheck passes at `|phi| ~ 0.037`. **Fixing this means changing `se3_exp` itself** (and re-running the `xform_a`/`xform_b` agreement test); until then, initialise pose deltas with a small random rotation, not zeros.
+
+- **Double backward is not supported on MPS.** `BlendFunction.backward` is wrapped in `once_differentiable`, so a second-order method (or any loss whose graph differentiates a gradient) raises rather than returning wrong numbers. The CPU reference has no such restriction.
+
+- **The per-point feature gradient reduction is a torch `index_add_`, not an atomic.** On MPS this is a separate kernel launch over F fragments after `blend_bwd`, and its summation order is torch's, not ours; results are deterministic in practice on this backend but the order is not contractually guaranteed by torch. TRIPS instead accumulates with `atomicAdd` per fragment, which is *less* deterministic.
+
+- **`mode="broadcast"` gives per-point sizes no gradient at all.** With `use_layer_point_size=false` the layer factor is 1 everywhere and each point is written to every layer, so `size` feeds nothing that affects the image and `size.grad` is `None`. This is not a bug in the backward; it is what TRIPS's shipped default does, and it is why every released TRIPS checkpoint's point sizes are untrained (docs/TRIPS_REFERENCE.md §10.1).
 ## net/ (feat/net, 2026-09-05): U-Net, neural camera, losses port
 
 - **Gated conv block: VERIFIED, not a guess.** `External/saiga/` is empty in the vendored TRIPS

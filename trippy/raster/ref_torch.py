@@ -15,7 +15,8 @@ Invariants:
       *prefix* of an already depth-sorted segment.
     - float64 by default: the whole point is to be more accurate than the
       float32 GPU path it validates.
-    - Differentiable in alpha (hence in uv, size, conf) and in feat/bg.
+    - Differentiable in alpha (hence in uv, size, conf), in feat/bg and
+      in the optional SE(3) pose delta.
       Fragment *ordering* is a discrete function of the inputs and carries no
       gradient, exactly as in TRIPS.
 Units / frames: see trippy.raster.emit (world-frame xyz, world-unit size,
@@ -135,6 +136,7 @@ def render_pyramid_ref(
     sort_method: str = "composite",
     segment_method: str = "searchsorted",
     compute_dtype: torch.dtype | None = torch.float64,
+    pose_delta: Tensor | None = None,
 ) -> tuple[list[Tensor], dict]:
     """Render the whole pyramid in torch (the float64 CPU reference path).
 
@@ -154,6 +156,9 @@ def render_pyramid_ref(
         sort_method, segment_method: see trippy.raster.sort.
         compute_dtype: dtype the whole render runs in; None keeps the input
             dtype. Default float64 (this is the reference).
+        pose_delta: optional (6,) SE(3) twist refining `(R, t)`
+            left-multiplicatively (trippy.raster.emit.apply_pose_delta).
+            Differentiable, so `pose_delta.grad` is the camera-pose gradient.
 
     Returns:
         layers: list of L tensors, layer l is (C, h_l, w_l) with
@@ -168,6 +173,7 @@ def render_pyramid_ref(
 
     xyz_d, size_d, feat_d, conf_d = (a.to(dtype) for a in (xyz, size, feat, conf))
     K_d, R_d, t_d = (a.to(dtype) for a in (K, R, t))
+    delta_d = None if pose_delta is None else pose_delta.to(dtype)
 
     frags = build_sorted_fragments(
         xyz_d,
@@ -182,6 +188,7 @@ def render_pyramid_ref(
         znear=znear,
         sort_method=sort_method,
         segment_method=segment_method,
+        pose_delta=delta_d,
     )
     out, t_final, n_used, depth_sum = composite_sorted(
         frags.layer_pixel,

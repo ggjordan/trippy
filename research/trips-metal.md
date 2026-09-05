@@ -127,3 +127,66 @@ source feeds a training run (docs/SPEC.md v0.2.0).
 `output/runs/EXP-0004/coverage_stats.json`,
 `output/runs/EXP-0004/{IMG_38*_coverage.png,sheet.png}` (sheet delivered,
 see delivery line above), `experiments/EXP-0004-monodepth-points/README.md`.
+- 2026-09-05T13:18:13Z submitted job trippy-raster-bwd-gpu-1 prio 12: bash -c cd /Users/nzbirdranch/trippy/.worktrees/raster-bwd && PYTHONPATH=. /Users/nzbirdranch/trippy/.venv/bin/python -m pytest -q -m gpu -s tests/test_raster_bwd_metal.py
+
+## 2026-09-06 — Milestone: the MPS pyramid rasteriser is differentiable (blend_bwd)
+
+`blend_bwd.metal` + `blend_autograd.py` land; `render_pyramid` on MPS now returns tensors connected to
+autograd for positions, sizes, confidences, features, background and an optional SE(3) pose delta.
+
+**Question**: Do the float32 Metal backward gradients match the float64 CPU reference, and what does
+forward+backward cost at a realistic frame size?
+
+**Job name**: `output/jobs/trippy-raster-bwd-gpu-1.sh` (prio 12), rc=0, 8/8 gpu tests passed.
+Log: `~/Splats/tools/gpu_queue/logs/trippy-raster-bwd-gpu-1.log`
+
+**Numbers** — worst relative gradient error (max|metal - ref| / max|ref|, float32 MPS vs float64 CPU),
+budget was 1e-3:
+
+| input | trilinear C=3 | broadcast C=3 | trilinear C=4 | broadcast C=4 | cap+cutoff scene |
+|---|---|---|---|---|---|
+| xyz        | 1.170e-06 | 1.120e-06 | 1.596e-06 | 6.108e-07 | 1.268e-06 |
+| size       | 1.677e-07 | no grad*  | 5.508e-07 | no grad*  | 1.437e-06 |
+| conf       | 1.530e-07 | 1.765e-07 | 2.119e-07 | 2.596e-07 | 5.174e-07 |
+| feat       | 1.159e-07 | 1.054e-07 | 1.466e-07 | 1.098e-07 | 1.102e-06 |
+| pose_delta | 3.831e-06 | 2.601e-06 | 1.535e-06 | 2.122e-06 | n/a |
+| forward    | 1.791e-07 | 2.079e-07 | 1.791e-07 | 2.150e-07 | — |
+
+\* `mode="broadcast"` gives the layer factor 1 everywhere, so per-point size feeds nothing and has no
+gradient on *either* device — TRIPS's shipped default trains no point sizes at all (§10.1).
+
+**Worst error anywhere: 3.83e-06**, i.e. 260x inside the 1e-3 budget and roughly float32 round-off.
+
+Fragment cap and transmittance cutoff both fire in one scene (24 fragments stacked on one layer-0 pixel,
+stacked confidence raised to 0.95): `n_used` max 16 on both devices, `t_final` min 5.517e-04 vs the 1e-3
+cutoff, and `n_used` is *bit-identical* between float32 Metal and float64 CPU — so the gradient comparison
+is not masking a discrete disagreement.
+
+Timing, 256x192, 50k points, C=4, L=5, 345,934 fragments: **forward 20.0 ms, forward+backward 26.4 ms,
+backward 6.4 ms** (backward is 32% of forward — the whole backward is one kernel plus one `index_add_`).
+
+Feature-only SGD, 20 steps, lr 0.2 on a 32x32 scene: loss falls monotonically
+2.26881 -> 0.44316 (5.1x). Features enter the composite linearly, so the objective is exactly quadratic and
+any increase would have been a wrong gradient.
+
+CPU: 217 tests green (`-m "not gpu"`), including float64 `torch.autograd.gradcheck` on all five learnable
+inputs individually and jointly (atol 1e-6, rtol 1e-4) on a hand-built fixture that sits >= 0.05 from every
+discrete switch in the rasteriser.
+
+**Design note**: the kernel uses two *division-free* suffix recurrences
+(`U_{i-1} = a_i f_i + (1-a_i) U_i`, `Q_{i-1} = (1-a_i) Q_i`) instead of TRIPS's
+`colour_behind / (1 - alpha + 1e-9)` (`RenderBackward.cu:290`). Algebraically identical, but exact at
+`alpha == 1` with no epsilon to tune. `tests/test_raster_bwd_src.py` asserts the kernel body contains no
+`/` at all.
+
+**Verdict**: PASS
+**Artifact**: `~/Splats/tools/gpu_queue/logs/trippy-raster-bwd-gpu-1.log`;
+`docs/ARCHITECTURE.md` "Backward pass data flow" (formulas and the reason for the design).
+
+**Open finding (not a blocker, but a trap for the trainer)**: `trippy.geom.xform_b.se3_exp` returns an
+exactly zero gradient for the *rotation* half of a twist at `phi == 0`, because it builds the rotation as
+`a * |phi| * skew(phi / max(|phi|, 1e-8))`, which is second order in `phi` at the origin (true derivative:
+the SO(3) generator, magnitude 1). A pose delta initialised at exactly zero would therefore learn
+translation but never rotation. Pinned by
+`tests/test_raster_bwd_ref.py::test_pose_delta_rotation_gradient_vanishes_at_zero`; the fix belongs in
+`xform_b.se3_exp` (and needs the xform_a/xform_b agreement test re-run), not in the rasteriser.
