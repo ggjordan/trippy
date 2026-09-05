@@ -681,3 +681,136 @@ eval_ep<NNNN>/
 `trippy hybrid-c eval --checkpoint <run_dir>/checkpoints/checkpoint_latest.pt [--images ...]`
 (`trippy.hybrid.train_c.evaluate_checkpoint`) re-evaluates a checkpoint without re-training,
 mirroring `trippy eval`.
+
+## Distillation (design B)
+
+docs/SPEC.md D2: "A plain splat that incorporates TRIPS learning (Design B) is a valid
+fallback path, not the primary deliverable" -- and the Quest honesty note: "ship fallback:
+distilled Gaussians via the existing `~/Splats/tools/publish/` path". `trippy distill`
+(`trippy/distill/{cameras,colmap_writer,render_set,brush_runner,compare}.py`) turns any
+trained TRIPS checkpoint into a plain 3DGS PLY that opens unchanged in every existing
+viewer (Brush, Splats' `tools/publish/publish_splat.sh`, Quest), by rendering the TRIPS
+network's own output into an ordinary photo set and training an ordinary Gaussian splat
+model (Brush) on it.
+
+### Why this works: distillation, not compression
+
+The checkpoint's point cloud + U-Net + tone mapper together define a function from
+(camera pose) to (image). Design B samples that function at a dense set of poses close to
+the real capture path and hands the resulting (pose, image) pairs to an off-the-shelf 3DGS
+trainer exactly as if they were photographs -- the trained Gaussians end up approximating
+whatever the TRIPS network learned to render (including, if it worked, the shade-as-lighting
+effect the whole project is chasing), while paying none of TRIPS's own runtime cost in the
+viewer. This is strictly a fallback (D2): a distilled splat re-quantises TRIPS's continuous,
+network-refined appearance back into per-point Gaussian primitives, so it can only be as
+good as (never better than) the TRIPS checkpoint it was distilled from, and it re-introduces
+whatever splat artefacts Gaussians have (Jordan's stated worry, docs/SPEC.md D6).
+
+### Step 1: render the image set (`trippy.distill.render_set`, `trippy distill --stage render`)
+
+For each registered training camera ("anchor") plus a small number of cameras interpolated
+between *consecutive* anchor pairs ("near-path", `trippy.distill.cameras`), render the
+checkpoint's network output (`trippy.render.candidate.render_candidate`'s own `net.png` --
+after the U-Net and tone mapper, never the raw pre-U-Net composite) at the checkpoint's own
+training width. Anchors use each image's real COLMAP pose (no pose-refinement delta, same
+convention `trippy.render.dolly`/`trippy.render.offpath` already use for arbitrary poses);
+interpolated poses slerp rotation and lerp the camera centre between two anchors, at
+`k` intermediates per pair (`--interp-k`, default `DISTILL_DEFAULT_INTERP_K`).
+
+**Honesty guard** (AGENTS.md's honesty rule extended to camera poses, not just pixels): a
+consecutive pair is only bridged with interpolated poses if (a) both images share one
+physical camera (`camera_id`) and (b) their centre-to-centre distance is at most
+`--max-jump-multiplier` (default `DISTILL_MAX_JUMP_MULTIPLIER`, 4x) times the scene's own
+median consecutive-pair distance. A pair failing either check is not "consecutive along one
+continuous walk" (a lens change, a registration gap, two separate sweeps of the same scene)
+and is skipped rather than interpolated through -- recorded in
+`DistillCameraPlan.skipped_pairs` and `distill_report.json`'s `skipped_pairs`/
+`n_skipped_pairs`. Every interpolated pose is a linear blend between two real, photographed
+anchors, so by construction it can never be farther from the nearest anchor than the anchor-
+to-anchor distance itself -- "no far off-path invention".
+
+Output layout, under `--out`:
+
+```
+<out>/
+├── trips_export.ply           (the checkpoint's own trained point cloud, Trainer.export_ply)
+├── renders/                   (render_candidate's full per-pose tree: raw/net/coverage/
+│                                honesty PNGs + metrics.json -- for inspection, never opened)
+├── images/<name>.png          (one copy of each pose's net.png, flat layout Brush expects)
+├── sparse_txt/{cameras,images,points3D}.txt   (COLMAP text model, trippy.distill.colmap_writer
+│                                                on trippy.scene.colmap_io's writers -- points3D
+│                                                is the TRIPS export's own point cloud, seeded
+│                                                deterministically down to --max-init-points rows,
+│                                                default DISTILL_DEFAULT_MAX_INIT_POINTS)
+└── distill_report.json        (every count above, plus skipped_pairs, mean_coverage_full)
+```
+
+`images/` + `sparse_txt/` together are `dataset_dir` for step 2 -- exactly the COLMAP layout
+Brush's own dataset loader (`rust/brush-trips/crates/brush-dataset/src/formats/colmap.rs`)
+auto-detects: `cameras.txt`/`images.txt` for every view, `points3D.txt` as Brush's own
+initial-splat point cloud (positions + colours; Brush has no `--init-ply` flag and does not
+read a size/opacity/rotation column from points3D.txt -- it seeds means + SH-DC from there
+and initialises everything else itself). "Init from the TRIPS export ply" is therefore this
+points3D.txt, not a separate Brush CLI flag.
+
+`--device mps` only runs inside a `scripts/gpu_submit.sh` job (same rule as `trippy train`/
+`trippy render`); the render step is GPU work, prio 15 (short job, not a training job).
+
+### Step 2: train Gaussians on the image set (`trippy.distill.brush_runner`, `--stage brush-cmd`)
+
+Brush's trainer must never run outside the GPU queue (AGENTS.md), so this module only builds
+the exact command line and a self-contained job script -- it never executes Brush or
+`scripts/gpu_submit.sh` itself, the same "print the GPU command, don't run it" convention
+`trippy depth-points --run-depth` already uses. `resolve_brush_binary` prefers the lean
+headless `brush-cli` binary over the full `brush`/`brush-app` GUI binary (both share the same
+`Cli`/`TrainStreamConfig` flags, `apps/brush-cli/src/lib.rs`); neither is built by
+`scripts/build.sh`/`scripts/test.sh` (rust/README.md), so build first:
+
+```bash
+bash scripts/cpu_heavy.sh brush-cli-build -- bash -c \
+  'cd rust/brush-trips && cargo build --release -p brush-cli'
+```
+
+`brush_train_command` builds the argv: `<binary> <dataset_dir> --total-train-iters
+<--brush-iters, default DISTILL_DEFAULT_BRUSH_ITERS=6000> --sh-degree 0 --max-resolution
+<the render width> --eval-split-every 8 --eval-every 1000 --export-every <total-train-iters>
+--export-path <out>/brush_out/ --export-name distilled_{iter}.ply --seed 0`. `--sh-degree 0`
+(view-independent colour only): a single-checkpoint distillation gives Brush no multi-view
+specular signal to recover with higher SH orders, so degree 0 is the honest choice, not
+merely the cheap one. `--export-every` always equals `--total-train-iters` -- this pipeline
+wants the final distilled PLY, not intermediate checkpoints. `write_brush_job_script` writes
+that argv as `<out>/brush_train_job.sh` (mirrors `scripts/gpu_submit.sh`'s own generated job-
+file shape: `set -eu` then one `exec` line); `brush_gpu_submit_command` prints the
+copy-pasteable `scripts/gpu_submit.sh --train <name> -- bash <script>` line -- training is a
+prio-70 job, behind Splats' own jobs and any other trippy trainings already queued (D9); the
+task's own iteration budget ("5k-8k steps") is sized for a queue that already has several
+long trainings ahead of it.
+
+### Step 3: audit and compare (`trippy.distill.compare`, `--stage compare`)
+
+Runs Splats' shade audit + extent gate (`trippy.eval.audits.audit_report`, unmodified,
+subprocess) on up to three PLYs -- the training run's own baseline source PLY (`--baseline-
+ply`, e.g. `kkc_15000.ply`), the checkpoint's own TRIPS export (`trips_export.ply` from step
+1), and the Brush-trained distilled PLY (`--distilled-ply`, once step 2's queued job has
+finished) -- and prints a markdown table (point count, shade dark-mass fraction, extent
+p99/max) with one column per PLY given. A column whose PLY was not given (most commonly
+`distilled`, before that training job returns) renders "pending", never a fabricated number
+(AGENTS.md's honesty rule); a PLY that was given but whose audit itself failed (e.g. no
+`~/Splats` installation on this machine) renders "n/a" per cell. `trippy distill --stage all`
+(the default) runs render then compare in one command, using render's own `trips_export.ply`
+and `scene_root` automatically -- `compare` alone (after an earlier `render`) reuses the same
+`distill_report.json` rather than requiring every flag again.
+
+### `trippy distill` end to end
+
+```bash
+trippy distill --checkpoint <run_dir>/checkpoints/checkpoint_latest.pt --out <out_dir> \
+  --stage all --device mps --interp-k 2 --baseline-ply <path/to/kkc_15000.ply>
+```
+
+runs steps 1 and 3 in one command (step 2's actual training always needs the separate queued
+`scripts/gpu_submit.sh --train` call `--stage brush-cmd` prints); `--stage render`,
+`--stage brush-cmd`, `--stage compare` also run individually against the same `--out`
+directory. See `experiments/EXP-0008-distill/README.md` for the worked pipeline-proof run
+against a weak (40-epoch, 14.4 dB) EXP-0003 checkpoint, including the audit comparison table
+and an honest read of the numbers.

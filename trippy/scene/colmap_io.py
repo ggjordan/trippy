@@ -10,6 +10,12 @@ Invariants: text parsing is never duplicated here -- it is delegated to
     ~/Splats/scenes/karekare/kk-coherent/sparse/0 model during development
     (6 OPENCV cameras, 219 registered images) -- see
     tests/test_scene_colmap_io.py's real-scene integration test.
+    The writers (`write_cameras_txt`/`write_images_txt`/`write_points3d_txt`/
+    `save_colmap_model_txt`, added for trippy.distill's design-B pipeline,
+    docs/SPEC.md D2) are the exact textual inverse of the text readers above
+    -- `write_*` then `load_colmap_model` round-trips every field the text
+    format itself carries (not the binary-only point3D track, which the text
+    format has no column for -- see read_points3d_txt's own docstring).
 Coordinate frame: identical COLMAP world/camera convention as
     trippy.geom.xform_a/xform_b -- qvec is (qw, qx, qy, qz), x_cam =
     R(qvec) @ x_world + tvec. xys are 2D keypoint pixel coordinates in the
@@ -17,7 +23,8 @@ Coordinate frame: identical COLMAP world/camera convention as
     has no triangulated 3D point.
 Related docs: docs/ARCHITECTURE.md "Module overview" (trippy/scene);
     docs/SPEC.md v0.1.0 milestone ("colmap_io"); trippy.geom.camera
-    (intrinsics_from_colmap_params, OpenCVDistortion).
+    (intrinsics_from_colmap_params, OpenCVDistortion); docs/EXPERIMENTS.md
+    "Distillation (design B)".
 """
 
 from __future__ import annotations
@@ -337,3 +344,122 @@ def distortion(cam: Camera) -> tuple[float, float, float, float]:
         k1, k2 = cam.params[3:5]
         return (float(k1), float(k2), 0.0, 0.0)
     raise ValueError(f"unsupported COLMAP camera model for distortion(): {cam.model!r}")
+
+
+# --- text writers: the inverse of read_cameras_txt/read_images_txt/read_points3d_txt ---
+
+
+def write_cameras_txt(path: str | Path, cameras: dict[int, Camera]) -> Path:
+    """Write a COLMAP cameras.txt from `cameras` (camera_id -> Camera), sorted by id.
+
+    Args:
+        path: output path; parent directories are created if missing.
+        cameras: as `ColmapScene.cameras`.
+
+    Returns:
+        `path`.
+    """
+    lines = [
+        "# Camera list with one line of data per camera:",
+        "#   CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]",
+        f"# Number of cameras: {len(cameras)}",
+    ]
+    for camera_id in sorted(cameras):
+        cam = cameras[camera_id]
+        params = " ".join(repr(float(p)) for p in cam.params)
+        lines.append(f"{camera_id} {cam.model} {cam.width} {cam.height} {params}")
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n")
+    return path
+
+
+def write_images_txt(path: str | Path, images: dict[int, Image]) -> Path:
+    """Write a COLMAP images.txt from `images` (image_id -> Image), sorted by id.
+
+    Every image line is followed by a POINTS2D line, blank for an image with
+    no observations (`xys.shape[0] == 0`) -- a real, zero-length line, never
+    omitted, matching this module's own text reader (see its docstring:
+    "a zero-observation image still writes a genuine, blank POINTS2D line").
+
+    Args:
+        path: output path; parent directories are created if missing.
+        images: as `ColmapScene.images`.
+
+    Returns:
+        `path`.
+    """
+    lines = [
+        "# Image list with two lines of data per image:",
+        "#   IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME",
+        "#   POINTS2D[] as (X, Y, POINT3D_ID)",
+        f"# Number of images: {len(images)}",
+    ]
+    for image_id in sorted(images):
+        im = images[image_id]
+        qvec_str = " ".join(repr(float(v)) for v in im.qvec)
+        tvec_str = " ".join(repr(float(v)) for v in im.tvec)
+        lines.append(f"{image_id} {qvec_str} {tvec_str} {im.camera_id} {im.name}")
+        if im.xys.shape[0] == 0:
+            lines.append("")
+        else:
+            points2d = " ".join(
+                f"{x!r} {y!r} {pid}"
+                for (x, y), pid in zip(im.xys.tolist(), im.point3D_ids.tolist(), strict=True)
+            )
+            lines.append(points2d)
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n")
+    return path
+
+
+def write_points3d_txt(path: str | Path, points3D: dict[int, Point3D]) -> Path:
+    """Write a COLMAP points3D.txt from `points3D` (point3D_id -> Point3D), sorted by id.
+
+    The track is written when present (`Point3D.track`) but this module's own
+    text reader ignores it on the way back in (see `read_points3d_txt`'s
+    docstring) -- writing it anyway keeps a round-tripped file
+    format-realistic for other COLMAP-reading tools.
+
+    Args:
+        path: output path; parent directories are created if missing.
+        points3D: as `ColmapScene.points3D`.
+
+    Returns:
+        `path`.
+    """
+    lines = [
+        "# 3D point list with one line of data per point:",
+        "#   POINT3D_ID, X, Y, Z, R, G, B, ERROR, TRACK[] as (IMAGE_ID, POINT2D_IDX)",
+        f"# Number of points: {len(points3D)}",
+    ]
+    for point3d_id in sorted(points3D):
+        p = points3D[point3d_id]
+        xyz_str = " ".join(repr(float(v)) for v in p.xyz)
+        rgb_str = " ".join(str(int(v)) for v in p.rgb)
+        line = f"{point3d_id} {xyz_str} {rgb_str} {p.error!r}"
+        if p.track:
+            line += " " + " ".join(f"{image_id} {point2d_idx}" for image_id, point2d_idx in p.track)
+        lines.append(line)
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n")
+    return path
+
+
+def save_colmap_model_txt(sparse_dir: str | Path, scene: ColmapScene) -> Path:
+    """Write `scene` as a COLMAP text triple (cameras.txt/images.txt/points3D.txt) under `sparse_dir`.
+
+    Args:
+        sparse_dir: output directory; created if missing.
+        scene: the ColmapScene to write.
+
+    Returns:
+        `sparse_dir`.
+    """
+    sparse_dir = Path(sparse_dir)
+    write_cameras_txt(sparse_dir / "cameras.txt", scene.cameras)
+    write_images_txt(sparse_dir / "images.txt", scene.images)
+    write_points3d_txt(sparse_dir / "points3D.txt", scene.points3D)
+    return sparse_dir
