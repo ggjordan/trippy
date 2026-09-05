@@ -43,7 +43,6 @@ from trippy.constants import (
     TRAIN_CHECKPOINT_DIRNAME,
     TRAIN_CHECKPOINT_FILENAME_FMT,
     TRAIN_CHECKPOINT_LATEST_FILENAME,
-    TRAIN_DEFAULT_BACKGROUND,
     TRAIN_EVAL_DIRNAME_FMT,
     TRAIN_EVAL_MAX_SHEET_IMAGES,
     TRAIN_EVAL_METRICS_FILENAME,
@@ -56,7 +55,7 @@ from trippy.constants import (
 )
 from trippy.geom import xform_b
 from trippy.net.camera_model import NeuralCamera
-from trippy.net.losses import LossWeights, TripsLoss, _LazyLPIPS, ssim
+from trippy.net.losses import LossWeights, TripsLoss, _LazyLPIPS, mse_loss, ssim
 from trippy.net.unet import MultiScaleUnet2dDecOnlySmallFixed, NetworkConfig
 from trippy.raster.pyramid import render_pyramid
 from trippy.render.sheets import colorize, contact_sheet, save_png
@@ -93,6 +92,12 @@ class Trainer:
 
     def __init__(self, cfg: TrainConfig) -> None:
         self.cfg = cfg
+        # Seed the *global* torch RNG, not just `self._rng`: the U-Net's and the
+        # NeuralCamera's weight initialisation go through torch's default generator,
+        # so without this two runs of the same config start from different networks
+        # and their held-out numbers are not comparable (observed: 6.7 dB vs 8.4 dB
+        # at init on the same EXP-0003 smoke config).
+        torch.manual_seed(cfg.seed)
         self.device = pick_device(cfg.device)
         settings = load_settings()
         cache_root = Path(cfg.cache_root) if cfg.cache_root else settings.trippy_output / "cache"
@@ -122,7 +127,7 @@ class Trainer:
         )
         self.pose_params = PoseParams(len(self.dataset.names)).to(self.device)
         self.background = nn.Parameter(
-            torch.full((cfg.feature_channels,), TRAIN_DEFAULT_BACKGROUND, device=self.device)
+            torch.full((cfg.feature_channels,), float(cfg.background), device=self.device)
         )
 
         network_cfg = NetworkConfig(num_input_channels=cfg.feature_channels, num_layers=cfg.layers)
@@ -178,13 +183,27 @@ class Trainer:
     # --- construction helpers ---
 
     def _initial_exposure(self) -> torch.Tensor:
-        """Per-image EV_log2 from cached EXIF, 0.0 where EXIF is missing.
+        """Per-image EV_log2 from cached EXIF, **relative to the scene mean**.
 
         Simplified from TRIPS's full formula (docs/TRIPS_REFERENCE.md Sec.
         6: `log2(FNumber^2 / ExposureTime) + log2(ISO/100) -
         ExposureBiasValue`) -- `trippy.scene.dataset`'s EXIF reader only
         extracts ExposureTime and ISO (no FNumber/ExposureBiasValue), so
         the f-number and bias terms are omitted here.
+
+        The scene mean is subtracted because that is what TRIPS does and
+        because `NeuralCamera` applies the value as a *gain*,
+        `x = x * 2 ** -EV`: `colmap2adop.cpp:105` stores
+        `dataset.ini`'s `scene_exposure_value = mean(EV over all images)`
+        and `NeuralScene.cpp:38` initialises the per-frame exposure as
+        `f.exposure_value - scene_exposure_value`. So the initialisation
+        only ever encodes *relative* brightness differences between
+        images, and the average image starts at gain 1. Absolute EVs
+        (kk-coherent: mean 6.14, i.e. gain 2**-6.14 = 1/70) would instead
+        divide every prediction by ~70 before the response LUT, which no
+        amount of training at `lr_exposure=5e-4` can undo -- the bug that
+        produced the 1.6 dB EXP-0003 smoke run (research/trips-metal.md,
+        2026-09-06).
         """
         meta = json.loads((self.dataset.cache_dir / SCENE_CACHE_META_FILENAME).read_text())["images"]
         values = []
@@ -197,7 +216,10 @@ class Trainer:
             else:
                 ev = 0.0
             values.append(ev)
-        return torch.tensor(values, dtype=torch.float32)
+        ev_tensor = torch.tensor(values, dtype=torch.float32)
+        if ev_tensor.numel() == 0:
+            return ev_tensor
+        return ev_tensor - ev_tensor.mean()
 
     def _apply_locks(self, epoch: int) -> None:
         """Freeze pose deltas / xyz+size during their respective lock periods (see module docstring)."""
@@ -278,16 +300,31 @@ class Trainer:
         lo, hi = self.cfg.zoom_min, self.cfg.zoom_max
         return lo + torch.rand((), generator=self._rng).item() * (hi - lo)
 
-    def _sample_crop_center(self, height: int, width: int) -> tuple[float, float]:
-        """Uniform random centre over the full frame (including margins, so crops overshoot
-        the border sometimes -- `trippy.scene.dataset.crop`'s validity mask handles that).
+    def _sample_crop_center(self, height: int, width: int, zoom: float) -> tuple[float, float]:
+        """Uniform random centre such that the `crop/zoom` window stays inside the frame.
 
-        Simplified from TRIPS's `crop_prefere_border=true` (docs/TRIPS_REFERENCE.md Sec. 7),
-        which biases sampling toward the image border; trippy samples uniformly instead.
+        TRIPS's `RandomImageCrop` (`Dataset.cpp:264`) samples a crop that
+        lies within the source image; `crop_prefere_border=true`
+        (docs/TRIPS_REFERENCE.md Sec. 7) only biases *where* inside it
+        lands. trippy samples uniformly inside instead of biasing, and
+        falls back to the frame centre on whichever axis the window is
+        larger than the image (`trippy.scene.dataset.crop`'s validity mask
+        then covers the unavoidable overshoot).
+
+        Sampling the centre over the *whole* frame -- what this method used
+        to do -- makes roughly half of every crop's pixels padding
+        (mask == 0): they cost a full rasterisation and contribute nothing
+        to the loss, halving the useful signal per step.
         """
-        cx = torch.rand((), generator=self._rng).item() * width
-        cy = torch.rand((), generator=self._rng).item() * height
-        return cx, cy
+        window = self.cfg.crop / zoom
+
+        def _axis(extent: int) -> float:
+            low, high = window / 2.0, extent - window / 2.0
+            if high <= low:  # window wider than the image on this axis: centre it
+                return extent / 2.0
+            return low + torch.rand((), generator=self._rng).item() * (high - low)
+
+        return _axis(width), _axis(height)
 
     # --- training ---
 
@@ -319,7 +356,7 @@ class Trainer:
         height, width = int(item["rgb"].shape[0]), int(item["rgb"].shape[1])
 
         zoom = self._sample_zoom() if zoom is None else zoom
-        center = self._sample_crop_center(height, width) if center is None else center
+        center = self._sample_crop_center(height, width, zoom) if center is None else center
         cropped = dataset_crop(item, size=self.cfg.crop, zoom=zoom, center=center)
 
         target = cropped["rgb"].to(torch.float32).permute(2, 0, 1).unsqueeze(0) / 255.0
@@ -339,6 +376,7 @@ class Trainer:
 
         self.optimizer.zero_grad(set_to_none=True)
         total.backward()
+        nonfinite_grads = self._sanitise_gradients()
         self.optimizer.step()
         self.camera.apply_constraints()
 
@@ -352,9 +390,35 @@ class Trainer:
             "image_loss": float(image_loss.detach().item()),
             "extent_penalty": float(extent_penalty.detach().item()),
             "camera_reg": float(camera_reg.detach().item()),
+            "nonfinite_grads": int(nonfinite_grads.item()),
         }
         self._append_metrics(record)
         return record
+
+    def _sanitise_gradients(self) -> torch.Tensor:
+        """Zero every non-finite gradient entry before the optimizer step; return how many.
+
+        Containment, not a cure: a single degenerate fragment can make the
+        rasteriser's backward emit a NaN gradient for one point (see
+        docs/LIMITATIONS.md, "NaN gradient out of the rasteriser backward" --
+        the root cause lives in `trippy.raster`, outside this module).
+        Adam turns one NaN gradient into a permanently NaN parameter, and
+        because `_extent_penalty` reduces over *all* points, one NaN `xyz`
+        row then makes the reported total loss NaN for the rest of the run
+        while the images still look fine -- exactly the kind of silent
+        corruption that must not reach a checkpoint. Zeroing the offending
+        entries keeps the run alive and puts the count in `metrics.jsonl`
+        so it is visible rather than silent.
+        """
+        count: torch.Tensor | None = None
+        for group in self.optimizer.param_groups:
+            for param in group["params"]:
+                if param.grad is None:
+                    continue
+                bad = ~torch.isfinite(param.grad)
+                count = bad.sum() if count is None else count + bad.sum()
+                torch.nan_to_num_(param.grad, nan=0.0, posinf=0.0, neginf=0.0)
+        return count if count is not None else torch.zeros((), dtype=torch.long, device=self.device)
 
     # --- evaluation ---
 
@@ -404,7 +468,10 @@ class Trainer:
                 target_c = _center_crop_like(target, pred.shape[-2], pred.shape[-1])
                 mask_c = _center_crop_like(mask, pred.shape[-2], pred.shape[-1])
 
-                mse = ((pred - target_c) ** 2 * mask_c).sum() / mask_c.sum().clamp_min(1.0)
+                # `mse_loss` averages over every (channel, pixel) element the mask keeps.
+                # Dividing a 3-channel error sum by a 1-channel mask sum (what this used
+                # to do) inflates the MSE 3x and costs exactly 4.77 dB of reported PSNR.
+                mse = mse_loss(pred, target_c, mask_c)
                 psnr = -10.0 * torch.log10(mse + TRAIN_PSNR_EPS)
                 psnr_vals.append(float(psnr.item()))
                 ssim_vals.append(float(ssim(pred, target_c, mask_c).item()))

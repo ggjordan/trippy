@@ -77,6 +77,16 @@ Use a modulo-8 split (hold out every 8th training view as test). Report:
 - **PSNR** on non-shade frames (frames outside the shade region).
 - **LPIPS** on the same split.
 
+`Trainer.evaluate`'s PSNR is `-10*log10(masked_mse)` where the masked MSE averages over every
+*(channel, pixel)* element the mask keeps (`trippy.net.losses.mse_loss`). Dividing a 3-channel error sum
+by a 1-channel mask sum instead costs exactly `10*log10(3) = 4.771 dB`; that bug shipped in the first
+EXP-0003 smoke run (`docs/LIMITATIONS.md`).
+
+**Sanity floor.** Before believing any held-out number, compare it with the PSNR of a *constant* image at
+the target's own mean. Anything below that floor is not a bad render, it is a broken pipeline (black,
+inverted, or scaled into the wrong range). `tests/test_train_regression.py` asserts the floor on the
+synthetic scene so the CPU suite catches it in seconds.
+
 Target: v0.2.0 acceptance requires PSNR within 1.5 dB of the best plain Gaussian on non-shade frames.
 
 ### Extent gate
@@ -344,6 +354,15 @@ a shade-region number rather than one that got lucky and landed in train.
 
 Resume a run: `trippy train --config <cfg.yaml> --resume <run_dir>/checkpoints/checkpoint_latest.pt`.
 Override the wall-clock budget from the CLI without editing the file: `--max-minutes 90`.
+Override the output directory the same way: `--run-dir <abs path>` (useful when the job runs from a
+git worktree but its artefacts should land in the main checkout's `output/`).
+
+**How long is an epoch?** `steps_per_epoch = ceil(train_factor * n_train)` and each step is **one** crop
+(`crops_per_step` is in `TrainConfig` but the trainer does not batch yet). With the default
+`train_factor = 0.125` and kk-coherent's 186 training images that is 24 crops per epoch -- two orders of
+magnitude fewer crops than a TRIPS epoch (`batch_size=4 x inner_batch_size=4` crops per step, one step
+per image). Read "epoch" in a trippy run as "1/8 of a pass over the training images", and size smoke runs
+accordingly: the EXP-0003 2-epoch smoke run does 48 optimiser steps in total.
 
 ### Output layout
 
@@ -368,7 +387,8 @@ output/runs/<exp>/<run>/
 ```
 
 `metrics.jsonl` is append-only and safe to `tail -f` during a run: per-step records have keys `step`,
-`epoch`, `image`, `zoom`, `loss`, `image_loss`, `extent_penalty`, `camera_reg`; per-eval records have
+`epoch`, `image`, `zoom`, `loss`, `image_loss`, `extent_penalty`, `camera_reg`, `nonfinite_grads`
+(gradient entries zeroed before the optimizer step -- normally 0, see `docs/LIMITATIONS.md`); per-eval records have
 `eval: true` plus the same fields as that eval's `metrics.json` (minus `names`, to keep each line short).
 `log.txt` gets one human-readable line per checkpoint save and per eval (`"epoch N: eval psnr=... ssim=..."`),
 plus a line when a `--max-minutes` budget cuts a run short.

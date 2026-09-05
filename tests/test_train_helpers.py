@@ -14,6 +14,10 @@ Invariants: every fixture built here is synthetic (generated numpy/torch
     `tests/test_train_*.py` files import it directly (pytest's default
     "prepend" import mode puts `tests/` on `sys.path`, see pyproject.toml
     `testpaths = ["tests"]` and the absence of `tests/__init__.py`).
+    The synthetic photos carry real EXIF (ExposureTime + ISO, see
+    `_exif_for`) so the tone mapper's exposure initialisation is exercised
+    by CPU tests -- without it every EV would be 0 and
+    `Trainer._initial_exposure` would be untestable.
 """
 
 from __future__ import annotations
@@ -24,6 +28,7 @@ import numpy as np
 import torch
 from PIL import Image as PILImage
 
+from trippy.constants import EXIF_TAG_EXIF_IFD_POINTER, EXIF_TAG_EXPOSURE_TIME, EXIF_TAG_ISO
 from trippy.points.source import PointSet
 from trippy.raster.pyramid import render_pyramid
 from trippy.train.config import PointSourceConfig, TrainConfig
@@ -35,6 +40,13 @@ FX = FY = 48.0
 CX, CY = IMG_WIDTH / 2.0, IMG_HEIGHT / 2.0
 N_POINTS = 300
 N_IMAGES = 4
+
+# EXIF written into every synthetic photo: a realistic *absolute* exposure (EV ~ 8.2,
+# i.e. a gain of 2**-8.2 = 1/294 if a trainer forgets to centre it on the scene mean --
+# see Trainer._initial_exposure) with only a small spread between images, so the
+# scene stays fittable by a single texture once the mean is removed.
+EXIF_EXPOSURE_TIMES = (1 / 320.0, 1 / 300.0, 1 / 280.0, 1 / 260.0)
+EXIF_ISO = 100
 
 
 def synthetic_point_set(n_points: int = N_POINTS, seed: int = 0) -> PointSet:
@@ -78,6 +90,23 @@ def render_reference_image(point_set: PointSet, image_index: int, num_layers: in
     return (img * 255.0).round().astype(np.uint8)
 
 
+def _exif_for(image_index: int) -> PILImage.Exif:
+    """EXIF block (ExposureTime + ISO) for the `image_index`-th synthetic photo.
+
+    Real EXIF is what makes the tone mapper's exposure initialisation
+    non-trivial: `Trainer._initial_exposure` must subtract the scene-mean
+    EV (TRIPS `NeuralScene.cpp:38`) or every prediction is divided by
+    `2 ** mean(EV)`. Without EXIF here every EV would be 0 and that bug
+    would be invisible to the CPU suite -- see
+    tests/test_train_regression.py.
+    """
+    exif = PILImage.Exif()
+    ifd = exif.get_ifd(EXIF_TAG_EXIF_IFD_POINTER)
+    ifd[EXIF_TAG_EXPOSURE_TIME] = EXIF_EXPOSURE_TIMES[image_index % len(EXIF_EXPOSURE_TIMES)]
+    ifd[EXIF_TAG_ISO] = EXIF_ISO
+    return exif
+
+
 def build_synthetic_scene(tmp_path: Path, n_images: int = N_IMAGES, seed: int = 0) -> tuple[Path, PointSet]:
     """Write a minimal 1-camera PINHOLE COLMAP scene with `n_images` rendered photos.
 
@@ -93,7 +122,7 @@ def build_synthetic_scene(tmp_path: Path, n_images: int = N_IMAGES, seed: int = 
     names = [f"IMG_{i}.jpg" for i in range(n_images)]
     for i, name in enumerate(names):
         img = render_reference_image(point_set, i)
-        PILImage.fromarray(img, mode="RGB").save(images_dir / name)
+        PILImage.fromarray(img, mode="RGB").save(images_dir / name, exif=_exif_for(i))
 
     sparse_dir = scene_root / "sparse_txt"
     sparse_dir.mkdir(parents=True)

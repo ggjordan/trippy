@@ -79,6 +79,20 @@ def l1_loss(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor | None 
     return _masked_mean((pred - target).abs(), mask)
 
 
+def mse_loss(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+    """Mean squared error, optionally restricted to `mask` (1=valid).
+
+    The mean is taken over every (batch, channel, pixel) *element* that the
+    mask keeps, so a single-channel `mask` broadcast over a 3-channel
+    `pred` is handled correctly. Dividing a 3-channel squared-error sum by
+    a 1-channel mask sum instead would overstate the MSE by exactly the
+    channel count and understate the derived PSNR by 10*log10(3) = 4.77 dB
+    -- the bug this helper exists to make unrepeatable (see
+    tests/test_train_regression.py and docs/LIMITATIONS.md).
+    """
+    return _masked_mean((pred - target) ** 2, mask)
+
+
 def _gaussian_kernel_2d(radius: int, sigma: float) -> torch.Tensor:
     """Port of Saiga's gaussianBlurKernel2d_tinyeigen (ImageSimilarity.h:13-30).
 
@@ -208,8 +222,7 @@ class TripsLoss(nn.Module):
         if w.l1 != 0:
             total = total + w.l1 * l1_loss(pred, target, mask)
         if w.mse != 0:
-            diff2 = (pred - target) ** 2
-            total = total + w.mse * _masked_mean(diff2, mask)
+            total = total + w.mse * mse_loss(pred, target, mask)
         if w.ssim != 0:
             total = total + w.ssim * (1.0 - ssim(pred, target, mask)) / 2.0
         if w.vgg != 0:

@@ -234,3 +234,87 @@ layer 0 (4 pixels out of 2 073 600), mean ~1e-07 per level, zero pixels over 1e-
   `img_worst_144_output.jpg` names as the run's worst test frame.
 - **Rolling shutter and motion blur are still not ported** (both `false` in the horse `params.ini`, so
   they do not affect this result).
+
+## train/ (fix/train-debug, 2026-09-06): why the first EXP-0003 smoke run rendered black
+
+The first real training run (`trippy-train-smoke-2`, kk-coherent, 2 epochs, 48 steps) finished rc 0 and
+reported **1.61 dB / SSIM 0.054 / LPIPS 0.824** on the held-out split. Two independent root causes (an
+exposure-initialisation bug that rendered the frame black, and a metric bug that understated the number
+by 4.771 dB), plus three smaller ones found while measuring -- all now fixed. The same config, same 48
+steps, re-run as `trippy-train-smoke-3` reports **12.25 dB / SSIM 0.199 / LPIPS 0.777**.
+None of these interact with the pyramid layer-selection `mode`: the exposure gain is applied after the
+U-Net and the PSNR bug is in the metric, so `trilinear`, `trips` and `broadcast` were all equally black.
+
+**Fixed — exposure was initialised with the absolute EXIF EV, not the EV relative to the scene mean.**
+`NeuralCamera` applies exposure as a gain, `x = x * 2 ** -EV` (`NeuralCamera.cpp:307-309`). TRIPS
+initialises the per-frame value as `EV - scene_exposure_value` where `scene_exposure_value` is the
+*mean* EV over the dataset (`colmap2adop.cpp:105` writes it, `NeuralScene.cpp:38` subtracts it), so the
+initialisation only encodes relative brightness differences and the average frame starts at gain 1.
+`Trainer._initial_exposure` used the absolute EV. kk-coherent's EVs run 4.99-7.31 (mean 6.14), i.e. every
+prediction was divided by ~70 before the response LUT. Measured on `checkpoint_ep0000`: U-Net output mean
++0.113, after exposure +0.0012, after the LUT +0.0116 against a target mean of 0.457 -- a black frame.
+`lr_exposure = 5e-4` moves the value by 4e-3 in a whole epoch, so training cannot climb out of it.
+
+**Fixed — the eval PSNR was 4.771 dB too low.** `Trainer.evaluate` computed
+`((pred - target)**2 * mask).sum() / mask.sum()` with `pred` (1, 3, H, W) and `mask` (1, 1, H, W): a
+3-channel error sum over a 1-channel mask sum, i.e. exactly `3x` the MSE and `10*log10(3) = 4.771 dB` off
+every reported number. Now `trippy.net.losses.mse_loss`, which averages over the elements the mask keeps.
+The reported 1.61 dB was really 6.38 dB.
+
+**Fixed — `cfg.background` was ignored**; the trainer always used the `TRAIN_DEFAULT_BACKGROUND` constant.
+
+**Fixed — training crops were sampled overlapping the frame border.** `_sample_crop_center` drew the
+centre uniformly over the *whole* frame, so a `crop/zoom` window routinely hung half outside the image;
+those pixels are masked out of the loss but still cost a full rasterisation. TRIPS's `RandomImageCrop`
+(`Dataset.cpp:264`) keeps the crop inside the image and only *biases* where it lands
+(`crop_prefere_border`). trippy now samples uniformly inside, and only falls back to the frame centre on
+an axis where the window is genuinely larger than the image.
+
+**Fixed — the trainer never seeded the global torch RNG.** `cfg.seed` only fed `Trainer._rng` (image,
+zoom and crop sampling); the U-Net's and NeuralCamera's weight init went through torch's default
+generator, so two runs of one config started from different networks (observed: 6.7 dB vs 8.4 dB held-out
+at init on the same config). `Trainer.__init__` now calls `torch.manual_seed(cfg.seed)`.
+
+### Not fixed: a NaN gradient out of the rasteriser backward (contained, not cured)
+
+Reproduced on CPU with the fixed trainer on kk-coherent (`config_smoke.yaml`, `train_factor = 1.0`,
+6 epochs): somewhere in epoch 4 a *single* point's `xyz` (3 entries) and `raw_size` (1 entry) become NaN,
+along with the pose delta of the 1-2 frames that point was last rendered in. The image loss stays finite
+-- a NaN position fails every bounds comparison, so the point is culled from every subsequent render --
+but `_extent_penalty` reduces over *all* points, so the reported total loss is NaN from then on while the
+held-out PSNR keeps improving (13.39 -> 13.47 dB across the NaN). The root cause is a NaN gradient
+produced inside `trippy.raster`'s backward for a degenerate fragment; that package is outside this task's
+file list, so it is reported rather than fixed. Related and already known:
+`trippy.raster.ref_torch.composite_sorted` produces NaN for `alpha == 1.0` exactly (see the EXP-0002
+section above), and `xform_b.se3_exp` has a zero -- not NaN -- rotation gradient at `phi == 0`.
+
+Containment: `Trainer._sanitise_gradients` zeroes non-finite gradient entries before `optimizer.step()`
+and records the count as `nonfinite_grads` in `metrics.jsonl`, so one degenerate fragment can no longer
+write NaN into a checkpoint, and the event is visible instead of silent. `trippy-train-smoke-3` recorded
+`nonfinite_grads = 0` for all 48 steps.
+
+### Known gaps in the trainer (not bugs, but they bound what a smoke run can show)
+
+- **`crops_per_step` is not implemented.** It exists in `TrainConfig` but the trainer does one crop per
+  optimiser step; TRIPS does `batch_size=4 x inner_batch_size=4 = 16`.
+- **An "epoch" is 24 crops on kk-coherent** (`train_factor = 0.125` x 186 training images), so a 2-epoch
+  smoke run is 48 optimiser steps. 12.25 dB is what 48 steps buys; a CPU rehearsal at 186 steps/epoch
+  reaches 13.09 dB after one epoch and 13.47 dB after six (both `mode: trilinear`; `mode: trips`
+  gives 12.27 / 12.53 dB at 24 steps/epoch, within noise of `trilinear`'s 12.12 / 12.25 -- see the
+  coverage table below for why).
+- **The pyramid is nearly empty above level 0 on this scene, in every layer-selection mode.** Measured
+  at init on a held-out kk-coherent view (200k points from `kkc_15000.ply`, 504 px), mean `t_final` per
+  level, finest to coarsest -- 1.0 means "nothing was drawn here":
+
+  | mode | L0 | L1 | L2 | L3 | L4 | fragments |
+  |---|---:|---:|---:|---:|---:|---:|
+  | `trilinear` | 0.934 | 0.985 | 0.975 | 0.944 | 0.948 | 416,721 |
+  | `trips` (TRIPS's own rule, now native since #11) | 0.931 | 0.978 | 0.965 | 0.943 | 0.949 | 430,376 |
+  | `broadcast` | 0.901 | 0.761 | 0.592 | 0.544 | 0.661 | 1,951,937 |
+
+  `trips` behaves almost identically to `trilinear` here because `layer_higher = clamp(ceil(log2(size_px)))`
+  is 0 for every point whose projected footprint is under a pixel, and the 3DGS-derived point sizes on
+  kk-coherent mostly are. The U-Net therefore sees 90%+ background at *every* level, so it has to invent
+  most of the frame. This bounds achievable PSNR far more than any remaining trainer bug; the levers are
+  more points (`point_source.max_points`), larger `size0`, or `mode: broadcast`. Not a bug -- recorded so
+  the next person does not read a 12 dB smoke run as a broken trainer.
