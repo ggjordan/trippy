@@ -745,3 +745,66 @@ Artifacts: `output/logs/web-build-verify.log`.
 - 2026-09-05T16:50:59Z delivered EXP-0003-full1-broadcast-points: Same candidate exported as a 3DGS-style ply (isotropic points, no network): open in Brush to see where TRIPS put its points after 40 epochs. (/Users/nzbirdranch/trippy/output/runs/EXP-0003-kk-trips-train/full1-broadcast/candidate/export.ply)
 
 - 2026-09-06 EXP-0003 full1-broadcast candidate report (job cand-full1-broadcast rc 0): held-out 14.42 dB; dolly coverage 0.46 -> 0.08 -> 0.00 along the path (camera exits the geometry); shade audit (walkable shade volume, 6 frames): baseline kkc_15000.ply mass 336874, dark(lum<0.25) 67069 (19.9%); TRIPS full1-broadcast export mass 342813, dark(lum<0.25) 124120 (36.2%). Read: after 40 epochs the point cloud carries MORE dark mass in the shade volume than the Gaussians it started from; the U-Net paints over it (hallucination risk). Extent p99 40.0, max 124.5 (baseline to compare next). Delivered: dolly.mp4, honesty_sheet.png, export.ply.
+- 2026-09-05T16:55:52Z submitted job trippy-depthpro-kk-coherent prio 11: bash -c /Users/nzbirdranch/Splats/tools/vggt/.venv/bin/python3 /Users/nzbirdranch/Splats/tools/ldi/depth_batch.py /Users/nzbirdranch/trippy/output/depth/kk-coherent-all/manifest.json
+- 2026-09-05T17:20:24Z submitted job trippy-train-union-broadcast prio 70: trippy train --config experiments/EXP-0006-union/config_broadcast.yaml --max-minutes 330 --run-dir /Users/nzbirdranch/trippy/output/runs/EXP-0006-union/broadcast
+- 2026-09-05T17:20:26Z submitted job trippy-train-union-trips prio 70: trippy train --config experiments/EXP-0006-union/config_trips.yaml --max-minutes 330 --run-dir /Users/nzbirdranch/trippy/output/runs/EXP-0006-union/trips
+
+## 2026-09-06 — EXP-0006: full-scene MonoDepth build + Union point source, training queued
+
+Question: does extending point source 2 (MonoDepthSource) from EXP-0004's 12-image
+sample to all 219 registered kk-coherent images, then building the Union(Gaussian,
+MonoDepth-219) point set with a voxel dedupe, produce a usable point source 3 that two
+overnight training runs can start from?
+
+Job: `depthpro-kk-coherent` (prio 11, `scripts/gpu_submit.sh --prio 11 --wait`). rc=0,
+219/219 images at 1008x756, `valid_fraction=1.0` for every frame, 293.6 s total (~1.34
+s/image, matching EXP-0004's 1.3-1.7 s/image). No image skipped for too few
+sparse-COLMAP scale matches. Shade frames (`SHADE_FRAMES_KK`) mean scale=1.304,
+MAD=0.188, n_matches=1,914; non-shade mean scale=1.712, MAD=0.221, n_matches=3,978 --
+same qualitative finding as EXP-0004 (fewer matches in the dark region, but the ones it
+gets agree with each other well).
+
+MonoDepthSource (all 219 images): 5,063,856 raw points -> **3,786,345** after its own
+voxel dedupe (voxel=0.03, 25.2% collapsed -- much higher than the 12-image sample's
+7.6%, expected: a dense sequential walk overlaps frame-to-frame far more than 12 frames
+spread across the scene). median_nn_distance=0.2806. bbox
+`[-39.6,-138.8,-203.4]` to `[145.1,7.2,60.5]`.
+
+Union(Gaussian `min_opacity=0.05` `size_mode=knn`, MonoDepth-219, voxel=0.03), built via
+`trippy points-build --config output/points/union_source_config.yaml` under
+`scripts/cpu_heavy.sh union-build` (CPU-heavy: kNN over the full 5.74M-row Gaussian
+PLY): raw total 9,522,964 -> **5,887,647** survivors (38.2% collapsed). Provenance
+histogram: gaussian 2,205,602, monodepth 3,682,045. Finding: the collapse is almost
+entirely Gaussian-vs-Gaussian (5,736,619 -> 2,205,602 gaussian survivors, 61.5%
+collapsed) rather than Gaussian-vs-MonoDepth (MonoDepth only loses 2.8% of its own
+points to Gaussian competition) -- the 0.03 voxel (matched to MonoDepthSource's own
+default, not tuned for the Gaussian cloud) is smaller than the Gaussian median
+nn-distance (0.0795) but the Gaussian cloud is heavily non-uniform, so dense regions
+still collapse a lot. median_nn_distance=0.2984. bbox `[-79.3,-138.8,-203.4]` to
+`[145.1,68.3,94.1]`.
+
+Shade-frame coverage (MonoDepth-219 source only, same 8px-radius point-presence method
+as EXP-0004, numeric only -- no image opened/viewed): 100.00% full-frame and central-box
+coverage for all 6 `SHADE_FRAMES_KK` frames (n points visible 772,928-1,175,233 per
+frame) -- as with EXP-0004, this is saturated by construction at this point density and
+answers "is there some geometry near every pixel" (yes), not "is it metrically correct."
+
+Submitted (prio 70, behind Splats' own jobs and EXP-0003's two full2 trainings already
+queued): `train-union-broadcast` (`experiments/EXP-0006-union/config_broadcast.yaml`,
+mode=broadcast) and `train-union-trips` (`config_trips.yaml`, mode=trips), both 300
+epochs, train_factor=1.0, `--max-minutes 330`, `point_source={type: npz, path:
+output/points/kk-coherent-union-full.npz}`. Both `submit.sh rc=0`.
+
+Verdict: PASS on the build/submit pipeline (DepthPro rc=0 on all 219 images, both point
+sets built and saved with summaries, both training jobs accepted by the queue); the
+v0.2.0 stop-or-go comparison against EXP-0003 (Gaussian-only) and EXP-0004 (MonoDepth
+12-sample, no training yet) is still open until the two queued trainings complete.
+
+Artifacts: `output/points/kk-coherent-monodepth-219.npz` (+`.summary.json`),
+`output/points/kk-coherent-union-full.npz` (+`.summary.json`),
+`output/points/union_source_config.yaml`, `output/runs/EXP-0006-union/coverage_stats.json`,
+this worktree's `output/jobs/trippy-depthpro-kk-coherent.sh` (prio-11 job, submitted
+before `TRIPPY_OUTPUT` was pinned to the main checkout), the main checkout's
+`output/jobs/trippy-train-union-{broadcast,trips}.sh` (submitted with
+`TRIPPY_OUTPUT=/Users/nzbirdranch/trippy/output` so the queue's own copy lands there),
+`experiments/EXP-0006-union/README.md`.
