@@ -190,3 +190,43 @@ the SO(3) generator, magnitude 1). A pose delta initialised at exactly zero woul
 translation but never rotation. Pinned by
 `tests/test_raster_bwd_ref.py::test_pose_delta_rotation_gradient_vanishes_at_zero`; the fix belongs in
 `xform_b.se3_exp` (and needs the xform_a/xform_b agreement test re-run), not in the rasteriser.
+- 2026-09-05T13:24:52Z submitted job trippy-adop-parity-1 prio 13: bash -c cd /Users/nzbirdranch/trippy/.worktrees/adop-parity && PYTHONPATH=. /Users/nzbirdranch/trippy/.venv/bin/python -m trippy.cli parity --scene /Users/nzbirdranch/trippy/third_party/zenodo/scenes/tnt_scenes/tt_horse --checkpoint /Users/nzbirdranch/trippy/third_party/zenodo/tt_checkpoints/checkpoint_horse --epoch ep0600 --indices 8,120,144 --render-scale 1 --modes trips,broadcast,trilinear --device mps --out /Users/nzbirdranch/trippy/output/EXP-0002-horse-parity
+- 2026-09-05T13:26:40Z delivered EXP-0002-horse-parity: Authors' TRIPS horse checkpoint rendered through trippy's Metal rasteriser + U-Net vs ground truth (PSNR in the sheet). This is the public Tanks&Temples scene, not family data. (/Users/nzbirdranch/trippy/.worktrees/adop-parity/output/EXP-0002-horse-parity/summary_sheet.png)
+
+## 2026-09-06 01:25 — EXP-0002: does trippy's forward render match TRIPS's own checkpoint?
+
+**Question**: Rendered through trippy's ADOP reader + Metal pyramid rasteriser + ported U-Net +
+NeuralCamera, does the authors' public `checkpoint_horse` @ ep0600 reproduce their own render of the
+public Tanks & Temples `tt_horse` scene?
+
+**Job**: `trippy-adop-parity-1` (prio 13, MPS, rc 0). Log: `output/logs/trippy-adop-parity-1.log`.
+3 held-out frames (indices 8, 120, 144 from the checkpoint's own test split), 1920x1080, render_scale 1,
+2,218,471 points, 8 pyramid layers, 3 layer-selection modes. 0.2-1.2 s/frame.
+
+**Numbers** (all cropped by TRIPS's own `train_mask_border = 16`; uncropped costs ~10 dB because the
+authors' saved test JPGs are blacked out that far in):
+
+| mode | PSNR vs GT | SSIM | LPIPS | PSNR vs authors' render |
+|---|---:|---:|---:|---:|
+| trips (the checkpoint's real path) | **22.265** | 0.8002 | 0.1266 | **36.989** |
+| broadcast (all layers, factor 1) | 15.141 | 0.6853 | 0.3411 | 15.552 |
+| trilinear (two straddling layers) | 21.474 | 0.7929 | 0.1615 | 27.222 |
+| *the authors' own renders* | *22.335* | *0.8171* | *0.1382* | — |
+
+Per frame (trips): 25.099 / 21.979 / 19.716 dB against the authors' 25.186 / 22.043 / 19.775 dB.
+
+**Verdict**: **PASS** — 0.07 dB behind the authors' own render, against a 1.5 dB bar. The v0.1.0 gate
+"forward renders match a reference" is met.
+
+**Three source-level corrections were needed** (now in `docs/TRIPS_REFERENCE.md` 2a/2b/3a/3b/6a/8a-c/9b):
+1. The neural texture is used **raw**, not `abs()`-ed — `Pipeline.cpp:257` passes `non_subzero_texture`
+   un-negated, contradicting the reference doc. Worth **+16.6 dB** (8.46 -> 25.10 on one frame).
+2. `use_layer_point_size` is **true** for every published checkpoint — it is derived from
+   `!fix_point_size` (`Settings.cpp:39`), not read from an ini, so the "always false" claim was wrong.
+   It selects a different forward kernel (`RenderFast16`) whose layer rule is neither of the two the docs
+   describe. Getting it wrong costs 7.1 dB (broadcast) or 0.8 dB (trilinear).
+3. TRIPS's pixel centres sit on integers and its pyramid halves with `ceil`, not integer division
+   (`PointRenderer.cu:385-391`, `PointBlending.h:216-240`).
+
+**Artifact**: `output/EXP-0002-horse-parity/` (summary sheet delivered to Jordan-Review; per-frame contact
+sheets carry GT | authors' render | ours | abs-diff | raw level-0 honesty panel).

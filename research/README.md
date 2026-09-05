@@ -7,6 +7,7 @@ This is the experiment and milestone tracking index for the trippy project. Each
 | EXP-0001-forward-pyramid | v0.1.0 | done | PASS on speed (135.7 ms worst-case/frame, trilinear, 1008 wide); shade-region coverage measurably lower than non-shade (numeric, from T_final: ~0.17-0.23 vs ~0.21-0.34) -- holes are honest, not a bug, and are the U-Net's job to fill | `output/runs/EXP-0001/{trilinear,broadcast}/summary_sheet.png` + `metrics.json` (delivered via `scripts/deliver.sh`) |
 | EXP-0001-forward-pyramid | v0.1.0 | planned | — | contact sheet: photo / ref / Metal / 5 pyramid levels |
 | EXP-0004-monodepth-points | v0.2.0 | done | inconclusive (coverage metric saturates) / signal found (scale-alignment) | `output/points/kk-coherent-monodepth-12.npz`; sheet delivered as `EXP-0004-monodepth-shade-coverage` |
+| EXP-0002-horse-parity | v0.1.0 | done 2026-09-06 | **PASS** — 22.27 dB vs the authors' own 22.34 dB (0.07 dB gap); 37.0 dB against their render | `output/EXP-0002-horse-parity/summary_sheet.png`, delivered as `Jordan-Review/4-other/EXP-0002-horse-parity.png` |
 
 ## Parked ideas (never culled for effort)
 

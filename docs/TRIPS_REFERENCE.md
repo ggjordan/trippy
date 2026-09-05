@@ -655,3 +655,188 @@ order — the network architecture (Sec. 5) is now checkpoint-verified, not just
   directly.
 - The exact consumer/semantics of `warmup_epochs` (ini `20`) — referenced in the config but its use site was
   not located inside `Pipeline.cpp`'s loss block in this pass.
+
+---
+
+## Corrections found by rendering a real checkpoint (feat/adop-parity, EXP-0002, 2026-09-06)
+
+Everything below was found while reproducing the public Zenodo `checkpoint_horse` render end to end
+(`trippy parity`, see `experiments/EXP-0002-horse-parity/README.md`). Each correction is stated against
+the section it corrects, with the `path:line` that settles it. Three of them are the difference between
+an 8.5 dB render and a 25.1 dB one, so they are not cosmetic.
+
+### 2a. `PrepareTexture` is NOT called with `!non_subzero_texture` — Sec. 2 is wrong
+
+Sec. 2 says: "`PrepareTexture(abs)` optionally takes `abs()` of both texture and background before use;
+the `abs` flag is `!non_subzero_texture` in the pipeline (config `non_subzero_texture=false` → texture
+is abs'd, so effectively non-negative)." The negation is not there. The two call sites pass the config
+flag straight through:
+
+```cpp
+scene.texture->PrepareTexture(params->pipeline_params.non_subzero_texture);
+    // src/lib/models/Pipeline.cpp:257  (and data/NeuralScene.cpp:1292)
+```
+
+and `PrepareTexture(bool abs)` only takes `abs()` when its argument is *true* (`NeuralTexture.h:44-57`).
+With `non_subzero_texture = false` — the value in `configs/train_normalnet.ini` **and** in every published
+Tanks & Temples `params.ini` — the texture and the background colour are consumed **raw, negatives
+intact**. The published horse texture ranges `[-107.6, +95.9]`; taking `abs()` roughly triples the
+composited feature magnitude, pushes the U-Net's output to a median of 1.05 (it should be ~0.4), saturates
+the response LUT, and costs 16.6 dB (measured: 8.46 dB with `abs()`, 25.10 dB without, same frame).
+
+### 2b. `use_layer_point_size` IS reachable from a config — Sec. 2 and Sec. 11 are wrong
+
+Sec. 2 says `use_layer_point_size` "cannot be set from any `.ini` file and is always `false` in practice",
+and Sec. 11 repeats it. True that there is no `SAIGA_PARAM(use_layer_point_size)`; false that the value is
+therefore fixed. `CombinedParams::Check` *derives* it from an optimizer flag that **is** a config field:
+
+```cpp
+render_params.use_layer_point_size = !optimizer_params.fix_point_size;
+    // src/lib/data/Settings.cpp:39
+```
+
+`checkpoint_horse/params.ini` has `fix_point_size = false`, so **`use_layer_point_size = true` for every
+published Tanks & Temples checkpoint**. Consequences: the point-size parameter, the `softplus`
+parametrisation, `compute_point_size_fac` and the whole "layer factor" machinery Sec. 2/3/11 write off as
+dead weight are all live, and `RenderParams::use_environment_map` is likewise derived, not configured:
+
+```cpp
+render_params.use_environment_map =
+    pipeline_params.enable_environment_map && !pipeline_params.environment_map_params.use_points_for_env_map;
+    // src/lib/data/Settings.cpp:34
+```
+The horse config has `enable_environment_map = true` **and** `use_points_for_env_map = true`, so
+`use_environment_map` is **false** and the learned `background_color` *is* composited under the
+transmittance (`RenderForward.cu:3620-3634`). The "environment map" is instead 4 x 100 000 = 400 000 extra
+points added to the cloud on nested spheres (`NeuralScene.cpp:77-88` `AddNewRandomForEnvSphere`), which is
+why the horse checkpoint has 2 218 471 points against the scene's own 1 818 471.
+
+### 3a. The published checkpoints do not use the kernel Sec. 3 documents
+
+With `use_layer_point_size = true`, `render_points_in_all_lower_resolutions = true` (`Settings.h:78`, also
+in the horse `params.ini`) and `combine_lists = false`, `PointRenderer.cu:726-750` takes the `new_impl`
+branch and calls `PointRendererCache::RenderFast16` (`RenderForward.cu:1065`) instead of the
+`CountTiled` / `CollectTiled2` / `FusedSortAndBlend2` chain Sec. 3 describes. The forward kernel is
+`CountAndCollectTiled<num_layers>` (`RenderForward.cu:168-368`) plus `SplattingPass` and
+`FastSortFusedNew<NUM_DESCRIPTORS, 16, train>` (`RenderForward.cu:474`, dispatched at 1285-1389).
+`ELEMENTS_PER_PIXEL` is still 16 and the blend is still front-to-back with `ALPHA_DEST_CUTOFF = 0.001`,
+but the **layer selection is a third thing**, neither Sec. 3's "every point into every layer" nor
+GEOMETRY.md's "two straddling layers":
+
+```
+point_size_opt = K.fx * crop_transform.fx * softplus(t_point_size) / z        // RenderForward.cu:268
+layer_higher   = (point_size_opt > 1) ? min(ceil(log2(point_size_opt)), L-1) : 0   // :334-338
+for (layer = 0; layer <= layer_higher; ++layer, ip *= 0.5f)                    // :340-352
+    if (!valid_point(floor(ip), z, layer)) break;                              // note: break, not continue
+    atomicAdd 4x into per_pixel_list_lengths[layer]
+alpha_bilin = bilinear_fac * confidence * compute_point_size_fac(point_size_opt, layer, L)  // :3511-3517
+```
+
+and `compute_point_size_fac` returns **1.0** for every `layer < layer_lower` (`PointBlending.h:92-96`).
+So a 5-pixel point writes layers 0..3 with factors 1, 1, 0.75, 0.25. trippy calls this mode `"trips"`.
+Measured on three held-out horse frames: `trips` 22.27 dB, trippy's `trilinear` (two straddling layers
+only) 21.47 dB, trippy's `broadcast` (all layers, factor 1 — Sec. 3's reading) **15.14 dB**.
+
+### 3b. The pyramid halves with `ceil`, not integer division
+
+Sec. 3 says "each subsequent layer is `h/=2; w/=2` (integer division, `PointRenderer.cu:378`)". That is
+only the `else` branch. The live code is:
+
+```cpp
+if (info->scene->params->net_params.network_version != "MultiScaleUnet2d") { h = std::ceil(h/2.f); w = std::ceil(w/2.f); }
+else                                                                       { h = h / 2;            w = w / 2; }
+    // src/lib/rendering/PointRenderer.cu:385-391
+```
+
+Every published checkpoint sets `network_version = MultiScaleUnet2dDecOnlySmallFixed`, so **ceil** wins.
+This matters: 1080 floor-halved 8 times gives 1080, 540, 270, 135, 67, 33, 16, 8, whose upsamples make the
+U-Net's output 1024 rows; ceil gives 1080, 540, 270, 135, 68, 34, 17, 9 and the output stays 1080. It also
+means `trippy.raster.emit.layer_grid`'s ceil halving — documented there as a *deviation* from TRIPS — is
+in fact exactly what TRIPS does for this network. The `CombineBridge(below=features_input, skip=upsampled)`
+crop then only ever trims the upsampled tensor by one row/column (136 -> 135), never the raw input.
+
+### 6a. TRIPS's `ip` puts pixel centres on integers; trippy's `uv` puts them on half-integers
+
+`compute_blending_fac` (`PointBlending.h:216-240`) takes `subpixel_pos = ip - floor(ip)` and writes the
+2x2 footprint at `floor(ip)` and `floor(ip)+1`. So in TRIPS the *centre* of pixel `i` is at coordinate
+`i`, whereas `docs/GEOMETRY.md` puts it at `i + 0.5`. Feeding trippy's rasteriser the raw `K` therefore
+shifts the whole render by half a pixel per layer. `trippy.render.parity` corrects this by adding 0.5 to
+`cx, cy` **and** rendering each pyramid layer with its own `num_layers=1` call at
+`K_l = (fx, fy, cx, cy) / 2**l`, which reproduces TRIPS's `ip *= 0.5f` exactly (a single multi-layer call
+cannot: `uv/2**l - 0.5` and `ip/2**l` differ by a layer-dependent amount for any fixed `cx`).
+
+### 8a. `poses.txt` xyzw camera-to-world is confirmed against TRIPS's own buffer
+
+Sec. 8/Sec. 10.5's claim is correct and now cross-checked against the trained state rather than the
+writer: `PoseModuleImpl` stores `frame.pose.inverse()` as an `[N, 8]` float64 buffer
+(`data/NeuralStructure.cpp:20-33`; a `Sophus::SE3d` is quaternion `x, y, z, w` + translation + one padding
+double). For tt_horse frame 0, `poses.txt` line 1 is
+`q_xyzw = (0.012484, 0.151535, 0.020931, 0.988151)`, `t = (-0.557297, 0.415945, -3.309434)`, and the
+checkpoint's `poses_se3[0]` is `(-0.012484, -0.151535, -0.020931, 0.988151, -0.476943, -0.333750, 3.331228)`
+— exactly the inverse. `trippy.scene.adop_io.pose_c2w_xyzw_to_w2c_wxyz` reproduces the checkpoint value to
+1e-7 (`tests/test_scene_adop_io.py::test_read_poses_matches_manual_conversion`). Note also that although
+`fix_poses = false`, the horse checkpoint's `tangent_poses` are all zero and `poses_se3` equals the scene
+file to float64 precision — the poses did not move.
+
+### 8b. `point_cloud.bin` is a Saiga zlib container, not a bespoke format
+
+Sec. 8 mentions `point_cloud_compressed` without saying what it is. `SceneData.cpp:121` calls
+`Saiga::UnifiedMesh::SaveCompressed` (`saiga/core/model/UnifiedMesh.cpp:508-528`), which is
+`compress(BinaryOutputVector << position << normal << color << texture_coordinates << data << bone_info
+<< triangles << lines << material_id)`. `Saiga::compress` (`saiga/core/util/zlib.cpp:68-88`) prepends a
+24-byte header of three little-endian `size_t`s: magic `0x006712956A9725DE`, compressed size,
+decompressed size, then a plain zlib stream. Each `std::vector<T>` is a `size_t` count followed by packed
+elements (`saiga/core/util/BinaryFile.h:79-110`); `vec3` is 12 bytes, `vec4` 16, `vec2` 8.
+**The header's compressed-size field is unreliable** — Saiga's `compress3` accumulates `stream.total_out`
+without resetting it between `deflate` calls (`zlib.cpp:40-60`), so it over-counts for multi-chunk
+streams; validate against the decompressed size instead. `trippy.scene.adop_io.read_point_cloud_bin`
+implements this and `write_point_cloud_bin` round-trips it.
+
+### 8c. Saiga's 8-parameter distortion model, fetched and verified
+
+Sec. 3/8 list this as "not verifiable from this checkout". It is public MIT source
+(https://github.com/darglein/saiga @ `ee7a4e6b65832433e2ca521353b7b7431c8e17a0`,
+`src/saiga/vision/cameraModel/Distortion.h:130-171`):
+
+```
+r2 = x^2 + y^2
+xd = x * (1 + k1 r2 + k2 r4 + k3 r6) / (1 + k4 r2 + k5 r4 + k6 r6) + (p1*2xy + p2*(r2 + 2x^2))
+yd = y * (same radial)                                             + (p1*(r2 + 2y^2) + p2*2xy)
+if (r2 > max_r^2) xd = yd = 100000            // max_r = RenderParams::dist_cutoff = 20 (Settings.h:61)
+```
+
+**Coefficient order in `camera<i>.ini` is `k1 k2 k3 k4 k5 k6 p1 p2`** (`Distortion.h:20-45`), *not*
+OpenCV's `k1 k2 p1 p2 k3 k4 k5 k6`. tt_horse uses `k1 = -0.0640, k2 = +0.0444`, the rest zero: a 2.2%
+radial shift at the image corner, ~24 px. Ignoring it is not an option. `K.normalizedToImage` is
+`(fx*x + s*y + cx, fy*y + cy)` (`Intrinsics4.h:80`), and at eval time `crop_transform` is the default
+`IntrinsicsPinholef()` = identity (`Dataset.cpp:276`, `Intrinsics4.h:33-38`), so `ip = image_p`.
+
+### 9b. Field-by-field map of a real scene checkpoint
+
+Observed in `checkpoint_horse/ep0600` (2 218 471 points, 151 frames, `num_texture_channels = 4`); every
+file opens with `torch.jit.load` per Sec. 9a.
+
+| file | tensor | shape | meaning |
+|---|---|---|---|
+| `scene_<s>_points.pth` | `t_position` | `[N,4]` | world xyz + learnable drop-out radius in `.w` |
+| | `t_point_size` | `[N,1]` | **pre-softplus** size; `softplus(x)` (beta 1, threshold 20) is the world-unit size |
+| | `t_index` | `[N,1]` i32 | render-order id -> texture column (identity in the published files) |
+| | `t_original_color` | `[N,4]` | the input cloud's RGBA, unused at render time |
+| `scene_<s>_texture.pth` | `texture` | `[C,N]` | **`texture_raw`** despite the name (`register_parameter("texture", texture_raw)`, NeuralTexture.cpp:53) |
+| | `background_color` | `[C]` | **`background_color_raw`** (`.cpp:54`) |
+| | `confidence_value_of_point` | `[1,N]` | **`confidence_raw`** (`.cpp:55`), pre-sigmoid; horse range `[-0.42, 1.17]` |
+| `scene_<s>_poses.pth` | `poses_se3` | `[M,8]` f64 | world-to-camera, xyzw + t + 1 pad (see 8a) |
+| | `tangent_poses` | `[M,6]` f64 | pending SE3 delta; zero in a saved checkpoint |
+| `scene_<s>_intrinsics.pth` | `intrinsics` | `[num_cameras,13]` | `fx fy cx cy s` + 8 distortion coefficients |
+| `scene_<s>_ex.pth` | `0` | `[M,1,1,1]` | per-frame exposure EV, applied as `x * 2**-EV` |
+| `scene_<s>_wb.pth` | `0` | `[M,3,1,1]` | per-frame white balance (all 1.0 in the horse run: `fix_wb = true`) |
+| `scene_<s>_response.pth` | `response` | `[1,3,1,25]` | per-channel response LUT |
+| `scene_<s>_vignette.pth` | `vignette_params` | `[3]` | radial polynomial (all 0 in the horse run: `fix_vignette = true`) |
+| | `vignette_center` | `[1,2,1,1]` | uv centre (0 in the horse run) |
+
+The `ep<NNNN>/test/` subdirectory holds TRIPS's own rendered test images (`<scene>_<index>.jpg`) and their
+targets (`..._gt.jpg`). **Those renders carry a blacked-out border of `train_mask_border = 16` pixels on
+every side** (measured: 15-16 all-zero rows/columns per side on every frame checked). Comparing them to
+the scene photographs without cropping that border costs about 10 dB — the authors' own horse render
+scores 15.7 dB uncropped and 25.2 dB cropped on frame index 8. Any parity number quoted against those
+files must say which.

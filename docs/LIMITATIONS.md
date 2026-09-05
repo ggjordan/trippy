@@ -161,3 +161,46 @@ tensors once the layer counts diverge). Rebuilding the target with `NetworkConfi
 exactly**, in registration order. This was run manually against the extracted file (not committed as an
 automated pytest test, since the checkpoint file lives outside the git-tracked worktree and cannot be
 required by CI); the exact commands are reproducible from `docs/TRIPS_REFERENCE.md` Sec. 9a.
+
+## EXP-0002 (feat/adop-parity, 2026-09-06): reproducing the published TRIPS horse render
+
+`trippy parity` now renders the authors' `checkpoint_horse` @ `ep0600` end to end and lands within
+0.07 dB of their own saved render (22.27 dB vs 22.34 dB mean over three held-out frames; see
+`experiments/EXP-0002-horse-parity/README.md`). What is *not* bit-exact, and what is still unverified:
+
+- **Not bit-exact, and cannot be from Python.** TRIPS blends in a CUDA warp with `__shfl` reductions over
+  float32; trippy sorts the whole fragment list and blends in a Metal kernel. Ordering of equal-depth
+  fragments, float32 accumulation order, and the `abs(ip - g) > 1` defensive guard
+  (`RenderForward.cu:3507`, unreachable for an exact 2x2 footprint) all differ at the ULP level. Measured
+  agreement against the authors' own render is 37.0 dB PSNR, not infinity.
+- **Border-pixel rule differs by one pixel.** TRIPS drops a point from layer `l` when
+  `floor(ip_l)` is outside `[0, w_l-2] x [0, h_l-2]` and then `break`s out of all coarser layers.
+  `trippy.render.parity` reproduces both rules, but `trippy.raster.emit.emit_fragments` additionally drops
+  individual out-of-bounds *corners*, which TRIPS never reaches because its point-level test already
+  guarantees all four are inside. No observable difference; noted so a future refactor does not "fix" one
+  of the two.
+- **`render_scale != 1` is untested for parity.** `size_px = fx * softplus(size) / z` scales with `fx`, so
+  a downscaled render moves points into different pyramid layers than the checkpoint was trained for. A
+  1/8-scale smoke render of frame 8 scores 10.4 dB. Parity numbers are only claimed at `render_scale = 1`.
+- **The `trilinear` ablation renders one multi-layer `render_pyramid` call**, so its coarse layers use
+  trippy's corner-origin halving rather than TRIPS's `ip *= 0.5f`. Layer 0 is aligned (the `cx, cy` +0.5
+  shift is applied); coarser layers are up to half a layer-pixel off. That is fine for an ablation column
+  and wrong for a parity claim, which is why the `trips` mode renders each layer separately.
+- **`alpha == 1.0` exactly makes the float32 CPU reference compositor produce NaN.**
+  `trippy.raster.ref_torch.composite_sorted` clamps alpha to `1 - RASTER_ALPHA_MAX_EPS` with
+  `RASTER_ALPHA_MAX_EPS = 1e-12`, which is a no-op in float32 (`1 - 1e-12 == 1.0f`), so `log1p(-1) = -inf`
+  and the per-segment rebase `exclusive - exclusive[start]` becomes `-inf - -inf`. Unreachable in a real
+  render (confidence is a sigmoid output, strictly < 1) and unreachable on the Metal path (which loops
+  sequentially), but it bit `tests/test_parity_render.py` when a test used `conf = 1.0`. Not fixed here:
+  `trippy/raster/ref_torch.py` is outside this task's file list.
+- **Masks are untested.** `tt_horse`'s `masks.txt` is 151 blank lines and its `params.ini` has
+  `use_image_masks = false`, so the mask path in `trippy.scene.adop_io` (which parses the file and exposes
+  `AdopView.mask_path`) has never been exercised against a scene that actually has masks.
+- **Only one scene, one epoch, three frames.** The other seven published Tanks & Temples scenes, and every
+  frame outside `{8, 120, 144}`, are unrendered. The three chosen frames are all in the authors' own test
+  split (`checkpoint_horse/test_indices_tt_horse.txt`), so none of them is a training view.
+- **The brief asked for `00200.jpg`; the scene has 151 images (`00001.jpg`..`00151.jpg`).** Frame index
+  144 was substituted — the last index in the checkpoint's own test split, and the one its
+  `img_worst_144_output.jpg` names as the run's worst test frame.
+- **Rolling shutter and motion blur are still not ported** (both `false` in the horse `params.ini`, so
+  they do not affect this result).
