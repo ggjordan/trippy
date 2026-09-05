@@ -215,6 +215,36 @@ Splats' code. `tests/test_export_ply.py::test_splats_extent_gate_accepts_synthet
 runs this same check via subprocess and skips cleanly on a machine
 without the Splats `ml-sharp` venv.
 
+## `trippy render` output layout
+
+`trippy render` (`trippy/render/pyramid_render.py`, `render_frames`) is the
+CLI entry point for the no-U-Net forward pass in this document's "Mandatory
+honesty sheet" spirit, applied per pyramid level. Given `--out <dir>` and
+`--frames a.jpg,b.jpg`, it writes:
+
+```
+<dir>/
+├── a/
+│   ├── photo.png        (undistorted source image)
+│   ├── level_0.png .. level_{L-1}.png   (native per-level resolution)
+│   ├── coverage.png     (1 - T_final at level 0, colorized)
+│   ├── depth.png        (expected depth at level 0, colorized; uncovered
+│   │                      pixels are exactly black, never a fabricated value)
+│   └── sheet.png         (photo | L0 .. L{L-1} | coverage | depth, one row;
+│                           levels are nearest-upsampled to level-0 size only
+│                           for this sheet, so coarse blockiness stays visible)
+├── b/ (same layout)
+├── summary_sheet.png     (all frames, one row each: photo | L0 | coverage)
+├── metrics.json          (per frame: image_hw, timing_ms {emit, sort, blend,
+│                           total}, num_fragments, points_visible)
+└── README.md             (the command that produced the run + the timing table)
+```
+
+`points_visible` is the count of points that survived the conservative
+view-frustum cull (`trippy.raster.cull_points`) -- candidates handed to
+fragment emission, not the (more expensive) count of points that actually
+survived the per-pixel fragment cap/transmittance cutoff inside compositing.
+
 `trippy.render.sheets` (`contact_sheet`, `side_by_side`, `colorize`,
 `save_png`) and `trippy.render.video` (`write_video`, `frames_from_dir`)
 give every export an inspectable artifact: a labelled contact sheet
