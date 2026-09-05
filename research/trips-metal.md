@@ -406,6 +406,7 @@ diagnostics under `output/diag/`.
 - 2026-09-05T15:02:32Z submitted job trippy-train-smoke-4 prio 16: bash -c cd /Users/nzbirdranch/trippy/.worktrees/train-debug && PYTHONPATH=. /Users/nzbirdranch/trippy/.venv/bin/python -m trippy.cli train --config experiments/EXP-0003-kk-trips-train/config_smoke.yaml --run-dir /Users/nzbirdranch/trippy/output/runs/EXP-0003-kk-trips-train/EXP-0003-kk-trips-train_smoke4 --device mps --max-minutes 25
 - 2026-09-05T15:09:55Z submitted job trippy-train-full1 prio 70: bash -c PYTHONPATH=. /Users/nzbirdranch/trippy/.venv/bin/python -m trippy.cli train --config experiments/EXP-0003-kk-trips-train/config.yaml --device mps --max-minutes 360
 - 2026-09-05T15:09:55Z submitted job trippy-train-full1-broadcast prio 70: bash -c PYTHONPATH=. /Users/nzbirdranch/trippy/.venv/bin/python -m trippy.cli train --config experiments/EXP-0003-kk-trips-train/config_broadcast.yaml --device mps --max-minutes 360
+<<<<<<< HEAD
 - 2026-09-05T13:47:54Z submitted job trippy-hybrid-c-render-1 prio 17: bash -c cd /Users/nzbirdranch/trippy/.worktrees/hybrid-c && PYTHONPATH=. /Users/nzbirdranch/Splats/tools/ml-sharp/.venv/bin/python -m trippy.hybrid.render_splat_views --scene /Users/nzbirdranch/Splats/scenes/karekare/kk-coherent --ply /Users/nzbirdranch/Splats/output/Training-Data/karekare/kk-coherent/kkc_15000.ply --out /Users/nzbirdranch/trippy/.worktrees/hybrid-c/output/hybrid-c/renders/w1008 --width 1008 --device mps --start-index 0 --end-index 110
 - 2026-09-05T13:53:29Z submitted job trippy-hybrid-c-render-2 prio 17: bash -c cd /Users/nzbirdranch/trippy/.worktrees/hybrid-c && PYTHONPATH=. /Users/nzbirdranch/Splats/tools/ml-sharp/.venv/bin/python -m trippy.hybrid.render_splat_views --scene /Users/nzbirdranch/Splats/scenes/karekare/kk-coherent --ply /Users/nzbirdranch/Splats/output/Training-Data/karekare/kk-coherent/kkc_15000.ply --out /Users/nzbirdranch/trippy/.worktrees/hybrid-c/output/hybrid-c/renders/w1008 --width 1008 --device mps --start-index 110 --end-index 219
 - 2026-09-05T14:52:23Z submitted job trippy-hybrid-c-train-1 prio 18: trippy hybrid-c train --config experiments/EXP-0005-hybrid-c/config.yaml --max-minutes 40
@@ -472,3 +473,5 @@ docs/SPEC.md's v0.3.0 plan.
 `checkpoints/`); delivered sheet `EXP-0005-hybrid-c-refine`
 (`~/Splats/output/Jordan-Review/4-other/EXP-0005-hybrid-c-refine.png`); full writeup
 `experiments/EXP-0005-hybrid-c/README.md`.
+=======
+>>>>>>> 2a86415 (Log full-run submissions)

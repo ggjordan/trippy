@@ -83,6 +83,9 @@ FIRST="${CMD[0]}"
 REST=()
 if [ ${#CMD[@]} -gt 1 ]; then REST=("${CMD[@]:1}"); fi
 VENV_PY="$REPO_ROOT/.venv/bin/python"
+# Git worktrees have no .venv: fall back to the main checkout's interpreter (PYTHONPATH=. below
+# keeps the worktree's package first on sys.path).
+if [ ! -x "$VENV_PY" ]; then VENV_PY="$(git rev-parse --path-format=absolute --git-common-dir)/../.venv/bin/python"; fi
 EXTRA=()
 case "$FIRST" in
   python) NEWHEAD="$VENV_PY" ;;
@@ -110,7 +113,8 @@ export SPLATS_ROOT="$SPLATS_ROOT"
 export TRIPPY_OUTPUT="$TRIPPY_OUTPUT"
 export RUST_LOG=info
 export PYTORCH_ENABLE_MPS_FALLBACK=0
-export PATH="$REPO_ROOT/.venv/bin:\$PATH"
+export PYTHONPATH="$REPO_ROOT"
+export PATH="$(dirname "$VENV_PY"):\$PATH"
 cd "$REPO_ROOT"
 $EXEC_LINE
 EOF
