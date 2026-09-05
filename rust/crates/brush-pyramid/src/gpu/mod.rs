@@ -46,14 +46,63 @@ pub fn default_device() -> WgpuDevice {
     WgpuDevice::DefaultDevice
 }
 
+/// Turn CubeCL's **roofline autotune bounds** off, process-wide.
+///
+/// # Why a browser has to call this
+///
+/// `brush_unet`'s decoder is convolutions, and `burn-cubecl` autotunes
+/// `conv2d` the first time it sees a shape. The tuner's *bounds generator*
+/// (`burn-cubecl/src/kernel/autotune_bounds.rs`) asks
+/// `cubecl_std::throughput::measure_peak_throughput` for the device's roofline
+/// first — and that function is documented upstream as **"Native only, panics
+/// on WASM"** (`cubecl-std/src/throughput/base.rs`). It probes the device with
+/// `ThroughputBenchmarker::measure`, which ends in
+/// `cubecl_environment::future::base::block_on`, i.e. `read_sync`, i.e. the
+/// wasm trap *"Failed to read tensor data synchronously"*.
+///
+/// That, and not the `Tensor` -> `CubeTensor` resolve, is what took the U-Net
+/// view down in the browser. `with_bounds` registers no generator at all when
+/// the level is `AutotuneLevel::Full`, so setting the level is a complete,
+/// supported way out — no fork, no patch. Autotune itself still runs, and its
+/// wasm path (`tune_fixed_samples`, resolved through `spawn_local`) is
+/// asynchronous throughout.
+///
+/// # Cost
+///
+/// `Full` means "benchmark every candidate", so the first frame that meets a
+/// new convolution shape pays for the whole candidate set instead of
+/// short-circuiting at the roofline. It is a one-off per shape, and there is
+/// no alternative: `Minimal`, `Balanced` and `Extensive` all install the
+/// generator that traps.
+///
+/// # When to call it
+///
+/// **Before the first CubeCL device is created**, and once. The underlying
+/// `try_set` refuses to override a configuration that has already been read,
+/// and returns whether it won.
+///
+/// # Returns
+/// `true` if this call installed the configuration; `false` if something had
+/// already set or read it, in which case the level is whatever that was.
+#[must_use]
+pub fn disable_autotune_roofline_bounds() -> bool {
+    use burn_cubecl::cubecl::config::autotune::AutotuneLevel;
+    use burn_cubecl::cubecl::config::{CubeClRuntimeConfig, RuntimeConfig};
+
+    let mut config = CubeClRuntimeConfig::default();
+    config.autotune.level = AutotuneLevel::Full;
+    CubeClRuntimeConfig::try_set(config)
+}
+
 /// Upload a host slice as a contiguous f32 device buffer.
 ///
-/// Exposed for the web viewer, which cannot use
-/// [`burn_bridge::resolve_to_cube_float`]: burn-fusion resolves a tensor
-/// through `submit_blocking`, and `cubecl`'s `read_sync` cannot block on
-/// `wasm32` ("Failed to read tensor data synchronously"). There the network's
-/// output is read back asynchronously and re-uploaded through this instead.
-/// See `docs/WEB_VIEWER.md`.
+/// Added in v0.5.0 for the web viewer's readback-and-re-upload path, on the
+/// belief that [`burn_bridge::resolve_to_cube_float`] could not run on wasm.
+/// It can — see `docs/WEB_VIEWER.md` blocker 4 — so **nothing in the viewer
+/// calls this any more**. Kept because "put this slice on the device" is a
+/// reasonable primitive to have next to [`UploadedPoints`], and because a
+/// readback-and-re-upload is still the fallback shape if a future browser
+/// makes the zero-copy resolve impossible again.
 ///
 /// # Arguments
 /// - `data`: the values, in the layout the consumer expects.
@@ -326,6 +375,153 @@ impl PyramidRender {
     }
 }
 
+/// A [`PointSet`] that already lives on the device, ready to bind.
+///
+/// **Why this exists.** [`render_pyramid`] takes host memory and uploads all
+/// four point arrays on every call. For the public horse bundle — 2.2 M
+/// points, `C = 4` — that is ~80 MB of `create_tensor_from_slice` per frame,
+/// and on this Mac it measures a flat **12.2 ms** per frame -- 55 % of a
+/// `raw level-0` frame at 1080p, which went 22.0 ms -> 9.8 ms when this type
+/// removed it (`research/trips-metal.md`). In a browser the same copy crosses the
+/// wasm/JS boundary once a frame. A viewer's point set never changes between
+/// frames, so it belongs on the device once per bundle: build one of these at
+/// load time and hand it to [`render_pyramid_uploaded`] every frame.
+///
+/// **The feature element type is baked in.** [`FeatureStore::F16`] is a
+/// different buffer, not a different binding, so it is chosen at upload time.
+/// [`render_pyramid_uploaded`] returns `Err` when the
+/// [`PyramidParams::feature_store`] it is given disagrees, rather than
+/// silently compositing at the other precision; a caller that exposes the
+/// f16 lever as a runtime toggle re-uploads on the toggle.
+///
+/// **Cloning is cheap.** Every field is a `CubeTensor` handle — a reference to
+/// a device allocation, not the bytes — so a clone costs a few atomics and is
+/// how a `&self` render path gets a copy out from behind a cell without
+/// holding a borrow across an `await`.
+#[derive(Clone)]
+pub struct UploadedPoints {
+    device: WgpuDevice,
+    num_points: usize,
+    num_channels: usize,
+    feature_store: FeatureStore,
+    device_bytes: usize,
+    /// `(N * 3,)` f32 world-frame positions.
+    xyz: CubeTensor<WgpuRuntime>,
+    /// `(N,)` f32 radii.
+    size: CubeTensor<WgpuRuntime>,
+    /// `(N,)` f32 confidences.
+    conf: CubeTensor<WgpuRuntime>,
+    /// `(N * C,)` f32 or f16 features, per [`Self::feature_store`].
+    feat: CubeTensor<WgpuRuntime>,
+}
+
+impl UploadedPoints {
+    /// Upload `points` to `device` once.
+    ///
+    /// # Arguments
+    /// - `points`: the host-side point set. Not retained; the caller keeps it
+    ///   only if it may need to re-upload at a different `feature_store`.
+    /// - `feature_store`: element type for the feature buffer. Must match the
+    ///   [`PyramidParams::feature_store`] of every render that uses this
+    ///   handle.
+    /// - `device`: the wgpu device to allocate on.
+    ///
+    /// # Errors
+    /// Returns `Err` if `points.num_channels` is not one of
+    /// [`SUPPORTED_CHANNELS`], because the blend kernel is specialised on `C`
+    /// and a later failure would be much harder to read.
+    pub fn new(
+        points: &PointSet,
+        feature_store: FeatureStore,
+        device: &WgpuDevice,
+    ) -> Result<Self, String> {
+        let num_channels = points.num_channels;
+        if !SUPPORTED_CHANNELS.contains(&num_channels) {
+            return Err(unsupported_channels(num_channels));
+        }
+        // `pad1`: a zero-length buffer is not a valid binding.
+        let xyz_host = pad1(&points.xyz);
+        let size_host = pad1(&points.size);
+        let conf_host = pad1(&points.conf);
+        let feat_host = pad1(&points.feat);
+        let xyz = create_tensor_from_slice(xyz_host, device, DType::F32);
+        let size = create_tensor_from_slice(size_host, device, DType::F32);
+        let conf = create_tensor_from_slice(conf_host, device, DType::F32);
+        let (feat, feat_bytes) = match feature_store {
+            FeatureStore::F32 => (
+                create_tensor_from_slice(feat_host, device, DType::F32),
+                feat_host.len() * size_of::<f32>(),
+            ),
+            FeatureStore::F16 => {
+                let half: Vec<HalfF32> =
+                    feat_host.iter().copied().map(HalfF32::from_f32).collect();
+                let bytes = half.len() * size_of::<HalfF32>();
+                (create_tensor_from_slice(&half, device, DType::F16), bytes)
+            }
+        };
+        let device_bytes =
+            (xyz_host.len() + size_host.len() + conf_host.len()) * size_of::<f32>() + feat_bytes;
+        Ok(Self {
+            device: device.clone(),
+            num_points: points.len(),
+            num_channels,
+            feature_store,
+            device_bytes,
+            xyz,
+            size,
+            conf,
+            feat,
+        })
+    }
+
+    /// The device these buffers live on.
+    #[must_use]
+    pub fn device(&self) -> &WgpuDevice {
+        &self.device
+    }
+
+    /// `N`, the number of points.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.num_points
+    }
+
+    /// True when the set holds no points (one padding element is still
+    /// allocated, because a zero-length binding is invalid).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.num_points == 0
+    }
+
+    /// `C`, the feature width.
+    #[must_use]
+    pub fn num_channels(&self) -> usize {
+        self.num_channels
+    }
+
+    /// The element type the features were uploaded as.
+    #[must_use]
+    pub fn feature_store(&self) -> FeatureStore {
+        self.feature_store
+    }
+
+    /// Bytes of device memory these four buffers occupy — the per-frame
+    /// transfer this handle removes.
+    #[must_use]
+    pub fn device_bytes(&self) -> usize {
+        self.device_bytes
+    }
+}
+
+/// The one wording for an unsupported `C`, shared by the upload and the render
+/// so the two cannot drift apart.
+fn unsupported_channels(channels: usize) -> String {
+    format!(
+        "C = {channels} is not supported on the GPU path; the blend kernel is \
+         specialised for {SUPPORTED_CHANNELS:?}"
+    )
+}
+
 /// Wall-clock cost of each forward-pass stage, milliseconds.
 ///
 /// Only produced by [`render_pyramid_timed`], which inserts a real device
@@ -335,6 +531,21 @@ impl PyramidRender {
 /// use [`render_pyramid`] plus one barrier for the honest whole-frame figure.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct StageTimings {
+    /// Stage 0, uploading the point set to the device.
+    ///
+    /// Only ever non-zero for [`render_pyramid_timed`], which is handed a
+    /// host-side [`PointSet`] and so has to upload it. When the points are
+    /// already device-resident ([`render_pyramid_uploaded_timed`]) this is
+    /// `0.0`, because no upload happened — which is the whole point of
+    /// [`UploadedPoints`]. Before this lane existed the cost was hidden inside
+    /// `project_count_ms`, where it read 12.1 ms of a 22.6 ms `raw` profile.
+    ///
+    /// **Read a profile in `raw` mode.** In `network` mode the first stage's
+    /// forced sync also drains the *previous* frame's still-queued U-Net, and
+    /// `project_count_ms` reads ~180 ms — which is that queue, not this
+    /// stage. `docs/LIMITATIONS.md` records how long that artefact was
+    /// believed to be a measurement.
+    pub upload_ms: f64,
     /// Stage 1, project + cull + count slots.
     pub project_count_ms: f64,
     /// Stage 2, prefix sum, including the one host readback of the total.
@@ -347,7 +558,7 @@ pub struct StageTimings {
     pub segment_ms: f64,
     /// Stages 6 and 7, blend and background.
     pub blend_ms: f64,
-    /// Sum of the above.
+    /// Sum of the above, `upload_ms` included.
     pub total_ms: f64,
     /// Fragment slots reserved, i.e. how much the sort actually moved.
     pub fragment_slots: u32,
@@ -415,12 +626,43 @@ pub async fn render_pyramid(
     params: &PyramidParams,
     background: Option<&[f32]>,
 ) -> Result<PyramidRender, String> {
-    let (render, _) = render_inner(device, points, camera, params, background, false).await?;
+    let uploaded = UploadedPoints::new(points, params.feature_store, device)?;
+    let (render, _) = render_inner(&uploaded, camera, params, background, false).await?;
+    Ok(render)
+}
+
+/// [`render_pyramid`] for points that are **already on the device**.
+///
+/// This is the per-frame entry point a viewer wants: the ~80 MB the
+/// [`PointSet`] overload re-uploads every call is exactly the cost
+/// [`UploadedPoints`] exists to remove. Everything after the upload is
+/// identical, so a frame from here is bit-for-bit a frame from there.
+///
+/// # Arguments
+/// - `points`: the device-resident point set; its own device is the one
+///   everything is allocated on.
+/// - `camera`, `params`, `background`: as [`render_pyramid`].
+///
+/// # Errors
+/// Returns `Err` on invalid geometry, a failed readback of the fragment
+/// count, or a `params.feature_store` that disagrees with the element type
+/// `points` was uploaded as.
+pub async fn render_pyramid_uploaded(
+    points: &UploadedPoints,
+    camera: &Camera,
+    params: &PyramidParams,
+    background: Option<&[f32]>,
+) -> Result<PyramidRender, String> {
+    let (render, _) = render_inner(points, camera, params, background, false).await?;
     Ok(render)
 }
 
 /// [`render_pyramid`] with a device `sync` at every stage boundary, returning
 /// the per-stage wall times as well.
+///
+/// [`StageTimings::upload_ms`] carries the point upload, which is charged to
+/// this overload alone; [`render_pyramid_uploaded_timed`] reports 0 there
+/// because it does not upload.
 ///
 /// # Errors
 /// As [`render_pyramid`], plus any device synchronisation failure.
@@ -431,7 +673,34 @@ pub async fn render_pyramid_timed(
     params: &PyramidParams,
     background: Option<&[f32]>,
 ) -> Result<(PyramidRender, StageTimings), String> {
-    let (render, timings) = render_inner(device, points, camera, params, background, true).await?;
+    // Measured the same way every other stage is: allocate, then drain the
+    // queue, so the number is the transfer's and not the enqueue's.
+    let client = WgpuRuntime::<burn_wgpu::AutoCompiler>::client(device);
+    let clock = std::time::Instant::now();
+    let uploaded = UploadedPoints::new(points, params.feature_store, device)?;
+    client
+        .sync()
+        .await
+        .map_err(|e| format!("device sync failed: {e:?}"))?;
+    let upload_ms = clock.elapsed().as_secs_f64() * 1e3;
+    let (render, timings) = render_inner(&uploaded, camera, params, background, true).await?;
+    let mut timings = timings.unwrap_or_default();
+    timings.upload_ms = upload_ms;
+    timings.total_ms += upload_ms;
+    Ok((render, timings))
+}
+
+/// [`render_pyramid_uploaded`] with a device `sync` at every stage boundary.
+///
+/// # Errors
+/// As [`render_pyramid_uploaded`], plus any device synchronisation failure.
+pub async fn render_pyramid_uploaded_timed(
+    points: &UploadedPoints,
+    camera: &Camera,
+    params: &PyramidParams,
+    background: Option<&[f32]>,
+) -> Result<(PyramidRender, StageTimings), String> {
+    let (render, timings) = render_inner(points, camera, params, background, true).await?;
     Ok((render, timings.unwrap_or_default()))
 }
 
@@ -440,18 +709,26 @@ pub async fn render_pyramid_timed(
 // make every other stage's timing harder to read.
 #[allow(clippy::too_many_lines, unused_assignments)]
 async fn render_inner(
-    device: &WgpuDevice,
-    points: &PointSet,
+    points: &UploadedPoints,
     camera: &Camera,
     params: &PyramidParams,
     background: Option<&[f32]>,
     timed: bool,
 ) -> Result<(PyramidRender, Option<StageTimings>), String> {
-    let channels = points.num_channels;
+    let device = points.device();
+    let channels = points.num_channels();
     if !SUPPORTED_CHANNELS.contains(&channels) {
+        return Err(unsupported_channels(channels));
+    }
+    // f16 storage is a different buffer, not a different binding, so this
+    // cannot be honoured after the fact. Refusing beats compositing at a
+    // precision the caller did not ask for and cannot see.
+    if params.feature_store != points.feature_store() {
         return Err(format!(
-            "C = {channels} is not supported on the GPU path; the blend kernel is \
-             specialised for {SUPPORTED_CHANNELS:?}"
+            "these points were uploaded as {:?} but params.feature_store is {:?}; \
+             rebuild the UploadedPoints at the requested precision",
+            points.feature_store(),
+            params.feature_store
         ));
     }
     if let Some(bg) = background {
@@ -500,18 +777,10 @@ async fn render_inner(
     }
 
     // --- upload -----------------------------------------------------------
-    // `.max(1)`: a zero-length buffer is not a valid binding.
-    let xyz = create_tensor_from_slice(pad1(&points.xyz), device, DType::F32);
-    let size = create_tensor_from_slice(pad1(&points.size), device, DType::F32);
-    let conf = create_tensor_from_slice(pad1(&points.conf), device, DType::F32);
-    let feat = match params.feature_store {
-        FeatureStore::F32 => create_tensor_from_slice(pad1(&points.feat), device, DType::F32),
-        FeatureStore::F16 => {
-            let half: Vec<HalfF32> = pad1(&points.feat).iter().copied().map(HalfF32::from_f32).collect();
-            create_tensor_from_slice(&half, device, DType::F16)
-        }
-    };
-
+    // Nothing here: `points` is already on the device. That is the whole
+    // change -- this block used to push ~80 MB per frame for the horse
+    // bundle, a flat 12.2 ms that halved the rasteriser's frame rate.
+    //
     // (L, 4) u32: height, width, flat offset, unused padding lane.
     let mut geom = Vec::with_capacity(grid.num_layers() * LAYER_GEOM_LANES as usize);
     for (layer, &(h_l, w_l)) in grid.shapes().iter().enumerate() {
@@ -541,8 +810,8 @@ async fn render_inner(
         &client,
         points_dispatch.clone(),
         cube_dim,
-        xyz.into_tensor_arg(),
-        size.into_tensor_arg(),
+        points.xyz.clone().into_tensor_arg(),
+        points.size.clone().into_tensor_arg(),
         layer_geom.clone().into_tensor_arg(),
         proj.clone().into_tensor_arg(),
         counts.clone().into_tensor_arg(),
@@ -585,7 +854,7 @@ async fn render_inner(
             points_dispatch,
             cube_dim,
             proj.into_tensor_arg(),
-            conf.into_tensor_arg(),
+            points.conf.clone().into_tensor_arg(),
             counts.into_tensor_arg(),
             cum_counts.into_tensor_arg(),
             layer_geom.into_tensor_arg(),
@@ -659,7 +928,7 @@ async fn render_inner(
             permutation.into_tensor_arg(),
             alphas.into_tensor_arg(),
             point_ids.into_tensor_arg(),
-            feat.into_tensor_arg(),
+            points.feat.clone().into_tensor_arg(),
             out.clone().into_tensor_arg(),
             t_final.clone().into_tensor_arg(),
             n_used.clone().into_tensor_arg(),
@@ -676,7 +945,7 @@ async fn render_inner(
             permutation.into_tensor_arg(),
             alphas.into_tensor_arg(),
             point_ids.into_tensor_arg(),
-            feat.into_tensor_arg(),
+            points.feat.clone().into_tensor_arg(),
             out.clone().into_tensor_arg(),
             t_final.clone().into_tensor_arg(),
             n_used.clone().into_tensor_arg(),
@@ -706,7 +975,8 @@ async fn render_inner(
     if let Some(t) = timings.as_mut() {
         t.fragment_slots = num_slots;
         t.radix_passes = radix_passes;
-        t.total_ms = t.project_count_ms
+        t.total_ms = t.upload_ms
+            + t.project_count_ms
             + t.prefix_ms
             + t.emit_ms
             + t.sort_ms

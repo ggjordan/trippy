@@ -254,8 +254,10 @@ fn run_headless(args: &Args, bundle: Bundle) -> Result<(), String> {
         ))?;
         if let Some(s) = frame.stats.stages {
             println!(
-                "PROFILE project {:.1} | prefix {:.1} | emit {:.1} | sort {:.1} ({} radix \
-                 passes over {} slots) | segment {:.1} | blend {:.1} | sum {:.1} ms",
+                "PROFILE upload {:.1} | project {:.1} | prefix {:.1} | emit {:.1} | sort \
+                 {:.1} ({} radix passes over {} slots) | segment {:.1} | blend {:.1} | sum \
+                 {:.1} ms",
+                s.upload_ms,
                 s.project_count_ms,
                 s.prefix_ms,
                 s.emit_ms,

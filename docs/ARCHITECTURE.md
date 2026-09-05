@@ -393,13 +393,26 @@ Two decisions are worth carrying forward:
 `crates/trips-viewer` closes the loop. Per frame:
 
 ```
+bundle load (once)      -> gpu::UploadedPoints   xyz/size/conf/feat, on the device
+                                                 and kept there for the session
+
 fly camera (WASD/drag)  -> brush_pyramid::Camera  (R row-major, t, fx/fy/cx/cy,
                                                    8-param Saiga distortion)
-   -> render_pyramid                       the six kernels above
+   -> render_pyramid_uploaded              the six kernels above, binding the
+                                           resident buffers -- no upload
    -> Unet + NeuralCamera                  (view mode "network" only)
    -> resolve_to_cube_float                back to one bindable buffer
    -> egui paint callback + blit.wgsl      fullscreen triangle samples it
 ```
+
+The **`UploadedPoints` step is the whole reason the frame rate is what it is.**
+`render_pyramid` takes a host-side `PointSet` and uploads all four arrays on
+every call: 80 MB per frame on the horse, for data that never changes, worth a
+flat 12.2 ms. Splitting the upload out took the shipped `--half-net --scale
+0.75` view from 21.7 to 29.5 fps and the `raw level-0` view from 46.2 to 116.2
+fps (`research/trips-metal.md`, job `trippy-web-unet-gpu-3`). The `PointSet`
+entry points still exist and still work — they upload and delegate — so every
+test, example and CLI tool is unchanged.
 
 and the view toggle picks *which* buffer is blitted, from the **same** render:
 
@@ -429,16 +442,16 @@ the rest of the pipeline:
   ignoring them.
 - **`Unet::load_with_precision`** lets the decoder run in f16. This is the lever that
   matters: measuring the viewer's `raw level-0` view — the identical rasteriser with the
-  network removed — gives **21.6 ms against a 204 ms frame**, so the rasteriser is ~11 %
-  and the network ~89 %, and the f16 network alone is 2.58x for 59.8 dB (visually free).
+  network removed — gives **9.8 ms against a 190 ms frame**, so the rasteriser is ~5 %
+  and the network ~95 %, and the f16 network alone is 2.58x for 59.8 dB (visually free).
   Every rasteriser-side lever measures within run-to-run noise. `docs/LIMITATIONS.md`
   and `research/trips-metal.md` carry the table; this overturns the "sort-dominated"
   reading of the first Mac timing.
 
-Still open for v0.4.0: the backward pass (`blend_bwd`) in Rust; an API that uploads a
-point set **once** instead of re-uploading 80 MB every frame (the next obvious
-optimisation, see `docs/LIMITATIONS.md`); and wiring TRIPS into the web build
-(`docs/WEB_VIEWER.md`).
+Still open: the backward pass (`blend_bwd`) in Rust, and why a browser frame is
+~27x a native one now that the point upload — the obvious suspect — has been
+removed and did not explain it (`docs/LIMITATIONS.md`). The point-upload API and
+the web build are both done (`gpu::UploadedPoints`; `docs/WEB_VIEWER.md`).
 
 ## Validation strategy
 

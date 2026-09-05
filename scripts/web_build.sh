@@ -12,6 +12,8 @@
 # Usage: scripts/web_build.sh [--trips] [--dev] [--check] [--bundle DIR] [--out DIR]
 #   --trips      build trippy's viewer instead of the stock Brush demo
 #   --dev        wasm-pack --dev (fast, unoptimized, dwarf debug info) instead of --release
+#   --profiling  wasm-pack --profiling: release codegen, wasm-opt -O, symbol names KEPT. The
+#                build to use when a wasm panic's stack trace has to be readable.
 #   --check      dry run: verify the toolchain and print the plan; build nothing. For tests that
 #                want to confirm the toolchain without paying for a full wasm-pack build.
 #   --bundle DIR --trips only: the TRIPS bundle directory to copy in.
@@ -58,11 +60,15 @@ OUT=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --dev) MODE="dev"; shift ;;
+    # Release codegen + wasm-opt -O, but names and DWARF kept: the only build
+    # in which a wasm panic's stack trace has readable frames. Used to find
+    # which dependency called CubeCL's read_sync (docs/WEB_VIEWER.md).
+    --profiling) MODE="profiling"; shift ;;
     --check) CHECK=1; shift ;;
     --trips) TRIPS=1; shift ;;
     --bundle) BUNDLE=${2:?--bundle needs a directory}; shift 2 ;;
     --out) OUT=${2:?--out needs a directory}; shift 2 ;;
-    *) echo "✗ unknown argument: $1 (expected --trips, --dev, --check, --bundle DIR, --out DIR)" >&2; exit 2 ;;
+    *) echo "✗ unknown argument: $1 (expected --trips, --dev, --profiling, --check, --bundle DIR, --out DIR)" >&2; exit 2 ;;
   esac
 done
 

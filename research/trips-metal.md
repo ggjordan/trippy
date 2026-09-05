@@ -1350,3 +1350,131 @@ effect.
 - 2026-09-05T20:53:39Z delivered hybrid-a-smoke-honesty: trippy train report hybrid-a-smoke: epoch 1, held-out PSNR 8.88 dB, shade dark-mass 20.5% vs baseline 19.9% (/Users/nzbirdranch/trippy/output/runs/EXP-0009-hybrid-a/hybrid-a-smoke/report/dolly/honesty_sheet.png)
 - 2026-09-05T20:53:39Z delivered hybrid-a-smoke-export: trippy train report hybrid-a-smoke: epoch 1, held-out PSNR 8.88 dB, shade dark-mass 20.5% vs baseline 19.9% (/Users/nzbirdranch/trippy/output/runs/EXP-0009-hybrid-a/hybrid-a-smoke/export.ply)
 - 2026-09-05T20:55:16Z submitted job trippy-hybrid-a-all-levels prio 70: trippy train --config experiments/EXP-0009-hybrid-a/config.yaml --report --max-minutes 330
+- 2026-09-05T20:44:44Z submitted job trippy-web-unet-gpu-1 prio 12: bash /Users/nzbirdranch/trippy/output/web-unet/bench.sh /Users/nzbirdranch/trippy/output/.cargo-target-web-unet/trips-viewer-baseline BASELINE
+- 2026-09-05T20:54:39Z submitted job trippy-web-unet-gpu-2 prio 12: bash /Users/nzbirdranch/trippy/output/web-unet/bench_after.sh
+- 2026-09-05T21:34:33Z submitted job trippy-web-unet-gpu-3 prio 12: bash /Users/nzbirdranch/trippy/output/web-unet/bench_ab.sh
+- 2026-09-05T21:53:24Z submitted job trippy-web-unet-gpu-4 prio 12: bash /Users/nzbirdranch/trippy/output/web-unet/bench_final.sh
+- 2026-09-05T21:48:01Z delivered trips-web-viewer-horse: Desktop web TRIPS viewer, updated: the U-Net view now RENDERS in the browser (it could not before) -- open it in Chrome, not Safari, and give the first frame ~20 s while it autotunes, then it runs at ~1.1 fps at 1440x810; press V for the raw level-0 and coverage honesty views, which run at ~3.3 fps. Browser frame matches the Mac viewer's at 62 dB. Double-click; nothing leaves the machine (127.0.0.1). (/Users/nzbirdranch/trippy/output/web/trips-dist)
+
+## 2026-09-06 — the point upload was 12 ms a frame, and the browser's U-Net block was never `read_sync` on the output
+
+Two questions, one session, both answered on the public **horse** bundle
+(2 218 471 points, C = 4, view 8). Jobs `trippy-web-unet-gpu-1` (before),
+`-gpu-2` (after + GPU parity tests), `-gpu-3` (before/after in one job, plus a
+pixel guard), `-gpu-4` (the shipped binary, confirming `-gpu-3`). All rc = 0.
+
+### A. `UploadedPoints`: upload the point set once, not once a frame
+
+`render_pyramid` took a host-side `PointSet` and called
+`create_tensor_from_slice` on `xyz`/`size`/`conf`/`feat` on **every call** —
+80 MB per frame for data that never changes. `brush_pyramid::gpu::UploadedPoints`
+is that upload as a handle, built once per bundle by `trips_viewer::Renderer`
+and bound every frame through the new `render_pyramid_uploaded`. The old
+`PointSet` entry points still work and now simply upload and delegate.
+
+Whole-frame medians over 30 frames, one device sync per frame, **job
+`trippy-web-unet-gpu-3`**, both binaries in the same job with nothing else on
+the GPU:
+
+| view | levers | before | after | gain |
+|---|---|---|---|---|
+| 1920x1080 | `network`, exact | 202.75 ms · **4.93 fps** | 189.54 ms · **5.28 fps** | +7 % |
+| 1920x1080 | `network --half-net` | 80.33 ms · **12.45 fps** | 68.30 ms · **14.64 fps** | +18 % |
+| 1440x810 | `network --half-net --scale 0.75` (the shipped launcher) | 46.04 ms · **21.72 fps** | 33.95 ms · **29.46 fps** | **+36 %** |
+| 1920x1080 | `raw level-0`, exact | 22.03 ms · **45.40 fps** | 9.77 ms · **102.31 fps** | **+125 %** |
+| 1440x810 | `raw level-0` | 21.66 ms · **46.17 fps** | 8.61 ms · **116.21 fps** | **+152 %** |
+
+The saving is a flat **~12.2 ms per frame**, which is the whole of it: it is a
+fixed cost, so it is 55 % of a `raw level-0` frame and 6 % of an exact 1080p
+network frame.
+
+**And the old "stage 1 = 178 ms" reading was an artefact.** `--profile` was
+being run in `network` mode, where the first stage's forced device sync drains
+the *previous* warm-up frame's still-queued U-Net. Profiling in `raw` mode
+instead, where the warm-up frames are cheap, gives the honest table and the
+upload's true size:
+
+```
+before  PROFILE project 12.1 | prefix 0.7 | emit 0.5 | sort 7.4 | segment 0.4 | blend 1.4 | sum 22.6 ms
+after   PROFILE upload  0.0 | project  0.4 | prefix 0.8 | emit 0.6 | sort 7.6 | segment 0.4 | blend 1.5 | sum 11.3 ms
+```
+
+`project` 12.1 → **0.4 ms**. `StageTimings` gained an `upload_ms` lane so the
+cost can never hide inside stage 1 again; `render_pyramid_timed` charges the
+upload to it, `render_pyramid_uploaded_timed` reports 0 because it does not
+upload.
+
+**Pixels unchanged:** the new binary's `--half-net --scale 0.75 --screenshot`
+frame is **byte-identical** (PSNR `inf`) to `output/brush/viewer/halfnet_s75.png`,
+the v0.5.0 reference. GPU parity tests re-run in job `-gpu-2`: brush-pyramid
+5/5 (max|feature| 2.2e-6 vs CPU), brush-unet 4/4 (horse view 8 PSNR 114.49 dB
+vs the Python engine).
+
+### B. The U-Net view in a browser: the blocker was CubeCL's autotune, not the tensor read
+
+v0.5.0 recorded the browser's `network` view as blocked by CubeCL's `read_sync`
+on the route from `burn::Tensor<4>` to a bindable buffer, and shipped
+`networkBlocked: true` with `raw level-0` substituted. **That diagnosis was
+wrong**, and the code it blamed is fine on wasm:
+`FusionClient::resolve_tensor_float` reaches `submit_blocking`, which on
+`wasm32-unknown-unknown` is `ReentrantMutexDeviceHandle::submit_blocking` — an
+inline call under a reentrant mutex, because cubecl's `multi_threading` cfg is
+`not(target_family = "wasm")` (`cubecl-common/build.rs:11`). No thread parks.
+
+The real path was found by reading the **stack**, which needed
+`scripts/web_build.sh --profiling` (new flag; `--release`'s `wasm-opt` strips
+the name section) plus `wasm-pack --no-opt` and `Error.stackTraceLimit = 300`:
+
+```
+NeuralCamera::forward -> linspace_centered -> Tensor::from_data
+  -> fusion stream drains -> the U-Net's queued conv2d
+    -> burn_cubecl conv_autotune -> BoundsGenerator::generate
+      -> cubecl_std::throughput::measure_peak_throughput   <-- "Native only, panics on WASM"
+        -> ThroughputBenchmarker::measure -> block_on -> read_sync -> trap
+```
+
+It is the **autotuner's roofline probe**, not the output tensor.
+`raw level-0` was never affected because it runs no convolution.
+
+**Fix, with no fork and no `[patch]`:**
+`burn-cubecl/src/kernel/autotune_bounds.rs::with_bounds` registers no bounds
+generator at all when the autotune level is `AutotuneLevel::Full`, so
+`brush_pyramid::gpu::disable_autotune_roofline_bounds()` sets that level
+through cubecl's own `RuntimeConfig::try_set`, and `trips_web::gpu::Gpu::create`
+calls it before the first CubeCL device exists. Cost: `Full` benchmarks every
+candidate, so the **first** frame of a new convolution shape takes ~20 s, once;
+the page says so on the canvas while it happens.
+
+**Result, Chrome 152, 1440x810, view 8, `--half-net` equivalent, release build,
+with a Splats training on the same GPU (so a lower bound):**
+
+| | v0.5.0 | now |
+|---|---|---|
+| `network` (U-Net) | not available | **renders**, 1.09 fps (6 frames / 5.49 s) |
+| `raw level-0` | 2.90 fps | **3.32 fps** |
+| GPU-readback PNG | 0 bytes (blocked) | 2 547 624 bytes |
+| PSNR vs native `--half-net --scale 0.75` | not measurable | **62.04 dB** (readback), 62.03 dB (`canvas.toBlob`) |
+
+62 dB against `output/brush/viewer/halfnet_s75.png` is the same picture; the
+residual is f16 rounding and a different autotune-chosen convolution kernel.
+`resolve_network_output` is no longer `cfg`-split — the browser's frame now
+goes U-Net → blit with no readback, exactly like the Mac app's.
+
+### Confirmed on the shipped binary: job `trippy-web-unet-gpu-4` (rc = 0)
+
+The table above was measured with the binary as it stood mid-session; the final
+one differs by doc comments, one removed unused parameter and one public
+function native never calls. Re-run against the exact shipped binary:
+
+```
+final  s0.75-network-halfnet  33.88 ms (29.52 fps)      [-gpu-3 said 33.95 / 29.46]
+final  1080p-raw               9.52 ms (104.99 fps)     [-gpu-3 said  9.77 / 102.31]
+final  profile-raw   PROFILE upload 0.0 | project 0.5 | prefix 0.6 | emit 0.5 |
+                             sort 7.4 | segment 0.5 | blend 1.2 | sum 10.6 ms
+final  halfnet_s75_final.png vs halfnet_s75.png:  inf dB   (byte-identical)
+```
+
+**Verdict.** PASS on both. Artefacts:
+`$SPLATS_ROOT/tools/gpu_queue/logs/trippy-web-unet-gpu-{1,2,3,4}.log`;
+`$TRIPPY_OUTPUT/web/verify-chrome-release/` (beacon + two PNGs, public horse
+scene, not committed); `$TRIPPY_OUTPUT/brush/viewer/web-unet/halfnet_s75_after.png`.

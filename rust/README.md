@@ -328,10 +328,16 @@ Build: `scripts/web_build.sh --trips` (2 m 14 s cold on this Mac; 24.4 MB wasm).
 Serve: `scripts/deliver.sh output/web/trips-dist <name> "<why>"`.
 
 **Read `docs/WEB_VIEWER.md` before touching it.** Four blockers had to be found
-and named to get a frame out of a browser at all, two of them are worked around
-by shims in `web/trips.js`, and one of them — the U-Net view — is still
-unsolved: CubeCL's `read_sync` cannot block on wasm32, so the rasteriser's views
-render and the network's does not. `docs/LIMITATIONS.md` has the short version.
+and named to get a frame out of a browser at all, and two of them are worked
+around by shims in `web/trips.js`. All three view modes render, including the
+U-Net's: blocker 4 was **not** the tensor read it was first reported as, but
+CubeCL's convolution autotuner, whose roofline probe
+(`cubecl_std::throughput::measure_peak_throughput`, "Native only, panics on
+WASM") ends in `block_on`. `brush_pyramid::gpu::disable_autotune_roofline_bounds()`
+sets `AutotuneLevel::Full`, at which `burn-cubecl` registers no bounds generator
+at all; `trips_web::gpu::Gpu::create` calls it before the first CubeCL device
+exists. The price is ~20 s of autotune on the first frame of each convolution
+shape. `docs/LIMITATIONS.md` has the short version.
 
 ## `trips-viewer`: the native Mac viewer
 
@@ -376,7 +382,9 @@ it. Nothing round-trips through host memory.
 
 `resolve_to_cube_float` (the reverse of the existing `float_tensor`) and `gpu::sync`
 were added to `brush-pyramid` for this, so the viewer needs no dependency on
-`brush-render`.
+`brush-render`. The same `resolve_to_cube_float` runs in the browser: it is not
+`cfg`-split, and contrary to what v0.5.0 recorded it does **not** end in
+CubeCL's `read_sync` on wasm (`docs/WEB_VIEWER.md` blocker 4).
 
 ### Building and running
 
@@ -412,7 +420,12 @@ bash scripts/gpu_submit.sh --prio 12 --wait mac-viewer-gpu-N -- bash -c \
 - `--bench N` times `N` frames, each ended by a real device sync (`gpu::sync`) rather
   than a readback, so the number is the render's and not a 24 MB transfer's.
 - `--profile` prints per-stage milliseconds (a device sync per stage; a profile, not a
-  frame time).
+  frame time). **Profile in `--mode raw`.** In `network` mode the first stage's
+  forced sync drains the previous warm-up frame's still-queued U-Net and stage 1
+  reads ~180 ms, which is that queue and not the stage; the same stage reads
+  0.4 ms in `raw`. `StageTimings` also carries `upload_ms`, which is non-zero
+  only for the `PointSet` entry points — the viewer's own path uploads nothing
+  per frame.
 - `--half-net`, `--scale F`, `--no-cull`, `--cap-fragments`, `--fp16`,
   `--packed-sort` are the performance levers, all off / 1.0 by default.
   `docs/LIMITATIONS.md` says what each costs and `research/trips-metal.md` has
@@ -425,16 +438,64 @@ before the network, which makes the split free to measure:
 
 | what | 1920x1080, horse bundle |
 |---|---|
-| whole frame (`network` view, exact) | 204 ms — 4.9 fps |
-| pyramid rasteriser alone (`raw` / `coverage` view) | **21.5 ms — 46.6 fps** |
+| whole frame (`network` view, exact) | 190 ms — 5.3 fps |
+| pyramid rasteriser alone (`raw` / `coverage` view) | **9.8 ms — 102 fps** |
+
+(Both numbers improved on 2026-09-06 from 204 ms / 21.5 ms when
+`gpu::UploadedPoints` removed a flat 12.2 ms of per-frame point upload; see
+"Upload the points once" below.)
 
 So the rasteriser, 10.4 M fragments and two 32-bit radix sorts included, is about
-**11 %** of the frame; the U-Net and tone mapper are the other **89 %**. This
+**5 %** of the frame; the U-Net and tone mapper are the other **95 %**. This
 contradicts the "sort-dominated" reading of the first Mac timing recorded in
 `research/trips-metal.md` (which timed cumulative prefixes and could not separate
 the last stage from the whole). Every rasteriser-side lever consequently measures
 within noise, and the levers that move the number are the two that reduce the
 *network's* work: `--scale` and `--half-net`.
+
+### Upload the points once: `gpu::UploadedPoints`
+
+`render_pyramid` takes a host-side `PointSet` and calls
+`create_tensor_from_slice` on `xyz`, `size`, `conf` and `feat` **on every
+call**. On the horse bundle that is 80 MB per frame of data that never changes.
+
+`brush_pyramid::gpu::UploadedPoints` is that upload as a handle:
+
+```rust
+// once, when the bundle loads
+let points = UploadedPoints::new(&point_set, params.feature_store, &device)?;
+
+// every frame
+let render = render_pyramid_uploaded(&points, &camera, &params, background).await?;
+```
+
+- The `PointSet` entry points (`render_pyramid`, `render_pyramid_timed`) are
+  **unchanged and still work** — they build an `UploadedPoints` and delegate, so
+  every test, example and CLI tool needed no edit.
+- `UploadedPoints` is `Clone`, and a clone is four `CubeTensor` handles, not the
+  bytes. That is how `Renderer::render(&self, ..)` gets one out from behind its
+  `RefCell` without holding a borrow across the `.await`.
+- The **feature element type is fixed at upload time**: `FeatureStore::F16` is a
+  different buffer, not a different binding. `render_pyramid_uploaded` returns
+  `Err` if `params.feature_store` disagrees rather than silently compositing at
+  the other precision, and `Renderer` re-uploads when the `--fp16` lever flips
+  (which is why it keeps the host copy of the point set alive).
+- `StageTimings::upload_ms` exists so this cost can never hide inside stage 1
+  again. `render_pyramid_timed` charges the upload to it;
+  `render_pyramid_uploaded_timed` reports 0, because it does not upload.
+
+Measured on the public horse bundle, view 8, 30-frame medians, job
+`trippy-web-unet-gpu-3`:
+
+| view | before | after |
+|---|---|---|
+| 1080p `network` exact | 202.75 ms · 4.93 fps | 189.54 ms · 5.28 fps |
+| 1080p `network --half-net` | 80.33 ms · 12.45 fps | 68.30 ms · 14.64 fps |
+| 1440x810 `network --half-net` (the shipped launcher) | 46.04 ms · 21.72 fps | **33.95 ms · 29.46 fps** |
+| 1080p `raw level-0` | 22.03 ms · 45.40 fps | **9.77 ms · 102.31 fps** |
+| 1440x810 `raw level-0` | 21.66 ms · 46.17 fps | **8.61 ms · 116.21 fps** |
+
+The `--screenshot` PNG is byte-identical before and after (PSNR `inf`).
 
 ### The bundle format
 
