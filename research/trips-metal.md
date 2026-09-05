@@ -191,6 +191,7 @@ translation but never rotation. Pinned by
 `tests/test_raster_bwd_ref.py::test_pose_delta_rotation_gradient_vanishes_at_zero`; the fix belongs in
 `xform_b.se3_exp` (and needs the xform_a/xform_b agreement test re-run), not in the rasteriser.
 - 2026-09-05T13:24:52Z submitted job trippy-adop-parity-1 prio 13: bash -c cd /Users/nzbirdranch/trippy/.worktrees/adop-parity && PYTHONPATH=. /Users/nzbirdranch/trippy/.venv/bin/python -m trippy.cli parity --scene /Users/nzbirdranch/trippy/third_party/zenodo/scenes/tnt_scenes/tt_horse --checkpoint /Users/nzbirdranch/trippy/third_party/zenodo/tt_checkpoints/checkpoint_horse --epoch ep0600 --indices 8,120,144 --render-scale 1 --modes trips,broadcast,trilinear --device mps --out /Users/nzbirdranch/trippy/output/EXP-0002-horse-parity
+- 2026-09-05T13:29:37Z submitted job trippy-train-smoke-1 prio 16: bash -c PYTHONPATH=. /Users/nzbirdranch/trippy/.venv/bin/python -m trippy.cli train --config experiments/EXP-0003-kk-trips-train/config_smoke.yaml --device mps --max-minutes 25
 - 2026-09-05T13:26:40Z delivered EXP-0002-horse-parity: Authors' TRIPS horse checkpoint rendered through trippy's Metal rasteriser + U-Net vs ground truth (PSNR in the sheet). This is the public Tanks&Temples scene, not family data. (/Users/nzbirdranch/trippy/.worktrees/adop-parity/output/EXP-0002-horse-parity/summary_sheet.png)
 
 ## 2026-09-06 01:25 — EXP-0002: does trippy's forward render match TRIPS's own checkpoint?
@@ -306,3 +307,100 @@ old `trilinear` default and **+7.12 dB** over `broadcast`.
 with the per-level engine-agreement table, per-frame contact sheets). Job logs:
 `$SPLATS_ROOT/tools/gpu_queue/logs/trippy-trips-mode-gpu-{1,2}.log`. Nothing under `output/` is committed.
 - 2026-09-05T14:01:19Z submitted job trippy-trips-mode-gpu-1 prio 12: bash /tmp/trips_mode_gpu.sh
+- 2026-09-05T14:52:56Z submitted job trippy-train-smoke-3 prio 16: bash -c cd /Users/nzbirdranch/trippy/.worktrees/train-debug && PYTHONPATH=. /Users/nzbirdranch/trippy/.venv/bin/python -m trippy.cli train --config experiments/EXP-0003-kk-trips-train/config_smoke.yaml --run-dir /Users/nzbirdranch/trippy/output/runs/EXP-0003-kk-trips-train/EXP-0003-kk-trips-train_smoke3 --device mps --max-minutes 25
+
+## 2026-09-06 02:53 — EXP-0003: why did the first real training run render black (1.61 dB)?
+
+**Question**: `trippy-train-smoke-2` (kk-coherent, 504 px, 2 epochs, 48 steps, MPS) finished rc 0 but
+reported held-out **PSNR 1.61 dB / SSIM 0.054 / LPIPS 0.824** with the training loss flat at 1.2-1.8.
+A PSNR that low means MSE ~0.7 on [0,1] images — the prediction is not merely bad, the pipeline is broken.
+Which stage?
+
+**Method**: a CPU diagnostic (`output/diag/train_stage_stats.py`) rebuilds a `Trainer` from the run's own
+`checkpoint_ep0000.pt` with `trippy.train.eval.build_trainer_from_checkpoint(device="cpu")`, renders one
+held-out 252 px crop through the trainer's own `_render` / `_tone_map`, and prints min/max/mean/std at
+every stage. Runs in 3 s. No image was opened; numbers only.
+
+**Stage trace** (held-out `IMG_3703.jpg`, 200k points, `mode=trilinear`, 5 layers):
+
+| stage | min | max | mean |
+|---|---:|---:|---:|
+| pyramid layer 0 (4 ch) | +0.0028 | +0.812 | +0.276 |
+| U-Net output (3 ch) | -0.177 | +0.364 | +0.113 |
+| after exposure (`x * 2**-EV`, EV = 6.585) | -0.0019 | +0.0038 | +0.0012 |
+| after white balance / vignette | unchanged (init is identity) | | |
+| after response LUT | +0.0022 | +0.0235 | **+0.0116** |
+| target photo | 0.0 | 1.0 | **+0.457** |
+
+**Two independent root causes**:
+
+1. **Exposure was initialised with the absolute EXIF EV instead of the EV relative to the scene mean.**
+   TRIPS: `colmap2adop.cpp:105` stores `scene_exposure_value = mean(EV)`, `NeuralScene.cpp:38` initialises
+   the per-frame exposure as `f.exposure_value - scene_exposure_value`. `Trainer._initial_exposure` used
+   the raw EV. kk-coherent's EVs are 4.99-7.31, mean **6.14**, so every prediction was multiplied by
+   `2**-6.14 = 1/70` before the response LUT. `lr_exposure = 5e-4` moves it 4e-3 per epoch — unrecoverable.
+2. **The eval PSNR was 4.771 dB too low.** `((pred - target)**2 * mask).sum() / mask.sum()` with a
+   3-channel error and a 1-channel mask is exactly `3x` the MSE. Measured ratio on the checkpoint:
+   `3.0000`. The "1.61 dB" was really 6.38 dB.
+
+Three more found while measuring, all fixed: `cfg.background` was ignored (the constant was used);
+training crop centres were sampled over the whole frame so roughly half of every crop was masked-out
+padding that still cost a rasterisation (TRIPS's `RandomImageCrop`, `Dataset.cpp:264`, keeps the crop
+inside the image); and the trainer never seeded the *global* torch RNG, so `cfg.seed` did not reproduce
+the U-Net init (6.7 dB vs 8.4 dB at init across two runs of one config).
+
+**Jobs**: `trippy-train-smoke-3` (prio 16, MPS, **rc 0**) — same config as smoke-2 with only `run_dir`
+changed, so the comparison is the fixes and nothing else. `trippy-train-smoke-4` (prio 16, MPS, **rc 0**)
+— the same again after rebasing onto main's native `mode: trips` (#11), to check the fixes are
+mode-independent. Both: 2 epochs, 24 steps/epoch, 33 held-out images.
+
+| run | epoch | PSNR | SSIM | LPIPS | loss (first / last / mean) |
+|---|---:|---:|---:|---:|---|
+| smoke-2 (before) | 0 | 1.183 | 0.0253 | 0.7845 | 1.184 / 1.047 / 1.511 |
+| smoke-2 (before) | 1 | **1.609** | 0.0537 | 0.8245 | 1.490 / 1.507 / 1.525 |
+| smoke-3 (after, `trilinear`) | 0 | 12.116 | 0.1975 | 0.7921 | 1.639 / 1.375 / 1.473 |
+| smoke-3 (after, `trilinear`) | 1 | **12.250** | 0.1995 | 0.7773 | 1.324 / 1.397 / 1.376 |
+| smoke-4 (after, `trips`) | 0 | 12.130 | 0.1972 | 0.7879 | 1.639 / 1.375 / 1.467 |
+| smoke-4 (after, `trips`) | 1 | **12.258** | 0.1990 | 0.7738 | 1.323 / 1.393 / 1.373 |
+
+**Verdict**: **PASS** — +10.65 dB on the identical config and step count, loss now decreasing rather than
+flat, and above the >12 dB bar the brief set for 2 epochs. Neither root cause interacts with the pyramid
+layer-selection mode (the exposure gain is applied after the U-Net; the PSNR bug is in the metric), and
+smoke-4 confirms it: `trips` and `trilinear` land within 0.01 dB of each other. The remaining number is
+still low because a trippy "epoch" is 24 crops (`train_factor = 0.125`, one crop per step): a CPU
+rehearsal at 186 steps/epoch reaches **13.09 dB after epoch 0** and **13.47 dB after epoch 5** on the
+same scene. `nonfinite_grads = 0` on every step of both runs.
+
+**A ceiling worth knowing about**: on kk-coherent the pyramid is nearly empty above level 0 in *every*
+mode — mean `t_final` per level (finest to coarsest) is 0.93/0.98/0.97/0.94/0.95 for `trilinear`,
+0.93/0.98/0.97/0.94/0.95 for `trips`, and only `broadcast` fills the coarse levels
+(0.90/0.76/0.59/0.54/0.66). `trips` collapses onto `trilinear` here because
+`layer_higher = clamp(ceil(log2(size_px)))` is 0 for every sub-pixel footprint and the 3DGS-derived point
+sizes mostly are. The U-Net is inventing 90%+ of every frame; more points, larger `size0`, or
+`mode: broadcast` are the levers. Table in `docs/LIMITATIONS.md`.
+
+**Also found, not fixed (out of file scope)**: a NaN gradient escapes `trippy.raster`'s backward for a
+degenerate fragment. Reproduced on CPU (`train_factor = 1.0`, 6 epochs) — one point's `xyz`/`raw_size`
+and 1-2 frames' pose deltas become NaN in epoch 4. The image loss stays finite (a NaN position fails
+every bounds test, so the point is culled), but `_extent_penalty` reduces over all points, so the
+*reported* loss is NaN for the rest of the run while held-out PSNR keeps climbing (13.39 -> 13.47 dB).
+Contained by `Trainer._sanitise_gradients` (zeroes non-finite grads, logs the count as `nonfinite_grads`
+in `metrics.jsonl`; smoke-3 recorded 0). Root cause belongs in `trippy/raster/` — see
+`docs/LIMITATIONS.md`, "NaN gradient out of the rasteriser backward".
+
+**Regression cover**: `tests/test_train_regression.py` (8 tests, 2 s on CPU). The synthetic fixture's
+photos now carry real EXIF (EV ~8.2), so the exposure bug is reachable from the CPU suite at all; with
+both bugs reintroduced, 4 of the 8 tests fail. The headline assertion is a sanity floor: held-out PSNR
+after 40 steps must beat the PSNR of a constant image at the target's own mean (20.03 dB vs 18.26 dB).
+
+**Incident (self-reported)**: the first CPU diagnostics ran from the worktree without `TRIPPY_OUTPUT`
+set, so `trippy.config.load_settings` defaulted to `<repo>/output` and `SceneDataset` wrote a 131 MB
+undistorted cache of kk-coherent into `.worktrees/train-debug/output/cache/` — scene imagery inside the
+repo, against AGENTS.md Sec. 6. It was `.gitignore`d (`output/`) and never staged; deleted with `rm -rf`
+and re-run with `TRIPPY_OUTPUT=/Users/nzbirdranch/trippy/output`. Any script run with cwd inside a
+worktree needs that variable set explicitly (worktrees carry no `.env`).
+
+**Artifacts**: `output/runs/EXP-0003-kk-trips-train/EXP-0003-kk-trips-train_smoke{3,4}/` (log.txt,
+metrics.jsonl, eval_ep0000/, eval_ep0001/ incl. the honesty sheets, checkpoints/, export.ply);
+diagnostics under `output/diag/`.
+- 2026-09-05T15:02:32Z submitted job trippy-train-smoke-4 prio 16: bash -c cd /Users/nzbirdranch/trippy/.worktrees/train-debug && PYTHONPATH=. /Users/nzbirdranch/trippy/.venv/bin/python -m trippy.cli train --config experiments/EXP-0003-kk-trips-train/config_smoke.yaml --run-dir /Users/nzbirdranch/trippy/output/runs/EXP-0003-kk-trips-train/EXP-0003-kk-trips-train_smoke4 --device mps --max-minutes 25

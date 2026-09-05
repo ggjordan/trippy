@@ -152,6 +152,8 @@ def _cmd_train(args: argparse.Namespace) -> int:
     cfg = TrainConfig.load_yaml(args.config)
     if args.device is not None:
         cfg.device = args.device
+    if args.run_dir is not None:
+        cfg.run_dir = args.run_dir
     trainer = Trainer(cfg)
     if args.resume is not None:
         trainer.resume(args.resume)
@@ -498,6 +500,7 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--resume", default=None, help="checkpoint .pt path to resume from")
     train.add_argument("--max-minutes", type=float, default=None, help="wall-clock budget override")
     train.add_argument("--device", choices=["cpu", "mps"], default=None, help="override the config's device")
+    train.add_argument("--run-dir", default=None, help="override the config's run_dir (artefact output directory)")
     train.set_defaults(func=_cmd_train)
 
     ev = sub.add_parser("eval", help="evaluate a checkpoint's held-out (or given) images")

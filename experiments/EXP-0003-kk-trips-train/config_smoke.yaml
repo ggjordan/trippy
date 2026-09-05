@@ -6,7 +6,7 @@
 # (through scripts/gpu_submit.sh, never invoked directly -- see AGENTS.md).
 
 scene_root: /Users/nzbirdranch/Splats/scenes/karekare/kk-coherent
-run_dir: output/runs/EXP-0003-kk-trips-train/EXP-0003-kk-trips-train_smoke
+run_dir: output/runs/EXP-0003-kk-trips-train/EXP-0003-kk-trips-train_smoke4
 
 width: 504
 crop: 256
