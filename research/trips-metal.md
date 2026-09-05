@@ -631,3 +631,6 @@ each diffed against the float64 CPU reference at 1e-3 relative). Full CPU suite 
 
 **Job**: `trippy-raster-nan-gpu-1` (prio 12) — 51 passed in 1.60s, **rc 0**.
 - 2026-09-05T16:26:13Z submitted job trippy-brush-pyramid-gpu-5 prio 12: bash -c cd /Users/nzbirdranch/trippy/rust && cargo test -p brush-pyramid --features gpu --offline --test parity_gpu -- --nocapture --test-threads=1
+- 2026-09-05T16:27:00Z submitted job trippy-cand-full1-broadcast prio 15: bash -c PYTHONPATH=. /Users/nzbirdranch/trippy/.venv/bin/python -m trippy.cli candidate-report --checkpoint output/runs/EXP-0003-kk-trips-train/full1-broadcast/checkpoints/checkpoint_latest.pt --out output/runs/EXP-0003-kk-trips-train/full1-broadcast/candidate --device mps
+- 2026-09-05T16:27:01Z submitted job trippy-train-full2-trips prio 70: bash -c PYTHONPATH=. /Users/nzbirdranch/trippy/.venv/bin/python -m trippy.cli train --config experiments/EXP-0003-kk-trips-train/config_full2_trips.yaml --device mps --max-minutes 330
+- 2026-09-05T16:27:01Z submitted job trippy-train-full2-broadcast prio 70: bash -c PYTHONPATH=. /Users/nzbirdranch/trippy/.venv/bin/python -m trippy.cli train --config experiments/EXP-0003-kk-trips-train/config_full2_broadcast.yaml --device mps --max-minutes 330

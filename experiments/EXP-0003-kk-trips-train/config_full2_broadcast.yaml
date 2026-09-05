@@ -1,0 +1,39 @@
+# EXP-0003: full kk-coherent training run (point source 1, trained Gaussian centres).
+# See docs/EXPERIMENTS.md "Training runs" for the config file format (only fields that
+# differ from TrainConfig's scaled-for-trippy defaults need to be listed here) and
+# experiments/EXP-0003-kk-trips-train/README.md for the question/gate this run answers.
+#
+# Run via: trippy train --config experiments/EXP-0003-kk-trips-train/config.yaml
+# (through scripts/gpu_submit.sh --train, never invoked directly -- see AGENTS.md).
+
+scene_root: /Users/nzbirdranch/Splats/scenes/karekare/kk-coherent
+run_dir: output/runs/EXP-0003-kk-trips-train/full2-broadcast
+
+width: 1008
+crop: 384
+mode: broadcast
+layers: 5
+epochs: 300
+# 0.5 x 186 train images = 93 crops per epoch (smoke used 0.125 -> 24; too few to learn).
+train_factor: 1.0
+
+point_source:
+  type: gaussian
+  path: /Users/nzbirdranch/Splats/output/Training-Data/karekare/kk-coherent/kkc_15000.ply
+  min_opacity: 0.05
+  # knn: mean 4-NN distance (TRIPS's own init). Gaussian scales project sub-pixel at 1008 wide,
+  # leaving t_final ~0.93 (the U-Net invents 90% of every frame). Measured in EXP-0003 smoke.
+  size_mode: knn
+
+# Every kk-coherent eval must report a shade-region number (docs/SPEC.md "Context";
+# docs/EXPERIMENTS.md's dolly-camera note anchors on IMG_3830.jpg).
+forced_heldout:
+  - IMG_3828.jpg
+  - IMG_3829.jpg
+  - IMG_3830.jpg
+  - IMG_3831.jpg
+  - IMG_3832.jpg
+  - IMG_3833.jpg
+
+device: mps
+seed: 0
