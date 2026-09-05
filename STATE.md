@@ -28,4 +28,4 @@ Last updated: 2026-09-05 (session 1, Orchestrator: Claude Fable 5.1)
 - None.
 
 ## Open questions for Jordan (review queue; nothing blocks on these)
-- None yet.
+- PRIVACY INCIDENT (2026-09-05 ~23:40): the render-kk subagent opened `output/runs/EXP-0001/.../sheet.png` (a CPU dry-run contact sheet whose first panel is a kk-coherent photo) with its Read tool to sanity-check layout. Image pixels went to the model API. My task brief caused it ("look at the coverage image with the Read tool"). Fixed: AGENTS.md now forbids viewing any scene-derived imagery; all running agents were told. Nothing else left the machine. Please decide whether you want any further action.
