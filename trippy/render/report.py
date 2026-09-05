@@ -9,8 +9,14 @@ Purpose: turn a finished `Trainer.fit()` run into something Jordan can open
     Splats' shade/extent audits, shade dolly video, off-path honesty
     sheet), adds a cached baseline audit of the training run's own source
     PLY, appends a baseline-vs-candidate comparison table to the run's own
-    `README.md`, and delivers `dolly.mp4` + `honesty_sheet.png` +
-    `export.ply` via `scripts/deliver.sh` with one honest summary line.
+    `README.md`, exports a free-navigation viewer bundle from the same
+    final checkpoint (Jordan: "fixed dolly paths are hard to judge, I want
+    to navigate freely") with a Mac double-click launcher, and delivers the
+    launcher + `dolly.mp4` + `honesty_sheet.png` + `export.ply` via
+    `scripts/deliver.sh`, launcher first, all with one honest summary line.
+    `export_bundle_and_viewer_launcher` (bundle export + launcher + delivery)
+    is factored out so `trippy bundle-launcher` can run the same three steps
+    against any existing checkpoint, not just a run's own final one.
 Invariants:
     - Every function here that reads a metrics/audit dict degrades to
       `None`/"n/a" on missing or `{"error": ...}` data rather than raising
@@ -18,20 +24,25 @@ Invariants:
       verdict is final" and AGENTS.md's honesty rule both forbid a report
       that silently hides a failed audit behind a made-up value.
     - `run_train_report` itself may raise (a checkpoint that fails to
-      reload, a scene whose sparse dir is missing, ...) -- callers
-      (`trippy.cli._cmd_train`) are responsible for catching that and
-      writing `TRAIN_REPORT_FAILED_FILENAME` per this task's brief
-      requirement 1 ("--report never crashes the run"); this module does
-      not swallow its own top-level errors, only the per-audit ones that
-      `trippy.eval.audits.audit_report`/`cached_baseline_audit` already
-      catch.
+      reload, a scene whose sparse dir is missing, a bundle export that
+      fails, ...) -- callers (`trippy.cli._cmd_train`) are responsible for
+      catching that and writing `TRAIN_REPORT_FAILED_FILENAME` per this
+      task's brief requirement 1 ("--report never crashes the run"); this
+      module does not swallow its own top-level errors, only the per-audit
+      ones that `trippy.eval.audits.audit_report`/`cached_baseline_audit`
+      already catch, and the viewer-launcher step (`build_mac_viewer_launcher`),
+      which never raises by its own contract -- a missing/stale viewer
+      binary must not cost Jordan the rest of an otherwise-successful report.
     - `TRIPPY_DELIVER_DRY_RUN=1` skips the `scripts/deliver.sh` subprocess
       entirely (no artifact-under-TRIPPY_OUTPUT path check, no
-      `research/trips-metal.md` write) -- set by tests so the CPU suite
-      never touches Splats' review queue or the real research log.
+      `research/trips-metal.md` write), printing the command that would
+      have run instead -- set by tests so the CPU suite never touches
+      Splats' review queue or the real research log.
 Related docs: docs/EXPERIMENTS.md "Training runs", "Candidate report",
-    "Dolly camera paths"; AGENTS.md section 6 ("Deliverables ... go only
-    through scripts/deliver.sh").
+    "Dolly camera paths", "Self-reporting training runs"; docs/USER_GUIDE.md
+    "How to open the native TRIPS viewer (Mac)", "How to make a scene
+    openable in the native viewer"; AGENTS.md section 6 ("Deliverables ...
+    go only through scripts/deliver.sh").
 """
 
 from __future__ import annotations
@@ -44,6 +55,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from trippy.config import load_settings
 from trippy.constants import (
     CANDIDATE_HONESTY_SHEET_FILENAME,
     CANDIDATE_NET_VIDEO_FILENAME,
@@ -52,11 +64,16 @@ from trippy.constants import (
     CANDIDATE_REPORT_OFFPATH_DIRNAME,
     DELIVER_SUBPROCESS_TIMEOUT_S,
     SHADE_AUDIT_DARK_MASS_LUM_KEY,
+    TRAIN_CHECKPOINT_DIRNAME,
     TRAIN_CHECKPOINT_LATEST_FILENAME,
     TRAIN_EXPORT_FILENAME,
+    TRAIN_REPORT_BUNDLE_DIRNAME,
     TRAIN_REPORT_DIRNAME,
+    VIEWER_DELIVERY_WHY_SUFFIX,
+    VIEWER_LAUNCHER_FAILED_FILENAME,
 )
 from trippy.eval.audits import audit_report, cached_baseline_audit
+from trippy.render.bundle import export_bundle
 from trippy.render.candidate import render_candidate
 from trippy.render.dolly import shade_dolly_poses
 from trippy.render.offpath import offpath_poses
@@ -65,6 +82,8 @@ if TYPE_CHECKING:
     from trippy.train.trainer import Trainer
 
 _DELIVER_SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "deliver.sh"
+_OPEN_MAC_VIEWER_SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "open_mac_viewer.sh"
+_TRIPS_VIEWER_BINARY_REL = Path("rust") / "target" / "release" / "trips-viewer"
 _RUN_README_FILENAME = "README.md"
 _SPARSE_TXT_DIRNAME = "sparse_txt"  # matches _cmd_candidate_report's own literal (audits need COLMAP text)
 
@@ -247,6 +266,10 @@ def _deliver(artifact: Path, name: str, why: str) -> dict:
         return record
     if os.environ.get("TRIPPY_DELIVER_DRY_RUN") == "1":
         record["status"] = "skipped: TRIPPY_DELIVER_DRY_RUN=1"
+        print(
+            "trippy: TRIPPY_DELIVER_DRY_RUN=1 -- would run: "
+            f"bash {_DELIVER_SCRIPT} {str(artifact)!r} {name!r} {why!r}"
+        )
         return record
     result = subprocess.run(
         ["bash", str(_DELIVER_SCRIPT), str(artifact), name, why],
@@ -260,6 +283,167 @@ def _deliver(artifact: Path, name: str, why: str) -> dict:
     if result.returncode != 0:
         record["stderr"] = result.stderr
     return record
+
+
+# --- viewer bundle + Mac launcher (Jordan: "I want to navigate freely") ---
+
+
+def _main_checkout_root() -> Path:
+    """Root of the MAIN git checkout, not a `.worktrees/<name>` sandbox this code may run in.
+
+    Matches `scripts/open_mac_viewer.sh`'s own `REPO_ROOT` computation
+    (`git rev-parse --git-common-dir`'s parent): the generated `.command`
+    launcher and the binary-exists check here must agree on where the
+    viewer binary lives, and that place must still exist after any
+    worktree this code happened to run in is removed (AGENTS.md section 5).
+    Falls back to this file's own checkout root if `git` is unavailable for
+    any reason (never raises -- this is a best-effort default, not a gate).
+    """
+    result = subprocess.run(
+        ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        cwd=Path(__file__).resolve().parents[2],
+        check=False,
+    )
+    git_common_dir = result.stdout.strip()
+    if result.returncode != 0 or not git_common_dir:
+        return Path(__file__).resolve().parents[2]
+    return Path(git_common_dir).parent
+
+
+def viewer_delivery_why(base_line: str) -> str:
+    """The Mac viewer launcher's delivery "why": `base_line` plus this task's free-navigation note."""
+    return f"{base_line}; {VIEWER_DELIVERY_WHY_SUFFIX}"
+
+
+def build_mac_viewer_launcher(bundle_dir: Path, name: str) -> dict:
+    """Generate `OPEN_TRIPS_MAC_<name>.command` for `bundle_dir` via `scripts/open_mac_viewer.sh`.
+
+    This task's brief, requirement 2. Never raises: a viewer binary that has
+    not been built yet, or any other failure of the script, is recorded in
+    the returned dict instead of propagating -- neither a training run's
+    `--report` nor a standalone `trippy bundle-launcher` call should die
+    because a Rust binary is stale.
+
+    Args:
+        bundle_dir: a `trippy-bundle-1` directory (`trippy.render.bundle.
+            export_bundle`'s output) -- must already exist and contain
+            `bundle.json`.
+        name: the launcher's name; the script writes
+            `$TRIPPY_OUTPUT/deliver/<name>/OPEN_TRIPS_MAC_<name>.command`.
+
+    Returns:
+        `{"command_path": str|None, "status": "ok"|"failed", "note": str}`
+        (`"note"` only present when `"status" == "failed"`).
+    """
+    binary_path = _main_checkout_root() / _TRIPS_VIEWER_BINARY_REL
+    if not binary_path.is_file():
+        return {
+            "command_path": None,
+            "status": "failed",
+            "note": (
+                f"viewer binary not found at {binary_path} -- build it with "
+                "`cd rust && cargo build --release -p trips-viewer` "
+                "(scripts/cpu_heavy.sh recommended) before a launcher can be generated"
+            ),
+        }
+    result = subprocess.run(
+        ["bash", str(_OPEN_MAC_VIEWER_SCRIPT), str(bundle_dir), name],
+        capture_output=True,
+        text=True,
+        timeout=DELIVER_SUBPROCESS_TIMEOUT_S,
+        check=False,
+    )
+    if result.returncode != 0:
+        return {
+            "command_path": None,
+            "status": "failed",
+            "note": f"scripts/open_mac_viewer.sh exited {result.returncode}: {result.stderr.strip()}",
+        }
+    settings = load_settings()
+    command_path = settings.trippy_output / "deliver" / name / f"OPEN_TRIPS_MAC_{name}.command"
+    return {"command_path": str(command_path), "status": "ok"}
+
+
+def default_bundle_out_dir(checkpoint: Path) -> Path:
+    """Default bundle output directory for a checkpoint, for `trippy bundle-launcher --out`.
+
+    A trippy-native checkpoint is usually `<run_dir>/checkpoints/checkpoint_*.pt`
+    (`trippy.render.bundle.native_checkpoint_path`); this mirrors `train --report`'s
+    own `<run_dir>/bundle` layout in that case, and falls back to a `bundle/`
+    alongside the checkpoint itself for anything else (a TRIPS checkpoint
+    directory, or a `.pt` not inside a `checkpoints/` dir).
+    """
+    if checkpoint.is_file() and checkpoint.parent.name == TRAIN_CHECKPOINT_DIRNAME:
+        return checkpoint.parent.parent / TRAIN_REPORT_BUNDLE_DIRNAME
+    if checkpoint.is_dir():
+        return checkpoint / TRAIN_REPORT_BUNDLE_DIRNAME
+    return checkpoint.parent / TRAIN_REPORT_BUNDLE_DIRNAME
+
+
+def export_bundle_and_viewer_launcher(
+    checkpoint: str | Path,
+    out: str | Path,
+    name: str,
+    why_base: str,
+    scene: str | Path | None = None,
+    epoch: str | None = None,
+) -> dict:
+    """Steps 1-3 of this task's brief: bundle export, Mac viewer launcher, delivery.
+
+    Shared by `run_train_report` (called against the run's own final
+    checkpoint, with `out=<run_dir>/bundle`) and the standalone `trippy
+    bundle-launcher` command (any existing checkpoint) -- one place builds
+    and delivers the free-navigation launcher either way.
+
+    `export_bundle` itself is allowed to raise (a checkpoint that fails to
+    load is a real failure, same as every other step of `run_train_report`);
+    the viewer-launcher and delivery steps never raise, per
+    `build_mac_viewer_launcher`'s own contract.
+
+    Args:
+        checkpoint: forwarded to `trippy.render.bundle.export_bundle`.
+        out: bundle directory to write.
+        name: bundle label, launcher name, and delivery name all at once
+            (`bundle.json`'s `name` field and the delivered artifact's name
+            agree by construction).
+        why_base: the delivery "why" line before `viewer_delivery_why`
+            appends the free-navigation note -- `run_train_report`'s own
+            `summary_line`, or a simpler description for a standalone
+            `bundle-launcher` call.
+        scene, epoch: forwarded to `export_bundle` (TRIPS checkpoints only).
+
+    Returns:
+        `{"bundle_dir": str, "bundle_json": dict, "viewer": dict, "delivery": dict}`.
+    """
+    bundle_dir, bundle_json = export_bundle(checkpoint, out, scene=scene, epoch=epoch, name=name)
+    viewer = build_mac_viewer_launcher(bundle_dir, name)
+    why = viewer_delivery_why(why_base)
+    if viewer["command_path"] is not None:
+        delivery = _deliver(Path(viewer["command_path"]), f"{name}-viewer", why)
+    else:
+        delivery = {
+            "artifact": None,
+            "name": f"{name}-viewer",
+            "status": f"failed: {viewer['note']}",
+        }
+    return {"bundle_dir": str(bundle_dir), "bundle_json": bundle_json, "viewer": viewer, "delivery": delivery}
+
+
+def _deliveries_markdown(deliveries: list[dict]) -> str:
+    """"### Deliveries" section, one bullet per artifact, in the given order.
+
+    This task's brief, requirement 4: the viewer launcher is listed FIRST
+    (Jordan wants free navigation front and centre, not buried under the
+    fixed-path dolly video) simply by being first in `deliveries`.
+    """
+    lines = ["### Deliveries", ""]
+    for record in deliveries:
+        artifact = record.get("artifact") or "n/a"
+        lines.append(f"- {record['name']}: `{artifact}` ({record['status']})")
+    return "\n".join(lines)
 
 
 # --- orchestration ---
@@ -300,9 +484,12 @@ def run_train_report(trainer: Trainer, held_out_metrics: dict) -> dict:
     Returns:
         `{"checkpoint", "device", "scene_root", "export_ply", "epoch",
         "held_out", "dolly", "offpath", "audits": {"candidate", "baseline"},
-        "summary_line", "deliveries"}` -- also written to
-        `<run_dir>/report/report.json`, with the comparison table + summary
-        line appended to `<run_dir>/README.md`.
+        "bundle": {"bundle_dir", "viewer"}, "summary_line", "deliveries"}`
+        (`deliveries[0]` is always the Mac viewer launcher) -- also written
+        to `<run_dir>/report/report.json`, with the comparison table,
+        summary line, and deliveries list (launcher first) appended to
+        `<run_dir>/README.md`, and the bundle itself written to
+        `<run_dir>/bundle/`.
     """
     run_dir = Path(trainer.run_dir)
     out_dir = run_dir / TRAIN_REPORT_DIRNAME
@@ -346,17 +533,35 @@ def run_train_report(trainer: Trainer, held_out_metrics: dict) -> dict:
     line = summary_line(run_name, epoch, held_out_metrics, candidate_audits, baseline_audits)
     table = comparison_table_markdown(held_out_metrics, candidate_audits, baseline_audits, dolly_metrics)
 
-    readme_path = _ensure_run_readme(run_dir)
-    with open(readme_path, "a") as f:
-        f.write(f"\n## Report: epoch {epoch}\n\n{line}\n\n{table}\n")
+    # Jordan: "fixed dolly paths are hard to judge, I want to navigate freely" -- export
+    # a free-navigation bundle + Mac viewer launcher from this same final checkpoint,
+    # alongside the existing dolly/honesty artifacts (this task's brief, requirements
+    # 1-3). Never raises past this point regardless of whether the viewer binary has
+    # been built (`build_mac_viewer_launcher`'s own contract); `export_bundle` failing
+    # for some other reason is a real failure and propagates like any other step here.
+    bundle_result = export_bundle_and_viewer_launcher(
+        checkpoint_path,
+        run_dir / TRAIN_REPORT_BUNDLE_DIRNAME,
+        run_name,
+        why_base=line,
+    )
+    if bundle_result["viewer"]["status"] != "ok":
+        (out_dir / VIEWER_LAUNCHER_FAILED_FILENAME).write_text(bundle_result["viewer"]["note"] + "\n")
 
     dolly_mp4 = out_dir / CANDIDATE_REPORT_DOLLY_DIRNAME / CANDIDATE_NET_VIDEO_FILENAME
     honesty_sheet = out_dir / CANDIDATE_REPORT_DOLLY_DIRNAME / CANDIDATE_HONESTY_SHEET_FILENAME
+    # Viewer launcher goes first (requirement 4: Jordan wants free navigation front and
+    # centre); the dolly/honesty/export deliveries stay too -- they are cheap.
     deliveries = [
+        bundle_result["delivery"],
         _deliver(dolly_mp4, f"{run_name}-dolly", line),
         _deliver(honesty_sheet, f"{run_name}-honesty", line),
         _deliver(export_path, f"{run_name}-export", line),
     ]
+
+    readme_path = _ensure_run_readme(run_dir)
+    with open(readme_path, "a") as f:
+        f.write(f"\n## Report: epoch {epoch}\n\n{line}\n\n{_deliveries_markdown(deliveries)}\n\n{table}\n")
 
     report = {
         "checkpoint": str(checkpoint_path),
@@ -368,6 +573,7 @@ def run_train_report(trainer: Trainer, held_out_metrics: dict) -> dict:
         "dolly": dolly_metrics,
         "offpath": offpath_metrics,
         "audits": {"candidate": candidate_audits, "baseline": baseline_audits},
+        "bundle": {"bundle_dir": bundle_result["bundle_dir"], "viewer": bundle_result["viewer"]},
         "summary_line": line,
         "deliveries": deliveries,
     }

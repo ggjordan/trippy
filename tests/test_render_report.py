@@ -16,8 +16,18 @@ Invariants under test:
       fraction vs baseline, and never the word "good" (AGENTS.md/this
       task's honesty rule -- no verdict language).
     - `_deliver` never shells out to scripts/deliver.sh when
-      `TRIPPY_DELIVER_DRY_RUN=1` is set, and reports a clean "skipped"
-      status either way for a missing artifact.
+      `TRIPPY_DELIVER_DRY_RUN=1` is set, reports a clean "skipped" status
+      either way for a missing artifact, and prints the deliver.sh command
+      it would have run under the dry-run env var (so a dry-run
+      `bundle-launcher` invocation has something to show for itself).
+    - `build_mac_viewer_launcher` (Jordan: "I want to navigate freely")
+      never raises: a missing viewer binary is caught before
+      `scripts/open_mac_viewer.sh` even runs, and a script failure (e.g. a
+      missing bundle directory) is reported the same way -- both return
+      `{"status": "failed", "command_path": None, "note": ...}` rather than
+      propagating. `viewer_delivery_why` appends the free-navigation note to
+      an existing summary line. `default_bundle_out_dir` resolves a
+      checkpoint's default bundle directory for `trippy bundle-launcher`.
 Fixtures: only synthetic dicts (no real scene, checkpoint, or PLY --
     AGENTS.md test fixtures must be synthetic only).
 """
@@ -196,3 +206,82 @@ def test_deliver_missing_artifact_is_skipped_cleanly(tmp_path: Path, monkeypatch
     monkeypatch.delenv("TRIPPY_DELIVER_DRY_RUN", raising=False)
     record = report_mod._deliver(tmp_path / "does_not_exist.mp4", "test-dolly", "why")
     assert record["status"] == "skipped: artifact not found"
+
+
+def test_deliver_dry_run_prints_the_would_run_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Acceptance: a dry-run bundle-launcher invocation must print the deliver.sh
+    # command it would have run, not just silently record a skip.
+    monkeypatch.setenv("TRIPPY_DELIVER_DRY_RUN", "1")
+    artifact = tmp_path / "OPEN_TRIPS_MAC_test.command"
+    artifact.write_text("#!/bin/bash\n")
+    report_mod._deliver(artifact, "test-viewer", "some why")
+    out = capsys.readouterr().out
+    assert "would run" in out
+    assert "deliver.sh" in out
+    assert str(artifact) in out
+    assert "some why" in out
+
+
+# --- viewer bundle + Mac launcher ---
+
+
+def test_viewer_delivery_why_appends_free_navigation_suffix() -> None:
+    line = report_mod.viewer_delivery_why("trippy train report run: epoch 3, held-out PSNR n/a dB")
+    assert line.startswith("trippy train report run: epoch 3, held-out PSNR n/a dB; ")
+    assert "free-navigation viewer" in line
+    assert "N/P" in line
+
+
+def test_build_mac_viewer_launcher_missing_binary_is_reported_not_raised(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # No rust/target/release/trips-viewer under this fake checkout root.
+    monkeypatch.setattr(report_mod, "_main_checkout_root", lambda: tmp_path)
+
+    def _boom(*args, **kwargs):  # pragma: no cover -- must never be called
+        raise AssertionError("open_mac_viewer.sh must not run when the binary check fails first")
+
+    monkeypatch.setattr(report_mod.subprocess, "run", _boom)
+
+    result = report_mod.build_mac_viewer_launcher(tmp_path / "bundle", "test-run")
+    assert result["command_path"] is None
+    assert result["status"] == "failed"
+    assert "trips-viewer" in result["note"]
+    assert "cargo build" in result["note"]
+
+
+def test_build_mac_viewer_launcher_script_failure_is_reported_not_raised(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    binary = tmp_path / "rust" / "target" / "release" / "trips-viewer"
+    binary.parent.mkdir(parents=True)
+    binary.write_text("#!/bin/sh\n")
+    binary.chmod(0o755)
+    monkeypatch.setattr(report_mod, "_main_checkout_root", lambda: tmp_path)
+
+    # open_mac_viewer.sh checks the bundle directory before the binary -- a bundle
+    # directory that doesn't exist makes it fail deterministically, regardless of
+    # whether the real repo's own trips-viewer binary happens to be built.
+    missing_bundle_dir = tmp_path / "no_such_bundle"
+    result = report_mod.build_mac_viewer_launcher(missing_bundle_dir, "test-run")
+    assert result["command_path"] is None
+    assert result["status"] == "failed"
+    assert "open_mac_viewer.sh" in result["note"]
+
+
+def test_default_bundle_out_dir_for_checkpoint_inside_checkpoints_dirname(tmp_path: Path) -> None:
+    run_dir = tmp_path / "EXP-0006-union"
+    checkpoints_dir = run_dir / "checkpoints"
+    checkpoints_dir.mkdir(parents=True)
+    checkpoint = checkpoints_dir / "checkpoint_latest.pt"
+    checkpoint.write_bytes(b"")
+    assert report_mod.default_bundle_out_dir(checkpoint) == run_dir / "bundle"
+
+
+def test_default_bundle_out_dir_falls_back_to_alongside_the_checkpoint(tmp_path: Path) -> None:
+    # A bare .pt not inside a checkpoints/ dir (e.g. handed a file directly).
+    loose_checkpoint = tmp_path / "some_checkpoint.pt"
+    loose_checkpoint.write_bytes(b"")
+    assert report_mod.default_bundle_out_dir(loose_checkpoint) == tmp_path / "bundle"

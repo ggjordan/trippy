@@ -151,6 +151,19 @@ trippy export-bundle --checkpoint <checkpoint> --out <folder> [--name NAME]
 
 The folder holds exactly three files — `bundle.json` (the cameras and render settings), `points.npz` (the point cloud) and `weights.safetensors` (the network). The points are stored in **world space** with every real camera of the scene listed alongside them, so the viewer can fly anywhere rather than replay one fixed frame; it opens on the scene's reference view. It accepts either a published TRIPS checkpoint (add `--scene <scene folder>`) or one of trippy's own training checkpoints, and prints which kind it found. It runs on the CPU, so it does not need to queue for the GPU.
 
+**Every self-reporting training run does this for you automatically.** `trippy train --report`
+exports this same bundle from the run's own final checkpoint and delivers a
+`OPEN_TRIPS_MAC_<run>.command` launcher — it's the *first* thing listed for a finished run, ahead of
+the dolly video, because a fixed dolly path is hard to judge; the bundle lets you fly through the
+scene yourself instead. If you have a checkpoint from *before* this existed (or just want a fresh
+launcher without re-training), run:
+
+```
+trippy bundle-launcher --checkpoint <checkpoint> --name <name>
+```
+
+That's the same export + launcher + delivery, for any checkpoint on demand.
+
 ## How to change GPU priority
 
 If a job is running too slowly (bogging down other work) or too fast (starving training for GPU time), you can re-prioritise it by asking:
