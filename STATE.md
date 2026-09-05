@@ -6,6 +6,7 @@ Last updated: 2026-09-05 (session 1, Orchestrator: Claude Fable 5.1)
 - Spec + plan grilled and approved 2026-09-05.
 - Phase 1 skeleton reviewed and pushed as `build-0001` (public repo github.com/ggjordan/trippy, 27 CPU tests green).
 - feat/points merged (build-0004): PointSet, GaussianPlySource (5.74M pts on kk-coherent, median nn 0.080), density CLI; 50 tests green.
+- v0.5.0 PARTIAL (merged): web viewer runs the TRIPS pyramid in Chrome via WebGPU (raw level-0 only, ~3 fps at 1440x810); the U-Net cannot run in the browser yet (Burn's synchronous readback traps on wasm); Safari draws wrong output and is blocked by the page. Chrome was installed as dev tooling. Launcher `trips-web-viewer-horse` delivered. Quest: not interactive by any measure; distilled Gaussians / videos remain the Quest path.
 - v0.2.0 RELEASED: native Mac viewer at 22 fps (horse scene), 82.7 dB screenshot parity; launcher `trips-mac-viewer-horse.command` in Jordan-Review. Finding: the U-Net is 89% of frame time, the rasteriser 11%.
 - Merged brush-unet (build-0032): Rust pyramid + U-Net + camera on wgpu match the PyTorch path at 115 dB on the horse scene; whole frame 193 ms at 1080p (5 fps, sort-dominated) -> perf work in feat/mac-viewer.
 - Merged: self-reporting trainings (build-0028), union point set (EXP-0006: monodepth 3.79M, union 5.89M), web toolchain. Baseline shade audit on kkc_15000: dark(lum<0.25) 19.9% of region mass.
@@ -19,7 +20,8 @@ Last updated: 2026-09-05 (session 1, Orchestrator: Claude Fable 5.1)
 
 ## In flight
 - GPU queue (prio 70, self-reporting, in order): full2-broadcast, full2-trips (EXP-0003, 300 ep), union-broadcast, union-trips (EXP-0006), full-trips (EXP-0007 Hunua clip4982). Each delivers dolly/honesty/ply + audit table to Jordan-Review on completion.
-- feat/web-trips (large/high): TRIPS pipeline in the browser (wasm32 + WebGPU), OPEN_TRIPS_WEB launcher, fps in Safari/Chrome.
+- fix/viewer-input (large/high): mouse-look, scene-scaled fly speed, orbit default, training-view start; v2 launchers for horse + Karekare bundle.
+- feat/hybrid-a (large/high): Gaussian render + TRIPS pyramid fused in the U-Net (EXP-0009); re-rendering the 219 Gaussian views, then smoke + 300-epoch run.
 - feat/distill (mid/high): design B fallback -- distil a TRIPS checkpoint into plain Gaussians with the Brush fork for Quest/publish.
 
 ## Next (in order)
