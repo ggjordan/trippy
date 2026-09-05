@@ -404,3 +404,71 @@ worktree needs that variable set explicitly (worktrees carry no `.env`).
 metrics.jsonl, eval_ep0000/, eval_ep0001/ incl. the honesty sheets, checkpoints/, export.ply);
 diagnostics under `output/diag/`.
 - 2026-09-05T15:02:32Z submitted job trippy-train-smoke-4 prio 16: bash -c cd /Users/nzbirdranch/trippy/.worktrees/train-debug && PYTHONPATH=. /Users/nzbirdranch/trippy/.venv/bin/python -m trippy.cli train --config experiments/EXP-0003-kk-trips-train/config_smoke.yaml --run-dir /Users/nzbirdranch/trippy/output/runs/EXP-0003-kk-trips-train/EXP-0003-kk-trips-train_smoke4 --device mps --max-minutes 25
+- 2026-09-05T15:09:55Z submitted job trippy-train-full1 prio 70: bash -c PYTHONPATH=. /Users/nzbirdranch/trippy/.venv/bin/python -m trippy.cli train --config experiments/EXP-0003-kk-trips-train/config.yaml --device mps --max-minutes 360
+- 2026-09-05T15:09:55Z submitted job trippy-train-full1-broadcast prio 70: bash -c PYTHONPATH=. /Users/nzbirdranch/trippy/.venv/bin/python -m trippy.cli train --config experiments/EXP-0003-kk-trips-train/config_broadcast.yaml --device mps --max-minutes 360
+- 2026-09-05T13:47:54Z submitted job trippy-hybrid-c-render-1 prio 17: bash -c cd /Users/nzbirdranch/trippy/.worktrees/hybrid-c && PYTHONPATH=. /Users/nzbirdranch/Splats/tools/ml-sharp/.venv/bin/python -m trippy.hybrid.render_splat_views --scene /Users/nzbirdranch/Splats/scenes/karekare/kk-coherent --ply /Users/nzbirdranch/Splats/output/Training-Data/karekare/kk-coherent/kkc_15000.ply --out /Users/nzbirdranch/trippy/.worktrees/hybrid-c/output/hybrid-c/renders/w1008 --width 1008 --device mps --start-index 0 --end-index 110
+- 2026-09-05T13:53:29Z submitted job trippy-hybrid-c-render-2 prio 17: bash -c cd /Users/nzbirdranch/trippy/.worktrees/hybrid-c && PYTHONPATH=. /Users/nzbirdranch/Splats/tools/ml-sharp/.venv/bin/python -m trippy.hybrid.render_splat_views --scene /Users/nzbirdranch/Splats/scenes/karekare/kk-coherent --ply /Users/nzbirdranch/Splats/output/Training-Data/karekare/kk-coherent/kkc_15000.ply --out /Users/nzbirdranch/trippy/.worktrees/hybrid-c/output/hybrid-c/renders/w1008 --width 1008 --device mps --start-index 110 --end-index 219
+- 2026-09-05T14:52:23Z submitted job trippy-hybrid-c-train-1 prio 18: trippy hybrid-c train --config experiments/EXP-0005-hybrid-c/config.yaml --max-minutes 40
+- 2026-09-05T14:54:22Z submitted job trippy-hybrid-c-train-1 prio 18: bash -c cd /Users/nzbirdranch/trippy/.worktrees/hybrid-c && PYTHONPATH=. /Users/nzbirdranch/trippy/.venv/bin/python -m trippy.cli hybrid-c train --config experiments/EXP-0005-hybrid-c/config.yaml --max-minutes 40
+- 2026-09-05T15:45:57Z delivered EXP-0005-hybrid-c-refine: Design C: U-Net refines Gaussian renders of kk-coherent toward photos. Sheet: photo | Gaussian render | refined | diff on held-out frames incl. shade. Numbers in README. (/Users/nzbirdranch/trippy/.worktrees/hybrid-c/output/runs/EXP-0005-hybrid-c/EXP-0005-hybrid-c_1/eval_ep1125/sheet.png)
+
+## 2026-09-06 -- EXP-0005 Hybrid design C: render->photo U-Net refinement
+
+**Question**: render `kkc_15000.ply` for every registered kk-coherent view with Splats'
+`gsrender.py` (rgb + depth + alpha, `max_hw=400`), then train trippy's U-Net + neural camera
+to map render -> photo -- does a learned renderer change anything in the shade region
+specifically, or only sharpen already-well-covered pixels? (docs/PLAN-2026-09-05.md's cheap
+side-experiment, meant to validate net/losses before the more expensive A1 design.)
+
+**Job names**: `hybrid-c-render-1` (prio 17, rc=0, 1495.1 s, frames 0-110), `hybrid-c-render-2`
+(prio 17, rc=0, 1675.8 s, frames 110-219) -- 219/219 registered views rendered, 0 skipped,
+0 errors. `hybrid-c-train-1` (prio 18, rc=0; first submission failed rc=1, `.venv` missing
+in this git worktree -- fixed by invoking the main repo's `.venv/bin/python` directly with
+`PYTHONPATH=.` from the worktree dir, same `bash -c` pattern as the render jobs, then
+resubmitted under the same job name). Training: 40.0-minute wall-clock budget, reached
+epoch 1125 (~27,000 crop steps at 384x384, `mode` n/a -- Design C has no rasteriser --
+on MPS) before the budget stopped it.
+
+**Numbers** (held-out split: 33 frames, 27 non-shade + 6 forced shade `SHADE_FRAMES_KK`;
+final eval `eval_ep1125/metrics.json`; baseline = raw Gaussian render vs photo, no U-Net at
+all, identical at every epoch by construction):
+
+| Metric | Baseline | Refined | delta |
+|---|---|---|---|
+| PSNR, all (n=33) | 15.53 dB | 15.54 dB | +0.01 dB |
+| PSNR, non-shade (n=27) | 15.66 dB | 16.11 dB | +0.45 dB |
+| PSNR, shade (n=6) | 14.94 dB | 12.97 dB | -1.96 dB |
+| SSIM, all | 0.431 | 0.476 | +0.045 |
+| SSIM, non-shade | 0.432 | 0.483 | +0.051 |
+| SSIM, shade | 0.427 | 0.442 | +0.015 |
+| LPIPS, all (lower better) | 0.477 | 0.461 | -0.015 |
+| LPIPS, non-shade | 0.465 | 0.448 | -0.018 |
+| LPIPS, shade | 0.526 | 0.519 | -0.007 |
+
+Checked the shade PSNR regression against 5 intermediate checkpoints (`eval_ep{0050,0200,
+0500,0800,1125}/metrics.json`): refined shade PSNR is 12.15, 14.86, 13.54, 13.48, 12.97 dB
+against a flat 14.94 dB baseline -- a stable -1 to -2 dB deficit from early training onward
+(epoch 200 briefly nearly matches baseline, then the regression widens and holds), not a
+transient early-training artifact. Non-shade PSNR rises above baseline by epoch 200 and
+holds a stable +0.4 to +0.5 dB gain from there on. Aggregate "all" PSNR stays flat because
+the two effects partly cancel across a 27-vs-6-frame average.
+
+**Verdict**: FAIL on the question this experiment asked. A learned renderer does change the
+shade region, but it makes shade PSNR *worse* (~2 dB), not better, while giving only small
+SSIM/LPIPS gains there; it clearly helps the non-shade region on every metric. Consistent
+with (not proof of): the shade region's Gaussian render carries more low-coverage/alpha
+holes than non-shade (EXP-0001's T_final finding), and this design's deliberately
+full-frame loss mask (`alpha>0` OR-ed with an all-ones mask, always all-ones) gives the
+U-Net no extra incentive to fill those holes *correctly* rather than merely plausibly --
+SSIM/LPIPS reward structural/perceptual plausibility more than exact per-pixel brightness,
+which is exactly the asymmetry the numbers show. Does not remove or improve the shade
+defect on the primary photometric metric; trades shade accuracy for non-shade gains. Not a
+reason to iterate further on Design C for the shade problem -- supports moving to A1
+(Gaussians as TRIPS points with learned feature vectors, joint training) next per
+docs/SPEC.md's v0.3.0 plan.
+
+**Artifact**: `output/runs/EXP-0005-hybrid-c/EXP-0005-hybrid-c_1/` (`eval_ep*/metrics.json`,
+`eval_ep*/sheet.png`, `eval_ep*/shade_frames/*.png`, `metrics.jsonl`, `log.txt`,
+`checkpoints/`); delivered sheet `EXP-0005-hybrid-c-refine`
+(`~/Splats/output/Jordan-Review/4-other/EXP-0005-hybrid-c-refine.png`); full writeup
+`experiments/EXP-0005-hybrid-c/README.md`.

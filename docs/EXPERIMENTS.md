@@ -468,3 +468,100 @@ has neither), so `tests/test_eval_audits.py`'s real-audit test runs against the 
 `sparse_txt` geometry with a synthetic PLY placed inside its bounding box, skipping cleanly when
 `~/Splats`/the ml-sharp venv aren't present. The Orchestrator runs `candidate-report` against real trained
 checkpoints (GPU-trained, via `scripts/gpu_submit.sh`) once one exists.
+honesty triplets (no ground truth) at arbitrary poses from a JSON file -- the stable API the dolly-camera-
+path generator (see "Dolly camera paths" above) will plug into once it exists.
+
+## Hybrid design C: render->photo U-Net refinement
+
+Design C (docs/PLAN-2026-09-05.md "Hybrid (v0.3): (C) render->photo U-Net refinement on
+gsrender.py outputs first (cheap, validates net/losses)") is deliberately independent of
+`trippy.train.trainer.Trainer`: there is no point cloud, no rasteriser, no pose refinement.
+Input is a *fixed* Gaussian-splat render (rgb + depth + alpha, from Splats' `gsrender.py`),
+target is the photo, and the only trainable state is the U-Net and the per-image `NeuralCamera`
+tone mapper -- both reused unmodified from `trippy.net`.
+
+### Rendering the splat views
+
+`trippy.hybrid.render_splat_views` (`python -m trippy.hybrid.render_splat_views`, run only via
+`scripts/gpu_submit.sh` since it calls Splats' MPS `gsrender.render`) renders every registered
+image of a scene against a binary 3DGS PLY, at `SceneDataset`'s own undistorted `(H, W, K)` grid
+so every render lines up pixel-for-pixel with its photo. `max_hw` always passes
+`HYBRID_C_GSRENDER_MAX_HW` (400) -- gsrender's own kwarg default (32) corrupts near-camera
+Gaussian footprints. Output layout, per frame (`stem = Path(name).stem`):
+
+```
+<out_dir>/
+├── <stem>.png              (rgb, uint8, gsrender's composited RGB)
+├── <stem>.depth.npy        (float16, alpha-weighted expected camera-space z; 0 where alpha~0)
+├── <stem>.alpha.npy        (float16, accumulated opacity in [0, 1])
+└── manifest_<start>_<end>.json   (per-shard: scene_root, ply_path, width, device, max_hw,
+                                    min_opacity, num_requested/rendered/skipped, elapsed_s,
+                                    per-frame timing)
+```
+
+Idempotent per frame (a frame whose three files already exist is skipped unless `--force`) and
+shardable via `--start-index`/`--end-index`, so a long scene renders across multiple queue jobs
+without re-deciding which frames go where.
+
+### Pairing and pyramids
+
+`trippy.hybrid.dataset_c` pairs a render triple with its photo by filename stem
+(`paired_names`); a photo with no matching render is silently excluded, never an error (useful
+mid-shard). `render_to_tensor` stacks `[r, g, b, alpha, (depth)]` into the U-Net's input
+tensor -- `channels=4` (rgb+alpha, the default, same `NetworkConfig` TRIPS itself ships) or
+`channels=5` (+ a coarsely-normalised depth channel, `HYBRID_C_DEPTH_NORM_SCALE`).
+`build_pyramid` is plain repeated `avg_pool2d(kernel=2, stride=2)`, finest level first, matching
+`trippy.net.unet`'s own convention (and its odd-size `combine_bridge` generalisation handles the
+resulting floor-halved chain on full-frame eval, where the source image need not be divisible by
+`2 ** (layers - 1)`; training crops are chosen divisible by that quantity so every level is exact).
+
+### Config and training
+
+`trippy hybrid-c train --config <cfg.yaml>` (`trippy.hybrid.config_c.HybridCConfig`,
+`trippy.hybrid.train_c.HybridCTrainer`) runs the crop/pyramid/U-Net/tone-map/loss loop. Config
+format mirrors `TrainConfig`'s "state only what differs from the default" YAML convention:
+
+```yaml
+scene_root: /Users/nzbirdranch/Splats/scenes/karekare/kk-coherent
+renders_dir: output/hybrid-c/renders/w1008
+run_dir: output/runs/EXP-0005-hybrid-c/EXP-0005-hybrid-c_1
+width: 1008
+crop: 384          # must be divisible by 2**(layers-1) -- HybridCConfig validates this
+channels: 4        # rgb + alpha; 5 adds depth
+layers: 5
+loss_l1: 1.0
+loss_ssim: 1.0
+loss_lpips: 1.0    # L1 + SSIM + LPIPS(alex); no vgg term (unlike TrainConfig's TRIPS parity)
+forced_heldout:
+  - IMG_3828.jpg   # ... SHADE_FRAMES_KK
+```
+
+Loss mask is deliberately full-frame: `(render alpha > 0) | ones_like(...)` always evaluates to
+all-ones (an OR with True is always True) -- documented in `train_step`'s own comment, not a
+bug. The point is a network that can also repair the render's own holes toward the photo, not
+just refine already-covered pixels.
+
+`trippy hybrid-c train --config <cfg.yaml> --max-minutes 40` caps wall clock the same way
+`trippy train` does; `--resume <checkpoint.pt>` continues a run. Output layout matches the
+point-based trainer's (`checkpoints/`, `log.txt`, `metrics.jsonl`, `eval_ep<NNNN>/`) with one
+addition: `evaluate()` reports **two** numbers per bucket, `baseline` (raw render vs photo, no
+U-Net at all) and `refined` (U-Net + tone-mapper output vs photo), each split into `all`,
+`shade` (`cfg.forced_heldout`), and `nonshade` -- so a shade-region verdict is never averaged
+away by the easy frames:
+
+```
+eval_ep<NNNN>/
+├── metrics.json          ({"epoch", "n_images",
+│                            "baseline": {"all"|"shade"|"nonshade": {"n","psnr_mean",
+│                                                                     "ssim_mean","lpips_mean"}},
+│                            "refined": {...same shape...}, "names"})
+├── sheet.png              (photo | render | refined | |diff|, up to HYBRID_C_EVAL_MAX_SHEET_IMAGES
+│                            rows, shade frames first)
+└── shade_frames/
+    └── <stem>_refined.png  (standalone refined PNG per cfg.forced_heldout name -- the
+                              delivery artifact for Jordan)
+```
+
+`trippy hybrid-c eval --checkpoint <run_dir>/checkpoints/checkpoint_latest.pt [--images ...]`
+(`trippy.hybrid.train_c.evaluate_checkpoint`) re-evaluates a checkpoint without re-training,
+mirroring `trippy eval`.
