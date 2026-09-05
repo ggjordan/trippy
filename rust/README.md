@@ -237,6 +237,37 @@ from `budget / 4` rather than re-running the selection. Corners that fall outsid
 layer, or below `alpha_min`, write a sentinel key equal to `P` (the layer-pixel
 count), which sorts after every real key and lies outside the segment table.
 
+## Web viewer (v0.5.0 groundwork)
+
+`apps/brush-app/web` (wasm-pack + vite + React) is the fork's web demo. Full
+build steps, timings, the browser support matrix on this Mac, and the on-paper
+Quest assessment live in `docs/WEB_VIEWER.md`; the short version:
+
+- `scripts/web_build.sh` builds it reproducibly (guard clauses for
+  `npm`/`wasm-pack`/`wasm32-unknown-unknown`, then `wasm-pack build --release`
+  + `vite build` at base path `/`) into `$TRIPPY_OUTPUT/web/brush-dist/`.
+  First cold build on this Mac: **3 m 36 s** wall (`npm ci` seconds; cargo
+  build for `wasm32-unknown-unknown` 1 m 30 s; `wasm-bindgen` + `wasm-opt -Oz
+  --converge` shrinking `brush_app.wasm` 53 MB → 21.7 MB for the rest;
+  `vite build` 1.48 s).
+- `scripts/deliver.sh <dist-dir> <name> "<why>"` generates the
+  `OPEN_<NAME>.command` launcher (127.0.0.1-only `http.server`) — no change to
+  `deliver.sh` was needed; its existing "directory with `index.html`" branch
+  already serves a vite build correctly.
+- Proven end to end on this Mac (2026-09-06) with the **stock** Brush
+  renderer and a synthetic 2,000-point Gaussian `.ply`
+  (`trippy.train.export.write_gaussian_ply`, never anything from `~/Splats`):
+  WebGPU adapter obtained, full asset chain loads, wasm app initialises a
+  correctly-sized canvas with zero JS errors, in **Safari** (Chrome is not
+  installed on this machine, so the actual `docs/SPEC.md` v0.5.0 acceptance
+  criterion — fps in Chrome — is not yet checked).
+- **Not yet done, and not in scope of this groundwork**: compiling
+  `brush-pyramid`/`brush-unet` for `wasm32-unknown-unknown` at all, and hooking
+  their output into this web build the way `splat_backbuffer.rs` will hook
+  them into the native viewer. See `docs/WEB_VIEWER.md` "Next: wiring TRIPS
+  in" for the specific risks (untested wasm32 compilation, the wasm-only `burn`
+  feature set and `[patch]` table any new crate must respect).
+
 ## Licensing
 
 The Brush fork retains Apache-2.0 license (inherited from the upstream Brush project by ArthurBrussee). trippy's own `rust/` workspace crates (`brush-pyramid`, `brush-unet` skeletons) are MIT, per ADR-0004. When distributing trippy's Rust code, include the `NOTICE` file with attribution.
@@ -252,7 +283,12 @@ The Brush fork retains Apache-2.0 license (inherited from the upstream Brush pro
   safetensors loader in `brush-unet`, wrapping the output as `burn::Tensor<4>` (see
   `docs/LIMITATIONS.md`), and the viewer hook-in at
   `apps/brush-app/src/ui/splat_backbuffer.rs`.
-- **v0.5.0**: Web viewer complete.
+- **v0.5.0, in progress**: web-viewer *toolchain* proven end to end with the
+  stock Brush renderer (build script, `.command` launcher, WebGPU render of a
+  synthetic splat in Safari — see "Web viewer" section above and
+  `docs/WEB_VIEWER.md`). **Not yet done**: wiring trippy's own TRIPS forward
+  pass into the web build, a Chrome fps measurement, and the Quest on-device
+  check.
 
 ## Submodule vs. subtree decision
 

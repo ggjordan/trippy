@@ -6,6 +6,7 @@ Last updated: 2026-09-05 (session 1, Orchestrator: Claude Fable 5.1)
 - Spec + plan grilled and approved 2026-09-05.
 - Phase 1 skeleton reviewed and pushed as `build-0001` (public repo github.com/ggjordan/trippy, 27 CPU tests green).
 - feat/points merged (build-0004): PointSet, GaussianPlySource (5.74M pts on kk-coherent, median nn 0.080), density CLI; 50 tests green.
+- EXP-0003 full1-broadcast (40 ep, 11 min): held-out 14.42 dB / SSIM 0.39 / LPIPS 0.51, still rising -> long runs queued. Hybrid C (EXP-0005) negative for shade (-1.96 dB). brush-pyramid CubeCL port merged (GPU parity 2e-6). Raster NaN guard merged.
 - Trainer fixed (smoke 12.26 dB), native trips mode merged, candidate-report merged. Finding: with Gaussian-scale sizes the U-Net invents ~90% of every frame (t_final 0.93); full runs use kNN sizes.
 - v0.1.0 RELEASED on GitHub. Merged since: Brush fork submodule (ggjordan/brush trippy-fork) + crate skeletons, candidate-report (dolly/off-path/audits), se3_exp fix.
 - v0.1.0 GATE PASSED 2026-09-06: horse parity 22.27 dB vs GT (authors 22.34), 36.99 dB vs authors' render (EXP-0002). Merged: backward (grads <4e-6), trainer, monodepth, render CLI (EXP-0001, EXP-0004 sheets delivered).
@@ -14,11 +15,9 @@ Last updated: 2026-09-05 (session 1, Orchestrator: Claude Fable 5.1)
 - Jordan set the goal (2026-09-05 ~22:50): finish all stages autonomously; anything needing Jordan goes in the review queue below.
 
 ## In flight
-- GPU queue: EXP-0003 full runs (trips + broadcast, knn sizes, prio 70, 6 h budget each) and trippy-hybrid-c-train-1 (prio 18).
-- fix/se3-exp-grad (mid): rotation gradient at phi=0.
-- feat/hybrid-c (mid/high): design C render->photo refinement on gsrender outputs (EXP-0005).
-- feat/brush-pyramid (large/high): CubeCL port of the pyramid forward into the Brush fork + parity fixtures.
-- fix/raster-nan (large/high): NaN gradient from a degenerate fragment in the raster backward.
+- GPU queue (in order): brush-pyramid-gpu-5 (re-confirm after merge), cand-full1-broadcast (first shade audit + dolly on a TRIPS checkpoint), train-full1 (trips, 40 ep), train-full2-trips + train-full2-broadcast (300 ep, train_factor 1.0, ~2.5 h each).
+- feat/brush-unet (large/high): Burn U-Net + camera model, safetensors export, CubeTensor->Burn bridge, end-to-end horse parity + first Mac ms numbers.
+- feat/web-build (mid): Brush web app build toolchain, 127.0.0.1 launcher, Quest assessment on paper.
 
 ## Next (in order)
 1. Merge scene-io + points; launch feat/raster (large/high: numpy reference + Metal blend_fwd + pyramid forward) and feat/net (mid/high: U-Net + tone mapper ports) once TRIPS_REFERENCE.md lands.
