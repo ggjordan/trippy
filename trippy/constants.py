@@ -102,3 +102,63 @@ COLMAP_DEFAULT_CONF0 = 0.5
 
 DEFAULT_DENSITY_GAUSSIAN_PLY = "output/Training-Data/karekare/kk-coherent/kkc_15000.ply"
 DEFAULT_DENSITY_COLMAP_SPARSE_DIR = "scenes/karekare/kk-coherent/sparse_txt"
+# --- scene/colmap_io.py binary format ---
+
+# COLMAP's fixed camera_model_id -> (model_name, num_params) table, as used
+# by cameras.bin (and by COLMAP's own scripts/python/read_write_model.py).
+# Verified byte-for-byte against a real cameras.bin (6 OPENCV cameras,
+# model_id=4, num_params=8) in ~/Splats/scenes/karekare/kk-coherent.
+COLMAP_CAMERA_MODEL_TABLE: dict[int, tuple[str, int]] = {
+    0: ("SIMPLE_PINHOLE", 3),
+    1: ("PINHOLE", 4),
+    2: ("SIMPLE_RADIAL", 4),
+    3: ("RADIAL", 5),
+    4: ("OPENCV", 8),
+    5: ("OPENCV_FISHEYE", 8),
+    6: ("FULL_OPENCV", 12),
+    7: ("FOV", 5),
+    8: ("SIMPLE_RADIAL_FISHEYE", 4),
+    9: ("RADIAL_FISHEYE", 5),
+    10: ("THIN_PRISM_FISHEYE", 12),
+}
+
+# --- scene/dataset.py cache ---
+
+# Filename of the per-(scene, width) cache sidecar written by SceneDataset,
+# holding scaled intrinsics/poses/EXIF for every cached image (used to
+# validate the cache is still current on the next construction).
+SCENE_CACHE_META_FILENAME = "meta.json"
+
+# EXIF tag ids (TIFF/Exif spec, not COLMAP-specific) SceneDataset reads for
+# the tone-mapper's per-image exposure/ISO init. Missing tags are fine.
+EXIF_TAG_EXPOSURE_TIME = 33434
+EXIF_TAG_ISO = 34855
+
+# TIFF/Exif tag id of the "Exif IFD Pointer" -- the sub-IFD that actually
+# holds ExposureTime/ISO (the base IFD PIL's Image.getexif() returns does
+# not), per the Exif spec.
+EXIF_TAG_EXIF_IFD_POINTER = 0x8769
+
+# --- scene/splits.py ---
+
+# Default modulo-split stride: 1 in MODULO_SPLIT_DEFAULT_K images is held
+# out, the rest train. Matches the "held-out" fraction used for v0.1.0/
+# v0.2.0 PSNR gates in docs/SPEC.md.
+MODULO_SPLIT_DEFAULT_K = 8
+MODULO_SPLIT_DEFAULT_OFFSET = 0
+
+# Six consecutive kk-coherent frames that pass through the shade region
+# under the trees (the project's core defect, see docs/SPEC.md "Context"
+# and docs/EXPERIMENTS.md's dolly camera note, which anchors on
+# IMG_3830.jpg as the centre of the shade region). Forced into the
+# held-out set so every eval reports a shade-region number, not just an
+# average over easy frames. See docs/EXPERIMENTS.md ("shade frames
+# IMG_3828-3833").
+SHADE_FRAMES_KK = [
+    "IMG_3828.jpg",
+    "IMG_3829.jpg",
+    "IMG_3830.jpg",
+    "IMG_3831.jpg",
+    "IMG_3832.jpg",
+    "IMG_3833.jpg",
+]
