@@ -195,15 +195,6 @@ def apply_pose_delta(R: Tensor, t: Tensor, delta: Tensor) -> tuple[Tensor, Tenso
     (R', t') flow through projection into every fragment's alpha and depth,
     so `delta.grad` is populated by an ordinary backward.
 
-    CAUTION -- do not initialise `delta` at exactly zero if you want the
-    *rotation* half to train. trippy.geom.xform_b.se3_exp builds its rotation
-    from `axis = phi / max(|phi|, EPS_SE3_ANGLE)` and then multiplies by
-    `|phi|`, so at `phi == 0` the whole rotation term is second order in phi
-    and autograd returns an exactly zero gradient for `delta[3:]` (the true
-    derivative is the generator, magnitude 1). Translation (`delta[:3]`) is
-    unaffected and is correct at zero. See docs/LIMITATIONS.md and
-    tests/test_raster_bwd_ref.py::test_pose_delta_rotation_gradient_vanishes_at_zero.
-
     Args:
         R: (3, 3) float, world->camera rotation.
         t: (3,) float, world->camera translation, world units.
