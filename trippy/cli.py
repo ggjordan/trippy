@@ -2,13 +2,17 @@
 
 Module: trippy.cli
 Invariants: `smoke` only touches MPS when --device mps is explicitly passed
-    (never a silent default); the `render`/`train`/`eval` stubs do no work
-    and always exit 2. `density` builds a PointSource and prints/saves its
+    (never a silent default); the `train`/`eval` stubs do no work and always
+    exit 2. `density` builds a PointSource and prints/saves its
     PointSet.summary(); it is CPU-only (point sources never touch MPS).
+    `render` (trippy.render.pyramid_render.render_frames) only touches MPS
+    when --device mps is explicitly passed, same rule as `smoke`; it never
+    builds a SceneDataset over every registered image in a scene, only the
+    frames named in --frames.
 Related docs: docs/SPEC.md "Technical design", AGENTS.md forbidden
     list (no direct GPU/MPS work outside scripts/gpu_submit.sh -- `smoke
-    --device mps` is only ever invoked by the GPU-queue job itself);
-    docs/SPEC.md D4 (point sources).
+    --device mps` and `render --device mps` are only ever invoked by a
+    GPU-queue job); docs/SPEC.md D4 (point sources).
 """
 
 from __future__ import annotations
@@ -30,11 +34,14 @@ from trippy.constants import (
     DEFAULT_DENSITY_GAUSSIAN_PLY,
     DEFAULT_MIN_OPACITY,
     GIT_DESCRIBE_MATCH_PATTERN,
+    RASTER_NUM_LAYERS,
+    RENDER_CACHE_SUBDIR,
     SMOKE_MPS_TEST_TENSOR_LEN,
 )
 from trippy.points.colmap_sparse import ColmapSparseSource
 from trippy.points.gaussian_ply import GaussianPlySource
 from trippy.points.source import PointSource
+from trippy.render import pyramid_render
 
 _METAL_ADD_ONE_SRC = """
 kernel void add_one(device float* x [[buffer(0)]],
@@ -146,6 +153,35 @@ def _cmd_density(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_render(args: argparse.Namespace) -> int:
+    device = pick_device(args.device)
+    frame_names = [f.strip() for f in args.frames.split(",") if f.strip()]
+    if not frame_names:
+        raise ValueError("--frames must list at least one frame name")
+
+    settings = load_settings()
+    cache_root = settings.trippy_output / RENDER_CACHE_SUBDIR
+    command = "trippy " + " ".join(sys.argv[1:])
+
+    metrics = pyramid_render.render_frames(
+        scene_root=args.scene,
+        ply_path=args.ply,
+        frame_names=frame_names,
+        width=args.width,
+        out_dir=args.out,
+        device=device,
+        mode=args.mode,
+        num_layers=args.layers,
+        min_opacity=args.min_opacity,
+        size_mode=args.size_mode,
+        max_points=args.max_points,
+        cache_root=cache_root,
+        command=command,
+    )
+    print(f"JSON:{json.dumps({'num_frames': len(metrics['frames']), 'out': str(args.out)})}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="trippy")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -154,9 +190,28 @@ def build_parser() -> argparse.ArgumentParser:
     smoke.add_argument("--device", choices=["cpu", "mps"], default=None)
     smoke.set_defaults(func=_cmd_smoke)
 
-    for name in ("render", "train", "eval"):
+    for name in ("train", "eval"):
         stub = sub.add_parser(name, help=f"{name} (not implemented yet)")
         stub.set_defaults(func=_cmd_not_implemented(name))
+
+    render = sub.add_parser(
+        "render", help="rasterise the TRIPS pyramid for chosen frames + a contact sheet (no U-Net yet)"
+    )
+    render.add_argument("--scene", required=True, help="COLMAP scene root (images/ + sparse/0 or sparse_txt)")
+    render.add_argument("--points", choices=["gaussian"], default="gaussian", help="point source")
+    render.add_argument("--ply", required=True, help="binary 3DGS PLY (--points gaussian)")
+    render.add_argument("--min-opacity", type=float, default=DEFAULT_MIN_OPACITY, help="gaussian source only")
+    render.add_argument("--size-mode", choices=["scale", "knn"], default="scale", help="gaussian source only")
+    render.add_argument("--max-points", type=int, default=None, help="gaussian source only")
+    render.add_argument("--width", type=int, required=True, help="layer-0 (undistorted) image width in pixels")
+    render.add_argument(
+        "--frames", required=True, help="comma-separated image filenames, e.g. IMG_3830.jpg,IMG_3700.jpg"
+    )
+    render.add_argument("--mode", choices=["trilinear", "broadcast"], default="trilinear")
+    render.add_argument("--layers", type=int, default=RASTER_NUM_LAYERS)
+    render.add_argument("--out", required=True, help="output directory")
+    render.add_argument("--device", choices=["cpu", "mps"], default=None)
+    render.set_defaults(func=_cmd_render)
 
     density = sub.add_parser("density", help="build a point source and print PointSet.summary()")
     density.add_argument("--source", choices=["gaussian", "colmap"], required=True)

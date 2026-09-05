@@ -373,3 +373,29 @@ RASTER_SORT_DEPTH_BITS = 32
 # Largest flat layer-pixel index the composite sort key can hold without
 # overflowing int64: 2**63 / 2**RASTER_SORT_DEPTH_BITS.
 RASTER_SORT_MAX_LAYER_PIXELS = 1 << 31
+
+# --- render/pyramid_render.py : `trippy render` orchestration ---
+
+# Subdirectory of TRIPPY_OUTPUT that SceneDataset's undistortion cache is
+# written under by `trippy render` (see trippy.config.load_settings).
+RENDER_CACHE_SUBDIR = "cache"
+
+# A layer-0 pixel with (1 - t_final) at or below this is treated as
+# "nothing was drawn here" for the honesty coverage/depth maps -- below
+# this the expected-depth divide (depth_sum / (1 - t_final)) is numerically
+# unstable and the pixel is rendered black instead of a fabricated depth.
+# One order of magnitude above RASTER_T_CUTOFF's compositing stop threshold.
+RENDER_COVERAGE_EPS = 1e-2
+
+# Percentile clamp (of the *covered* pixels' expected depth) used as
+# colorize()'s vmin/vmax for the depth panel, so a handful of far outlier
+# points (e.g. sky, mis-triangulated Gaussians) don't wash out the ramp.
+RENDER_DEPTH_PERCENTILE_LOW = 1.0
+RENDER_DEPTH_PERCENTILE_HIGH = 99.0
+
+# Central crop fraction (of height and width) used for metrics.json's
+# "mean_center" coverage number: a numeric proxy for "is the middle of the
+# frame covered", computed directly from the T_final tensor (never from a
+# rendered image) so a shade-region coverage verdict never requires opening
+# a photo-derived image (AGENTS.md privacy rule).
+RENDER_CENTER_REGION_FRAC = 0.5

@@ -90,6 +90,16 @@ Subagents **never** run `git commit`, `git push`, `git merge`, `git tag`, or `gh
 - No hosted APIs with images (e.g., cloud vision, online rendering services).
 - Public weights and code are fine.
 
+### Never send scene imagery to a model (this includes YOU)
+- Viewing an image with an agent tool (Read on a PNG/JPG, image attachments, screenshots) transmits the pixels to a
+  hosted model API. That counts as the image leaving the machine. Therefore: **never open, view, or attach any
+  photo, render, contact sheet, video frame, or depth/points-over-photo overlay derived from Jordan's scenes.**
+- Allowed to view: purely synthetic test images, abstract heatmaps with no photographic content (coverage maps,
+  T_final, difference masks rendered from scratch), plots of metrics, and images of the PUBLIC Zenodo TRIPS scenes.
+- Verdicts about Jordan's scene renders come from metrics + Jordan's own eyes. Write the sheet, deliver it, describe
+  what the metrics say; do not look at it. If in doubt, don't open it.
+- Incident 2026-09-05: a subagent opened a kk-coherent contact sheet with the Read tool; logged in STATE.md. Do not repeat.
+
 ### Disk and delivery
 - Never copy scenes or PLYs from `$SPLATS_ROOT/scenes/` or `$SPLATS_ROOT/output/` into this repo; read them live or link them.
 - Deliverables (renders, contact sheets, videos, exported PLYs) go **only** through `scripts/deliver.sh <artifact> <name> "<why>"`.
