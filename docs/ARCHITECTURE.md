@@ -14,6 +14,10 @@ trippy/
 │                index_add_ reduction), pyramid.py (device dispatch),
 │                ref_numpy.py / ref_torch.py
 ├── net/         U-Net decoder, gated ELU convolutions, perceptual loss
+├── hybrid/      Gaussian-splat renders as network input: render_splat_views (batch
+│                renderer via Splats' gsrender), dataset_c/train_c/config_c (design C,
+│                render->photo only), config_a/gaussian_input/gsrender_live (design A,
+│                render + TRIPS pyramid together inside train/'s own Trainer)
 ├── train/       trainer loop, config, eval harness, export to 3DGS PLY
 ├── render/      dolly camera paths, off-path rendering, video export, honesty sheets
 └── cli.py       command-line interface, smoke tests
@@ -555,3 +559,42 @@ change here, since nothing in `trainer.py` inspects which backward path is activ
 
 CLI: `trippy train --config cfg.yaml [--resume ckpt] [--max-minutes M] [--device cpu|mps]` and
 `trippy eval --checkpoint ckpt [--images ...] [--device cpu|mps]` (`trippy/cli.py`).
+
+## hybrid/ -- Gaussian splat renders as U-Net input (v0.3.0, designs C and A)
+
+Two designs share one on-disk contract and one renderer, and nothing else.
+
+- **`trippy/hybrid/render_splat_views.py`** renders every registered view of a scene against a
+  binary 3DGS PLY through Splats' `gsrender.render` (imported by path, never copied), on
+  `SceneDataset`'s own undistorted `(H, W, K)` grid so every render lines up pixel-for-pixel
+  with its photo. Writes `<stem>.png` (uint8 rgb) + `<stem>.depth.npy` + `<stem>.alpha.npy`
+  (float16) + a per-shard manifest. Idempotent per frame and shardable; MPS, so only ever run
+  inside a GPU-queue job.
+- **Design C** (`config_c.py`, `dataset_c.py`, `train_c.py`; `trippy hybrid-c train`) is a
+  standalone image->image trainer: render in, photo out, no point cloud and no rasteriser.
+  See docs/EXPERIMENTS.md "Hybrid design C".
+- **Design A** (`config_a.py`, `gaussian_input.py`, `gsrender_live.py`) is not a trainer at
+  all -- it is an *option on the existing point-based `Trainer`*. `HybridConfig` is a block
+  inside `TrainConfig`; `GaussianInputs` loads/crops/pools the render and concatenates it onto
+  every level of the TRIPS pyramid before the U-Net; `gsrender_live` supplies the same block
+  at poses no photo exists for. See docs/EXPERIMENTS.md "Hybrid design A".
+
+Design A's three load-bearing decisions:
+
+1. **Only the network widens.** `TrainConfig.net_input_channels = feature_channels + G` feeds
+   `NetworkConfig.num_input_channels`. Point features, background and the rasteriser stay at
+   `feature_channels`, so `render_pyramid` is untouched and `layers[0]` is still the pure
+   TRIPS composite every honesty artifact ("raw L0", coverage) is defined against.
+2. **The render is cropped by the photo's own crop function**, with the same
+   `(size, zoom, center)` and the same `K`, so the K-adjust cannot drift. Depth is metric
+   camera-space z and is resampled, never rescaled, by the crop; its only scale is the
+   scene-global `depth_scale` (measured once, recorded in the checkpoint).
+3. **Missing Gaussian information is an all-zero block, never a fabrication.** A frame with no
+   render, a crop chosen by `dropout_gaussian_p`, and a pose with no live renderer all produce
+   the same thing. The channel count and level count never vary within a run, and the network
+   is trained (by the dropout ablation) to be a working TRIPS renderer in that state. In
+   particular a dolly/off-path pose never borrows its anchor image's precomputed render: that
+   render is from a different camera, so it is rendered live or it is zeros.
+
+`enabled: false` is the default and a hard no-op: `Trainer.hybrid is None`, the network keeps
+its old width, and every code path is the pre-design-A one.

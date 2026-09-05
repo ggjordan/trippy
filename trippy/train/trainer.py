@@ -14,6 +14,11 @@ Invariants: every render call goes through `trippy.raster.pyramid.
     crop's fragments are ever rasterised (the "K-adjust" strategy -- see
     `tests/test_train_crop_equivalence.py` for the proof this equals
     cropping a full render of the same points/pose).
+    Hybrid design A (`cfg.hybrid.enabled`) concatenates a Gaussian-splat
+    render onto every pyramid level before the U-Net (trippy.hybrid.
+    gaussian_input). It is strictly additive: with `hybrid.enabled` false
+    `self.hybrid is None` and every code path below is the one that existed
+    before design A, down to the `NetworkConfig` channel count.
     Structure/camera "locking" (docs/TRIPS_REFERENCE.md Sec. 7) is
     implemented by toggling `requires_grad_` on the frozen parameters for
     the locked epoch range, not by zeroing an optimizer-group learning
@@ -31,6 +36,7 @@ from __future__ import annotations
 import json
 import math
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
@@ -54,6 +60,7 @@ from trippy.constants import (
     TRAIN_PSNR_EPS,
 )
 from trippy.geom import xform_b
+from trippy.hybrid.gaussian_input import GaussianInputs
 from trippy.net.camera_model import NeuralCamera
 from trippy.net.losses import LossWeights, TripsLoss, _LazyLPIPS, mse_loss, ssim
 from trippy.net.unet import MultiScaleUnet2dDecOnlySmallFixed, NetworkConfig
@@ -130,7 +137,26 @@ class Trainer:
             torch.full((cfg.feature_channels,), float(cfg.background), device=self.device)
         )
 
-        network_cfg = NetworkConfig(num_input_channels=cfg.feature_channels, num_layers=cfg.layers)
+        # Design A: the Gaussian render's channels are appended to every U-Net input
+        # level, so the network -- and only the network -- gets wider. Point features,
+        # background and the rasteriser all stay at `cfg.feature_channels`.
+        # `GaussianInputs.build` also resolves `cfg.hybrid.depth_scale` in place, so
+        # `save_checkpoint`'s `cfg.to_dict()` records the exact normaliser used.
+        self.hybrid: GaussianInputs | None = None
+        if cfg.hybrid.enabled:
+            self.hybrid = GaussianInputs.build(cfg.hybrid, list(self.dataset.names))
+            n_with_render = len(self.hybrid.available_names(list(self.dataset.names)))
+            self._log(
+                f"hybrid design A: mode={cfg.hybrid.mode} channels={cfg.hybrid.channels} "
+                f"(+{self.hybrid.num_channels} net input channels), depth_scale="
+                f"{cfg.hybrid.depth_scale}, renders for {n_with_render}/{len(self.dataset.names)} images"
+            )
+        # Set by callers that render poses no photo exists for (see `gaussian_for_pose`);
+        # `trippy.train.eval.build_trainer_from_checkpoint` installs a lazy live-gsrender
+        # provider here, and `trippy.render.candidate.render_candidate` can override it.
+        self.gaussian_provider: Callable[..., torch.Tensor | None] | None = None
+
+        network_cfg = NetworkConfig(num_input_channels=cfg.net_input_channels, num_layers=cfg.layers)
         self.net = MultiScaleUnet2dDecOnlySmallFixed(network_cfg).to(self.device)
 
         first_item = self.dataset[0]
@@ -243,9 +269,20 @@ class Trainer:
         return self.pose_params.compose_pose(frame_index, R0, t0)
 
     def _render(
-        self, K: torch.Tensor, R: torch.Tensor, t: torch.Tensor, image_hw: tuple[int, int]
+        self,
+        K: torch.Tensor,
+        R: torch.Tensor,
+        t: torch.Tensor,
+        image_hw: tuple[int, int],
+        gaussian: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, list[torch.Tensor], dict]:
-        """Render + decode one image: raster pyramid -> U-Net. Returns (net_out, layers, aux)."""
+        """Render + decode one image: raster pyramid -> U-Net. Returns (net_out, layers, aux).
+
+        `gaussian` is design A's `(G, H, W)` Gaussian block at level-0
+        resolution (None = zeros, or no hybrid at all); `layers` is always the
+        *TRIPS-only* pyramid, so every honesty artifact ("raw L0", coverage)
+        keeps meaning exactly what it meant before design A.
+        """
         layers, aux = render_pyramid(
             self.point_params.xyz,
             self.point_params.size(),
@@ -262,6 +299,8 @@ class Trainer:
             pyramid_halving=self.cfg.pyramid_halving,
         )
         inputs = [layer.unsqueeze(0) for layer in layers]
+        if self.hybrid is not None:
+            inputs = self.hybrid.attach(inputs, gaussian)
         net_out = self.net(inputs)
         return net_out, layers, aux
 
@@ -269,8 +308,46 @@ class Trainer:
         frame_index_t = torch.tensor([frame_index], device=self.device, dtype=torch.long)
         return self.camera(net_out, frame_index_t)
 
+    def gaussian_for_pose(
+        self,
+        name: str | None,
+        K: torch.Tensor,
+        R: torch.Tensor,
+        t: torch.Tensor,
+        image_hw: tuple[int, int],
+    ) -> torch.Tensor | None:
+        """Design A's Gaussian block for an **arbitrary** pose, or None (-> zeros).
+
+        Deliberately does NOT fall back to `name`'s precomputed render. A
+        `CameraPose.image_name` means "anchored to that image" -- every dolly
+        and off-path pose is *displaced* from the photographed one
+        (`trippy.render.offpath.offpath_poses`, `trippy.render.dolly`), so
+        reusing that image's render here would feed the network a Gaussian
+        image taken from the wrong camera. The precomputed renders are used
+        only where the pose genuinely is the image's own: `evaluate()`, which
+        calls `self.hybrid.frame` directly.
+
+        `name` is still passed through to the provider (it may want it for
+        logging or for a caller-supplied exact-pose cache); resolution is
+        otherwise: `self.gaussian_provider` if a caller installed one
+        (`trippy.hybrid.gsrender_live.gaussian_provider_for` renders the PLY
+        live at this exact pose), else None -- an honest all-zero block, the
+        TRIPS-only state `hybrid.dropout_gaussian_p` trained the network to
+        survive. Always None when the run is not hybrid, so non-hybrid callers
+        can invoke this unconditionally.
+        """
+        if self.hybrid is None or self.gaussian_provider is None:
+            return None
+        return self.gaussian_provider(name, K, R, t, image_hw)
+
     def render_at_pose(
-        self, K: torch.Tensor, R: torch.Tensor, t: torch.Tensor, image_hw: tuple[int, int], frame_index: int = 0
+        self,
+        K: torch.Tensor,
+        R: torch.Tensor,
+        t: torch.Tensor,
+        image_hw: tuple[int, int],
+        frame_index: int = 0,
+        image_name: str | None = None,
     ) -> tuple[torch.Tensor, list[torch.Tensor], dict]:
         """Public render+tone-map at an arbitrary pose (no pose-delta refinement applied).
 
@@ -286,13 +363,19 @@ class Trainer:
             frame_index: which trained per-image exposure/response
                 parameters to apply (default 0, an arbitrary but
                 deterministic stand-in when there is no natural frame).
+            image_name: the registered image this pose is *anchored to*, if
+                any -- passed straight through to design A's
+                `gaussian_for_pose` (which renders the Gaussian block live at
+                this pose; it never substitutes that image's own precomputed
+                render, see there). Ignored when not hybrid.
 
         Returns:
             (pred, layers, aux): `pred` is the toned-mapped (1, 3, H', W')
             image (see `_render` for the odd-size caveat); `layers`/`aux`
             are `render_pyramid`'s raw pyramid outputs.
         """
-        net_out, layers, aux = self._render(K, R, t, image_hw)
+        gaussian = self.gaussian_for_pose(image_name, K, R, t, image_hw)
+        net_out, layers, aux = self._render(K, R, t, image_hw, gaussian=gaussian)
         pred = self._tone_map(net_out, frame_index)
         return pred, layers, aux
 
@@ -362,8 +445,21 @@ class Trainer:
         target = cropped["rgb"].to(torch.float32).permute(2, 0, 1).unsqueeze(0) / 255.0
         mask = cropped["mask"].unsqueeze(0).unsqueeze(0)
 
+        # Design A: the Gaussian render is cropped through the *same* function with the
+        # *same* (size, zoom, center), so its K-adjust is identical to the photo's by
+        # construction (tests/test_hybrid_a_crop.py). `dropped` is ablation 1: a fraction
+        # of crops see zeros instead, so the net cannot rely on the Gaussians everywhere.
+        gaussian = None
+        dropped = False
+        if self.hybrid is not None:
+            dropped = self.hybrid.should_drop(self._rng)
+            if not dropped:
+                gaussian = self.hybrid.crop_frame(name, item, self.cfg.crop, zoom, center)
+
         R, t = self._pose_for(item, frame_index)
-        net_out, _layers, _aux = self._render(cropped["K"], R, t, (self.cfg.crop, self.cfg.crop))
+        net_out, _layers, _aux = self._render(
+            cropped["K"], R, t, (self.cfg.crop, self.cfg.crop), gaussian=gaussian
+        )
         pred = self._tone_map(net_out, frame_index)
 
         target = _center_crop_like(target, pred.shape[-2], pred.shape[-1])
@@ -392,6 +488,9 @@ class Trainer:
             "camera_reg": float(camera_reg.detach().item()),
             "nonfinite_grads": int(nonfinite_grads.item()),
         }
+        if self.hybrid is not None:
+            record["gaussian_dropped"] = bool(dropped)
+            record["gaussian_present"] = bool(gaussian is not None)
         self._append_metrics(record)
         return record
 
@@ -462,7 +561,12 @@ class Trainer:
                 mask = torch.ones((1, 1, height, width), device=self.device)
 
                 R, t = self._pose_for(item, frame_index)
-                net_out, layers, aux = self._render(item["K"], R, t, (height, width))
+                # Renders exist on disk for every registered image (held-out included),
+                # so held-out eval never needs a live gsrender pass.
+                gaussian = self.hybrid.frame(name, (height, width)) if self.hybrid is not None else None
+                net_out, layers, aux = self._render(
+                    item["K"], R, t, (height, width), gaussian=gaussian
+                )
                 pred = self._tone_map(net_out, frame_index)
 
                 target_c = _center_crop_like(target, pred.shape[-2], pred.shape[-1])

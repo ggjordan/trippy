@@ -682,6 +682,133 @@ eval_ep<NNNN>/
 (`trippy.hybrid.train_c.evaluate_checkpoint`) re-evaluates a checkpoint without re-training,
 mirroring `trippy eval`.
 
+## Hybrid design A: the Gaussian render fed to the U-Net *alongside* the TRIPS pyramid
+
+Design C (above) replaces the point pyramid with a Gaussian render. Design A1
+(`docs/PLAN-2026-09-05.md`) replaces the Gaussian render with points. **Design A keeps both**:
+the same `trippy.train.trainer.Trainer` that trains a TRIPS point cloud also receives the
+scene's Gaussian-splat render (rgb + alpha + depth) as extra U-Net input channels, and the
+whole thing -- points, sizes, features, poses, tone mapper, network -- trains end to end
+against the photos. This is the hybrid Jordan asked for on 2026-09-06 ("Splats combined with
+TRIPS"): the network can keep the Gaussians where they are good and use the TRIPS points
+where they fail, without anyone having to choose globally. Experiment: EXP-0009.
+
+### Config
+
+`hybrid:` is a block inside a normal `trippy train` config (`trippy/hybrid/config_a.py`).
+`enabled: false` is the default and a hard no-op -- a non-hybrid run's network width,
+checkpoint contents and numerics are exactly what they were before design A existed.
+
+```yaml
+hybrid:
+  enabled: true
+  renders_dir: /Users/nzbirdranch/trippy/output/hybrid-c/renders/w1008
+  channels: [rgb, alpha, depth]   # canonical order; any non-empty subset
+  mode: all_levels                # all_levels (default) | concat_level0
+  dropout_gaussian_p: 0.2         # ablation 1: fraction of crops with the block zeroed
+  mask_by_alpha: true             # ablation 2: rgb *= alpha before concatenation
+  depth_scale: null               # null = measure and record; else world units
+  missing: zeros                  # zeros (train through a half-rendered set) | error
+  ply_path: .../kkc_15000.ply     # for LIVE rendering at unphotographed poses
+```
+
+`renders_dir` is exactly design C's output layout (`<stem>.png` + `<stem>.depth.npy` +
+`<stem>.alpha.npy`, written by `trippy.hybrid.render_splat_views`); the two designs share the
+renderer and the on-disk contract. A render set produced at a different width is area-averaged
+onto the run's own grid (`resample_to`) -- same camera, proportional intrinsics.
+
+### Channels and the two modes
+
+Each U-Net input level becomes `[TRIPS features (C) | gaussian rgb (3) | alpha (1) |
+normalised depth (1)]`. `TrainConfig.net_input_channels` (= `feature_channels + G`) drives
+`NetworkConfig.num_input_channels`; the point cloud, background and rasteriser stay at
+`feature_channels`, so only the network gets wider. With the shipped defaults that is
+4 + 5 = 9 input channels against `filters = 32`, and every block's channel arithmetic still
+closes (`filters - 2C` / `filters - C`, see `trippy/net/unet.py`).
+
+- `all_levels` (**default**) area-averages the Gaussian block down to every level's own
+  `(h, w)`. It is the default because TRIPS's `CombineBridge` re-concatenates each level's
+  *raw* input twice per level, so a level-0-only signal never reaches the coarse blocks that
+  decide large-scale structure -- exactly where "trust the Gaussians here, not there" has to
+  be decided.
+- `concat_level0` puts the real block on level 0 and zeros in those channels on the coarser
+  levels (the U-Net requires a uniform channel count across levels).
+
+A missing render and a dropped-out crop are the same thing to the network: an all-zero block
+of the right width. The level count and channel count never vary within a run.
+
+The pooling itself is done **host-side**: `GaussianInputs` keeps every block on the CPU and
+`attach` copies only the finished per-level tensor onto the network's device. The pool costs a
+few milliseconds either way, and doing it on the CPU means design A needs no additional Metal
+kernel -- which matters because queue jobs run with `PYTORCH_ENABLE_MPS_FALLBACK=0` (an
+unimplemented op is a hard failure) and there is no way to test the MPS path outside the queue.
+
+### Crops: identical to the photo's, by construction
+
+`GaussianInputs.crop_frame` calls `trippy.scene.dataset.crop` with the **same**
+`(size, zoom, center)` and the **same** `K` the photo crop used, on the render block laid out
+channels-last. The K-adjust and the overshoot/validity mask are therefore identical because
+they are literally the same code on the same arguments, not a parallel implementation.
+`tests/test_hybrid_a_crop.py` asserts bit-identical `K` and mask against the photo path, and
+pixel agreement against an independently hand-written gather, over five (size, zoom, centre)
+cases including one that overshoots the frame.
+
+Depth is a metric camera-space z: a crop or zoom changes the intrinsics, not the distance to
+the surface, so depth values are resampled with the same gather and never rescaled by the
+crop. Their only rescale is the scene-global `depth_scale` -- with `depth_scale: null` that is
+the median camera-to-Gaussian depth over `alpha >= 0.5` pixels of 12 evenly-spaced rendered
+frames, measured at `Trainer` construction and **written back into the config**, so the
+checkpoint records the exact normaliser its weights were trained with and eval/report
+normalise identically.
+
+### Eval, and poses that were never photographed
+
+Renders exist for every registered image (held-out included), so held-out eval reads them from
+disk by image name and never renders anything live. The candidate report's dolly and off-path
+cameras are a different matter: no photo, therefore no precomputed render.
+`trippy/hybrid/gsrender_live.py` renders `hybrid.ply_path` on the fly through Splats'
+`gsrender` (imported by path, never copied; MPS, therefore only ever inside a queue job) and
+caches the 1.7 GB PLY once **per process**, so a report that calls `render_candidate` twice
+pays for it once.
+
+`trippy.train.eval.build_trainer_from_checkpoint` installs that provider lazily on any hybrid
+checkpoint -- lazily meaning nothing is loaded and MPS is never touched unless an
+unphotographed pose is actually rendered. `render_candidate(..., gaussian_provider=...)`
+overrides it with any `(name, K, R, t, image_hw) -> (G, H, W) tensor | None` callback; the CPU
+tests inject a fake so the suite never touches a PLY or MPS.
+
+**The precomputed renders are deliberately unreachable from that callback.** A
+`CameraPose.image_name` means "anchored to that image", and every dolly and off-path pose is
+*displaced* from the photographed one, so that image's render belongs to a different camera;
+substituting it would feed the network a Gaussian image from the wrong viewpoint. The cache is
+used only where the pose genuinely is the image's own, i.e. `Trainer.evaluate`. When no live
+renderer is configured the provider returns `None` -- an all-zero block, i.e. the TRIPS-only
+state `dropout_gaussian_p` trained the network to survive. That is the honest failure mode,
+not a fabricated render.
+
+### Ablations
+
+- `dropout_gaussian_p` (default 0.2): a fifth of training crops see zeros in the Gaussian
+  channels. Without it the network is free to become a thin residual on top of the Gaussian
+  render everywhere -- precisely the failure design C already measured (EXP-0005: +0.45 dB
+  non-shade, **-1.96 dB shade**). It is recorded per step in `metrics.jsonl` as
+  `gaussian_dropped` / `gaussian_present`.
+- `mask_by_alpha` (default true): an uncovered pixel then reads as "nothing here" rather than
+  as gsrender's composited background colour, which carries no scene information but does look
+  like content to a conv net.
+
+### Baselines any design-A run is judged against
+
+| Baseline | Held-out PSNR, all | Held-out PSNR, shade | Source |
+|---|---|---|---|
+| Plain Gaussians (raw render vs photo) | 15.53 dB | 14.94 dB | EXP-0005 |
+| Plain TRIPS (`full1-broadcast`, 40 ep) | 14.42 dB | n/a | EXP-0003 |
+| Design C (U-Net on the render only) | 15.54 dB | 12.97 dB | EXP-0005 |
+
+Recorded as `HYBRID_A_BASELINE_*` in `trippy/constants.py`. The plain-TRIPS row is the 40-epoch
+number; the fair comparison is EXP-0009 against EXP-0003's 300-epoch `full2-trips`, whose
+config EXP-0009 copies verbatim outside its `hybrid:` block.
+
 ## Distillation (design B)
 
 docs/SPEC.md D2: "A plain splat that incorporates TRIPS learning (Design B) is a valid
