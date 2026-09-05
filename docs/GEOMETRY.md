@@ -172,3 +172,37 @@ When converting from COLMAP (world-to-camera), use: `R_cw = R^T`, `t_cw = -R^T @
 3. **Padded pixels unprojected as scene**: rasterisation pads images to pyramid-level resolutions. Fragments from padded regions must be dropped before unprojection; otherwise, padded pixels project as valid scene points, corrupting gradients. Enforced by `tests/test_raster_bounds.py`: the emitter drops, and never clamps, any footprint corner outside its own layer, and the pre-emission visibility cull is proven conservative (a point 3 px off the left edge is culled from layer 0 but still drawn at layer 3).
 
 Each has been caught early by comparing `xform_a` (numpy) and `xform_b` (torch) on small CPU-only tests before GPU work. Make both implementations fail the same way before fixing.
+
+## SE(3) exponential map (pose-refinement twists)
+
+`trippy.geom.xform_b.se3_exp` maps a twist `xi = (rho, phi)` (Sophus/g2o
+convention: `rho = delta[:3]` translation generator, `phi = delta[3:]`
+rotation vector, axis * angle radians) to a homogeneous transform
+`T = [[R, V @ rho], [0, 0, 0, 1]]`, using the standard Taylor-guarded
+Rodrigues coefficients with `t = |phi|`:
+
+```
+A = sin(t)/t,  B = (1 - cos t)/t^2,  C = (1 - A)/t^2
+R = I + A [phi]x + B [phi]x^2
+V = I + B [phi]x + C [phi]x^2
+```
+
+`A`, `B`, `C` are computed from `t^2 = phi . phi` (never from `t = |phi|`
+directly, which has an undefined gradient at `phi == 0`), with the
+small-angle series `A ~= 1 - t^2/6`, `B ~= 1/2 - t^2/24`, `C ~= 1/6 - t^2/120`
+below `t = 1e-4` (avoids the float64 cancellation in `1 - cos t` for tiny
+`t`, not just the `0/0` at `t == 0`).
+
+**History:** an earlier version built `R` from a normalized axis,
+`a * |phi| * skew(phi / max(|phi|, eps))`. That expression is second order
+in `phi` at the origin, so autograd returned an exactly-zero rotation
+gradient for `delta[3:]` at `phi == 0` -- the common case of a pose delta
+initialised at zero -- even though the true derivative there is the SO(3)
+generator (magnitude 1). The fix builds `[phi]x` directly (linear in `phi`,
+so its own gradient at the origin is the generator) and keeps `A`, `B`, `C`
+as smooth even functions of `phi` computed via `t^2`, so every term is
+differentiable through `phi == 0`. Regression test:
+`tests/test_raster_bwd_ref.py::test_pose_delta_rotation_gradient_matches_generator_at_zero`;
+formula coverage: `tests/test_xform_agreement.py`'s `test_se3_exp_*` tests
+(gradcheck at `phi == 0`, at `|phi| = 1e-6`, and at `|phi| = 0.5`; agreement
+with `torch.matrix_exp` of the 4x4 se(3) generator to `1e-12`).

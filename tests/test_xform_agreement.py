@@ -116,3 +116,77 @@ def test_xform_b_never_imports_numpy() -> None:
     """trippy.geom.xform_b must stay torch-only (see module invariants)."""
     src = xform_b.__spec__.loader.get_source("trippy.geom.xform_b") or ""
     assert "import numpy" not in src
+
+
+# --------------------------------------------------------------------------
+# se3_exp: rotation-gradient-at-zero fix (see trippy/geom/xform_b.py
+# _so3_exp_coeffs/se3_exp and docs/GEOMETRY.md "SE(3) exponential map").
+# se3_exp used to build its rotation from a normalized axis
+# (phi / max(|phi|, eps)) scaled back up by |phi|, which is second order in
+# phi at the origin and zeroed the rotation gradient there
+# (tests/test_raster_bwd_ref.py::
+# test_pose_delta_rotation_gradient_matches_generator_at_zero pins the
+# regression test for that). These tests cover the replacement formula
+# itself: gradcheck through the origin and through tiny/moderate angles, and
+# agreement with an independently-computed reference.
+# --------------------------------------------------------------------------
+
+
+def _twist_matrix(delta: torch.Tensor) -> torch.Tensor:
+    """4x4 se(3) generator matrix Xi with se3_exp(delta) == torch.matrix_exp(Xi).
+
+    Xi = [[skew(phi), rho], [0, 0, 0, 0]]; exponentiating this 4x4 matrix is
+    the textbook definition of the SE(3) exponential map, and torch's
+    scaling-and-squaring `matrix_exp` is numerically independent of this
+    module's closed-form Rodrigues coefficients -- a genuine cross-check,
+    not the same formula written twice.
+    """
+    rho = delta[0:3]
+    phi = delta[3:6]
+    xi = torch.zeros((4, 4), dtype=delta.dtype, device=delta.device)
+    xi[:3, :3] = xform_b._skew(phi)
+    xi[:3, 3] = rho
+    return xi
+
+
+def _random_delta(rng: torch.Generator, theta_mag: float) -> torch.Tensor:
+    axis = torch.randn(3, dtype=torch.float64, generator=rng)
+    axis = axis / axis.norm()
+    phi = axis * theta_mag
+    rho = torch.randn(3, dtype=torch.float64, generator=rng)
+    return torch.cat([rho, phi])
+
+
+@pytest.mark.parametrize("theta_mag", [0.0, 1e-8, 1e-6, 1e-5, 1e-4, 1e-3, 0.5])
+def test_se3_exp_matches_matrix_exponential(theta_mag: float) -> None:
+    """se3_exp must match torch.matrix_exp of the 4x4 se(3) generator to
+    1e-12, including in the tiny-angle regime where a naive (1-cos)/theta^2
+    would lose precision to cancellation -- exactly the regime the
+    Taylor-guarded coefficients in _so3_exp_coeffs exist for.
+    """
+    rng = torch.Generator().manual_seed(0)
+    delta = _random_delta(rng, theta_mag)
+
+    T = xform_b.se3_exp(delta)
+    T_ref = torch.matrix_exp(_twist_matrix(delta))
+
+    torch.testing.assert_close(T, T_ref, atol=1e-12, rtol=0.0)
+
+
+def test_se3_exp_gradcheck_at_zero_delta() -> None:
+    """The whole point of the fix: gradcheck must pass through phi == 0,
+    where autograd used to return an exactly-zero rotation gradient.
+    """
+    delta = torch.zeros(6, dtype=torch.float64, requires_grad=True)
+    assert torch.autograd.gradcheck(xform_b.se3_exp, (delta,))
+
+
+@pytest.mark.parametrize("theta_mag", [1e-6, 0.5])
+def test_se3_exp_gradcheck_nonzero_phi(theta_mag: float) -> None:
+    """gradcheck at a tiny angle (inside the Taylor-series branch) and a
+    moderate angle (inside the closed-form branch), so both branches of
+    _so3_exp_coeffs are covered end to end through autograd.
+    """
+    rng = torch.Generator().manual_seed(0)
+    delta = _random_delta(rng, theta_mag).requires_grad_(True)
+    assert torch.autograd.gradcheck(xform_b.se3_exp, (delta,))
