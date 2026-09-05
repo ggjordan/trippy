@@ -1,167 +1,93 @@
-//! brush-pyramid: TRIPS image-pyramid rasteriser (skeleton).
+//! `brush-pyramid`: TRIPS's image-pyramid rasteriser, forward pass, in Rust.
 //!
-//! Module: brush_pyramid
-//! Purpose: v0.4.0 placeholder for the Rust/CubeCL port of trippy's pyramid
-//!     rasteriser (`trippy/raster/emit.py`). Only `layer_bounds`/`layer_factor`
-//!     are implemented so far, as a faithful scalar port validated against the
-//!     same hand-computed values as `tests/test_raster_layer_factor.py`. The
-//!     real workload -- `emit_fragments`, two radix argsorts, `prefix_sum`, and
-//!     the `blend_fwd`/`blend_bwd` CubeCL kernels -- is future work tracked in
-//!     docs/SPEC.md's v0.4.0 row.
-//! Invariants:
-//!     - `layer_factor`/`layer_bounds` must stay numerically identical to the
-//!       Python reference (`trippy.raster.emit.layer_bounds`/`layer_factor`,
-//!       an exact port of TRIPS's `compute_point_size_fac`,
-//!       third_party/TRIPS/src/lib/rendering/PointBlending.h:81-149). Do not
-//!       "clean up" the quirks documented below; they match the C++ source.
-//!     - `NUM_LAYERS` is a fixed constant here (unlike the Python version,
-//!       which takes it as a parameter) because this is a placeholder; the
-//!       real port should take it as a parameter once wired into brush-app.
-//! Related docs: docs/GEOMETRY.md "Pyramid level selection"; docs/SPEC.md
-//!     v0.4.0 row; docs/decisions/ADR-0005-brush-fork-layout.md.
+//! Module: `brush_pyramid`
+//! Purpose: the v0.4.0 port of trippy's Python/Metal pyramid rasteriser
+//!     (`trippy/raster/`) to Rust, so the Mac viewer (`apps/brush-app`, wgpu
+//!     on Metal) and later the web viewer (WebGPU) can render a TRIPS point
+//!     set natively. A point set plus a camera goes in; `L` alpha-composited
+//!     feature images, finest first, come out, ready for the U-Net decoder.
+//!
+//! # Layout
+//!
+//! - [`params`] — every render knob, mirroring `trippy.constants`.
+//! - [`grid`] — pyramid shapes and the layer-major flat index space.
+//! - [`factor`] — TRIPS's `compute_point_size_fac` and `layer_bounds`.
+//! - [`scene`] — [`PointSet`] and [`Camera`], with npz/JSON loaders.
+//! - [`npz`] — a dependency-light reader for numpy archives.
+//! - [`cpu`] — the reference forward pass, explicit loops, no GPU.
+//! - [`output`] — the host-side result type both paths produce.
+//! - [`fixture`] — loader for the synthetic Python parity fixtures.
+//! - `gpu` — the CubeCL kernels and the Burn entry point
+//!   (`gpu::render_pyramid`). **Behind the `gpu` feature**, which is off by
+//!   default so that `cargo check`/`cargo test -p brush-pyramid` (run on
+//!   every push by `scripts/build.sh` / `scripts/test.sh`) never has to
+//!   compile Burn, CubeCL and wgpu.
+//! - [`png`] — a tiny PNG writer for the `render_frame` example.
+//!
+//! # The pipeline
+//!
+//! Identical in both implementations, and atomic-free by design
+//! (`docs/ARCHITECTURE.md`, "Core principle: No atomics anywhere"):
+//!
+//! 1. **project & count** — per point: `uv`, depth, `size_px`, the near-plane
+//!    and visibility cull, and how many `(layer, corner)` slots it reserves.
+//! 2. **prefix sum** over those counts, giving each point its write offset.
+//! 3. **emit** — one fragment per slot: `(layer, pixel)` key, float32 depth
+//!    bits, alpha, point id.
+//! 4. **sort** — by depth, then by the `(layer, pixel)` key. Both passes are
+//!    stable LSB radix sorts, so the result is ordered by
+//!    `(layer, pixel, depth)` with ties broken by point id.
+//! 5. **segment offsets** — the `[start, end)` run of each layer-pixel.
+//! 6. **blend** — one thread per layer-pixel walks its run front-to-back:
+//!    `out += T * alpha * feature`, `T *= 1 - alpha`, stopping at
+//!    `max_frags` or when `T` drops below `t_cutoff`.
+//!
+//! Background is added afterwards as `out += t_final * bg`, never inside the
+//! blend loop, exactly as TRIPS does (`RenderForward.cu:3610-3620`).
+//!
+//! # Invariants
+//!
+//! - Numerics are float32 end to end, on both paths and on the Python side
+//!   the fixtures come from, so parity is a real comparison rather than a
+//!   dtype artefact.
+//! - Out-of-bounds fragments are **dropped, never clamped**
+//!   (`docs/GEOMETRY.md` bug class 3).
+//! - Every quirk of TRIPS's blend factor is reproduced deliberately; see
+//!   [`factor::layer_factor`] before "simplifying" any of it.
+//!
+//! # Example
+//!
+//! ```no_run
+//! use brush_pyramid::{cpu::render_pyramid_cpu, params::PyramidParams, scene::{Camera, PointSet}};
+//! use std::path::Path;
+//!
+//! let points = PointSet::from_npz(Path::new("points.npz")).expect("points");
+//! let camera = Camera::from_json(Path::new("camera.json")).expect("camera");
+//! let images = render_pyramid_cpu(&points, &camera, &PyramidParams::default(), None)
+//!     .expect("render");
+//! assert_eq!(images.layers.len(), PyramidParams::default().num_layers);
+//! ```
+//!
+//! Related docs: `docs/ARCHITECTURE.md`, `docs/GEOMETRY.md`,
+//! `docs/TRIPS_REFERENCE.md` sections 3/3a/3b,
+//! `docs/decisions/ADR-0005-brush-fork-layout.md`, `rust/README.md`.
 
-/// Number of pyramid layers. Matches `tests/test_raster_layer_factor.py`'s
-/// `NUM_LAYERS = 5` so the hand-computed values below carry over directly.
-/// A future, fully-wired version of this crate should take this as a
-/// parameter (as the Python `layer_bounds`/`layer_factor` do) rather than a
-/// constant.
-pub const NUM_LAYERS: u32 = 5;
+#![forbid(unsafe_code)]
 
-/// Floor on the sub-pixel blend factor (TRIPS `PointBlending.h:106`). A point
-/// smaller than one pixel still splats, with the factor never dropping below
-/// this cutoff.
-const SMALL_POINT_CUTOFF: f32 = 0.25;
+pub mod cpu;
+pub mod factor;
+pub mod fixture;
+pub mod grid;
+pub mod npz;
+pub mod output;
+pub mod params;
+pub mod png;
+pub mod scene;
 
-/// Lower/upper pyramid layer a point of pixel size `size_px` writes into.
-///
-/// Direct port of `compute_point_size_fac`'s first block
-/// (`PointBlending.h:86-93`): both layers are 0 when `size_px <= 1`,
-/// otherwise floor/ceil of `log2(size_px)` clamped to `[0, NUM_LAYERS - 1]`.
-fn layer_bounds(size_px: f32) -> (u32, u32) {
-    if size_px <= 1.0 {
-        return (0, 0);
-    }
-    let max_layer = (NUM_LAYERS - 1) as f32;
-    let log_ps = size_px.log2();
-    let lower = log_ps.floor().clamp(0.0, max_layer) as u32;
-    let upper = log_ps.ceil().clamp(0.0, max_layer) as u32;
-    (lower, upper)
-}
+#[cfg(feature = "gpu")]
+pub mod gpu;
 
-/// TRIPS's per-layer blend factor for a point of pixel size `size_px`.
-///
-/// Exact port of `compute_point_size_fac`
-/// (`third_party/TRIPS/src/lib/rendering/PointBlending.h:81-149`), including
-/// its quirks (see `tests/test_raster_layer_factor.py` for the Python-side
-/// documentation of each one):
-///
-/// - `layer < lower` returns **1.0** in the C++, not 0.0. The branch is
-///   unreachable from TRIPS's own point-size emission kernel, so the value
-///   is inert either way; this matches the source, not a "cleaner" reading.
-/// - `upper == 0` (a sub-pixel point, `size_px <= 1`) gives the exponential
-///   floor `(1 - c) * exp(size_px - 1) + c` with `c = SMALL_POINT_CUTOFF`.
-/// - `lower == upper` (an exact power of two, or clamped to the top layer)
-///   gives 1.0.
-/// - Otherwise the interpolation is linear **in point-size units** between
-///   `2**lower` and `2**upper`, not linear in the log2 fraction.
-///
-/// # Arguments
-/// - `s`: projected point size in layer-0 pixels (world-unit radius already
-///   converted via `fx * size_world / z`; see docs/GEOMETRY.md).
-/// - `l`: which pyramid layer the factor is wanted for, in `[0, NUM_LAYERS)`.
-pub fn layer_factor(s: f32, l: u32) -> f32 {
-    let (lower, upper) = layer_bounds(s);
-
-    if l < lower {
-        return 1.0;
-    }
-    if upper == 0 {
-        return (1.0 - SMALL_POINT_CUTOFF) * (s.min(1.0) - 1.0).exp() + SMALL_POINT_CUTOFF;
-    }
-    if lower == upper {
-        return 1.0;
-    }
-
-    let lo_pow = 2f32.powi(lower as i32);
-    let hi_pow = 2f32.powi(upper as i32);
-    let f = (s - lo_pow) / (hi_pow - lo_pow);
-    if l == lower { 1.0 - f } else { f }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Same hand-computed values as `tests/test_raster_layer_factor.py`
-    /// (which cites `PointBlending.h:81-149` line numbers directly), so the
-    /// two ports can be eyeballed against each other.
-    const TOL: f32 = 1e-6;
-
-    #[test]
-    fn layer_bounds_hand_values() {
-        assert_eq!(layer_bounds(0.25), (0, 0));
-        assert_eq!(layer_bounds(0.5), (0, 0));
-        assert_eq!(layer_bounds(1.0), (0, 0));
-        assert_eq!(layer_bounds(1.5), (0, 1));
-        assert_eq!(layer_bounds(2.0), (1, 1));
-        assert_eq!(layer_bounds(2.0f32.powf(1.3)), (1, 2));
-        assert_eq!(layer_bounds(4.0), (2, 2));
-        assert_eq!(layer_bounds(12.0), (3, 4));
-        assert_eq!(layer_bounds(16.0), (4, 4));
-        assert_eq!(layer_bounds(100.0), (4, 4));
-    }
-
-    #[test]
-    fn sub_pixel_points_get_the_exponential_floor() {
-        let expected_half = (1.0 - SMALL_POINT_CUTOFF) * (0.5f32 - 1.0).exp() + SMALL_POINT_CUTOFF;
-        assert!((expected_half - 0.704_897_99).abs() < TOL);
-        assert!((layer_factor(0.5, 0) - expected_half).abs() < TOL);
-
-        let expected_tiny = 0.75 * (-0.99f32).exp() + 0.25;
-        assert!((layer_factor(0.01, 0) - expected_tiny).abs() < TOL);
-        assert!(layer_factor(0.01, 0) > SMALL_POINT_CUTOFF);
-
-        assert!((layer_factor(1.0, 0) - 1.0).abs() < TOL);
-    }
-
-    #[test]
-    fn exact_power_of_two_gives_factor_one() {
-        assert!((layer_factor(2.0, 1) - 1.0).abs() < TOL);
-        assert!((layer_factor(4.0, 2) - 1.0).abs() < TOL);
-        assert!((layer_factor(8.0, 3) - 1.0).abs() < TOL);
-    }
-
-    #[test]
-    fn interpolation_is_linear_in_point_size_not_in_log2() {
-        // s = 2**1.3 = 2.46 -> 0.23 toward the upper layer, not 0.3.
-        let size_px = 2.0f32.powf(1.3);
-        let upper = layer_factor(size_px, 2);
-        let lower = layer_factor(size_px, 1);
-        let expected_upper = (size_px - 2.0) / (4.0 - 2.0);
-        assert!((upper - expected_upper).abs() < TOL);
-        assert!((upper - 0.23).abs() < 2e-3);
-        assert!((upper - 0.3).abs() > 1e-2);
-        assert!((lower - (1.0 - upper)).abs() < TOL);
-    }
-
-    #[test]
-    fn interpolation_weights_sum_to_one() {
-        for (size_px, lower_layer) in [(1.5, 0), (3.0, 1), (6.0, 2), (12.0, 3)] {
-            let total = layer_factor(size_px, lower_layer) + layer_factor(size_px, lower_layer + 1);
-            assert!((total - 1.0).abs() < TOL);
-        }
-    }
-
-    #[test]
-    fn sizes_beyond_the_top_layer_clamp_to_one() {
-        for size_px in [16.0, 20.0, 100.0, 1e6] {
-            assert!((layer_factor(size_px, NUM_LAYERS - 1) - 1.0).abs() < TOL);
-        }
-    }
-
-    #[test]
-    fn layer_below_lower_returns_one_matching_the_cpp_source() {
-        assert!((layer_factor(4.0, 0) - 1.0).abs() < TOL);
-        assert!((layer_factor(100.0, 3) - 1.0).abs() < TOL);
-    }
-}
+pub use grid::LayerGrid;
+pub use output::{LayerImage, PyramidImages};
+pub use params::{Mode, PixelCenter, PyramidHalving, PyramidParams};
+pub use scene::{Camera, PointSet};

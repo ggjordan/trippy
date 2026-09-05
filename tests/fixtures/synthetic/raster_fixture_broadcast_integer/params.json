@@ -1,0 +1,17 @@
+{
+  "mode": "broadcast",
+  "pixel_center": "integer",
+  "pyramid_halving": "ceil",
+  "num_layers": 3,
+  "num_channels": 4,
+  "max_frags": 16,
+  "t_cutoff": 0.001,
+  "alpha_min": 1e-05,
+  "znear": 0.001,
+  "background": [
+    0.1,
+    0.2,
+    0.3,
+    0.4
+  ]
+}

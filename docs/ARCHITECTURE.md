@@ -242,33 +242,81 @@ rust/brush-trips/
 
 The viewer loads a trained `.ply` and runs the full forward pass (emit → sort → blend_fwd → U-Net) every frame without leaving the browser or the native app.
 
-### Actual state as of v0.4.0 setup (see ADR-0005, `rust/README.md`)
+### Actual state as of v0.4.0 (see ADR-0005, `rust/README.md`)
 
-The diagram above is the eventual, fully-wired layout. What actually exists today:
+The diagram above is the eventual, fully-wired layout. What exists today:
 
 ```
 rust/
 ├── Cargo.toml                      trippy's own thin workspace (version 0.1.0)
+│                                    + exclude = ["brush-trips"] and a verbatim copy
+│                                    of the submodule's two [patch] tables
+├── Cargo.lock                      seeded from the submodule's, pinning the same
+│                                    burn / cubecl / wgpu revisions
 ├── crates/
-│   ├── brush-pyramid/src/lib.rs    layer_bounds + layer_factor port (with unit
-│   │                                tests against the same hand values as
-│   │                                tests/test_raster_layer_factor.py); no
-│   │                                emit_fragments/sort/CubeCL kernels yet
+│   ├── brush-pyramid/              the pyramid rasteriser FORWARD pass, ported
+│   │   ├── src/params.rs            PyramidParams, mirroring trippy.constants
+│   │   ├── src/grid.rs              LayerGrid: shapes, layer-major flat index
+│   │   ├── src/factor.rs            layer_bounds + TRIPS's compute_point_size_fac
+│   │   ├── src/scene.rs             PointSet, Camera (npz + JSON loaders)
+│   │   ├── src/npz.rs               minimal numpy .npz reader (stored + deflate)
+│   │   ├── src/cpu.rs               CPU reference forward (the twin)
+│   │   ├── src/gpu/kernels.rs       six #[cube(launch)] kernels    | `gpu` feature
+│   │   ├── src/gpu/mod.rs           Burn/wgpu host pipeline        | `gpu` feature
+│   │   ├── src/png.rs               tiny PNG writer for the example
+│   │   ├── examples/render_frame.rs points + camera JSON -> PNG
+│   │   └── tests/parity_{cpu,gpu}.rs
 │   └── brush-unet/src/lib.rs       UnetConfig placeholder (5 levels, 32 filters);
 │                                    no Burn conv2d graph or weight loading yet
 └── brush-trips/                    git submodule -> github.com/ggjordan/brush,
                                      branch trippy-fork (upstream 8b7f5c6c + Splats'
-                                     robust/appearance/surface patches, merged);
-                                     builds apps/brush-app in release mode
+                                     robust/appearance/surface patches, merged)
 ```
 
-`brush-pyramid`/`brush-unet` are intentionally **not** nested under
-`rust/brush-trips/crates/` yet — they live in trippy's own workspace so
-`scripts/build.sh`/`scripts/test.sh` stay fast on every push (see ADR-0005). Moving
-them into the submodule's workspace (or path-dependency-wiring them from
-`apps/brush-app`) is part of the still-open v0.4.0 work: `emit_fragments`, the two
-radix argsorts, `prefix_sum`, `blend_fwd`/`blend_bwd` CubeCL kernels, the real U-Net
-Burn graph + safetensors loader, and the `splat_backbuffer.rs` viewer hook-in.
+`brush-pyramid` and `brush-unet` stayed in trippy's own workspace rather than moving
+into the fork: the `gpu` feature reaches into `rust/brush-trips/crates/{brush-cube,
+brush-sort,brush-prefix-sum}` by path, which works across a workspace boundary once
+the submodule is `exclude`d and the `[patch]` tables are duplicated (`rust/README.md`
+explains why all three ingredients are load-bearing). Without that feature the crate
+has no dependency heavier than `serde` and `flate2`, so `scripts/build.sh` /
+`scripts/test.sh` stay in their seconds-long budget on every push.
+
+#### Forward data flow in Rust
+
+Identical on both paths, and atomic-free for the same reason as the Python/Metal
+version — every write goes to an address owned by exactly one thread:
+
+```
+points + camera
+   -> project & count      per point: uv, depth, size_px, cull, slot budget
+   -> prefix sum           brush-prefix-sum, giving each point its write offset
+   -> emit fragments       one (layer,pixel) key + depth key + alpha + point id per slot
+   -> radix argsort x2     by depth, then by key (both stable) = (layer, pixel, depth)
+   -> segment bounds       per-layer-pixel [start, end)
+   -> blend_fwd            one thread per layer-pixel, front-to-back, cap + cutoff
+   -> add background       out += t_final * bg
+   -> L feature images, finest first, plus t_final and n_used
+```
+
+Two decisions are worth carrying forward:
+
+- **Counting and emission cannot disagree.** The counting kernel reserves four slots
+  per selected layer; the emission kernel derives its layer loop from
+  `budget / 4` rather than re-deriving the selection. Per-corner bounds and
+  `alpha_min` tests happen only at emission, and a rejected corner writes a sentinel
+  key that sorts past every real key and sits outside the segment table. This removes
+  the whole class of bug `brush-render` guards against with its cap-and-pad in
+  `map_gaussians_to_intersect`.
+- **No `log2` in the kernels.** CubeCL exposes `ln` but not `log2`, and
+  `ln(x)/ln(2)` in f32 straddles the wrong side of an integer at exact powers of two,
+  which would move a point into the wrong pyramid layer. Both paths read the IEEE-754
+  exponent instead, which is exactly `floor(log2 x)` for a positive normal float.
+  That is *more* accurate than the Python reference and differs from it only within
+  ~1e-6 relative of a power of two (`docs/LIMITATIONS.md`).
+
+Still open for v0.4.0: the backward pass, the real U-Net Burn graph + safetensors
+loader, wrapping the output as `burn::Tensor<4>`, and the `splat_backbuffer.rs`
+viewer hook-in.
 
 ## Validation strategy
 
