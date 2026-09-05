@@ -1,0 +1,9 @@
+[package]
+name = "brush-pyramid"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "TRIPS image-pyramid rasteriser (skeleton). Real emit_fragments / radix argsort / prefix_sum / blend_fwd land here at v0.4.0 (see docs/SPEC.md)."
+publish = false
+
+[dependencies]

@@ -25,8 +25,12 @@ echo "▶ pytest (CPU, not gpu)"
 TRIPS_DEVICE=cpu PYTORCH_ENABLE_MPS_FALLBACK=0 "$PY" -m pytest -q -m "not gpu" tests
 
 if [ -f rust/Cargo.toml ]; then
-  echo "▶ cargo test (rust/)"
-  ( cd rust && cargo test --workspace -q )
+  # Scoped to trippy's own crates (brush-pyramid, brush-unet), not the full
+  # Brush fork vendored at rust/brush-trips (a separate workspace/submodule;
+  # see docs/decisions/ADR-0005-brush-fork-layout.md). That full suite is
+  # exercised separately via scripts/cpu_heavy.sh, never on every push.
+  echo "▶ cargo test (rust/: brush-pyramid, brush-unet)"
+  ( cd rust && cargo test -p brush-pyramid -p brush-unet -q )
 fi
 
 echo "✓ tests OK"

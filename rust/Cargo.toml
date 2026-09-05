@@ -1,0 +1,29 @@
+# rust/Cargo.toml — thin virtual workspace for trippy's OWN Rust crates.
+#
+# Purpose: this is intentionally NOT the Brush fork's workspace. `rust/brush-trips`
+# (a git submodule, see ../.gitmodules) is its own separate Cargo workspace with its
+# own version, pinned to a specific upstream commit plus Splats' patch set (see
+# docs/UPSTREAM.md and rust/README.md). Keeping the two workspaces apart means:
+#   - `scripts/build.sh` / `scripts/test.sh` stay fast (seconds, not the many minutes
+#     a full `cargo check --workspace` over vendored Brush would take) because they
+#     only ever touch brush-pyramid/brush-unet here, never the Brush tree.
+#   - `[workspace.package].version` here can track trippy's own VERSION file (see
+#     tests/test_version_sync.py) independently of Brush's own version.
+#   - A crate cannot be a member of two Cargo workspaces at once; nesting these two
+#     placeholder crates under rust/brush-trips/crates/ (as docs/ARCHITECTURE.md's
+#     forward-looking diagram shows for the real v0.4.0 integration) would collide
+#     with the submodule's own workspace. When brush-pyramid/brush-unet get their
+#     real implementations and are wired into apps/brush-app, that's a path
+#     dependency from the submodule into these crates (or a physical move), not a
+#     shared workspace -- a decision for the ADR/task that does the actual wiring.
+#
+# Related docs: docs/decisions/ADR-0005-brush-fork-layout.md, docs/UPSTREAM.md,
+# rust/README.md, docs/ARCHITECTURE.md ("Later: Brush fork mapping").
+[workspace]
+resolver = "2"
+members = ["crates/brush-pyramid", "crates/brush-unet"]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "MIT"
