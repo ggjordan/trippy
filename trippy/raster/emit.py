@@ -19,6 +19,10 @@ Invariants:
     - Out-of-bounds fragments are DROPPED, never clamped (docs/GEOMETRY.md
       historical bug class 3: clamped/padded pixels unproject as scene).
     - `alpha` stays connected to autograd; the integer key parts do not.
+    - An optional (6,) `pose_delta` refines `(R, t)` *left-multiplicatively*
+      (`se3_exp(delta) @ [R | t]`, trippy.geom.xform_b.compose's convention)
+      and is differentiable, so camera-pose refinement trains through the
+      same graph as everything else (see apply_pose_delta).
 Units: `size` is a world-unit radius; `size_px = fx * size / z` is the same
     quantity in layer-0 pixels; `depth` is camera-space z in world units.
 Related docs: docs/TRIPS_REFERENCE.md sections 3 and 10; docs/GEOMETRY.md
@@ -39,7 +43,7 @@ from trippy.constants import (
     RASTER_SMALL_POINT_CUTOFF,
     RASTER_ZNEAR,
 )
-from trippy.geom.xform_b import project_pinhole, world_to_cam
+from trippy.geom.xform_b import compose, project_pinhole, world_to_cam
 from trippy.raster.sort import segment_offsets, sort_fragments
 
 EMIT_MODES = ("trilinear", "broadcast")
@@ -176,6 +180,50 @@ def layer_factor(size_px: Tensor, layer: int, num_layers: int) -> Tensor:
     return torch.where(lower > layer, one, factor)
 
 
+def apply_pose_delta(R: Tensor, t: Tensor, delta: Tensor) -> tuple[Tensor, Tensor]:
+    """Refine a world->camera pose with a learnable SE(3) twist.
+
+    Left-multiplicative (global-frame) convention, the one
+    trippy.geom.xform_b.compose implements:
+    `[R' | t'] = se3_exp(delta) @ [R | t]`. `delta` is the Sophus/g2o twist
+    xi = (rho, phi): `delta[:3]` translation generator (world units),
+    `delta[3:]` rotation vector (axis * angle, radians). A zero delta is
+    exactly the identity, so `pose_delta=torch.zeros(6)` renders identically
+    to passing no delta at all.
+
+    This is the only hook the trainer needs for pose refinement: the returned
+    (R', t') flow through projection into every fragment's alpha and depth,
+    so `delta.grad` is populated by an ordinary backward.
+
+    CAUTION -- do not initialise `delta` at exactly zero if you want the
+    *rotation* half to train. trippy.geom.xform_b.se3_exp builds its rotation
+    from `axis = phi / max(|phi|, EPS_SE3_ANGLE)` and then multiplies by
+    `|phi|`, so at `phi == 0` the whole rotation term is second order in phi
+    and autograd returns an exactly zero gradient for `delta[3:]` (the true
+    derivative is the generator, magnitude 1). Translation (`delta[:3]`) is
+    unaffected and is correct at zero. See docs/LIMITATIONS.md and
+    tests/test_raster_bwd_ref.py::test_pose_delta_rotation_gradient_vanishes_at_zero.
+
+    Args:
+        R: (3, 3) float, world->camera rotation.
+        t: (3,) float, world->camera translation, world units.
+        delta: (6,) float twist; cast to `R`'s dtype/device.
+
+    Returns:
+        (R_refined (3, 3), t_refined (3,)) with the same dtype/device as `R`.
+
+    Raises:
+        ValueError: if `delta` is not shape (6,).
+    """
+    if tuple(delta.shape) != (6,):
+        raise ValueError(f"pose_delta must have shape (6,), got {tuple(delta.shape)}")
+    delta_c = delta.to(dtype=R.dtype, device=R.device)
+    bottom = torch.tensor([[0.0, 0.0, 0.0, 1.0]], dtype=R.dtype, device=R.device)
+    pose = torch.cat([torch.cat([R, t.reshape(3, 1)], dim=1), bottom], dim=0)
+    refined = compose(pose, delta_c)
+    return refined[:3, :3], refined[:3, 3]
+
+
 def project_points(
     xyz: Tensor,
     size: Tensor,
@@ -183,6 +231,7 @@ def project_points(
     R: Tensor,
     t: Tensor,
     znear: float = RASTER_ZNEAR,
+    pose_delta: Tensor | None = None,
 ) -> tuple[Tensor, Tensor, Tensor]:
     """Project world points to layer-0 pixels and pixel-space sizes.
 
@@ -197,6 +246,9 @@ def project_points(
         t: (3,) float, world->camera translation, world units.
         znear: float, depths at or below this are treated as behind the
             camera (see trippy.constants.RASTER_ZNEAR).
+        pose_delta: optional (6,) float SE(3) twist applied to `(R, t)` via
+            `apply_pose_delta` before projecting. Carries gradient, so this
+            is how camera-pose refinement is trained. None = no refinement.
 
     Returns:
         uv: (N, 2) float, continuous layer-0 pixel coordinates (corner
@@ -207,6 +259,8 @@ def project_points(
             diameter in layer-0 pixels. TRIPS uses fx only, not fy
             (RenderForward.cu:1489).
     """
+    if pose_delta is not None:
+        R, t = apply_pose_delta(R, t, pose_delta)
     fx = K[0, 0]
     fy = K[1, 1]
     cx = K[0, 2]
@@ -464,6 +518,7 @@ def build_sorted_fragments(
     sort_method: str = "composite",
     segment_method: str = "searchsorted",
     sort_stable: bool = True,
+    pose_delta: Tensor | None = None,
 ) -> SortedFragments:
     """Project -> cull -> emit -> sort -> segment, the whole pre-compositing pipeline.
 
@@ -483,11 +538,13 @@ def build_sorted_fragments(
         sort_method: "composite" or "two_pass" (see trippy.raster.sort).
         segment_method: "searchsorted" or "bincount".
         sort_stable: stable sort flag passed to sort_fragments.
+        pose_delta: optional (6,) SE(3) twist refining `(R, t)`; see
+            apply_pose_delta. Differentiable.
 
     Returns:
         SortedFragments on the same device/dtype as the inputs.
     """
-    uv, depth, size_px = project_points(xyz, size, K, R, t, znear=znear)
+    uv, depth, size_px = project_points(xyz, size, K, R, t, znear=znear, pose_delta=pose_delta)
     valid = cull_points(uv, depth, size_px, grid, znear=znear)
     frags = emit_fragments(uv, depth, size_px, conf, grid, mode=mode, valid=valid, alpha_min=alpha_min)
     perm = sort_fragments(frags.layer_pixel, frags.depth, method=sort_method, stable=sort_stable)

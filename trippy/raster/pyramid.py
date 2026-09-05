@@ -10,9 +10,14 @@ Purpose: `render_pyramid()` -- project a point set into an L-layer image
 Invariants:
     - CPU dispatches to trippy.raster.ref_torch (no Metal, no MPS), so CPU
       tests and gradcheck run on any machine.
-    - MPS dispatches to trippy.raster.metal_lib.blend_fwd. That kernel is
-      forward-only: the MPS path returns tensors detached from autograd until
-      blend_bwd lands (docs/LIMITATIONS.md, v0.2.0 milestone).
+    - MPS dispatches to trippy.raster.blend_autograd.blend_fragments, which
+      wraps the blend_fwd/blend_bwd Metal pair in a torch.autograd.Function.
+      The MPS render IS differentiable in xyz, size, conf, feat, bg and the
+      optional SE(3) pose delta. `aux["depth_sum"]` and `aux["n_used"]` are
+      not (docs/LIMITATIONS.md).
+    - Gradient tracking is enabled automatically when any input requires it;
+      `differentiable=False` forces the old forward-only behaviour (no graph,
+      no memory retained), `differentiable=True` forces graph construction.
     - Background is added in torch, never in the kernel:
       `out += t_final * bg` (TRIPS: RenderForward.cu:3610-3620).
     - No silent fallback: an unsupported device raises.
@@ -35,7 +40,7 @@ from trippy.constants import (
     RASTER_T_CUTOFF,
     RASTER_ZNEAR,
 )
-from trippy.raster import metal_lib
+from trippy.raster.blend_autograd import blend_fragments
 from trippy.raster.emit import build_sorted_fragments, layer_grid
 from trippy.raster.ref_torch import render_pyramid_ref, split_layers
 
@@ -59,6 +64,8 @@ def render_pyramid(
     sort_method: str = "composite",
     segment_method: str = "searchsorted",
     compute_dtype: torch.dtype | None = None,
+    pose_delta: Tensor | None = None,
+    differentiable: bool | None = None,
 ) -> tuple[list[Tensor], dict]:
     """Render one image as an L-layer alpha-composited pyramid.
 
@@ -90,6 +97,15 @@ def render_pyramid(
         compute_dtype: CPU only -- dtype the reference path computes in;
             None keeps the input dtype, torch.float64 gives the reference
             precision used by tests.
+        pose_delta: optional (6,) float SE(3) twist refining `(R, t)`
+            left-multiplicatively (`se3_exp(delta) @ [R|t]`, see
+            trippy.raster.emit.apply_pose_delta). Differentiable on both
+            devices, so `pose_delta.grad` is the camera-pose gradient.
+        differentiable: None (default) enables autograd exactly when some
+            input requires grad and grad mode is on; False renders under
+            torch.no_grad() (the pre-blend_bwd behaviour, cheapest); True
+            forces the autograd path. CPU always uses the differentiable
+            reference, so this flag only affects the MPS path.
 
     Returns:
         layers: list of L tensors; layer l is (C, h_l, w_l), channel-first.
@@ -125,30 +141,34 @@ def render_pyramid(
             sort_method=sort_method,
             segment_method=segment_method,
             compute_dtype=compute_dtype,
+            pose_delta=pose_delta,
         )
     if device.type != "mps":
         raise ValueError(f"render_pyramid supports device 'cpu' and 'mps', got {device.type!r}")
     if compute_dtype not in (None, torch.float32):
         raise ValueError(f"MPS renders in float32; compute_dtype={compute_dtype} is unsupported")
-    return _render_pyramid_mps(
-        xyz,
-        size,
-        feat,
-        conf,
-        K,
-        R,
-        t,
-        image_hw,
-        num_layers=num_layers,
-        mode=mode,
-        bg=bg,
-        max_frags=max_frags,
-        t_cutoff=t_cutoff,
-        alpha_min=alpha_min,
-        znear=znear,
-        sort_method=sort_method,
-        segment_method=segment_method,
-    )
+    if differentiable is None:
+        differentiable = torch.is_grad_enabled() and any(
+            isinstance(x, Tensor) and x.requires_grad
+            for x in (xyz, size, feat, conf, K, R, t, bg, pose_delta)
+        )
+    kwargs = {
+        "num_layers": num_layers,
+        "mode": mode,
+        "bg": bg,
+        "max_frags": max_frags,
+        "t_cutoff": t_cutoff,
+        "alpha_min": alpha_min,
+        "znear": znear,
+        "sort_method": sort_method,
+        "segment_method": segment_method,
+        "pose_delta": pose_delta,
+    }
+    if differentiable:
+        return _render_pyramid_mps(xyz, size, feat, conf, K, R, t, image_hw, **kwargs)
+    # No graph, nothing retained: identical numbers, the pre-blend_bwd cost.
+    with torch.no_grad():
+        return _render_pyramid_mps(xyz, size, feat, conf, K, R, t, image_hw, **kwargs)
 
 
 def _render_pyramid_mps(
@@ -169,12 +189,17 @@ def _render_pyramid_mps(
     znear: float,
     sort_method: str,
     segment_method: str,
+    pose_delta: Tensor | None,
 ) -> tuple[list[Tensor], dict]:
-    """MPS path: torch emission/sort + the Metal blend_fwd kernel.
+    """MPS path: torch emission/sort + the Metal blend_fwd/blend_bwd pair.
 
-    Forward only; the returned tensors are detached (see module docstring).
-    Buffers are made contiguous and cast to the kernel's exact dtypes here,
-    because torch.mps.compile_shader binds raw storage without checking.
+    Every tensor keeps its autograd history: the alpha and feature paths are
+    never detached, and the sort permutation is applied with `index_select` on
+    integer indices (ordering is piecewise constant, so it carries no
+    gradient). The caller decides whether a graph is built at all, by running
+    this under torch.no_grad() or not. Casting and contiguity are handled in
+    trippy.raster.blend_autograd, because torch.mps.compile_shader binds raw
+    storage without checking dtype or strides.
     """
     height, width = int(image_hw[0]), int(image_hw[1])
     grid = layer_grid(height, width, num_layers)
@@ -191,18 +216,16 @@ def _render_pyramid_mps(
         znear=znear,
         sort_method=sort_method,
         segment_method=segment_method,
+        pose_delta=None if pose_delta is None else pose_delta.to(torch.float32),
     )
-    out, t_final, n_used, depth_sum = metal_lib.blend_fwd(
-        frags.offsets.to(torch.int32).contiguous(),
-        frags.point_id.to(torch.int32).contiguous(),
-        frags.alpha.detach().to(torch.float32).contiguous(),
-        frags.depth.detach().to(torch.float32).contiguous(),
-        feat.detach().to(torch.float32).contiguous(),
+    out, t_final, n_used, depth_sum = blend_fragments(
+        frags,
+        feat.to(torch.float32),
         max_frags=max_frags,
         t_cutoff=t_cutoff,
     )
     if bg is not None:
-        out = out + t_final.reshape(-1, 1) * bg.detach().to(torch.float32).reshape(1, -1)
+        out = out + t_final.reshape(-1, 1) * bg.to(torch.float32).reshape(1, -1)
 
     layers, aux = split_layers(out, t_final, n_used, depth_sum, grid)
     aux["num_fragments"] = len(frags)

@@ -14,6 +14,11 @@ Pipeline (docs/ARCHITECTURE.md "Forward pass data flow"):
                                                            on MPS, ref_torch.py on CPU]
       -> add background, split into per-layer images      [pyramid.py]
 
+    backward: metal_src/blend_bwd.metal writes per-fragment d_alpha/d_feat;
+    blend_autograd.py reduces d_feat onto points with index_add_ and lets
+    autograd carry d_alpha back through emission to xyz / size / conf and
+    the SE(3) pose delta.
+
 Invariants:
     - No atomics anywhere. TRIPS uses `atomicAdd` for list-slot allocation and
       for every backward reduction; Metal via torch.mps.compile_shader has no
@@ -45,10 +50,12 @@ Related docs: docs/ARCHITECTURE.md, docs/GEOMETRY.md,
     docs/TRIPS_REFERENCE.md sections 3, 10, 11, docs/LIMITATIONS.md.
 """
 
+from trippy.raster.blend_autograd import BlendFunction, blend_fragments
 from trippy.raster.emit import (
     Fragments,
     LayerGrid,
     SortedFragments,
+    apply_pose_delta,
     build_sorted_fragments,
     cull_points,
     emit_fragments,
@@ -63,9 +70,12 @@ from trippy.raster.ref_torch import composite_sorted, render_pyramid_ref, split_
 from trippy.raster.sort import fragment_rank, segment_offsets, sort_fragments
 
 __all__ = [
+    "BlendFunction",
     "Fragments",
     "LayerGrid",
     "SortedFragments",
+    "apply_pose_delta",
+    "blend_fragments",
     "build_sorted_fragments",
     "composite_sorted",
     "cull_points",
