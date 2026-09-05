@@ -529,8 +529,12 @@ Two smaller consequences:
 - The autotune result is not cached across page loads (the persistent cache is
   a filesystem cache), so every reload pays the ~20 s again.
 - The kernel autotune picks in the browser is not necessarily the one it picks
-  natively, which is part of why the browser's frame matches the native
-  reference at 62 dB rather than exactly.
+  natively, and until it converges the browser's frame differs measurably from
+  the native reference. That is visible: a `network` session that has rendered
+  ~50 frames before the screenshot matches at **104.54 dB**, while a `raw`
+  session — where the only convolution ever run is the screenshot's own — sits
+  at 62.04 dB. v0.5.0 read its 62.04 dB as f16 rounding; it was an unconverged
+  autotune.
 
 ### Two shims in `web/trips.js` compensate for dependency bugs
 
@@ -540,7 +544,9 @@ browser.
 1. **`popErrorScope` is neutralised.** wgpu's WebGPU backend reads a clean pop
    (`null` per spec) into a `js_sys::JsOption`, which only treats `undefined`
    as "none", so it panics `"Unexpected error"` on *every* clean pop — and
-   CubeCL wraps every kernel launch in an error scope. Errors are still logged
+   CubeCL wraps shader compilation and every `sync()` in an error scope, so the
+   first frame trips it. (It does *not* scope each kernel launch; that reading
+   was checked while chasing the 27x and is wrong.) Errors are still logged
    to the console and the trace; what is lost is wgpu's own view of validation
    errors, so a bad frame shows as bad pixels rather than as an exception.
 2. **`enable subgroups;` is prepended to shaders that need it.** CubeCL's WGSL
@@ -548,49 +554,86 @@ browser.
    passes without the directive WGSL requires. Masking `Features::SUBGROUP` off
    does *not* avoid it — measured; there is no non-subgroup lowering.
 
-### Safari draws a WRONG image — use Chrome
+### Safari cannot run the rasteriser at all — use Chrome or Edge
 
-Safari 26.6.2 gets all the way to producing frames (3.25 fps, a
-plausible-looking 1 MB PNG) and **the picture is horizontal stripe noise, not
-the horse**. One CubeCL compute shader fails to compile there —
-`GPUValidationError: 1 error generated while compiling the shader: 1:0:
-Expected 'f16'`, then `createComputePipeline failed` — and because the shim
-above removes wgpu's fatal error path, the missing stage silently contributes
-nothing and the rest of the pipeline draws garbage.
+Safari 26.6.2 has **no WebGPU subgroups support in any of its three forms**: no
+`subgroups` adapter feature, no `enable subgroups;` directive, no
+`@builtin(subgroup_*)`. `brush-sort`'s four radix kernels (`sort_reduce_kernel`,
+`sort_scan_kernel`, `sort_scan_add_kernel`, `sort_scatter_kernel`) call CubeCL's
+`plane_sum` / `plane_inclusive_sum` unconditionally, so they cannot compile
+there, the fragments are never ordered, and the frame is stripe noise.
 
-Chrome 152 renders the same scene correctly (verified against the pixels; the
-horse is the public Zenodo scene).
+**This is not the f16 problem v0.5.0 recorded.** Safari's message —
+`1 error generated while compiling the shader: 1:0: Expected 'f16'` — is its
+WGSL parser saying that `f16` is the only extension name its `enable` directive
+accepts, at the exact position where `web/trips.js` prepends
+`enable subgroups;`. Safari grants `shader-f16` and compiles this pipeline's two
+actual f16 shaders without complaint. Proved with a shader-compile-only probe in
+both browsers; the table is in `docs/WEB_VIEWER.md`.
 
-This is why `web/trips.js` prints every WebGPU error **on screen in red** with
-"THIS IMAGE IS NOT TRUSTWORTHY" and puts them in the beacon. Neutralising a
-fatal error handler is only defensible if the errors stay visible: a viewer
-built around telling photographed pixels from invented ones must not quietly
-show an invented picture.
+There is no f32 fallback to offer: this is a missing browser feature, not a
+precision choice. `web/trips.js` therefore checks `adapter.features` **before
+starting**, and on a browser without `subgroups` it refuses to render and prints
+exactly which kernels and which builtins are unavailable, rather than drawing
+something. `?anyway=1` still shows the broken output on purpose, so the claim
+stays checkable. The check is on capability, not user agent, so a future Safari
+that ships subgroups will simply work.
+
+When a frame *is* drawn, `web/trips.js` still prints every WebGPU error on
+screen in red with "THIS IMAGE IS NOT TRUSTWORTHY" and puts them in the beacon.
+Neutralising wgpu's fatal error path (shim 1 above) is only defensible if the
+errors stay visible: a viewer built around telling photographed pixels from
+invented ones must not quietly show an invented picture.
 
 Note the contrast with the v0.5.0 groundwork, where Safari ran the *stock*
-Brush splat viewer fine — Brush's Gaussian rasteriser and trippy's TRIPS
-rasteriser share no kernels.
+Brush splat viewer fine — Brush's Gaussian rasteriser does not use subgroups.
 
-### The browser is much slower than the Mac app
+### The browser was 27x slower than the Mac app; it is now ~1.5x
 
 Measured in Chrome 152 on this M3 Ultra, 1440x810, view 8, release build,
-**while a Splats training was running on the same GPU** (so both browser
-numbers are lower bounds):
+**while a Splats training was running on the same GPU** (so every browser number
+is a lower bound):
 
-| view | Chrome | native `trips-viewer` |
-|---|---|---|
-| `network`, `--half-net` equivalent | **1.09 fps** (6 frames / 5.49 s) | 29.46 fps |
-| `raw level-0` | **3.32 fps** (17 frames / 5.12 s) | 116.21 fps |
+| view | Chrome, v0.5.0 | Chrome, now | native `trips-viewer` |
+|---|---|---|---|
+| `network`, `--half-net` equivalent | 1.09 fps | **17.7 fps** | 29.46 fps |
+| `raw level-0` | 3.32 fps | **75.9 fps** | 116.21 fps (1080p) |
+| PSNR of the GPU readback vs the native reference | 62.04 dB | **104.54 dB** | — |
 
-The v0.5.0 entry here blamed the per-frame point upload for most of the gap.
-That upload is now gone (`brush_pyramid::gpu::UploadedPoints`, below), and the
-browser's `raw level-0` went 2.90 → 3.32 fps while the native number more than
-doubled — so on this stack the upload was **not** the browser's main cost. What
-is left is unexplained and unmeasured from inside the page: a wasm build has no
-`Instant`, `?trace=1` only times whole stages, and Chrome's own profiler is an
-interactive tool. Candidates, in no measured order: WGSL compiled by the
-browser rather than MSL, the error-scope shim adding a promise round trip per
-kernel launch, and WebGPU's own per-dispatch validation.
+The v0.5.0 entry blamed the per-frame point upload, then, when removing it
+bought only 2.90 → 3.32 fps, listed WGSL-vs-MSL codegen, the error-scope shim
+and WebGPU validation as unmeasured candidates. **All three were wrong**, and so
+was every other candidate; `docs/WEB_VIEWER.md` blocker 5 has the table of
+rejections with the number that killed each one.
+
+The cause was the link, not the renderer. `wasm-ld` wrapped every export of the
+module in a `<name>.command_export` shim that re-runs the whole `.init_array` on
+entry — the WASI "command" ABI, normally free because Rust has no static
+constructors. This graph pulls in `pliron` through `cubecl-ir`, whose thousands
+of `inventory` registrations make one such run cost ~110 microseconds. Worse,
+`wasm-bindgen` resolves `__externref_table_alloc` and friends **by export name**,
+so every `JsValue` `wgpu` created while assembling a bind group paid for it:
+about 2,500 constructor runs a frame, 275 ms of a 297 ms frame.
+`rust/crates/trips-web/build.rs` now links with `--export=__wasm_call_ctors`,
+which suppresses the wrappers, and `web/trips.js` runs the constructors once
+itself (and refuses to start if the export is missing).
+
+What is left is real work, in the same shape as the native profile. A `raw`
+frame is now 11.5 ms of which **10.9 ms is waiting for the GPU** at
+`render_inner`'s one fragment-count readback, and 0.3 ms is the whole host-side
+launch path for 85 kernels; the network view's frame is its 314 launches, 260 of
+them the U-Net's. If anything is worth attacking next it is that readback —
+sizing the fragment buffers from a device-side count instead would remove the
+only stall in the frame, and it would help the native viewer too.
+
+Two things the browser still costs, independent of that:
+
+- **~20 s of autotune on the first frame of each new convolution shape**, above.
+- **`?packed=1` is offered and not shipped.** The packed 32-bit sort key is
+  8 radix passes instead of 14 and buys, pairwise on one binary,
+  79.1 → 114.6 fps raw / 17.4 → 19.4 fps network, for **36.85 dB instead of 104.54 dB** against the native reference.
+  Eleven percent more frames in the shipped view for 68 dB is not a trade the
+  viewer makes on anyone's behalf; the `P` key and the HUD keep it checkable.
 
 ## Distillation (design B)
 

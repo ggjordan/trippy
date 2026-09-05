@@ -13,6 +13,11 @@
 //     the two beacon POSTs go to this same origin and simply fail (harmlessly,
 //     caught) when the plain `python3 -m http.server` behind
 //     OPEN_TRIPS_WEB_*.command answers 501 to POST.
+//   - The frame is honest about which sort ran. The packed 32-bit key is a
+//     real approximation (36.9 dB against the native reference, versus
+//     104.5 dB for the exact two-pass sort) and it is OFF by default, exactly
+//     as it is natively, even though it is worth 11-45 % more frames. `P`
+//     toggles it and the HUD always names the sort in use.
 //   - `?screenshot=1` sizes the canvas to exactly `SHOT_SIZE` and pins the
 //     camera to the reference view, so the PNG it posts is directly
 //     comparable with `trips-viewer --screenshot --half-net --scale 0.75`.
@@ -22,6 +27,7 @@
 //   ?bundle=<url>     bundle directory (default ./bundle)
 //   ?scale=<f>        render scale, 0.1..1 (default 0.75, the shipped setting)
 //   ?half=0|1         f16 decoder (default 1)
+//   ?packed=0|1       packed 32-bit sort key (default 0; `P` toggles it live)
 //   ?mode=network|raw|coverage
 //   ?view=<n>         dataset view index
 //   ?screenshot=1     run the verification sequence, then stop
@@ -87,14 +93,27 @@ function mark(stage, detail = "") {
 /** How many shader modules needed the missing `enable subgroups;` directive. */
 let subgroupShaderPatches = 0;
 /**
+ * Whether this adapter advertises WebGPU `subgroups`.
+ *
+ * Set by [`subgroupSupportError`] before the wasm starts. The `enable subgroups;`
+ * injection below is only legal on an adapter that has the feature; on one
+ * that does not (Safari 26.6.2) the directive turns a precise error --
+ * "cannot call built-in function 'subgroupAdd' without extension 'subgroups'"
+ * -- into a misleading one, "Expected 'f16'", which cost this project a whole
+ * wrong diagnosis. Measured, see docs/WEB_VIEWER.md.
+ */
+let adapterHasSubgroups = false;
+/**
  * Every WebGPU error seen this session.
  *
  * This list is shown ON SCREEN, in red, and it is not optional. Neutralising
  * wgpu's fatal error path (below) means a kernel that fails to compile no
  * longer throws — it just produces a wrong picture. That happened for real:
- * Safari 26.6.2 fails one CubeCL shader with "Expected 'f16'" and then draws
- * confident-looking stripes instead of the horse. A viewer that shows an
- * invented image without saying so is the one thing this project must not do.
+ * Safari 26.6.2 cannot compile any of `brush-sort`'s four radix kernels (it has
+ * no WebGPU subgroups) and then draws confident-looking stripes instead of the
+ * horse. `subgroupSupportError` now catches that case before the first frame,
+ * but it can only catch the one it knows about. A viewer that shows an invented
+ * image without saying so is the one thing this project must not do.
  */
 const gpuErrors = [];
 
@@ -138,7 +157,7 @@ function installWebGpuWorkaround() {
   GPUDevice.prototype.createShaderModule = function createShaderModuleShim(descriptor) {
     const code = descriptor?.code ?? "";
     const usesSubgroups = /\bsubgroup[A-Z][A-Za-z]*\s*\(|@builtin\(subgroup_/.test(code);
-    if (!usesSubgroups || /^\s*enable\s+subgroups\s*;/m.test(code)) {
+    if (!usesSubgroups || !adapterHasSubgroups || /^\s*enable\s+subgroups\s*;/m.test(code)) {
       return createShaderModule.call(this, descriptor);
     }
     subgroupShaderPatches += 1;
@@ -257,6 +276,8 @@ function installInput() {
       trips.snap_to_view();
     } else if (key === "h") {
       trips.set_half_net(!lastStatus.halfNet);
+    } else if (key === "p") {
+      trips.set_packed_sort(!lastStatus.packedSort);
     } else {
       held.add(key);
       return;
@@ -306,7 +327,8 @@ function drawHud(frameInfo) {
   );
   parts.push(
     `${frameInfo.width}x${frameInfo.height} @ scale ${lastStatus.scale ?? "?"}` +
-      `  ·  ${frameInfo.mode}  ·  net ${frameInfo.halfNet ? "f16" : "f32"}`,
+      `  ·  ${frameInfo.mode}  ·  net ${frameInfo.halfNet ? "f16" : "f32"}` +
+      `  ·  sort ${frameInfo.packedSort ? "packed (approx depth)" : "exact"}`,
   );
   parts.push(`WebGPU: ${lastStatus.adapter?.name ?? "?"} (${lastStatus.adapter?.backend ?? "?"})`);
   if (lastStatus.halfNetFallback) parts.push(`f32 fallback: ${lastStatus.halfNetFallback}`);
@@ -319,7 +341,7 @@ ${gpuErrors[0].slice(0, 300)}</span>`,
   hud.innerHTML =
     parts.join("\n") +
     `<div id="keys">WASD move · Q/E down/up · drag look · scroll speed
-V modes · -/= scale · H f16 · R back to view</div>`;
+V modes · -/= scale · H f16 · P sort · R back to view</div>`;
 }
 
 async function renderOneFrame(timestamp) {
@@ -421,6 +443,8 @@ async function screenshotRun() {
       canvasPngBytes: canvasPng ? canvasPng.size : 0,
       readbackPngBytes: readback ? readback.length : 0,
       canvas: { width: canvas.width, height: canvas.height },
+      packedSort: status.packedSort,
+      adapterHasSubgroups,
       subgroupShaderPatches,
       gpuErrors,
     }),
@@ -437,25 +461,59 @@ window.addEventListener("unhandledrejection", (e) =>
 window.addEventListener("error", (e) => mark("jserror", String(e.message).slice(0, 200)));
 
 /**
- * Warn when this browser is known to render the scene WRONGLY.
+ * Refuse to render on a WebGPU implementation that cannot compile the sort.
  *
- * Safari 26.6.2 fails one CubeCL shader ("Expected 'f16'") and then draws
- * stripe noise that looks like a render. The delivered `.command` opens the
- * *default* browser, which on this Mac may well be Safari, so the page has to
- * say this itself. Not a hard block: `?anyway=1` proceeds, because "measured
- * wrong on 2026-09-06" should stay checkable rather than become folklore.
+ * This replaces a user-agent sniff, and it replaces a WRONG diagnosis. v0.5.0
+ * said Safari failed on f16 because the error it reports is
+ *
+ *     GPUValidationError: 1 error generated while compiling the shader:
+ *     1:0: Expected 'f16'
+ *
+ * It is not f16. Safari 26.6.2 grants `shader-f16`, and the only two shaders
+ * in the pipeline that mention f16 at all (`cast_element_i_f32_o_f16_n_*`,
+ * which carry their own `enable f16;`) compile there without complaint. The
+ * message is Safari's WGSL parser saying that `f16` is the only extension name
+ * its `enable` directive accepts: `enable subgroups;`, `enable subgroups_basic;`
+ * and even `enable f16, subgroups;` all fail at 1:0 with that same text.
+ * Position 1:0 is exactly where `installWebGpuWorkaround` prepends the
+ * directive. Measured 2026-09-06 with a shader-compile-only probe in both
+ * browsers; docs/WEB_VIEWER.md has the table.
+ *
+ * The real gate is subgroups, in all three of its forms: Safari lists no
+ * `subgroups` adapter feature, rejects the `enable` directive, and rejects
+ * `@builtin(subgroup_invocation_id)` ("9:66: Unknown builtin value"). And
+ * `brush-sort`'s four radix kernels call CubeCL's `plane_sum` /
+ * `plane_inclusive_sum` unconditionally, which its WGSL backend lowers to
+ * `subgroupAdd` / `subgroupInclusiveAdd`. So `sort_reduce_kernel`,
+ * `sort_scan_kernel`, `sort_scan_add_kernel` and `sort_scatter_kernel` cannot
+ * compile, the fragments are never ordered, and the frame is stripe noise.
+ * There is no f32 path to fall back to: this is a missing browser feature,
+ * not a precision choice.
+ *
+ * Checked on the adapter, not the user agent, so a future Safari that ships
+ * subgroups starts working with no change here.
+ *
+ * @returns {Promise<string|null>} the refusal text, or `null` to proceed.
  */
-function browserWarning() {
-  const ua = navigator.userAgent;
-  const isChromium = /Chrome\/|Chromium\/|Edg\//.test(ua);
-  const isSafari = /Safari\//.test(ua) && !isChromium;
-  if (!isSafari || params.get("anyway") === "1") return null;
+async function subgroupSupportError() {
+  const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
+  adapterHasSubgroups = Boolean(adapter && adapter.features.has("subgroups"));
+  mark("adapter-features", adapter ? [...adapter.features].join(" ") : "none");
+  if (adapterHasSubgroups || params.get("anyway") === "1") return null;
   return (
-    "Safari renders this viewer INCORRECTLY.\n\n" +
-    "It will happily draw something, but one of the renderer's compute shaders\n" +
-    "does not compile in Safari (\"Expected 'f16'\"), and what you get is stripe\n" +
-    "noise rather than the scene. Measured on this Mac, 2026-09-06.\n\n" +
-    "Open this same address in Google Chrome instead:\n\n    " +
+    "This browser's WebGPU has no `subgroups` extension, so the TRIPS\n" +
+    "rasteriser cannot run here. It would draw stripe noise, not the scene.\n\n" +
+    "Exactly what fails: brush-sort's four radix kernels (sort_reduce_kernel,\n" +
+    "sort_scan_kernel, sort_scan_add_kernel, sort_scatter_kernel) call\n" +
+    "CubeCL's plane_sum / plane_inclusive_sum, which its WGSL backend emits as\n" +
+    "subgroupAdd / subgroupInclusiveAdd with @builtin(subgroup_invocation_id).\n" +
+    "This adapter advertises:\n\n    " +
+    (adapter ? [...adapter.features].join(", ") : "(no adapter)") +
+    "\n\nwhich does not include `subgroups`. Safari 26.6.2 additionally rejects\n" +
+    "the `enable subgroups;` directive with \"1:0: Expected 'f16'\" -- that\n" +
+    "message is about the extension NAME, not about f16; Safari does grant\n" +
+    "shader-f16 and compiles this pipeline's f16 kernels fine.\n\n" +
+    "Open this same address in Google Chrome or Edge instead:\n\n    " +
     window.location.href +
     "\n\nTo look at the broken output anyway, add &anyway=1 to the address.\n" +
     "docs/WEB_VIEWER.md has the full diagnosis."
@@ -464,13 +522,6 @@ function browserWarning() {
 
 async function main() {
   mark("start");
-  // `?screenshot=1` is the verification path and must keep measuring Safari
-  // honestly, so the warning only guards ordinary viewing.
-  const warning = screenshotMode ? null : browserWarning();
-  if (warning) {
-    fail(warning);
-    return;
-  }
   if (!navigator.gpu) {
     fail(
       "This browser has no WebGPU (navigator.gpu is undefined).\n\n" +
@@ -482,9 +533,46 @@ async function main() {
     return;
   }
 
-  mark("start");
+  // Reads the adapter's feature list, which is what `installWebGpuWorkaround`
+  // needs before it decides whether prepending `enable subgroups;` is legal.
+  // `?screenshot=1` is the verification path and must keep measuring a broken
+  // browser honestly, so only ordinary viewing is refused.
+  const refusal = await subgroupSupportError();
+  if (refusal && !screenshotMode) {
+    fail(refusal);
+    return;
+  }
   installWebGpuWorkaround();
-  await init();
+  const wasm = await init();
+
+  // Run the module's static constructors, exactly once.
+  //
+  // `rust/crates/trips-web/build.rs` links with `--export=__wasm_call_ctors`,
+  // which stops `wasm-ld` wrapping every export in a `.command_export` shim
+  // that re-runs the whole `.init_array` on entry. That matters here far more
+  // than it usually would: `cubecl-ir` -> `pliron` registers thousands of
+  // dialect entries through `inventory`, one `__wasm_call_ctors` costs ~110 us,
+  // and `wasm-bindgen` resolves `__externref_table_alloc` by export name — so
+  // every `JsValue` `wgpu` created while building a bind group was paying for
+  // it. Measured: `raw level-0` went from 297 ms to ~20 ms a frame.
+  //
+  // Suppressing the wrappers means nothing calls the constructors any more,
+  // so this line does. It must run before any exported function; `init()` has
+  // only run `__wbindgen_start`, and this crate registers no
+  // `#[wasm_bindgen(start)]` function.
+  if (typeof wasm?.__wasm_call_ctors !== "function") {
+    fail(
+      "this build did not export `__wasm_call_ctors`.\n\n" +
+        "rust/crates/trips-web/build.rs is supposed to pass\n" +
+        "`--export=__wasm_call_ctors` to the wasm linker. Without it the page\n" +
+        "would still render, but ~15x slower, because wasm-ld wraps every\n" +
+        "export in a shim that re-runs pliron's whole inventory registration.\n" +
+        "Refusing rather than shipping that silently — docs/WEB_VIEWER.md.",
+    );
+    return;
+  }
+  wasm.__wasm_call_ctors();
+
   trips.install_panic_hook();
   mark("wasm-ready");
 
@@ -502,6 +590,8 @@ async function main() {
     // keeps the blit a 1:1 copy; see SHOT_SIZE.
     scale: screenshotMode ? 1.0 : Number(params.get("scale") ?? 0.75),
     halfNet: (params.get("half") ?? "1") !== "0",
+    // Off by default, as natively -- see the module header.
+    packedSort: params.get("packed") === "1",
     mode: params.get("mode") ?? "network",
   };
   if (params.has("view")) options.view = Number(params.get("view"));

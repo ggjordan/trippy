@@ -1535,3 +1535,127 @@ EXP-0008-distill-full1-broadcast.ply); experiments/EXP-0008-distill/README.md (f
 - 2026-09-05T22:42:03Z submitted job trippy-full-trips prio 70: trippy train --config experiments/EXP-0007-hunua/config.yaml --report --max-minutes 240
 - 2026-09-05T22:42:03Z EXP-0007: clip4982 frames gone from disk (Splats driver deletes frames post-training); job trippy-full-trips rc 1 at dataset build. Re-pointed to clip5923 (439 frames) as EXP-0007-hunua, 120 epochs, queued.
 - 2026-09-05T22:56:15Z delivered trips-leaderboard: One table of every TRIPS run so far vs the Gaussian baseline: held-out PSNR, shade dark-mass, extent, coverage. Regenerated after every training. (/Users/nzbirdranch/trippy/output/leaderboard/leaderboard.png)
+
+---
+
+## 2026-09-06 — Why the browser viewer was 27x slower than the Mac app: `wasm-ld` re-ran every static constructor on every call
+
+**Question.** `raw level-0` at 1440x810 ran at 3.32 fps in Chrome and 102 fps
+natively on the same machine; the shipped `network` preset, 1.09 fps vs
+29.5 fps. Removing the per-frame point upload had bought only 2.90 -> 3.32, so
+the upload was not the cause. Where does the browser frame go?
+
+**Harness** (throwaway, `$TRIPPY_OUTPUT/web/`, not committed):
+`perf-dist/trips.js` wraps every method on every `GPU*` prototype, every
+`__wbg_*` import in wasm-bindgen's import object, and `GPUBuffer.mapAsync` with
+counters and a per-frame event timeline; `perf_run.sh` serves it to
+`--headless=new` Chrome on 127.0.0.1 and waits for the beacon — **8 s per run**,
+which is what made this affordable with a training on the GPU; `cdp_profile.js`
+drives the DevTools protocol for a CPU sampling profile of exactly the measured
+frames. Headless reproduced the windowed number exactly (3.33 vs 3.32 fps).
+
+**Every candidate rejected, with the number:**
+
+| candidate | verdict | number |
+|---|---|---|
+| error-scope promise per kernel launch (the JS shim) | rejected | **0** `popErrorScope` per frame; cubecl scopes compilation and `sync()`, not launches |
+| the subgroup shim recompiling shaders | rejected | **0** `createShaderModule` per frame after warm-up |
+| validation cost of many small dispatches | rejected | 85 dispatches / 86 bind groups / 8 submits, **3.9 ms** of JS-side API time in a 315 ms frame |
+| a buffer map or readback per launch | rejected | **0** `createBuffer`, **1** `mapAsync` (1.2 ms) per frame |
+| WGSL-vs-MSL codegen of the radix sort | rejected | frame is **291 ms at render scale 1.0, 0.5 and 0.35** — 8x less pixel work, identical time |
+| `wasm-opt -Oz` trading speed for size | rejected | no-opt 476 ms, `-Oz --converge` 297 ms, `-O3` 300 ms |
+| V8 stuck in the Liftoff baseline tier | rejected | `--js-flags=--no-liftoff` 323 ms vs 297 ms |
+| **the JS<->wasm boundary itself** | **CONFIRMED** | `trips.look(0, 0)`, an exported no-op, cost **113 us**; `trips.status()` 210 us |
+
+**Cause.** `wasm32-unknown-unknown` has no libc, so `wasm-ld` synthesises an
+unguarded `__wasm_call_ctors` and — for a module it does not treat as a reactor
+— wraps every export in a `<name>.command_export` shim that calls it on entry
+(the WASI "command" ABI). Normally free; Rust has no static constructors. But
+`cubecl-ir` pulls in **`pliron`**, whose dialect and trait-cast registrations
+are thousands of `inventory::submit` calls in `.init_array`, and one run costs
+~110 us. All 21 exports were wrapped, **including `__externref_table_alloc`,
+`__externref_table_dealloc`, `__wbindgen_malloc` and `__wbindgen_free`**, which
+`wasm-bindgen` resolves by export name — so every `js_sys::Object::new()` that
+`wgpu` performs while building one bind group re-registered the whole of
+`pliron`. ~2,500 constructor runs a frame = **275 ms of the 297 ms**. The CPU
+profile's absurd-looking hot leaves (`__wasm_call_ctors`, `inventory::submit`,
+`pliron::TraitCasterInfo`) under `WebDevice::create_bind_group` were literal,
+not misattribution.
+
+**Fix.** `rust/crates/trips-web/build.rs` emits
+`cargo::rustc-link-arg=--export=__wasm_call_ctors` for wasm targets — exporting
+the symbol tells `wasm-ld` the caller runs the constructors, so it emits no
+wrappers (42 `command_export` functions before, **0** after) — and
+`web/trips.js` calls `__wasm_call_ctors()` once after `init()`, refusing to
+start if the export is missing. `cargo::rustc-link-arg` touches only this
+crate's cdylib: no dependency is recompiled and the native link never sees it.
+
+**Result** (Chrome 152 headless, 1440x810, view 8, release build, exact sort,
+**with `70-trippy-full2-broadcast` training on the same GPU**, so lower bounds):
+
+| | before | after | native |
+|---|---|---|---|
+| `trips.look(0, 0)` | 113 us | **0.065 us** | — |
+| `raw level-0` | 3.32 fps | **75.9 fps** | 116.2 fps (1080p) |
+| `network` (`--half-net` equivalent) | 1.09 fps | **17.7 fps** | 29.5 fps |
+| readback PNG vs `output/brush/viewer/halfnet_s75.png` | 62.04 dB | **104.54 dB** | — |
+
+**16x on the shipped view, 23x on `raw`,** and `docs/SPEC.md`'s ">=15 fps in
+Chrome" gate is met. The PSNR moved because 62.04 dB was never f16 rounding: it
+was an unconverged convolution autotune. A `raw` session, whose only convolution
+is the screenshot's own, still reads 62.04 dB; a `network` session that has run
+~50 frames first reads 104.54 dB.
+
+**Packed sort key, offered not shipped.** While launches were the frame it was
+worth 1.45x (85 -> 54 launches) and was briefly the web default. Now, pairwise
+on one binary: 79.1 -> 114.6 fps raw, 17.4 -> 19.4 fps network, for
+**36.85 dB** instead of 104.54 dB. Reverted to off, as natively; `?packed=1` / `P` keep it checkable.
+
+**Safari: it was never f16.** A shader-compile-only probe (no rendering, ~2 s,
+`$TRIPPY_OUTPUT/web/safari-probe/`) in both browsers:
+
+| case | Chrome 152 | Safari 26.6.2 |
+|---|---|---|
+| `subgroups` in `adapter.features` | yes | **no** |
+| `shader-f16` in `adapter.features` | yes | **yes** |
+| `enable f16;` + trivial shader | ok | **ok** |
+| `enable subgroups;` + trivial | ok | `1:0: Expected 'f16'` |
+| `enable f16, subgroups;` + trivial | ok | `1:0: Expected 'f16'` |
+| real `cast_element_i_f32_o_f16_n_1` (`enable f16;` inside) | ok | **ok** |
+| real `sort_reduce_kernel`, no directive | `cannot call 'subgroupAdd' without extension 'subgroups'` | `9:66: Unknown builtin value` |
+| real `sort_reduce_kernel` + `enable subgroups;` | ok | `1:0: Expected 'f16'` |
+
+`1:0` is exactly where the shim prepends the directive: Safari's parser is
+saying `f16` is the **only** extension name its `enable` accepts. Safari has no
+subgroups in any of the three forms, so all four `brush-sort` radix kernels fail
+(the old Safari beacon logged exactly four such errors and
+`subgroupShaderPatches: 4`) and the frame is stripe noise. There is no f32 path
+to offer. `web/trips.js` now checks `adapter.features` before starting and
+refuses with the exact kernels, builtins and feature list; capability-based, so
+a Safari that ships subgroups just works.
+
+**Artefacts.** `$TRIPPY_OUTPUT/web/perf-*/beacon.json` (counters, timelines,
+per-frame API counts), `$TRIPPY_OUTPUT/web/perf-prof/raw.cpuprofile`,
+`$TRIPPY_OUTPUT/web/probe-{safari,chrome}/beacon.json`,
+`$TRIPPY_OUTPUT/web/perf-final-network/shot_readback.png` (public horse scene,
+not committed). Verdict: PASS.
+- 2026-09-05T23:36:27Z delivered trips-web-viewer-horse: The horse in a browser, 23x faster: raw level-0 3.32 -> 75.9 fps and the network view 1.09 -> 17.7 fps in Chrome at 1440x810, matching the Mac app's frame at 104.5 dB (was 62.0). The 27x gap was the wasm linker re-running every static constructor on every call, not the renderer. Chrome or Edge only: Safari has no WebGPU subgroups and the page now says exactly which kernels that stops. (/Users/nzbirdranch/trippy/output/web/trips-dist)
+
+**Where the frame goes after the fix** (same instrumented page, same machine,
+identical per-frame API counts — 85 dispatches, 86 bind groups, 8 submits,
+1 `mapAsync`):
+
+| | before, ms | after, ms |
+|---|---|---|
+| `wasm-ld` command-export wrappers re-running `.init_array` | ~275 | **0** |
+| waiting for the GPU at the one fragment-count readback | 1.2 | **10.9** |
+| JS-side WebGPU API calls | 3.9 | **0.30** |
+| everything else in the wasm (CubeCL scheduler + wgpu marshalling, 85 launches) | ~16 | **~0.3** |
+| **whole frame** | **297** | **11.5** |
+
+The readback did not get slower; the frame got faster around it. It is now 95 %
+of a `raw` frame, which is the right shape — the native viewer pays the same
+sync and its `raw` profile is likewise GPU-dominated (`sort 7.4 ms` of 10.6 ms
+at 1080p). **Next lever, if one is wanted:** size the fragment buffers from a
+device-side count (indirect dispatch) so `render_inner` never stalls. That is a
+`brush-pyramid` change and would help the native viewer too; not attempted here.

@@ -306,3 +306,52 @@ def test_missing_submodule_exits_nonzero_with_message(tmp_path: Path) -> None:
     )
     assert result.returncode == 2
     assert "brush-trips submodule" in result.stderr
+
+
+# --- the wasm module must not be linked as a "command" -----------------------
+#
+# These two guard the single largest performance fact about the browser viewer.
+# `wasm-ld` wraps every export of a non-reactor wasm module in a
+# `<name>.command_export` shim that re-runs the whole `.init_array` on entry.
+# Rust normally has no static constructors so that is free; this graph pulls in
+# `pliron` through `cubecl-ir`, whose `inventory` registrations make one
+# `__wasm_call_ctors` cost ~110 us -- and `wasm-bindgen` resolves
+# `__externref_table_alloc` by export name, so every `JsValue` `wgpu` built for
+# a bind group paid it. Measured: `raw level-0` 3.3 fps with the wrappers,
+# 114 fps without (docs/WEB_VIEWER.md).
+#
+# The fix is two halves that only work together, in two different languages, so
+# each half is asserted here: `build.rs` suppresses the wrappers, and
+# `web/trips.js` then has to run the constructors itself.
+
+TRIPS_WEB_BUILD_RS = REPO_ROOT / "rust" / "crates" / "trips-web" / "build.rs"
+TRIPS_JS = REPO_ROOT / "web" / "trips.js"
+
+
+def test_trips_web_build_script_exports_wasm_call_ctors() -> None:
+    """`build.rs` must pass `--export=__wasm_call_ctors` to the wasm linker."""
+    assert TRIPS_WEB_BUILD_RS.is_file(), "rust/crates/trips-web/build.rs is missing"
+    source = TRIPS_WEB_BUILD_RS.read_text(encoding="utf-8")
+    assert "rustc-link-arg=--export=__wasm_call_ctors" in source, (
+        "trips-web/build.rs no longer exports __wasm_call_ctors; wasm-ld will go "
+        "back to wrapping every export in a command_export shim that re-runs "
+        "pliron's inventory registration (~15x slower). See docs/WEB_VIEWER.md."
+    )
+    # wasm only: the native trips-viewer link must not see this flag.
+    assert "CARGO_CFG_TARGET_FAMILY" in source and '"wasm"' in source, (
+        "the link argument must be gated on the wasm target family"
+    )
+
+
+def test_page_runs_the_static_constructors_once() -> None:
+    """`web/trips.js` must call `__wasm_call_ctors` and refuse if it is absent."""
+    source = TRIPS_JS.read_text(encoding="utf-8")
+    assert "wasm.__wasm_call_ctors();" in source, (
+        "web/trips.js must run the module's static constructors itself: "
+        "build.rs suppresses wasm-ld's command_export wrappers, which were the "
+        "only thing calling them."
+    )
+    assert 'typeof wasm?.__wasm_call_ctors !== "function"' in source, (
+        "web/trips.js must refuse to start when the export is missing, rather "
+        "than silently rendering ~15x slower"
+    )
