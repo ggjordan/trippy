@@ -2,6 +2,14 @@
 All notable changes to trippy. Format: Keep a Changelog. Versions: semver tags `vX.Y.Z`. Every push also gets a `build-NNNN` tag.
 
 ## [Unreleased]
+### Added
+- Native "trips" rasteriser mode (TRIPS's real layer rule), pixel_center/pyramid_halving options; native engine == per-layer parity to 1e-8 dB.
+- Candidate report: shade dolly, off-path poses, Splats audit wrappers, honesty sheet.
+- Brush fork as submodule (ggjordan/brush trippy-fork) + brush-pyramid/brush-unet crate skeletons (ADR-0005).
+- MonoDepthSource (DepthPro via GPU queue), EXP-0004 sheet.
+### Fixed
+- Trainer: exposure init relative to scene-mean EV, masked MSE normalisation (PSNR was 4.77 dB low), background, crop sampling inside image, seeding, non-finite gradient guard. Smoke run 1.6 -> 12.26 dB.
+- se3_exp rotation gradient at phi=0; dataset.crop float64 on MPS; MPS->float64 casts.
 
 ## [v0.1.0] - 2026-09-06
 

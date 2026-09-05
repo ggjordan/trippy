@@ -7,11 +7,11 @@
 # (through scripts/gpu_submit.sh --train, never invoked directly -- see AGENTS.md).
 
 scene_root: /Users/nzbirdranch/Splats/scenes/karekare/kk-coherent
-run_dir: output/runs/EXP-0003-kk-trips-train/full1
+run_dir: output/runs/EXP-0003-kk-trips-train/full1-broadcast
 
 width: 1008
 crop: 384
-mode: trips
+mode: broadcast
 layers: 5
 epochs: 40
 # 0.5 x 186 train images = 93 crops per epoch (smoke used 0.125 -> 24; too few to learn).

@@ -6,6 +6,7 @@ Last updated: 2026-09-05 (session 1, Orchestrator: Claude Fable 5.1)
 - Spec + plan grilled and approved 2026-09-05.
 - Phase 1 skeleton reviewed and pushed as `build-0001` (public repo github.com/ggjordan/trippy, 27 CPU tests green).
 - feat/points merged (build-0004): PointSet, GaussianPlySource (5.74M pts on kk-coherent, median nn 0.080), density CLI; 50 tests green.
+- Trainer fixed (smoke 12.26 dB), native trips mode merged, candidate-report merged. Finding: with Gaussian-scale sizes the U-Net invents ~90% of every frame (t_final 0.93); full runs use kNN sizes.
 - v0.1.0 RELEASED on GitHub. Merged since: Brush fork submodule (ggjordan/brush trippy-fork) + crate skeletons, candidate-report (dolly/off-path/audits), se3_exp fix.
 - v0.1.0 GATE PASSED 2026-09-06: horse parity 22.27 dB vs GT (authors 22.34), 36.99 dB vs authors' render (EXP-0002). Merged: backward (grads <4e-6), trainer, monodepth, render CLI (EXP-0001, EXP-0004 sheets delivered).
 - Merged: raster forward (Metal = reference to 2e-6; 41.6 ms @1008x756/200k pts), net port (34/34 tensors match the public horse checkpoint with num_layers=8), scene loader, PLY export/sheets/video. build-0009, 187 tests.
@@ -13,10 +14,11 @@ Last updated: 2026-09-05 (session 1, Orchestrator: Claude Fable 5.1)
 - Jordan set the goal (2026-09-05 ~22:50): finish all stages autonomously; anything needing Jordan goes in the review queue below.
 
 ## In flight
-- GPU queue: trippy-train-smoke-2 (EXP-0003 smoke, prio 16; smoke-1 failed on an MPS float64 crop bug, fixed) and trippy-hybrid-c-render-1 (prio 17).
+- GPU queue: EXP-0003 full runs (trips + broadcast, knn sizes, prio 70, 6 h budget each) and trippy-hybrid-c-train-1 (prio 18).
 - fix/se3-exp-grad (mid): rotation gradient at phi=0.
 - feat/hybrid-c (mid/high): design C render->photo refinement on gsrender outputs (EXP-0005).
-- feat/trips-mode (large/high): native TRIPS layer rule (layers 0..ceil(log2 s)), integer pixel centres, ceil halving; parity re-run.
+- feat/brush-pyramid (large/high): CubeCL port of the pyramid forward into the Brush fork + parity fixtures.
+- fix/raster-nan (large/high): NaN gradient from a degenerate fragment in the raster backward.
 
 ## Next (in order)
 1. Merge scene-io + points; launch feat/raster (large/high: numpy reference + Metal blend_fwd + pyramid forward) and feat/net (mid/high: U-Net + tone mapper ports) once TRIPS_REFERENCE.md lands.

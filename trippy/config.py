@@ -44,6 +44,11 @@ def load_settings() -> Settings:
     """Build Settings from the environment, falling back to documented defaults."""
     splats_root = Path(os.environ.get("SPLATS_ROOT", DEFAULT_SPLATS_ROOT)).expanduser()
     default_output = _repo_root() / "output"
+    # Git worktrees (.worktrees/<name>) must never accumulate scene caches: resolve to the main
+    # checkout's output/ when running inside one (AGENTS.md section 6, privacy + disk).
+    if ".worktrees" in default_output.parts:
+        parts = default_output.parts
+        default_output = Path(*parts[: parts.index(".worktrees")]) / "output"
     trippy_output = Path(os.environ.get("TRIPPY_OUTPUT", str(default_output))).expanduser()
     return Settings(splats_root=splats_root, trippy_output=trippy_output)
 
