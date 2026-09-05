@@ -624,6 +624,70 @@ to `gpu_submit.sh` (prints/writes the job file only). Tested in `tests/test_queu
 (missing config, missing/invalid `run_dir:`, invalid job-name characters, `--dry-run` output,
 `--max-minutes` forwarding) -- never calls the real GPU queue.
 
+## Leaderboard
+
+`trippy leaderboard [--out <dir>] [--deliver]` (`trippy.cli._cmd_leaderboard`, `trippy.render.
+leaderboard`) scans every run directory under `$TRIPPY_OUTPUT/runs/**/` that has finished at
+least one self-report -- `report/report.json` (`trippy train --report`) or `candidate/report.json`
+(`trippy candidate-report`) -- plus its own `metrics.jsonl`, and writes ONE markdown + PNG
+comparison table so Jordan can see every TRIPS run so far against the fixed baselines without
+opening each run's own README. `trippy.render.report.run_train_report` calls this automatically
+(`regenerate_and_deliver_safely`) at the end of every `--report` run, so the sheet never goes
+stale; `trippy leaderboard` on its own is for rebuilding it by hand (e.g. after deleting a run).
+
+Columns: run name (suffixed `(smoke)` when the run name contains "smoke" --
+`trippy.render.leaderboard.is_smoke_run`), experiment (the run's parent directory name under
+`runs/`), mode and point-source type (matched back to the `experiments/<experiment>/*.yaml` whose
+own `run_dir` field names this run -- `trippy.render.leaderboard.match_run_config`; matching is on
+just the last two path components, since `run_dir` is written either relative to the repo root or
+as an absolute, machine-specific path -- see EXP-0009's configs), epochs reached/planned and total
+training steps (from `metrics.jsonl`), held-out PSNR/SSIM/LPIPS (`metrics.jsonl`'s own last eval
+row), shade dark-mass fraction and extent p99/max (`trippy.render.report.dark_mass_fraction`/
+`extent_p99_max`, reused directly -- the same numbers `comparison_table_markdown` computes for a
+single run's own README), dolly mean-centre coverage (`trippy.render.report.
+dolly_mean_center_coverage`), an approximate wall time (`metrics.jsonl`'s own creation time to
+report.json's mtime -- no per-step timestamp is recorded, so this is a filesystem-timestamp
+estimate, not instrumented), and the delivered Mac viewer launcher's filename (`n/a` for
+`candidate-report` runs, which never export a viewer bundle).
+
+**Held-out shade PSNR/SSIM/LPIPS is honestly "n/a" for every scanned run**: `Trainer.evaluate()`
+records one aggregate over the whole held-out split (forced-shade frames included), not a
+per-image breakdown, so there is no real number to show without fabricating one. Only the two
+fixed baseline rows below carry a real shade-only PSNR/SSIM/LPIPS split, because that split
+already exists in their own source experiment's per-bucket eval.
+
+Two fixed baseline rows are always included (not scanned -- neither is a trippy-native training
+run with its own `metrics.jsonl`), sourced verbatim from their own experiment READMEs:
+- **Gaussians kkc_15000 (baseline PLY)**: the plain Gaussian point source rendered directly
+  (Splats' `gsrender.py`, no TRIPS/U-Net) -- PSNR/SSIM/LPIPS from EXP-0005's own "Baseline (raw
+  render vs photo)" row, dark-mass fraction (19.9%) and extent p99/max (52.2/133.4) from Splats'
+  shade audit + extent gate on the same PLY (experiments/EXP-0003-kk-trips-train/README.md).
+- **Design C: render->photo U-Net (EXP-0005)**: the same PLY's render refined by a trained U-Net
+  (experiments/EXP-0005-hybrid-c/README.md's own "Refined" row, final eval epoch 1125). No point
+  cloud/extent of its own to audit.
+
+Sorted by shade dark-mass fraction ascending (closer to/below the 19.9% Gaussian baseline first),
+then held-out PSNR descending -- a row missing either number (a failed audit, or a baseline with
+no held-out/points concept) sorts to the end of that axis rather than crashing the sort.
+
+Output: `<out>/leaderboard.md` and `<out>/leaderboard.png` (PIL-rendered table, no matplotlib --
+same "no new dependencies" rule as `trippy.render.sheets`); `--out` defaults to
+`$TRIPPY_OUTPUT/leaderboard`. `--deliver` (or the automatic end-of-`--report` hook) hands the PNG
+to `scripts/deliver.sh` under the fixed name **`trips-leaderboard`** -- `review_add.sh`'s
+`ln -sfn` replaces the same symlink every time rather than accumulating one leaderboard per
+training run, so Jordan always has exactly one up-to-date sheet to open (it does append one row to
+Splats' review-queue README per delivery, which is expected/acceptable). `TRIPPY_DELIVER_DRY_RUN=1`
+skips the `deliver.sh` subprocess exactly like every other delivery in this codebase. The
+end-of-run hook never fails an otherwise-successful `--report` run: `regenerate_and_deliver_safely`
+catches any exception from rebuilding the leaderboard (e.g. a corrupt run directory somewhere else
+under `runs/`) and only prints/records it.
+
+Tested on CPU against synthetic `runs/`/`experiments/` trees written directly under `tmp_path`
+(`tests/test_render_leaderboard.py`: both report.json layouts, missing/malformed fields, the sort
+order, the fixed baselines, markdown + PNG rendering; `tests/test_cli_leaderboard.py`: the
+`trippy leaderboard` subprocess end to end, `--deliver`'s dry-run safety, the `--out` default) --
+never a real scene, checkpoint, or PLY.
+
 ## Hybrid design C: render->photo U-Net refinement
 
 Design C (docs/PLAN-2026-09-05.md "Hybrid (v0.3): (C) render->photo U-Net refinement on

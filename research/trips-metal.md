@@ -1534,3 +1534,4 @@ EXP-0008-distill-full1-broadcast.ply); experiments/EXP-0008-distill/README.md (f
 + the publish-path invocation, documented not run).
 - 2026-09-05T22:42:03Z submitted job trippy-full-trips prio 70: trippy train --config experiments/EXP-0007-hunua/config.yaml --report --max-minutes 240
 - 2026-09-05T22:42:03Z EXP-0007: clip4982 frames gone from disk (Splats driver deletes frames post-training); job trippy-full-trips rc 1 at dataset build. Re-pointed to clip5923 (439 frames) as EXP-0007-hunua, 120 epochs, queued.
+- 2026-09-05T22:56:15Z delivered trips-leaderboard: One table of every TRIPS run so far vs the Gaussian baseline: held-out PSNR, shade dark-mass, extent, coverage. Regenerated after every training. (/Users/nzbirdranch/trippy/output/leaderboard/leaderboard.png)
