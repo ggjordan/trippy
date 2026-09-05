@@ -3,7 +3,40 @@ name = "brush-pyramid"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "TRIPS image-pyramid rasteriser (skeleton). Real emit_fragments / radix argsort / prefix_sum / blend_fwd land here at v0.4.0 (see docs/SPEC.md)."
+description = "TRIPS image-pyramid rasteriser: CPU reference + CubeCL/Burn forward pass."
 publish = false
 
 [dependencies]
+# Default build is dependency-light on purpose: `scripts/build.sh` and
+# `scripts/test.sh` compile this crate on every push and must stay under
+# their time budget. Everything heavy sits behind the `gpu` feature.
+serde = { workspace = true, features = ["std"] }
+serde_json.workspace = true
+# Inflate for `np.savez_compressed` archives (src/npz.rs) and deflate for the
+# example's PNG writer (src/png.rs). `rust_backend` keeps it pure Rust -- no C
+# toolchain, and it cross-compiles to wasm32 for the web viewer later.
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
+
+# --- `gpu` feature only -------------------------------------------------------
+burn = { workspace = true, features = ["wgpu"], optional = true }
+burn-cubecl = { workspace = true, optional = true }
+burn-wgpu = { workspace = true, optional = true }
+brush-cube = { path = "../../brush-trips/crates/brush-cube", optional = true }
+brush-sort = { path = "../../brush-trips/crates/brush-sort", optional = true }
+brush-prefix-sum = { path = "../../brush-trips/crates/brush-prefix-sum", optional = true }
+
+[features]
+default = []
+# The CubeCL kernels + Burn/wgpu host code. Off by default so the CPU-only
+# reference, the fixture loaders and their parity test build in seconds.
+gpu = [
+    "dep:burn",
+    "dep:burn-cubecl",
+    "dep:burn-wgpu",
+    "dep:brush-cube",
+    "dep:brush-sort",
+    "dep:brush-prefix-sum",
+]
+# Compile the kernels to MSL rather than going through wgpu's WGSL frontend.
+# macOS + MTLGPUFamily::Apple7 only; see brush-cube's manifest.
+metal = ["gpu", "brush-cube/metal"]

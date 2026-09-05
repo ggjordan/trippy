@@ -1,0 +1,13 @@
+# Scoped exception to the repo-root .gitignore, which excludes *.npz and *.npy
+# everywhere as "models and large files".
+#
+# These fixtures are the opposite of that: a few tens of KiB each, fully
+# synthetic (generated from a pinned seed by tools/dump_raster_fixture.py, never
+# derived from a scene or a photograph -- AGENTS.md section 6), and read from the
+# working tree by rust/crates/brush-pyramid's parity tests. Without this
+# negation a fresh clone would have the directories but not the arrays, and
+# `cargo test -p brush-pyramid` would fail on a missing points.npz.
+#
+# tests/test_dump_raster_fixture.py keeps the whole tree under 1 MB.
+!*.npz
+!*.npy

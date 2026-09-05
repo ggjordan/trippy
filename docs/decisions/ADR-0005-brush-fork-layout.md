@@ -74,6 +74,49 @@ integration lands) would force that conflict today for no benefit. `scripts/buil
 brush-unet` inside `rust/`, so every push stays fast; the full Brush build only runs
 manually via `scripts/cpu_heavy.sh` (see rust/README.md).
 
+### Revisited when the real port landed (v0.4.0, 2026-09-06)
+
+The open question this ADR left — whether trippy's crates would eventually have to
+move *into* the submodule's workspace once they needed Burn/CubeCL/wgpu and Brush's
+own `brush-cube`/`brush-sort`/`brush-prefix-sum` — has been answered: **they did
+not**. `rust/crates/brush-pyramid` reaches into
+`rust/brush-trips/crates/*` with ordinary path dependencies, from a separate
+workspace, behind an off-by-default `gpu` feature. Three things make that work, and
+all three are load-bearing:
+
+1. **`exclude = ["brush-trips"]`** in `rust/Cargo.toml`. The submodule sits inside
+   the `rust/` workspace directory, and Cargo automatically adopts a path dependency
+   under the workspace root as a member — which would make `brush-cube`'s
+   `log.workspace = true` resolve against trippy's `[workspace.dependencies]`
+   instead of Brush's, and fail. Excluding the subtree lets each crate keep
+   inheriting from the workspace it actually belongs to.
+2. **Both `[patch]` tables copied verbatim** from the submodule's manifest. Cargo
+   reads `[patch]` only from the workspace root being built, so without the copy the
+   thin workspace would link *unpatched* upstream wgpu and cubecl — which cannot
+   compile Brush's kernels to MSL (the `workgroup_uniform_load` fix,
+   tracel-ai/cubecl#1525, only exists on ArthurBrussee's fork). This is the one real
+   maintenance cost of staying separate: the tables must be kept byte-identical, and
+   a drift is a silently different GPU stack rather than a build error.
+3. **`rust/Cargo.lock` seeded from the submodule's lock.** Burn is pinned only by
+   `branch = "main"`, so an independent resolve would drift. Seeding pins both
+   workspaces to the same burn/cubecl/wgpu revisions. The dependency *specs* must
+   also stay byte-identical, because two different git specs for one repository are
+   two different Cargo sources and cannot be linked together.
+
+The benefit that motivated the split is preserved and is worth more than the cost:
+without the `gpu` feature, `brush-pyramid` has no dependency heavier than `serde`
+and `flate2`, so `scripts/build.sh` and `scripts/test.sh` still run in seconds on
+every push, and the whole Burn/CubeCL/wgpu tree is built only on demand through
+`scripts/cpu_heavy.sh`. Nothing was pushed to `ggjordan/brush` for this work; the
+submodule is untouched at its pinned commit.
+
+The one thing that *does* still argue for moving later is the viewer hook-in:
+`apps/brush-app` lives in the submodule and cannot path-depend outward into trippy
+without the fork's manifest referring to a directory that only exists in a trippy
+checkout. When `splat_backbuffer.rs` is wired up, either the crates move into the
+fork or the viewer integration lives on trippy's side as a separate binary. That
+decision belongs to the task that does the wiring, not here.
+
 ### Updating the fork
 
 Rebasing onto a newer upstream commit, or adding a fourth patch, means: fetch

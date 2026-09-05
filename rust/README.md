@@ -17,12 +17,17 @@ The Python phase (v0.1.0–v0.3.0) is where we iterate rapidly on algorithms and
 ```
 rust/
 ├── Cargo.toml                 trippy's OWN thin workspace (version 0.1.0, tracks VERSION)
+├── Cargo.lock                 seeded from brush-trips' lock -> same burn/cubecl/wgpu revisions
 ├── crates/
-│   ├── brush-pyramid/          skeleton: layer_bounds/layer_factor port + unit tests
+│   ├── brush-pyramid/          TRIPS pyramid rasteriser: CPU reference + CubeCL forward pass
+│   │   ├── src/{params,grid,factor,scene,npz,cpu,output,fixture,png}.rs   no heavy deps
+│   │   ├── src/gpu/{mod,kernels}.rs                                       `gpu` feature only
+│   │   ├── examples/render_frame.rs
+│   │   └── tests/{parity_cpu,parity_gpu}.rs
 │   └── brush-unet/             skeleton: UnetConfig placeholder + unit tests
 └── brush-trips/                git submodule -> https://github.com/ggjordan/brush (branch trippy-fork)
     ├── Cargo.toml               Brush's OWN workspace (version 1.0.0, upstream's own scheme)
-    ├── crates/                  brush-dataset, brush-render, brush-train, ... (upstream + patches)
+    ├── crates/                  brush-cube, brush-sort, brush-prefix-sum, brush-render, ...
     └── apps/brush-app/          the actual viewer app
 ```
 
@@ -37,6 +42,41 @@ to two workspaces at once, and nesting `brush-pyramid`/`brush-unet` under
 `docs/ARCHITECTURE.md`) would force that conflict today for no benefit. Keeping them
 apart also means `scripts/build.sh`/`scripts/test.sh` never need to touch the much
 larger Brush workspace on every push (see below).
+
+### How the thin workspace reaches into the submodule (v0.4.0)
+
+`brush-pyramid`'s `gpu` feature depends on three crates *inside* the submodule
+(`brush-cube`, `brush-sort`, `brush-prefix-sum`) by **path**, plus Burn, CubeCL and
+wgpu. That works from a separate workspace, but it took three things — all of which
+are load-bearing, so don't "tidy" them away:
+
+1. **`exclude = ["brush-trips"]` in `rust/Cargo.toml`.** The submodule physically
+   lives inside the `rust/` workspace directory, and Cargo auto-adopts any path
+   dependency under the workspace root as a *member*. Without the exclude,
+   `brush-cube` is pulled into trippy's workspace and its `log.workspace = true`
+   is looked up in trippy's `[workspace.dependencies]` instead of the submodule's,
+   failing with ``` `dependency.log` was not found in `workspace.dependencies` ```.
+   With it, each crate keeps inheriting from the workspace it really belongs to.
+2. **The two `[patch]` tables copied verbatim** from `rust/brush-trips/Cargo.toml`
+   into `rust/Cargo.toml`. Cargo only reads `[patch]` from the workspace root it is
+   *building*, so without the copy we would silently link unpatched upstream
+   wgpu/cubecl — which cannot compile Brush's kernels to MSL (the
+   `workgroup_uniform_load` barrier fix, tracel-ai/cubecl#1525, lives on the fork).
+   Keep the two tables byte-identical; a mismatch is a silently different GPU stack.
+3. **`rust/Cargo.lock` seeded from `rust/brush-trips/Cargo.lock`.** Burn is pinned
+   only by `branch = "main"`, so a fresh resolve would pick whatever `main` is
+   today and drift away from the revision Brush's own code compiles against.
+   Seeding the lock pins both workspaces to burn `b6e27bdc`, cubecl `0e0a3116`
+   (ArthurBrussee/cubecl `msl-trial`) and wgpu `28d01c4f`
+   (ArthurBrussee/wgpu `js-interop-30`). The dependency *specs* in
+   `[workspace.dependencies]` must stay byte-identical to the submodule's for this
+   to hold: two different git specs for one repository are two different Cargo
+   sources and cannot be linked together.
+
+So **the crates did not have to move into the fork**, and ADR-0005's
+two-workspace decision stands unchanged. `cargo check -p brush-pyramid` (no
+features) still has no dependency heavier than `serde` + `flate2`, so
+`scripts/build.sh` and `scripts/test.sh` are unaffected.
 
 ## Brush fork: commit and patches
 
@@ -76,12 +116,38 @@ All five branches (`upstream-base`, `patch-robust`, `patch-appearance`,
 
 ## Building and testing
 
-**trippy's own crates** (`brush-pyramid`, `brush-unet`) — fast, runs on every push:
+**trippy's own crates** (`brush-pyramid`, `brush-unet`) — fast, runs on every push.
+No `gpu` feature, so no Burn/CubeCL/wgpu: a cold build is seconds.
 
 ```bash
 cd rust
 cargo check -p brush-pyramid -p brush-unet   # scripts/build.sh does this
 cargo test  -p brush-pyramid -p brush-unet   # scripts/test.sh does this
+```
+
+**The GPU forward pass** — needs the whole Burn/CubeCL/wgpu tree, so build it
+through the CPU-heavy queue (measured: 1m25s for the library, 55s more for the
+test binaries, on a warm registry):
+
+```bash
+bash scripts/cpu_heavy.sh brush-pyramid-build -- bash -c \
+  'cd rust && cargo test -p brush-pyramid --features gpu --no-run'
+```
+
+Running the tests **is GPU work** and must go through the GPU queue:
+
+```bash
+bash scripts/gpu_submit.sh --prio 12 --wait brush-pyramid-gpu-1 -- bash -c \
+  'cd rust && cargo test -p brush-pyramid --features gpu --test parity_gpu -- --nocapture'
+```
+
+Render a frame to a PNG (CPU reference without `--features gpu`, wgpu with it):
+
+```bash
+cd rust && cargo run --example render_frame --features gpu -- \
+  --points ../tests/fixtures/synthetic/raster_fixture_trips_half/points.npz \
+  --camera ../tests/fixtures/synthetic/raster_fixture_trips_half/camera.json \
+  --mode trips --layers 3 --background 0.1,0.2,0.3,0.4 --out /tmp/frame.png
 ```
 
 **The Brush fork itself** — slow (Rust + Metal shader compilation across the whole
@@ -118,14 +184,58 @@ combined feature set.
 
 ## Parity testing
 
-Before shipping, the Brush forward pass is validated against the Python version:
+The Rust forward pass is checked against trippy's Python forward on identical
+synthetic inputs. `tools/dump_raster_fixture.py` renders six tiny fixtures on CPU
+(three layer-selection modes x both pixel-centre conventions, 64x48, 3 layers, 500
+points, C=4) into `tests/fixtures/synthetic/raster_fixture_*/`, ~294 KiB in total:
 
-```bash
-bash scripts/gpu_submit.sh --prio 15 parity-check -- \
-  cargo test --release --test parity_vs_pytorch -- --nocapture
+```
+points.npz     xyz/size/feat/conf          np.savez            (ZIP_STORED)
+camera.json    width/height/fx/fy/cx/cy/R/t
+params.json    mode, pixel_center, halving, max_frags, t_cutoff, alpha_min, znear, bg
+expected.npz   layer_l, t_final_l, n_used_l  np.savez_compressed (ZIP_DEFLATE)
+meta.json      num_fragments, fragments_per_layer, layer_shapes
 ```
 
-This test loads a trained `.ply`, runs it through both PyTorch and Rust pipelines, and asserts output agreement <1e-3.
+The two archives use different compression on purpose: between them they exercise
+both branches of `brush_pyramid::npz`, which is a ~200-line reader rather than a ZIP
+dependency.
+
+- `tests/parity_cpu.rs` — CPU reference vs the Python `.npy`. Runs on any machine in
+  milliseconds; part of `scripts/test.sh`.
+- `tests/parity_gpu.rs` — CubeCL/wgpu vs the same `.npy`, **and** GPU vs CPU. Behind
+  the `gpu` feature, so `scripts/test.sh` never builds or runs it.
+- `tests/test_dump_raster_fixture.py` — re-renders from the pinned seed and compares,
+  so a semantic change in `trippy.raster` fails on the Python side instead of
+  silently invalidating fixtures the Rust tests trust.
+
+Float images and `t_final` are compared with a 1e-4 absolute tolerance; `n_used` and
+the fragment counts are integers and must match **exactly**.
+
+## What `brush-pyramid` implements
+
+The same six stages on both paths, atomic-free by design:
+
+| # | Stage | CPU (`src/cpu.rs`) | GPU (`src/gpu/kernels.rs`) |
+|---|---|---|---|
+| 1 | project, cull, count slots | `project_point`, `selected_layers` | `project_and_count_kernel` |
+| 2 | prefix sum over counts | `Vec` running total | `brush_prefix_sum::prefix_sum` |
+| 3 | emit fragments | `corner_fragments` | `emit_fragments_kernel` |
+| 4 | sort by depth, then key | one stable `sort_by_key` | two `brush_sort::radix_argsort` passes |
+| 5 | segment offsets | counting scan | `segment_bounds_kernel` |
+| 6 | blend front-to-back | inline loop | `blend_fwd_kernel` |
+| 7 | background | inline | `add_background_kernel` |
+
+Stage 4 mirrors `brush-render`'s own depth-then-tile pattern: LSB radix sort is
+stable, so ordering by depth first and by `(layer, pixel)` second leaves each
+layer-pixel run in depth order, with ties broken by point id — the same order the
+Python composite key produces.
+
+Counting (stage 1) and emission (stage 3) cannot disagree, because stage 1 writes a
+*slot budget* of four slots per selected layer and stage 3 derives its layer loop
+from `budget / 4` rather than re-running the selection. Corners that fall outside a
+layer, or below `alpha_min`, write a sentinel key equal to `P` (the layer-pixel
+count), which sorts after every real key and lies outside the segment table.
 
 ## Licensing
 
@@ -135,12 +245,13 @@ The Brush fork retains Apache-2.0 license (inherited from the upstream Brush pro
 
 - **v0.3.0**: Python training complete; design locked.
 - **v0.4.0, in progress**: Brush fork forked and pinned (`rust/brush-trips`), Splats'
-  patches reapplied, `brush-pyramid`/`brush-unet` crate skeletons added (with
-  placeholder logic + passing unit tests) in trippy's own thin workspace, and the
-  fork builds `brush-app` in release mode. **Not yet done**: the real
-  `emit_fragments`/CubeCL kernels, the real U-Net Burn graph, moving/wiring
-  `brush-pyramid`/`brush-unet` into `rust/brush-trips` proper, the viewer hook-in at
-  `apps/brush-app/src/ui/splat_backbuffer.rs`, and the parity test.
+  patches reapplied, and the fork builds `brush-app` in release mode.
+  `brush-pyramid` now holds the **real forward pass** — the CPU reference, the six
+  CubeCL kernels, the npz/camera loaders, the `render_frame` example and both parity
+  tests. **Not yet done**: the backward pass (`blend_bwd`), the U-Net Burn graph +
+  safetensors loader in `brush-unet`, wrapping the output as `burn::Tensor<4>` (see
+  `docs/LIMITATIONS.md`), and the viewer hook-in at
+  `apps/brush-app/src/ui/splat_backbuffer.rs`.
 - **v0.5.0**: Web viewer complete.
 
 ## Submodule vs. subtree decision
