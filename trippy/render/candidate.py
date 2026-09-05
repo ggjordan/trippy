@@ -57,11 +57,12 @@ from trippy.constants import (
     CANDIDATE_OUTLINE_COLOR,
     CANDIDATE_RAW_FILENAME,
     CANDIDATE_RAW_VIDEO_FILENAME,
+    DOLLY_COVERAGE_STOP_THRESHOLD,
     VIDEO_DEFAULT_FPS,
 )
 from trippy.net.camera_model import default_uv_grid
 from trippy.raster.pyramid import render_pyramid
-from trippy.render.dolly import CameraPose
+from trippy.render.dolly import CameraPose, dolly_stop_index
 from trippy.render.pyramid_render import coverage_stats, coverage_tensor
 from trippy.render.sheets import colorize, contact_sheet, save_png, side_by_side
 from trippy.render.video import write_video
@@ -167,6 +168,8 @@ def render_candidate(
     write_video_files: bool = True,
     coverage_threshold: float = CANDIDATE_LOW_COVERAGE_THRESHOLD,
     max_sheet_frames: int = CANDIDATE_HONESTY_MAX_SHEET_FRAMES,
+    stop_at_low_coverage: bool = False,
+    dolly_stop_threshold: float = DOLLY_COVERAGE_STOP_THRESHOLD,
 ) -> dict:
     """Render `poses` through a checkpoint and write every honesty artifact.
 
@@ -190,13 +193,26 @@ def render_candidate(
         max_sheet_frames: cap on how many poses' triptychs go into
             `honesty_sheet.png` (every pose still gets its own per-frame
             `honesty.png`).
+        stop_at_low_coverage: for a dolly path (`poses` ordered along a
+            camera trajectory), truncate the assembled videos to
+            `trippy.render.dolly.dolly_stop_index`'s cutoff instead of the
+            full path, so the clip stops before the camera visibly exits
+            the point cloud (docs/EXPERIMENTS.md "Dolly camera paths").
+            Every pose is still rendered and gets its own per-frame PNGs
+            and an entry in `metrics["frames"]`; only the video/mean-
+            coverage summary is affected. False for off-path honesty poses
+            (not a single ordered path, so "stop" is meaningless there).
+        dolly_stop_threshold: forwarded to `dolly_stop_index`.
 
     Returns:
         The metrics dict also written to `<out_dir>/metrics.json`:
         `{"checkpoint", "device", "n_frames", "mean_coverage_full",
         "frames": [{"name", "image_hw", "coverage_mean_full",
         "coverage_mean_center"}, ...], "videos": {"net", "raw"} (only if
-        written), "honesty_sheet" (only if written)}`.
+        written), "honesty_sheet" (only if written)}`. When
+        `stop_at_low_coverage` is True, also includes `"dolly_stop_index"`
+        (the last kept frame's index into `"frames"`), `"dolly_stop_threshold"`,
+        and `"dolly_stopped_early"` (whether any frames were cut from the video).
     """
     trainer = build_trainer_from_checkpoint(checkpoint_path, device=device)
     trainer.net.eval()
@@ -267,6 +283,16 @@ def render_candidate(
         ),
         "frames": frame_metrics,
     }
+
+    if stop_at_low_coverage and frame_metrics:
+        stop_index = dolly_stop_index(
+            [f["coverage_mean_center"] for f in frame_metrics], dolly_stop_threshold
+        )
+        metrics["dolly_stop_index"] = stop_index
+        metrics["dolly_stop_threshold"] = dolly_stop_threshold
+        metrics["dolly_stopped_early"] = stop_index < len(frame_metrics) - 1
+        net_frames = net_frames[: stop_index + 1]
+        raw_frames = raw_frames[: stop_index + 1]
 
     if write_video_files and net_frames:
         videos = {

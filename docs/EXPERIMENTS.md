@@ -149,6 +149,23 @@ python ~/Splats/tools/depthprior_shade_dolly.py <export.ply> --outdir output/ren
 
 Output: MP4 video (typically 2–5 seconds at 24 fps).
 
+**Stop rule (the camera must not exit the geometry).** Splats' own `depthprior_shade_dolly.py`
+uses `t` from `-0.35` to `+1.20` of local depth because it dollies through *Gaussians*, which
+have volume everywhere along that range. TRIPS point sources do not: past the shade volume's
+far surface there is nothing left to render. On EXP-0003's full1-broadcast candidate the raw
+(level-0, no U-Net) centre coverage collapses across the path -- `0.46` at `t=-0.35`, `0.08` at
+`t=+0.51`, `0.0001` at `t=+1.20` (`output/runs/EXP-0003-kk-trips-train/full1-broadcast/candidate/
+report.json`) -- so a video that plays the whole default path drifts through several seconds of
+visibly empty space at the end. `trippy.render.dolly.dolly_stop_index(coverage_center, threshold=
+DOLLY_COVERAGE_STOP_THRESHOLD)` finds the last frame whose centre coverage is still at or above
+`DOLLY_COVERAGE_STOP_THRESHOLD` (`0.05`); `trippy.render.candidate.render_candidate`'s
+`stop_at_low_coverage=True` (on by default for the dolly render in both `trippy candidate-report`
+and `trippy train --report`) truncates `dolly.mp4`/`dolly_raw.mp4` there, while still rendering
+and recording per-frame metrics for every pose in the full path. `metrics.json` then carries
+`dolly_stop_index`, `dolly_stop_threshold`, and `dolly_stopped_early`. Unit-tested against
+synthetic coverage profiles (monotonic-decreasing, all-above, all-below, non-monotonic) in
+`tests/test_render_report.py`, since the rule itself needs no rendering to test.
+
 ## Jordan's viewer verdict is final
 
 All metrics are rankings. **Jordan's visual assessment in the viewer overrides any metric.** If PSNR is high but the shade looks wrong, the metric is wrong. If LPIPS is high but the scene looks good, fine. The only verdict that matters: can you step into the scene and see shading, not a cloud?
@@ -470,6 +487,78 @@ has neither), so `tests/test_eval_audits.py`'s real-audit test runs against the 
 checkpoints (GPU-trained, via `scripts/gpu_submit.sh`) once one exists.
 honesty triplets (no ground truth) at arbitrary poses from a JSON file -- the stable API the dolly-camera-
 path generator (see "Dolly camera paths" above) will plug into once it exists.
+
+## Self-reporting training runs
+
+`trippy train --config <cfg.yaml> --report` (`trippy.cli._cmd_train`, `trippy.render.report.
+run_train_report`) makes a training run report on itself: no human or orchestrator step is
+needed between "training finished" and "Jordan has something to open". After `Trainer.fit()`
+returns, it:
+
+1. Runs the same per-checkpoint pipeline `candidate-report` runs (dolly + off-path poses,
+   `render_candidate`, both with the dolly's `stop_at_low_coverage=True`, see "Dolly camera
+   paths" above) against the run's own final checkpoint and `export.ply` (both already written
+   by `fit()` -- no re-export). The dolly/off-path pose names default to `cfg.forced_heldout`
+   (e.g. `SHADE_FRAMES_KK` for a karekare config) or, if that's empty, the dataset's first
+   registered image name, so this works on any scene without CLI flags.
+2. Runs Splats' shade audit + extent gate (`trippy.eval.audits.audit_report`) on the candidate
+   `export.ply`, and a **cached baseline audit** of the training run's own source PLY
+   (`cfg.point_source.path`, only when `point_source.type == "gaussian"`) via
+   `trippy.eval.audits.cached_baseline_audit` -- keyed on the PLY's path + mtime + size under
+   `$TRIPPY_OUTPUT/audits/`, so repeated `--report` runs against the same unchanged source PLY
+   (e.g. re-running the same experiment) don't re-pay Splats' full points3D.txt + multi-GB PLY
+   audit cost.
+3. Builds a baseline-vs-candidate comparison table (`trippy.render.report.
+   comparison_table_markdown`) -- held-out PSNR/SSIM/LPIPS (candidate only; a baseline PLY has
+   no held-out concept), shade dark-mass fraction (`dark_mass_lum0.25 / mass_in_region`) baseline
+   vs candidate, extent radius p99/max baseline vs candidate, and dolly mean centre coverage over
+   the kept (post-stop-rule) path -- and appends it, with a one-line summary
+   (`trippy.render.report.summary_line`), to the run's own `<run_dir>/README.md` (created if it
+   doesn't exist yet). Every cell that can't be computed (a failed/missing audit) reads `"n/a"`
+   rather than being silently omitted or fabricated, so the table always renders even when an
+   audit legitimately fails (e.g. the synthetic CPU test scene's empty `points3D.txt`).
+4. Delivers `dolly.mp4`, `honesty_sheet.png`, and `export.ply` via `scripts/deliver.sh`, each
+   with the same honest one-line summary as the "why" -- e.g. `"trippy train report
+   full1-broadcast: epoch 39, held-out PSNR 14.42 dB, shade dark-mass 36.2% vs baseline 19.9%"`.
+   No verdict language ("looks good", etc.) -- just the numbers, per AGENTS.md's honesty rule and
+   "Jordan's viewer verdict is final" above. `TRIPPY_DELIVER_DRY_RUN=1` skips the `deliver.sh`
+   subprocess entirely (recorded as `"skipped: TRIPPY_DELIVER_DRY_RUN=1"` in `report.json`'s
+   `deliveries` list) -- set by the CPU test suite so it never touches Splats' review queue or
+   `research/trips-metal.md`.
+
+Output layout: `<run_dir>/report/` mirrors `candidate-report`'s own `<out>/` layout (`export.ply`
+is the run's own, not re-exported; `dolly/`, `offpath/`, `report.json`), plus the comparison
+table appended to `<run_dir>/README.md` and `report.json`'s extra `epoch`, `held_out`,
+`summary_line`, and `deliveries` fields.
+
+**Never crashes the run** (requirement, not just a hope): `trippy.cli._run_train_report_safely`
+wraps the whole report step in a `try`/`except`. If reporting itself throws -- a broken audit
+tool, a missing scene sparse dir, `deliver.sh` refusing an artifact -- the exception is logged to
+stderr and written to `<run_dir>/REPORT_FAILED.txt`; `trippy train`'s exit code still reflects
+`fit()` alone (0 on a successful training run, regardless of `--report`'s outcome).
+
+Tested end to end on CPU with the synthetic scene (`tests/test_cli_train_report.py`): `--report`
+writes `report.json` and the README table even though the synthetic scene's empty `points3D.txt`
+makes the shade audit degrade to `{"error": ...}` for both candidate and baseline (requirement 6);
+a separate unit test drives `_run_train_report_safely` with a monkeypatched `run_train_report`
+that raises, asserting `REPORT_FAILED.txt` is written and nothing propagates. The pure
+comparison-table/summary-line/dolly-stop-index functions are unit-tested directly in
+`tests/test_render_report.py` against synthetic dicts and coverage profiles, so those invariants
+don't depend on a full training run.
+
+### `scripts/queue_training.sh`: submit a self-reporting run in one command
+
+`scripts/queue_training.sh <config.yaml> [--max-minutes M] [--dry-run]` is the one-liner Jordan
+runs instead of hand-assembling a `scripts/gpu_submit.sh --train ... -- trippy train --config ...
+--report` call. It validates `<config.yaml>` exists and parses as YAML with a top-level `run_dir:`
+key (exit 2 otherwise), names the queue job after that `run_dir`'s own basename (so
+`output/jobs/trippy-<name>.sh` and `output/runs/.../<name>` line up without cross-referencing
+anything), and always submits `trippy train --config <config.yaml> --report` at
+`gpu_submit.sh --train` priority (70, behind Splats' own jobs at 60) -- `--report` is never
+optional here, matching this section's "no orchestrator step needed" goal. `--dry-run` forwards
+to `gpu_submit.sh` (prints/writes the job file only). Tested in `tests/test_queue_training_script.py`
+(missing config, missing/invalid `run_dir:`, invalid job-name characters, `--dry-run` output,
+`--max-minutes` forwarding) -- never calls the real GPU queue.
 
 ## Hybrid design C: render->photo U-Net refinement
 

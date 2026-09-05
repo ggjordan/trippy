@@ -857,6 +857,18 @@ DOLLY_DEPTH_PERCENTILE_HIGH = 95.0
 # points3D.txt in a minimal synthetic test scene).
 DOLLY_FALLBACK_DEPTH = 3.0
 
+# Splats' own depthprior_shade_dolly.py walks t in [-0.35, 1.20] of local depth
+# because Gaussians have volume everywhere along that range. TRIPS points do
+# not: past the shade volume's far surface there is nothing to render, so the
+# raw (level-0, no U-Net) centre coverage collapses towards zero (observed on
+# EXP-0003 full1-broadcast: 0.46 at t=-0.35 -> 0.08 at t=+0.51 -> 0.0001 at
+# t=+1.20, docs/EXPERIMENTS.md "Dolly camera paths"). `dolly_stop_index`
+# (trippy.render.dolly) finds the last frame whose centre coverage is still
+# at or above this threshold, so `render_candidate`'s dolly video stops
+# before the camera visibly exits the point cloud instead of drifting
+# through empty space for the rest of `DOLLY_DEFAULT_T_END`.
+DOLLY_COVERAGE_STOP_THRESHOLD = 0.05
+
 # --- render/offpath.py : off-path honesty poses ---
 # Same construction as ~/Splats/research/visual/render_offpath.py.
 
@@ -910,9 +922,43 @@ AUDIT_EXTENT_SCRIPT_REL = "tools/tmp/extent-audit/extent_gate.py"  # relative to
 # more (potentially multi-GB) PLYs.
 AUDIT_SUBPROCESS_TIMEOUT_S = 600.0
 
+# `depthprior_shade_audit.py --json-out` field for the darkest bucket its
+# `--json-out` payload reports (docs/EXPERIMENTS.md "Shade audit"); used as
+# the single dark-mass-fraction number in the train/candidate report's
+# baseline-vs-candidate comparison table (trippy.render.report).
+SHADE_AUDIT_DARK_MASS_LUM_KEY = "dark_mass_lum0.25"
+
+# `run_shade_audit`/`run_extent_gate` results for a given PLY never change
+# unless the file itself changes, so `trippy.eval.audits.cached_baseline_audit`
+# keys its cache filename on path + mtime + size and reuses a hit rather than
+# re-running Splats' (slow, full points3D.txt + multi-GB PLY) tools on every
+# `trippy train --report` for the same unchanged source PLY. Cache lives
+# under `$TRIPPY_OUTPUT/<this>/`.
+AUDIT_CACHE_SUBDIR = "audits"
+
 # --- cli.py : `trippy candidate-report` ---
 
 CANDIDATE_REPORT_DOLLY_DIRNAME = "dolly"
 CANDIDATE_REPORT_OFFPATH_DIRNAME = "offpath"
 CANDIDATE_REPORT_JSON_FILENAME = "report.json"
 CANDIDATE_REPORT_README_FILENAME = "README.md"
+
+# --- render/report.py : `trippy train --report` self-reporting ---
+
+# Sub-directory of a training run's own `run_dir` that holds the candidate
+# report artifacts (export.ply/dolly/offpath/report.json) `train --report`
+# builds from the final checkpoint -- mirrors `candidate-report`'s own
+# `--out` layout (docs/EXPERIMENTS.md "Candidate report") but nested under
+# the run instead of a separate directory the Orchestrator has to remember.
+TRAIN_REPORT_DIRNAME = "report"
+
+# Written under `run_dir` (never raised past `trippy.cli._cmd_train`) when
+# `--report` is passed and reporting itself throws -- training already
+# succeeded and must still exit 0 (this task's brief, requirement 1); this
+# file is the only visible trace that the report step did not complete.
+TRAIN_REPORT_FAILED_FILENAME = "REPORT_FAILED.txt"
+
+# `scripts/deliver.sh` subprocess timeout, seconds -- generous but bounded
+# (it mostly just copies a path reference into Splats' review queue and
+# appends one line to research/trips-metal.md, no heavy I/O).
+DELIVER_SUBPROCESS_TIMEOUT_S = 120.0

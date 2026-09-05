@@ -28,6 +28,15 @@ SPEC.md D10 requires (export PLY -> Splats' shade/extent audits ->
 dolly video -> off-path honesty sheet -> report.json + README.md); see
 docs/EXPERIMENTS.md "Candidate report". It never opens an image itself
 (AGENTS.md privacy rule) -- only metrics and file paths are printed/written.
+
+`train --report` runs that same pipeline against the just-finished run's
+final checkpoint (`trippy.render.report.run_train_report`), plus a cached
+baseline audit of the run's own source PLY, a baseline-vs-candidate
+comparison table appended to the run's README.md, and delivery via
+`scripts/deliver.sh` -- see docs/EXPERIMENTS.md "Self-reporting training
+runs". Reporting failures are caught here and written to
+`<run_dir>/REPORT_FAILED.txt`; they never fail an otherwise-successful
+training run (`trippy train`'s exit code reflects `fit()` only).
 """
 
 from __future__ import annotations
@@ -37,6 +46,7 @@ import json
 import platform
 import subprocess
 import sys
+import traceback
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -67,6 +77,8 @@ from trippy.constants import (
     SMOKE_MPS_TEST_TENSOR_LEN,
     TRAIN_DEFAULT_MODE,
     TRAIN_EXPORT_FILENAME,
+    TRAIN_REPORT_DIRNAME,
+    TRAIN_REPORT_FAILED_FILENAME,
 )
 from trippy.eval.audits import audit_report
 from trippy.hybrid.config_c import HybridCConfig
@@ -151,6 +163,32 @@ def _cmd_not_implemented(name: str):
     return _run
 
 
+def _run_train_report_safely(trainer: Trainer, metrics: dict) -> None:
+    """Run `trippy.render.report.run_train_report`, never letting it fail the training run.
+
+    Requirement 1 of this task's brief: `--report` must not crash a run
+    that trained successfully. Any exception here (a broken audit tool, a
+    missing scene sparse dir, deliver.sh refusing an artifact, ...) is
+    caught, logged to stderr, and recorded in `<run_dir>/REPORT_FAILED.txt`
+    -- `trippy train`'s own exit code is unaffected either way.
+    """
+    # Deferred import: pulls in the render/audit stack `trippy train` without
+    # `--report` has no need for.
+    from trippy.render.report import run_train_report
+
+    try:
+        report = run_train_report(trainer, metrics)
+        print(f"trippy train: report -> {trainer.run_dir / TRAIN_REPORT_DIRNAME}")
+        print(f"trippy train: {report['summary_line']}")
+    except Exception as exc:  # noqa: BLE001 -- deliberately broad, see docstring
+        failed_path = Path(trainer.run_dir) / TRAIN_REPORT_FAILED_FILENAME
+        failed_path.write_text(
+            "trippy train --report failed after a successful training run.\n"
+            f"error: {exc!r}\n\n{traceback.format_exc()}"
+        )
+        print(f"trippy train: --report FAILED (see {failed_path}): {exc}", file=sys.stderr)
+
+
 def _cmd_train(args: argparse.Namespace) -> int:
     cfg = TrainConfig.load_yaml(args.config)
     if args.device is not None:
@@ -164,6 +202,8 @@ def _cmd_train(args: argparse.Namespace) -> int:
     print(f"trippy train: run_dir={trainer.run_dir} final_epoch={trainer.epoch}")
     if metrics:
         print(f"trippy train: last eval psnr_mean={metrics.get('psnr_mean')} ssim_mean={metrics.get('ssim_mean')}")
+    if args.report:
+        _run_train_report_safely(trainer, metrics)
     return 0
 
 
@@ -385,6 +425,13 @@ def _candidate_report_readme(report: dict) -> str:
         f"- Frames: {dolly['n_frames']}",
         f"- Mean coverage (full frame, T_final-derived): {dolly['mean_coverage_full']:.4f}",
     ]
+    if "dolly_stop_index" in dolly:
+        stopped = "yes" if dolly.get("dolly_stopped_early") else "no"
+        lines.append(
+            f"- Stopped before camera exits geometry: {stopped} "
+            f"(kept frames 0..{dolly['dolly_stop_index']} of {dolly['n_frames'] - 1}, "
+            f"centre coverage threshold {dolly['dolly_stop_threshold']:g})"
+        )
     if "videos" in dolly:
         lines.append(f"- Video (network output): `{dolly['videos']['net']}`")
         lines.append(f"- Video (raw level-0): `{dolly['videos']['raw']}`")
@@ -453,6 +500,7 @@ def _cmd_candidate_report(args: argparse.Namespace) -> int:
         out_dir / CANDIDATE_REPORT_DOLLY_DIRNAME,
         device=str(device),
         write_video_files=True,
+        stop_at_low_coverage=True,
     )
     offpath_metrics = render_candidate(
         args.checkpoint,
@@ -526,6 +574,16 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--max-minutes", type=float, default=None, help="wall-clock budget override")
     train.add_argument("--device", choices=["cpu", "mps"], default=None, help="override the config's device")
     train.add_argument("--run-dir", default=None, help="override the config's run_dir (artefact output directory)")
+    train.add_argument(
+        "--report",
+        action="store_true",
+        help=(
+            "after fit(), run the candidate report on the final checkpoint, audit the baseline "
+            "source PLY (cached), append a baseline-vs-candidate table to the run's README.md, "
+            "and deliver dolly.mp4 + honesty_sheet.png + export.ply via scripts/deliver.sh -- "
+            "never fails the run (see REPORT_FAILED.txt if reporting itself breaks)"
+        ),
+    )
     train.set_defaults(func=_cmd_train)
 
     ev = sub.add_parser("eval", help="evaluate a checkpoint's held-out (or given) images")
