@@ -454,3 +454,173 @@ MONODEPTH_MIN_SCALE_MATCHES = 5
 # go run the printed GPU job first" -- distinct from argparse's own exit(2)
 # for bad arguments and the normal exit(0) success path.
 DEPTH_POINTS_MISSING_DEPTH_EXIT_CODE = 3
+# --- train/ : TrainConfig defaults, PointParams parametrisation, trainer schedule ---
+# Sources are configs/train_normalnet.ini (TRIPS @ a59a65b6d9a8b1c14c73bc004cc9a8956f054c24)
+# unless noted; every value below is scaled or substituted deliberately for trippy's smaller
+# compute budget / different optimizer, and says so inline. See docs/ARCHITECTURE.md "train/"
+# and docs/EXPERIMENTS.md "Training runs" for the narrative version of these decisions.
+
+# Dataset width: half of the 2016px "wide" undistort cache (docs/SPEC.md v0.1.0), keeping the
+# per-crop memory footprint small while still resolving the shade region.
+TRAIN_DEFAULT_WIDTH = 1008
+
+# ini:422 train_crop_size=512; trippy trains on smaller square crops (memory-safe first,
+# per task brief) since a full 512 crop rasterises 512*512*RASTER_MAX_FRAGS fragments per
+# pyramid layer on a CPU-testable, single-crop-per-step budget.
+TRAIN_DEFAULT_CROP = 384
+
+# ini:447 min_zoom=0.75, max_zoom=1.5 (crop augmentation range).
+TRAIN_DEFAULT_ZOOM_MIN = 0.75
+TRAIN_DEFAULT_ZOOM_MAX = 1.5
+
+# ini batch_size=4, inner_batch_size=4; trippy starts at one crop per optimizer step
+# (memory-safe first, per task brief) rather than reproducing TRIPS's 4x4 batching.
+TRAIN_DEFAULT_CROPS_PER_STEP = 1
+
+# ini:422 num_epochs=600, scaled down for trippy's much smaller per-epoch step count (see
+# TRAIN_DEFAULT_TRAIN_FACTOR) and shorter overnight training-job budget.
+TRAIN_DEFAULT_EPOCHS = 150
+
+# Not an ini field: ADOP/TRIPS's own "epoch" is itself a fixed step count from
+# [TrainParams], not one pass over the dataset (this checkout's Pipeline/train.cpp epoch
+# loop was out of scope for docs/TRIPS_REFERENCE.md's extraction). trippy defines one epoch
+# as a fraction of the training set so `steps_per_epoch = ceil(train_factor * n_train)`
+# scales sensibly across scenes of very different image counts; 0.125 means roughly one
+# in 8 training images gets a crop step per epoch.
+TRAIN_DEFAULT_TRAIN_FACTOR = 0.125
+
+# Fractions of `lock_*_epochs` / `num_epochs` and `only_start_vgg_after_epochs` /
+# `num_epochs` from the ini (lock_camera_params_epochs=100, lock_structure_params_epochs=10,
+# only_start_vgg_after_epochs=100, num_epochs=600). TrainConfig multiplies these fractions by
+# its own `epochs` field, so the *proportion* of a run spent locked/pre-VGG matches TRIPS
+# regardless of how many epochs trippy actually runs.
+TRAIN_LOCK_CAMERAS_FRAC = 100 / 600
+TRAIN_LOCK_STRUCTURE_FRAC = 10 / 600
+TRAIN_VGG_START_FRAC = 100 / 600
+
+# ini:151 lr_render_network=0.0002 -- resolution/optimizer-independent, used unscaled.
+TRAIN_DEFAULT_LR_NETWORK = 2e-4
+
+# ini lr_texture=0.1, tuned for TRIPS's own custom `MyAdam` optimizer (src/lib/models/
+# MyAdam.cu), whose update rule is not detailed in docs/TRIPS_REFERENCE.md Sec. 7 ("not
+# traced in detail here"). trippy uses plain torch.optim.Adam, whose effective step size at
+# a given lr differs from MyAdam's; empirically 0.1 way overshoots a per-point feature
+# vector under vanilla Adam's fixed learning rate (no visitation-count normalisation).
+# Started 10x lower; re-tune from the first real training run (see EXP-0003).
+TRAIN_DEFAULT_LR_TEXTURE = 0.01
+
+# ini lr_background_color=0.004.
+TRAIN_DEFAULT_LR_BACKGROUND = 0.004
+
+# ini lr_points=0.0001.
+TRAIN_DEFAULT_LR_POINTS = 1e-4
+
+# Not an ini field: TRIPS's own point-size parameter is dead code under the shipped default
+# (use_layer_point_size=false is unreachable from any .ini, docs/TRIPS_REFERENCE.md Sec. 2/
+# 11), so no lr_pointsize exists to copy. trippy's "trilinear" render mode does use size for
+# real (layer selection), so it needs its own rate; reuses lr_points' value since both
+# parameters affect point geometry at a similar physical scale.
+TRAIN_DEFAULT_LR_SIZE = 1e-4
+
+# ini lr_poses=0.0001.
+TRAIN_DEFAULT_LR_POSES = 1e-4
+
+# ini lr_confidence=0.001.
+TRAIN_DEFAULT_LR_CONFIDENCE = 1e-3
+
+# ini lr_exposure=0.0005. Exposure is not in the ini's fix_* list (fix_intrinsics,
+# fix_dynamic_refinement, fix_vignette, fix_wb, fix_motion_blur, fix_rolling_shutter --
+# docs/TRIPS_REFERENCE.md Sec. 7), so it is trained by default.
+TRAIN_DEFAULT_LR_EXPOSURE = 5e-4
+
+# ini lr_response=0.0001. Also absent from the fix_* list, so trained by default (unlike
+# vignette/white-balance, which trippy freezes -- see trainer.py).
+TRAIN_DEFAULT_LR_RESPONSE = 1e-4
+
+# ini lr_decay_factor=0.85, lr_decay_patience=10 (plateau-style LR decay, driven here by
+# held-out PSNR rather than TRIPS's untraced train.cpp consumer).
+TRAIN_LR_DECAY_FACTOR = 0.85
+TRAIN_LR_DECAY_PATIENCE = 10
+
+# docs/ARCHITECTURE.md's pyramid mode default: "trilinear" is the mode the TRIPS *paper*
+# describes and the only mode that makes the per-point size parameter do any work; TRIPS's
+# own shipped default is "broadcast" (use_layer_point_size=false, see that doc's mode
+# table). trippy's trainer defaults to "trilinear" so the size parameter it trains actually
+# affects rendering.
+TRAIN_DEFAULT_MODE = "trilinear"
+
+# ini num_input_layers=num_layers=5 (matches NET_DEFAULT_NUM_LAYERS/RASTER_NUM_LAYERS).
+TRAIN_DEFAULT_LAYERS = 5
+
+# ini num_texture_channels=4 (matches NET_DEFAULT_NUM_INPUT_CHANNELS).
+TRAIN_DEFAULT_FEATURE_CHANNELS = 4
+
+# NeuralTexture.cpp:37 `background_color_raw = ones(C) * 0.25` (fac_init=0.25), per-channel.
+TRAIN_DEFAULT_BACKGROUND = 0.25
+
+# Matches MODULO_SPLIT_DEFAULT_K -- trippy's held-out fraction (1 in 8 images).
+TRAIN_DEFAULT_HELDOUT_K = 8
+
+# Not an ini field (TRIPS logs to tfevents continuously); chosen so a 150-epoch run gets
+# 15 held-out evaluations (also the default checkpoint cadence, so every checkpoint has a
+# metrics reading next to it).
+TRAIN_DEFAULT_EVAL_EVERY = 10
+TRAIN_DEFAULT_CHECKPOINT_EVERY = 10
+
+TRAIN_DEFAULT_SEED = 0
+
+# docs/SPEC.md v0.2.0 acceptance / task brief: "up to 6 held-out images" per honesty/eval
+# contact sheet.
+TRAIN_EVAL_MAX_SHEET_IMAGES = 6
+
+# NeuralTexture.h:42 `confidence = sigmoid((10 + narrowing_param_times_epoch) *
+# confidence_raw)`; sigmoid_narrowing_factor=0 in the default config (ini:139), so this
+# simplifies to sigmoid(10 * confidence_raw) at every epoch. docs/TRIPS_REFERENCE.md Sec.
+# 10.4 flags dropping this factor as a fidelity gap (e.g. for 3DGS-opacity comparisons);
+# trippy's decision (this task): KEEP the x10 scale in PointParams.conf(), matching TRIPS
+# exactly, rather than a plain sigmoid(confidence_raw).
+CONF_SIGMOID_SCALE = 10.0
+
+# torch.nn.functional.softplus's own default threshold (beta=1, above which softplus(x)
+# linearises to x) -- named here because PointParams.raw_size's init (inverse_softplus)
+# must use the exact same threshold to round-trip, matching NeuralPointCloudCuda.cpp:19-24's
+# "beta=1, threshold=20" citation in docs/TRIPS_REFERENCE.md Sec. 2.
+TRAIN_SOFTPLUS_THRESHOLD = 20.0
+
+# Not in TRIPS (NeuralTexture.cpp's texture_raw init is plain Uniform(0,1) on every
+# channel, docs/TRIPS_REFERENCE.md Sec. 2). Task brief: PointParams.feat's first 3 channels
+# are seeded with rgb0 (so the untrained net sees real colour immediately) and any
+# remaining channels get small random noise at this standard deviation, rather than
+# TRIPS's full-range Uniform(0,1) init.
+TRAIN_FEAT_EXTRA_INIT_STD = 0.01
+
+# New trippy addition, not present in TRIPS: a soft penalty keeping trained point positions
+# near the initial point cloud's bounding box, guarding docs/SPEC.md's "extent inflation"
+# risk (scene sprawl making rendering/export unusable). Small by design so it only engages
+# once points drift meaningfully past the (margin-padded) initial bbox.
+TRAIN_EXTENT_PENALTY_WEIGHT_DEFAULT = 1e-3
+
+# Matches docs/EXPERIMENTS.md's extent gate wording ("should not exceed the extent of the
+# original sparse COLMAP points by >20%") -- the soft penalty's free margin before it starts
+# pushing back.
+TRAIN_EXTENT_MARGIN_FRAC = 0.2
+
+# eval.py's held-out LPIPS metric backbone -- matches TripsLoss's own vgg-substitute choice
+# (trippy.net.losses module docstring) so the training loss and the reported metric agree.
+TRAIN_LPIPS_METRIC_NET = "vgg"
+
+# Guards -10*log10(mse) against mse == 0 (a pred/target exact match, e.g. a degenerate
+# all-zero synthetic test image) producing +inf.
+TRAIN_PSNR_EPS = 1e-10
+
+# --- train/checkpoint_io.py, trainer.py : on-disk run layout ---
+# docs/EXPERIMENTS.md "Run location": output/runs/<exp>/<run>/{...}.
+TRAIN_CHECKPOINT_DIRNAME = "checkpoints"
+TRAIN_CHECKPOINT_FILENAME_FMT = "checkpoint_ep{epoch:04d}.pt"
+TRAIN_CHECKPOINT_LATEST_FILENAME = "checkpoint_latest.pt"
+TRAIN_LOG_FILENAME = "log.txt"
+TRAIN_METRICS_FILENAME = "metrics.jsonl"
+TRAIN_EVAL_DIRNAME_FMT = "eval_ep{epoch:04d}"
+TRAIN_EVAL_SHEET_FILENAME = "sheet.png"
+TRAIN_EVAL_METRICS_FILENAME = "metrics.json"
+TRAIN_EXPORT_FILENAME = "export.ply"

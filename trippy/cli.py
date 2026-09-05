@@ -13,6 +13,15 @@ Related docs: docs/SPEC.md "Technical design", AGENTS.md forbidden
     list (no direct GPU/MPS work outside scripts/gpu_submit.sh -- `smoke
     --device mps` and `render --device mps` are only ever invoked by a
     GPU-queue job); docs/SPEC.md D4 (point sources).
+    (never a silent default); the `render` stub does no work and always
+    exits 2. `density` builds a PointSource and prints/saves its
+    PointSet.summary(); it is CPU-only (point sources never touch MPS).
+    `train`/`eval` only touch MPS when `--device mps` (or the config's own
+    `device: mps`) is explicit -- same no-silent-fallback rule as `smoke`.
+Related docs: docs/SPEC.md "Technical design", AGENTS.md forbidden
+    list (no direct GPU/MPS work outside scripts/gpu_submit.sh -- `smoke
+    --device mps` is only ever invoked by the GPU-queue job itself);
+    docs/SPEC.md D4 (point sources); docs/EXPERIMENTS.md "Training runs".
 """
 
 from __future__ import annotations
@@ -48,6 +57,9 @@ from trippy.points.gaussian_ply import GaussianPlySource
 from trippy.points.monodepth import MonoDepthSource
 from trippy.points.source import PointSource
 from trippy.render import pyramid_render
+from trippy.train.config import TrainConfig
+from trippy.train.eval import evaluate_checkpoint
+from trippy.train.trainer import Trainer
 
 _METAL_ADD_ONE_SRC = """
 kernel void add_one(device float* x [[buffer(0)]],
@@ -113,6 +125,29 @@ def _cmd_not_implemented(name: str):
         return 2
 
     return _run
+
+
+def _cmd_train(args: argparse.Namespace) -> int:
+    cfg = TrainConfig.load_yaml(args.config)
+    if args.device is not None:
+        cfg.device = args.device
+    trainer = Trainer(cfg)
+    if args.resume is not None:
+        trainer.resume(args.resume)
+    metrics = trainer.fit(max_minutes=args.max_minutes)
+    print(f"trippy train: run_dir={trainer.run_dir} final_epoch={trainer.epoch}")
+    if metrics:
+        print(f"trippy train: last eval psnr_mean={metrics.get('psnr_mean')} ssim_mean={metrics.get('ssim_mean')}")
+    return 0
+
+
+def _cmd_eval(args: argparse.Namespace) -> int:
+    metrics = evaluate_checkpoint(args.checkpoint, images=args.images, device=args.device)
+    print(f"psnr_mean: {metrics['psnr_mean']}")
+    print(f"ssim_mean: {metrics['ssim_mean']}")
+    print(f"lpips_mean: {metrics['lpips_mean']}")
+    print(f"n_images: {metrics['n_images']}")
+    return 0
 
 
 def _build_density_source(args: argparse.Namespace) -> PointSource:
@@ -250,10 +285,6 @@ def build_parser() -> argparse.ArgumentParser:
     smoke.add_argument("--device", choices=["cpu", "mps"], default=None)
     smoke.set_defaults(func=_cmd_smoke)
 
-    for name in ("train", "eval"):
-        stub = sub.add_parser(name, help=f"{name} (not implemented yet)")
-        stub.set_defaults(func=_cmd_not_implemented(name))
-
     render = sub.add_parser(
         "render", help="rasterise the TRIPS pyramid for chosen frames + a contact sheet (no U-Net yet)"
     )
@@ -272,6 +303,18 @@ def build_parser() -> argparse.ArgumentParser:
     render.add_argument("--out", required=True, help="output directory")
     render.add_argument("--device", choices=["cpu", "mps"], default=None)
     render.set_defaults(func=_cmd_render)
+    train = sub.add_parser("train", help="train a TRIPS-style model from a YAML config")
+    train.add_argument("--config", required=True, help="path to a TrainConfig YAML file")
+    train.add_argument("--resume", default=None, help="checkpoint .pt path to resume from")
+    train.add_argument("--max-minutes", type=float, default=None, help="wall-clock budget override")
+    train.add_argument("--device", choices=["cpu", "mps"], default=None, help="override the config's device")
+    train.set_defaults(func=_cmd_train)
+
+    ev = sub.add_parser("eval", help="evaluate a checkpoint's held-out (or given) images")
+    ev.add_argument("--checkpoint", required=True, help="checkpoint .pt path")
+    ev.add_argument("--images", nargs="*", default=None, help="image names to evaluate (default: held-out split)")
+    ev.add_argument("--device", choices=["cpu", "mps"], default=None, help="override the checkpoint's device")
+    ev.set_defaults(func=_cmd_eval)
 
     density = sub.add_parser("density", help="build a point source and print PointSet.summary()")
     density.add_argument("--source", choices=["gaussian", "colmap"], required=True)
