@@ -34,6 +34,8 @@ if [ -f rust/Cargo.toml ]; then
   # docs/decisions/ADR-0005-brush-fork-layout.md.
   echo "▶ cargo check (rust/: brush-pyramid, brush-unet)"
   ( cd rust && cargo check -p brush-pyramid -p brush-unet )
+  echo "▶ cargo check --features gpu --all-targets (type-check only; GPU tests run in queue jobs)"
+  ( cd rust && cargo check -p brush-pyramid -p brush-unet --features gpu --all-targets --offline )
 fi
 
 echo "✓ build OK"

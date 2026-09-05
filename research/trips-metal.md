@@ -949,3 +949,4 @@ missing for v0.4.0: the backward pass (`blend_bwd`) and the viewer hook-in at
 `tests/fixtures/synthetic/unet_fixture_small/` (296 KiB, committed); real-weight
 exports at `output/brush/` (not committed: 411 KiB of weights, an 80 MB point set
 and a 50 MB expected frame). `scripts/test.sh` stays green at 43.6 s.
+- 2026-09-05T17:52:05Z submitted job trippy-brush-unet-gpu-6 prio 12: bash -c set -e; export TRIPPY_OUTPUT=/Users/nzbirdranch/trippy/output; cd /Users/nzbirdranch/trippy/rust && cargo run --release --example render_frame_full --features gpu --offline -- --points /Users/nzbirdranch/trippy/output/brush/horse/view_00008_points.npz --camera /Users/nzbirdranch/trippy/output/brush/horse/view_00008_camera.json --params /Users/nzbirdranch/trippy/output/brush/horse/view_00008_params.json --weights /Users/nzbirdranch/trippy/output/brush/horse/horse_unet.safetensors --out /Users/nzbirdranch/trippy/output/brush/horse/frame_00008.png --iters 10
