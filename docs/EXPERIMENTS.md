@@ -89,6 +89,34 @@ python ~/Splats/tools/tmp/extent-audit/extent_gate.py output/Training-Data/karek
 
 Output: radius p99, p99.9, max. These should not exceed the extent of the original sparse COLMAP points by >20%. Scene sprawl makes rendering unusable.
 
+## Point sources
+
+`trippy/points/` (D4) turns a scene into a `PointSet` (xyz, size0, rgb0, conf0, provenance):
+
+- `GaussianPlySource`: trained 3DGS Gaussian centres from a binary PLY. `min_opacity` filters by `sigmoid(opacity)`; `size_mode="scale"` uses the trained `exp(log_scale)` extent, `size_mode="knn"` ignores it and uses local point spacing instead. Reads the ~7M-row author PLYs in ~1-2 s (structured-dtype `np.fromfile`, no plyfile, no per-row loop).
+- `ColmapSparseSource`: the sparse triangulated points from `points3D.txt`, fixed `conf0=0.5`, size from kNN spacing.
+- `UnionSource`: concatenates any sources; with `voxel` set, dedupes colliding points keeping the highest-`conf0` survivor per cell.
+- `MonoDepthSource` / `LidarSource`: not implemented yet (v0.2.0 and "later" respectively); constructors document planned inputs.
+
+Inspect any source without training via the CLI:
+
+```bash
+trippy density --source gaussian --path <ply> --min-opacity 0.05 --size-mode scale --max-points 200000
+trippy density --source colmap --path <sparse_txt_dir>
+```
+
+`density` prints `PointSet.summary()` (count, bbox, median nearest-neighbour distance on a subsample, provenance histogram) as both a human table and a `JSON:`-prefixed line, and can also write it to `--out summary.json`. `size_mode="knn"` on the full multi-million-point Gaussian PLY is expensive by design (kNN over the whole cloud) -- pass `--max-points` first when exploring interactively.
+
+One-shot numbers on `kkc_15000.ply` (7.36M Gaussians) and its `sparse_txt` COLMAP model, `min_opacity=0.05`, `size_mode=scale`:
+
+| Source | Count (post-filter) | bbox (world units) | median nn-distance |
+|---|---|---|---|
+| gaussian (full) | 5,736,619 | [-79.3,-85.6,-61.4] to [83.1,68.3,94.1] | 0.0795 |
+| gaussian (`--max-points 200000`) | 200,000 | [-32.5,-83.8,-55.5] to [81.2,24.1,74.0] | 0.0803 |
+| colmap | 153,515 | [-130.6,-117.2,-207.3] to [213.5,168.7,188.1] | 0.0865 |
+
+The COLMAP sparse cloud's bbox is much larger than the Gaussians' -- expected, since sparse triangulated points include noisy far-field/sky points that training prunes away.
+
 ## Mandatory honesty sheet
 
 Every candidate must include a three-panel image:

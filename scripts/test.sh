@@ -8,6 +8,11 @@
 #   - Rust tests only run when rust/Cargo.toml exists.
 set -eu
 cd "$(dirname "$0")/.."
+# Worktrees have no .venv of their own: fall back to the main checkout's venv and make the
+# worktree's package shadow the editable install (PYTHONPATH=.).
+PY=./.venv/bin/python
+if [ ! -x "$PY" ]; then PY="$(git rev-parse --path-format=absolute --git-common-dir)/../.venv/bin/python"; fi
+export PYTHONPATH=.
 
 if [ "${RUN_GPU_TESTS:-0}" = "1" ]; then
   echo "GPU tests only run inside a queue job: scripts/gpu_submit.sh gpu-tests -- python -m pytest -m gpu tests"
@@ -16,7 +21,6 @@ fi
 
 scripts/build.sh
 
-PY=./.venv/bin/python
 echo "▶ pytest (CPU, not gpu)"
 TRIPS_DEVICE=cpu PYTORCH_ENABLE_MPS_FALLBACK=0 "$PY" -m pytest -q -m "not gpu" tests
 
