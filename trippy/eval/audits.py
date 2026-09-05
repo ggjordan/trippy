@@ -26,6 +26,11 @@ Invariants: neither function ever raises on a *missing tool* silently --
     `splats_scene` fixture) -- `audit_report` instead *catches* both kinds
     of failure per-audit, so one broken/missing tool never blocks the
     other's numbers, and `trippy candidate-report` always finishes.
+    `cached_baseline_audit` never raises either -- a `ply_path` that does
+    not exist (or a cache read/write that fails) degrades to the same
+    `{"error": ...}` shape `audit_report` already returns, since it exists
+    for `trippy train --report`'s "never crash the run" rule (this task's
+    brief, requirement 1).
 Related docs: docs/EXPERIMENTS.md "Shade audit", "Extent gate"; docs/SPEC.md D10.
 """
 
@@ -39,6 +44,7 @@ from pathlib import Path
 
 from trippy.config import load_settings
 from trippy.constants import (
+    AUDIT_CACHE_SUBDIR,
     AUDIT_EXTENT_SCRIPT_REL,
     AUDIT_SHADE_SCRIPT_REL,
     AUDIT_SUBPROCESS_TIMEOUT_S,
@@ -210,4 +216,64 @@ def audit_report(
         report["extent_gate"] = run_extent_gate(ply_paths)
     except (FileNotFoundError, RuntimeError, subprocess.TimeoutExpired) as exc:
         report["extent_gate"] = {"error": str(exc)}
+    return report
+
+
+def _cache_key(ply_path: Path) -> str:
+    """`<stem>-<mtime_ns>-<size>.json` -- changes iff `ply_path`'s content does (mtime+size)."""
+    stat = ply_path.stat()
+    return f"{ply_path.stem}-{stat.st_mtime_ns}-{stat.st_size}.json"
+
+
+def cached_baseline_audit(
+    ply_path: str | Path,
+    sparse_txt_dir: str | Path,
+    frames: list[str] | None = None,
+    cache_root: str | Path | None = None,
+) -> dict:
+    """`audit_report` for a baseline PLY, memoised on disk by path + mtime + size.
+
+    A training run's baseline is the *un-trained* source PLY its point
+    source was built from (e.g. `kkc_15000.ply`) -- it never changes across
+    runs that share that source, so re-running Splats' shade audit and
+    extent gate (a full points3D.txt parse plus a multi-GB PLY read) on
+    every `trippy train --report` invocation is wasted work. This wraps
+    `audit_report` with a `$TRIPPY_OUTPUT/<AUDIT_CACHE_SUBDIR>/` cache keyed
+    on `_cache_key`, so the first `--report` run pays the audit cost and
+    every later one against the same file reads the cached JSON instead.
+
+    Args:
+        ply_path: the baseline PLY to audit.
+        sparse_txt_dir: forwarded to `run_shade_audit`.
+        frames: forwarded to `run_shade_audit`.
+        cache_root: override the cache directory (tests only); defaults to
+            `load_settings().trippy_output / AUDIT_CACHE_SUBDIR`.
+
+    Returns:
+        The same shape as `audit_report`: `{"shade_audit": ..., "extent_gate":
+        ...}`, each either the tool's parsed output or `{"error": str}` --
+        including when `ply_path` itself does not exist (stat() raising is
+        caught here, not propagated, per this module's docstring).
+    """
+    ply_path = Path(ply_path)
+    cache_dir = Path(cache_root) if cache_root is not None else load_settings().trippy_output / AUDIT_CACHE_SUBDIR
+
+    try:
+        cache_file = cache_dir / _cache_key(ply_path)
+    except OSError as exc:
+        error = {"error": f"baseline ply not readable: {exc}"}
+        return {"shade_audit": error, "extent_gate": error}
+
+    if cache_file.exists():
+        try:
+            return json.loads(cache_file.read_text())
+        except (OSError, json.JSONDecodeError):
+            pass  # corrupt/unreadable cache entry -- fall through and recompute.
+
+    report = audit_report([ply_path], sparse_txt_dir, frames=frames)
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_file.write_text(json.dumps(report, indent=2))
+    except OSError:
+        pass  # caching is an optimisation, not a correctness requirement.
     return report

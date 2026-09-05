@@ -24,12 +24,14 @@ Related docs: docs/EXPERIMENTS.md "Dolly camera paths"; docs/SPEC.md D10.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 
 from trippy.constants import (
+    DOLLY_COVERAGE_STOP_THRESHOLD,
     DOLLY_DEFAULT_N_FRAMES,
     DOLLY_DEFAULT_POSE_NAME,
     DOLLY_DEFAULT_T_END,
@@ -211,3 +213,40 @@ def shade_dolly_poses(
             )
         )
     return poses
+
+
+def dolly_stop_index(
+    coverage_center: Sequence[float], threshold: float = DOLLY_COVERAGE_STOP_THRESHOLD
+) -> int:
+    """Index of the last dolly frame whose centre coverage is still >= `threshold`.
+
+    `shade_dolly_poses`' default `t_range` (-0.35..1.20, matching Splats'
+    own `depthprior_shade_dolly.py`) is tuned for Gaussians, which have
+    volume everywhere along that range. TRIPS point sources do not: past
+    the shade volume's far surface there is nothing left to render, so
+    `render_candidate`'s per-frame `coverage_mean_center` (raw, level-0,
+    no U-Net -- exactly what "the camera has exited the geometry" means
+    here) drops towards zero for the rest of the path (see
+    `DOLLY_COVERAGE_STOP_THRESHOLD`'s docstring in trippy.constants for the
+    observed EXP-0003 numbers). This finds where to cut the video off
+    instead of shipping a clip that drifts through empty space.
+
+    Args:
+        coverage_center: per-frame `coverage_mean_center` values, in the
+            same order as the poses that produced them (`shade_dolly_poses`'
+            t-ordering: `t_range[0]` to `t_range[1]`).
+        threshold: minimum centre coverage a frame must have to count as
+            "still inside the geometry".
+
+    Returns:
+        The largest index `i` such that `coverage_center[i] >= threshold`
+        (frames are not assumed to be monotonically decreasing -- a later
+        frame can dip below threshold and recover, and this still walks
+        all the way to the true last qualifying frame). `0` if the
+        sequence is empty or no frame meets the threshold, so the caller
+        always keeps at least one frame rather than an empty path.
+    """
+    for i in range(len(coverage_center) - 1, -1, -1):
+        if coverage_center[i] >= threshold:
+            return i
+    return 0

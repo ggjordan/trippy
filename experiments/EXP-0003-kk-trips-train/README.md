@@ -91,3 +91,29 @@ v0.2.0"); this README will be updated with cross-references once those experimen
 Artifact path (once run): `output/runs/EXP-0003-kk-trips-train/EXP-0003-kk-trips-train_1/`
 (`export.ply`, `eval_ep*/sheet.png`, `metrics.jsonl`, `checkpoints/`). Dolly video and
 delivery follow via `scripts/deliver.sh` once the run completes.
+
+## full1-broadcast candidate numbers
+
+First real candidate report against this experiment's `full1-broadcast` run (`mode: broadcast`,
+epoch 39; `output/runs/EXP-0003-kk-trips-train/full1-broadcast/candidate/report.json` +
+`README.md`, baseline audit at `output/runs/EXP-0003-kk-trips-train/baseline_shade_audit.json`
+against the source `kkc_15000.ply`). These are real numbers, distinct from the still-TBD
+`config.yaml` (150-epoch) run's own verdict table above; docs/EXPERIMENTS.md "Self-reporting
+training runs" describes the `trippy train --report`/`comparison_table_markdown` machinery that
+will produce this table automatically for every future candidate.
+
+| Metric | Baseline (`kkc_15000.ply`) | Candidate (`full1-broadcast`, epoch 39) |
+|---|---|---|
+| Held-out PSNR (dB) | n/a | 14.42 |
+| Held-out SSIM | n/a | 0.3900 |
+| Held-out LPIPS | n/a | 0.5131 |
+| Shade dark-mass fraction (lum<0.25) | 19.9% (67,068.8 / 336,873.5) | 36.2% (124,120.0 / 342,813.4) |
+| Extent radius p99 | n/a (not audited yet) | 40.02 |
+| Extent radius max | n/a (not audited yet) | 124.48 |
+| Dolly mean centre coverage (kept path: frames 0..28 of 47, `dolly_stop_index`=28 at threshold 0.05) | n/a | 0.26 (0.46 at `t=-0.35` falling to 0.08 at `t=+0.51`; unstopped mean over all 48 frames is 0.16 -- see docs/EXPERIMENTS.md "Dolly camera paths" stop rule) |
+
+The dark-mass fraction moved the *wrong* direction (candidate darker than baseline, not
+lighter) -- this run does not clear the shade-audit gate yet; PSNR (14.42 dB) is also well
+below the v0.2.0 target. Recorded here as a real data point, not a pass. Jordan's viewer
+verdict on the dolly video/honesty sheet is still the actual call (docs/EXPERIMENTS.md
+"Jordan's viewer verdict is final").
