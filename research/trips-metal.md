@@ -305,3 +305,4 @@ old `trilinear` default and **+7.12 dB** over `broadcast`.
 **Artifacts**: `output/EXP-0002-horse-parity-trips-mode/{perlayer,native,native2}/` (metrics.json, README
 with the per-level engine-agreement table, per-frame contact sheets). Job logs:
 `$SPLATS_ROOT/tools/gpu_queue/logs/trippy-trips-mode-gpu-{1,2}.log`. Nothing under `output/` is committed.
+- 2026-09-05T14:01:19Z submitted job trippy-trips-mode-gpu-1 prio 12: bash /tmp/trips_mode_gpu.sh
