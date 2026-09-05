@@ -69,6 +69,9 @@ from trippy.constants import (
     TRAIN_EXPORT_FILENAME,
 )
 from trippy.eval.audits import audit_report
+from trippy.hybrid.config_c import HybridCConfig
+from trippy.hybrid.train_c import HybridCTrainer
+from trippy.hybrid.train_c import evaluate_checkpoint as evaluate_hybrid_c_checkpoint
 from trippy.points import depth_io
 from trippy.points.colmap_sparse import ColmapSparseSource
 from trippy.points.gaussian_ply import GaussianPlySource
@@ -170,6 +173,28 @@ def _cmd_eval(args: argparse.Namespace) -> int:
     print(f"ssim_mean: {metrics['ssim_mean']}")
     print(f"lpips_mean: {metrics['lpips_mean']}")
     print(f"n_images: {metrics['n_images']}")
+    return 0
+
+
+def _cmd_hybrid_c_train(args: argparse.Namespace) -> int:
+    cfg = HybridCConfig.load_yaml(args.config)
+    if args.device is not None:
+        cfg.device = args.device
+    trainer = HybridCTrainer(cfg)
+    if args.resume is not None:
+        trainer.resume(args.resume)
+    metrics = trainer.fit(max_minutes=args.max_minutes)
+    print(f"trippy hybrid-c train: run_dir={trainer.run_dir} final_epoch={trainer.epoch}")
+    if metrics:
+        base = metrics["baseline"]["all"]["psnr_mean"]
+        ref = metrics["refined"]["all"]["psnr_mean"]
+        print(f"trippy hybrid-c train: last eval baseline_psnr={base} refined_psnr={ref}")
+    return 0
+
+
+def _cmd_hybrid_c_eval(args: argparse.Namespace) -> int:
+    metrics = evaluate_hybrid_c_checkpoint(args.checkpoint, images=args.images, device=args.device)
+    print(f"JSON:{json.dumps({k: v for k, v in metrics.items() if k != 'names'})}")
     return 0
 
 
@@ -508,6 +533,22 @@ def build_parser() -> argparse.ArgumentParser:
     ev.add_argument("--images", nargs="*", default=None, help="image names to evaluate (default: held-out split)")
     ev.add_argument("--device", choices=["cpu", "mps"], default=None, help="override the checkpoint's device")
     ev.set_defaults(func=_cmd_eval)
+
+    hybrid_c = sub.add_parser("hybrid-c", help="Design C: render->photo U-Net refinement")
+    hybrid_c_sub = hybrid_c.add_subparsers(dest="hybrid_c_command", required=True)
+
+    hc_train = hybrid_c_sub.add_parser("train", help="train a HybridCConfig YAML config")
+    hc_train.add_argument("--config", required=True, help="path to a HybridCConfig YAML file")
+    hc_train.add_argument("--resume", default=None, help="checkpoint .pt path to resume from")
+    hc_train.add_argument("--max-minutes", type=float, default=None, help="wall-clock budget override")
+    hc_train.add_argument("--device", choices=["cpu", "mps"], default=None, help="override the config's device")
+    hc_train.set_defaults(func=_cmd_hybrid_c_train)
+
+    hc_eval = hybrid_c_sub.add_parser("eval", help="evaluate a hybrid-c checkpoint's held-out (or given) images")
+    hc_eval.add_argument("--checkpoint", required=True, help="checkpoint .pt path")
+    hc_eval.add_argument("--images", nargs="*", default=None, help="image names to evaluate (default: held-out split)")
+    hc_eval.add_argument("--device", choices=["cpu", "mps"], default=None, help="override the checkpoint's device")
+    hc_eval.set_defaults(func=_cmd_hybrid_c_eval)
 
     density = sub.add_parser("density", help="build a point source and print PointSet.summary()")
     density.add_argument("--source", choices=["gaussian", "colmap"], required=True)

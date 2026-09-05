@@ -1,0 +1,25 @@
+scene_root: /Users/nzbirdranch/Splats/scenes/karekare/kk-coherent
+renders_dir: output/hybrid-c/renders/w1008
+run_dir: output/runs/EXP-0005-hybrid-c/EXP-0005-hybrid-c_1
+width: 1008
+crop: 384
+channels: 4
+layers: 5
+epochs: 2000
+train_factor: 0.125
+heldout_k: 8
+forced_heldout:
+  - IMG_3828.jpg
+  - IMG_3829.jpg
+  - IMG_3830.jpg
+  - IMG_3831.jpg
+  - IMG_3832.jpg
+  - IMG_3833.jpg
+loss_l1: 1.0
+loss_ssim: 1.0
+loss_lpips: 1.0
+eval_lpips: true
+eval_every: 5
+checkpoint_every: 5
+seed: 0
+device: mps

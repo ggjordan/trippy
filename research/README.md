@@ -8,6 +8,7 @@ This is the experiment and milestone tracking index for the trippy project. Each
 | EXP-0001-forward-pyramid | v0.1.0 | planned | — | contact sheet: photo / ref / Metal / 5 pyramid levels |
 | EXP-0004-monodepth-points | v0.2.0 | done | inconclusive (coverage metric saturates) / signal found (scale-alignment) | `output/points/kk-coherent-monodepth-12.npz`; sheet delivered as `EXP-0004-monodepth-shade-coverage` |
 | EXP-0002-horse-parity | v0.1.0 | done 2026-09-06 | **PASS** — 22.27 dB vs the authors' own 22.34 dB (0.07 dB gap); 37.0 dB against their render | `output/EXP-0002-horse-parity/summary_sheet.png`, delivered as `Jordan-Review/4-other/EXP-0002-horse-parity.png` |
+| EXP-0005-hybrid-c | v0.3.0 | done | learned renderer improves non-shade PSNR/SSIM/LPIPS (+0.45 dB / +0.051 / -0.018) but *worsens* shade PSNR by ~2 dB (14.94 -> 12.97 dB) despite small SSIM/LPIPS gains there; aggregate PSNR flat | `output/runs/EXP-0005-hybrid-c/EXP-0005-hybrid-c_1/`; sheet delivered as `EXP-0005-hybrid-c-refine` |
 
 ## Parked ideas (never culled for effort)
 

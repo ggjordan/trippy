@@ -649,6 +649,50 @@ TRAIN_LPIPS_METRIC_NET = "vgg"
 # all-zero synthetic test image) producing +inf.
 TRAIN_PSNR_EPS = 1e-10
 
+# --- hybrid/ : Design C, render->photo U-Net refinement (docs/PLAN-2026-09-05.md
+# "Hybrid (v0.3): (C) render->photo U-Net refinement on gsrender.py outputs first (cheap,
+# validates net/losses)"; docs/EXPERIMENTS.md "Training runs" for the sibling point-based
+# trainer this one deliberately does NOT reuse (Trainer is point-based; render_splat_views
+# + this section's constants back trippy.hybrid's own small image->image trainer instead) ---
+
+# ~/Splats/tools/gsrender.py's own `max_hw` kwarg defaults to 32, which corrupts near-camera
+# Gaussian footprints (Splats' PROJECT.md note, also cited in this task's brief); every
+# trippy.hybrid.render_splat_views call overrides it with this value.
+HYBRID_C_GSRENDER_MAX_HW = 400
+
+# gsrender.render()'s own opacity-cutoff default (min_opacity kwarg), used unscaled here so
+# trippy.hybrid.render_splat_views reproduces "the existing best Gaussian splat" render
+# faithfully rather than silently re-filtering it a second time.
+HYBRID_C_GSRENDER_MIN_OPACITY = 0.02
+
+# Subdirectory name (under output/hybrid-c/renders/) rendered rgb/depth/alpha triples are
+# written under, keyed by the dataset width so multiple resolutions never collide on disk.
+HYBRID_C_RENDER_SUBDIR_FMT = "w{width}"
+
+# Default render feature-channel count fed to the U-Net: rgb (3) + alpha (1) -- matches
+# NET_DEFAULT_NUM_INPUT_CHANNELS/TRAIN_DEFAULT_FEATURE_CHANNELS exactly, so the same
+# NetworkConfig applies unchanged to this design (task brief: "make channels configurable,
+# default 4 so the same net config as TRIPS applies").
+HYBRID_C_DEFAULT_CHANNELS = 4
+
+# Channel count when depth is included as an optional 5th input channel (rgb + alpha + depth).
+HYBRID_C_CHANNELS_WITH_DEPTH = 5
+
+# Rough normalisation divisor for the optional depth channel: gsrender's depth output is
+# alpha-weighted expected camera-space z in COLMAP/world metres (see gsrender.py docstring);
+# dividing by this constant keeps typical kk-coherent depths (a handful to a few dozen world
+# units) in an order-1 range before concatenation with the [0, 1] rgb/alpha channels. This is
+# a coarse heuristic for this "cheap side-experiment" (docs/PLAN-2026-09-05.md), not a
+# per-scene calibrated fit -- unlike, say, MonoDepthSource's median-ratio scale alignment.
+HYBRID_C_DEPTH_NORM_SCALE = 20.0
+
+# Number of held-out frames written to the honesty sheet / delivered as standalone PNGs.
+# Mirrors TRAIN_EVAL_MAX_SHEET_IMAGES's "up to 6" convention as its own constant (rather than
+# importing it) so trippy/hybrid never depends on trippy/train/trainer.py internals -- the two
+# trainers are deliberately independent per this task's brief ("write a small separate
+# trainer for image->image").
+HYBRID_C_EVAL_MAX_SHEET_IMAGES = 6
+
 # --- train/checkpoint_io.py, trainer.py : on-disk run layout ---
 # docs/EXPERIMENTS.md "Run location": output/runs/<exp>/<run>/{...}.
 TRAIN_CHECKPOINT_DIRNAME = "checkpoints"
