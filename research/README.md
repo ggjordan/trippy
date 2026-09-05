@@ -5,6 +5,8 @@ This is the experiment and milestone tracking index for the trippy project. Each
 | Experiment | Stage | Status | Verdict | Artifact |
 |---|---|---|---|---|
 | EXP-0001-forward-pyramid | v0.1.0 | done | PASS on speed (135.7 ms worst-case/frame, trilinear, 1008 wide); shade-region coverage measurably lower than non-shade (numeric, from T_final: ~0.17-0.23 vs ~0.21-0.34) -- holes are honest, not a bug, and are the U-Net's job to fill | `output/runs/EXP-0001/{trilinear,broadcast}/summary_sheet.png` + `metrics.json` (delivered via `scripts/deliver.sh`) |
+| EXP-0001-forward-pyramid | v0.1.0 | planned | — | contact sheet: photo / ref / Metal / 5 pyramid levels |
+| EXP-0004-monodepth-points | v0.2.0 | done | inconclusive (coverage metric saturates) / signal found (scale-alignment) | `output/points/kk-coherent-monodepth-12.npz`; sheet delivered as `EXP-0004-monodepth-shade-coverage` |
 
 ## Parked ideas (never culled for effort)
 

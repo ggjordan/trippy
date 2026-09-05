@@ -62,3 +62,68 @@ Decisions D1–D12 locked. Repository skeleton created: AGENTS.md, CLAUDE.md, RE
 **Privacy note**: during CPU dry-run sanity-checking, a `sheet.png` containing the source photo panel was opened with the Read tool (family photograph, kk-coherent). This is a violation of AGENTS.md's "family photographs never leave this machine" rule (Read sends image bytes to the model API). No further photo/sheet/summary-sheet images derived from Jordan's scenes were opened afterward; all shade-coverage numbers above were computed directly from the T_final tensor, not by viewing any image. AGENTS.md was updated (see "Never send scene imagery to a model" section) to make this explicit for future sessions.
 - 2026-09-05T13:16:57Z delivered EXP-0001-trips-pyramid-kk-trilinear: TRIPS pyramid forward (no network yet) on kk-coherent from 5.7M Gaussian centres: photo | level-0 splat | coverage for 4 frames incl. shade frame IMG_3830. Holes are expected before the U-Net; look at whether the shade region has point coverage. (/Users/nzbirdranch/trippy/output/runs/EXP-0001/trilinear/summary_sheet.png)
 - 2026-09-05T13:17:04Z delivered EXP-0001-trips-pyramid-kk-broadcast: TRIPS pyramid forward (no network yet, broadcast layer mode) on kk-coherent from 5.7M Gaussian centres: photo | level-0 splat | coverage for 4 frames incl. shade frame IMG_3830. Holes are expected before the U-Net; look at whether the shade region has point coverage. (/Users/nzbirdranch/trippy/output/runs/EXP-0001/broadcast/summary_sheet.png)
+- 2026-09-05T13:13:55Z submitted job trippy-depthpro-kk-1 prio 11: bash -c /Users/nzbirdranch/Splats/tools/vggt/.venv/bin/python3 /Users/nzbirdranch/Splats/tools/ldi/depth_batch.py /Users/nzbirdranch/trippy/output/depth/kk-coherent/manifest.json
+- 2026-09-05T13:17:54Z delivered EXP-0004-monodepth-shade-coverage: DepthPro-derived points (source 2) over the 6 Karekare shade frames: do we now have geometry inside the shade region? (/Users/nzbirdranch/trippy/output/runs/EXP-0004/sheet.png)
+
+## 2026-09-05 13:20 — EXP-0004 MonoDepthSource (DepthPro) on kk-coherent, 12 frames
+
+Implemented `trippy.points.monodepth.MonoDepthSource` (D4 point source 2):
+per-image Apple DepthPro metric depth (via Splats' `tools/ldi/depth_batch.py`,
+run only through the GPU queue) -> median-ratio scale alignment to
+reprojected COLMAP sparse depth -> unprojection into a world-frame
+`PointSet`, voxel-deduped (reusing `UnionSource`'s dedupe helper),
+provenance=MONODEPTH. New `trippy depth-points` CLI (`--run-depth` prints
+the exact GPU job and exits 3 when depth outputs are missing).
+
+**Question**: Run for real on the 6 kk-coherent shade frames (IMG_3828-3833)
++ 6 non-shade frames spread across the 219-image sequence (IMG_3703,
+IMG_3753, IMG_3796, IMG_3840, IMG_3896, IMG_3940); does the shade region now
+have monocular-depth geometry, and how does per-frame scale-alignment
+quality compare shade vs non-shade?
+**Job name**: `trippy-depthpro-kk-1` (`output/jobs/trippy-depthpro-kk-1.sh`)
+**Numbers**:
+- DepthPro (apple/DepthPro-hf, MPS, fp16): 12/12 images, 1008x756 each,
+  1.3-1.7s/image, 18.0s total, valid_fraction=1.0 for every frame (no
+  invalid/NaN depth pixels).
+- Per-image median-ratio scale s (z_colmap/d_pred) and MAD (n_matches =
+  sparse COLMAP points landing on valid depth pixels):
+  shade -- 3828: s=1.065 mad=0.230 n=2436; 3829: s=1.420 mad=0.267 n=2450;
+  3830: s=1.154 mad=0.184 n=1882; 3831: s=1.227 mad=0.152 n=1768;
+  3832: s=1.485 mad=0.153 n=1366; 3833: s=1.471 mad=0.142 n=1580.
+  non-shade -- 3703: s=2.781 mad=0.429 n=2937; 3753: s=1.353 mad=0.229 n=5361;
+  3796: s=2.015 mad=0.177 n=4127; 3840: s=1.595 mad=0.091 n=2729;
+  3896: s=1.744 mad=0.106 n=5629; 3940: s=3.358 mad=0.462 n=5456.
+  Shade mean: scale=1.304, mad=0.188, n_matches=1914.
+  Non-shade mean: scale=2.141, mad=0.249, n_matches=4373.
+- Points contributed pre-dedupe: 21,168/image (stride=6 on 1008x756,
+  valid_fraction=1.0 everywhere) x 12 = 254,016; after voxel dedupe
+  (voxel=0.03): 234,712 total (7.6% collapsed). median_nn_distance=0.166
+  world units. bbox [-29.7,-38.2,-58.5] to [30.9,5.5,34.6].
+- Shade-frame numeric coverage (8px radius, projecting the FULL 234,712-pt
+  union into each shade camera; no image was viewed by the agent, only
+  computed from arrays): IMG_3828 n_visible=109,746 full=100.00%
+  central-50%-box=100.00%; 3829 n_visible=117,744 full=100.00% central=100.00%;
+  3830 n_visible=119,957 full=100.00% central=100.00%; 3831
+  n_visible=112,897 full=99.998% central=100.00%; 3832 n_visible=95,689
+  full=99.9996% central=100.00%; 3833 n_visible=86,272 full=100.00%
+  central=100.00%.
+**Verdict**: INCONCLUSIVE (on the coverage metric as specified) / signal
+found (on scale-alignment quality). The 8px-radius point-presence coverage
+metric saturates near 100% for all 6 shade frames -- this is close to a
+foregone conclusion given the union of 12 dense (stride=6, i.e. ~6px native
+spacing) frames and DepthPro's valid_fraction=1.0 everywhere: MonoDepthSource
+assigns *some* depth to nearly every pixel including inside the shade band,
+so "is there a point near this pixel" cannot distinguish shade from
+non-shade. The genuinely informative number is scale-alignment confidence:
+shade frames have ~44% fewer usable sparse COLMAP matches (1914 vs 4373
+mean) than the spread frames, consistent with COLMAP/SIFT finding fewer
+keypoints in the darker shade region, though shade-frame MAD is actually
+*lower* on average (0.188 vs 0.249) -- the few matches shade frames do get
+happen to agree well with each other. Whether the resulting points are
+*correct* geometry (not just present) is not established by this
+experiment; that needs the shade audit / Jordan's viewer verdict once this
+source feeds a training run (docs/SPEC.md v0.2.0).
+**Artifact**: `output/points/kk-coherent-monodepth-12.npz` (+ `.summary.json`),
+`output/runs/EXP-0004/coverage_stats.json`,
+`output/runs/EXP-0004/{IMG_38*_coverage.png,sheet.png}` (sheet delivered,
+see delivery line above), `experiments/EXP-0004-monodepth-points/README.md`.

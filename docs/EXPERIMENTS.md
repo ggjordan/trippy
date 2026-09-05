@@ -244,6 +244,57 @@ honesty sheet" spirit, applied per pyramid level. Given `--out <dir>` and
 view-frustum cull (`trippy.raster.cull_points`) -- candidates handed to
 fragment emission, not the (more expensive) count of points that actually
 survived the per-pixel fragment cap/transmittance cutoff inside compositing.
+## Monocular depth points
+
+`trippy.points.monodepth.MonoDepthSource` is D4 point source 2: per-image
+Apple DepthPro metric depth (via Splats' `tools/ldi/depth_batch.py`, run
+only through `scripts/gpu_submit.sh`) -> median-ratio scale alignment
+against reprojected COLMAP sparse depth -> unprojection to a world-frame
+`PointSet`, voxel-deduped, `provenance=MONODEPTH`. `trippy.points.depth_io`
+builds depth_batch.py's manifest and parses its `<id>_depth.npy` /
+`_mask.npy` / `_meta.json` outputs; it also reimplements
+`trippy.scene.dataset.SceneDataset`'s undistortion+cache step for an
+arbitrary curated image subset (SceneDataset's own constructor only
+supports a `limit`-first-N-sorted-images slice, which would force
+undistorting most of a scene just to reach frames near the end of it).
+
+Resolution/EXIF choice: DepthPro is always run on the same undistorted
+pinhole image `SceneDataset`'s cache would produce (never the original
+distorted capture), so DepthPro's pixel grid and the scale-alignment /
+unprojection math share one `K` -- no separate "undistort these keypoints"
+step is needed. EXIF orientation is left untouched, matching both
+`SceneDataset` and `depth_batch.py`'s own documented convention for these
+photo folders.
+
+```bash
+# Print the exact GPU job to run (writes the manifest + undistorted PNG
+# inputs as a side effect; exits 3 while depth outputs are missing):
+trippy depth-points --scene ~/Splats/scenes/karekare/kk-coherent \
+  --images IMG_3828.jpg,IMG_3829.jpg,... --width 1008 \
+  --depth-dir output/depth/kk-coherent --run-depth
+
+# Then, after the printed scripts/gpu_submit.sh command has completed:
+trippy depth-points --scene ~/Splats/scenes/karekare/kk-coherent \
+  --images IMG_3828.jpg,IMG_3829.jpg,... --width 1008 \
+  --depth-dir output/depth/kk-coherent --out output/points/kk-coherent-monodepth-12.npz
+```
+
+One-shot numbers on kk-coherent, 12 frames (6 shade + 6 spread across the
+219-image sequence), `width=1008`, `stride=6`, `voxel=0.03` -- see
+`research/trips-metal.md`'s 2026-09-05 13:20 entry and
+`experiments/EXP-0004-monodepth-points/README.md` for the full breakdown:
+234,712 points after dedupe (from 254,016 raw), median nn-distance 0.166.
+Shade frames (IMG_3828-3833) average 1,914 usable sparse-COLMAP matches for
+scale alignment vs 4,373 for the spread frames -- fewer keypoints in the
+darker region, as expected -- but a *lower* mean MAD (0.188 vs 0.249),
+i.e. the few matches shade frames get agree well with each other. An
+8px-radius point-presence coverage check (projecting the full 12-frame
+union into each shade camera) comes back ~100% for every shade frame both
+over the whole image and a central 50% box -- this mostly reflects
+DepthPro's `valid_fraction=1.0` and stride-6 density (a point lands near
+almost every pixel by construction) rather than confirming the depth
+values themselves are *correct* there; that needs the shade audit /
+Jordan's viewer verdict once this source feeds a training run.
 
 `trippy.render.sheets` (`contact_sheet`, `side_by_side`, `colorize`,
 `save_png`) and `trippy.render.video` (`write_video`, `frames_from_dir`)

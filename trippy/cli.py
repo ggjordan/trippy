@@ -33,13 +33,19 @@ from trippy.constants import (
     DEFAULT_DENSITY_COLMAP_SPARSE_DIR,
     DEFAULT_DENSITY_GAUSSIAN_PLY,
     DEFAULT_MIN_OPACITY,
+    DEPTH_POINTS_MISSING_DEPTH_EXIT_CODE,
     GIT_DESCRIBE_MATCH_PATTERN,
+    MONODEPTH_DEFAULT_CONF0,
+    MONODEPTH_DEFAULT_STRIDE,
+    MONODEPTH_DEFAULT_VOXEL,
     RASTER_NUM_LAYERS,
     RENDER_CACHE_SUBDIR,
     SMOKE_MPS_TEST_TENSOR_LEN,
 )
+from trippy.points import depth_io
 from trippy.points.colmap_sparse import ColmapSparseSource
 from trippy.points.gaussian_ply import GaussianPlySource
+from trippy.points.monodepth import MonoDepthSource
 from trippy.points.source import PointSource
 from trippy.render import pyramid_render
 
@@ -179,6 +185,60 @@ def _cmd_render(args: argparse.Namespace) -> int:
         command=command,
     )
     print(f"JSON:{json.dumps({'num_frames': len(metrics['frames']), 'out': str(args.out)})}")
+def _cmd_depth_points(args: argparse.Namespace) -> int:
+    settings = load_settings()
+    scene_root = Path(args.scene)
+    image_names = [s.strip() for s in args.images.split(",") if s.strip()]
+    depth_dir = Path(args.depth_dir)
+    cache_root = Path(args.cache_dir) if args.cache_dir else settings.trippy_output / "cache"
+
+    if args.run_depth:
+        cache_dir = depth_io.undistort_and_cache(scene_root, image_names, args.width, cache_root)
+        manifest_path = depth_dir / "manifest.json"
+        depth_io.write_depthpro_manifest(cache_dir, image_names, depth_dir, manifest_path)
+
+        py_path, script_path = depth_io.resolve_depthpro_paths(settings.splats_root)
+        depthpro_cmd = depth_io.format_depthpro_command(py_path, script_path, manifest_path)
+        job_name = f"depthpro-{scene_root.name}"
+        print("Run the following to compute DepthPro depth maps (GPU queue):")
+        print(f"scripts/gpu_submit.sh --prio 11 --wait {job_name} -- bash -c {depthpro_cmd!r}")
+
+        missing = depth_io.depth_output_missing(depth_dir, [Path(n).stem for n in image_names])
+        if missing:
+            print(f"missing depth outputs for: {missing}")
+            return DEPTH_POINTS_MISSING_DEPTH_EXIT_CODE
+        print("all depth outputs already present; re-run without --run-depth to build the PointSet.")
+        return 0
+
+    source = MonoDepthSource(
+        scene_root,
+        image_names,
+        args.width,
+        depth_dir,
+        cache_root,
+        stride=args.stride,
+        voxel=args.voxel,
+        conf0=args.conf0,
+    )
+    point_set = source.build()
+    summary = point_set.summary()
+    describe = source.describe()
+
+    print(f"source: {describe}")
+    print(f"count: {summary['count']}")
+    print(f"bbox_min: {summary['bbox_min']}")
+    print(f"bbox_max: {summary['bbox_max']}")
+    print(f"median_nn_distance: {summary['median_nn_distance']}")
+    print(f"provenance_histogram: {summary['provenance_histogram']}")
+    print(f"JSON:{json.dumps({'summary': summary, 'describe': describe})}")
+
+    if args.out is not None:
+        out_path = Path(args.out)
+        point_set.save_npz(out_path)
+        summary_path = out_path.with_suffix(".summary.json")
+        summary_path.write_text(json.dumps({"summary": summary, "describe": describe}, indent=2))
+        print(f"wrote {out_path} and {summary_path}")
+
     return 0
 
 
@@ -223,6 +283,27 @@ def build_parser() -> argparse.ArgumentParser:
     density.add_argument("--max-points", type=int, default=None, help="gaussian source only")
     density.add_argument("--out", default=None, help="optional path to also write summary JSON")
     density.set_defaults(func=_cmd_density)
+
+    depth_points = sub.add_parser(
+        "depth-points", help="MonoDepthSource: build DepthPro-derived points, or print the GPU job to run first"
+    )
+    depth_points.add_argument("--scene", required=True, help="scene root (images/ + sparse/0 or sparse_txt)")
+    depth_points.add_argument("--images", required=True, help="comma-separated registered image filenames")
+    depth_points.add_argument("--width", type=int, required=True, help="undistorted pinhole image width")
+    depth_points.add_argument("--depth-dir", required=True, help="DepthPro output directory")
+    depth_points.add_argument("--out", default=None, help="optional path to write the PointSet .npz")
+    depth_points.add_argument("--stride", type=int, default=MONODEPTH_DEFAULT_STRIDE)
+    depth_points.add_argument("--voxel", type=float, default=MONODEPTH_DEFAULT_VOXEL)
+    depth_points.add_argument("--conf0", type=float, default=MONODEPTH_DEFAULT_CONF0)
+    depth_points.add_argument(
+        "--cache-dir", default=None, help="undistortion cache root (default: TRIPPY_OUTPUT/cache)"
+    )
+    depth_points.add_argument(
+        "--run-depth",
+        action="store_true",
+        help="prepare inputs + print the gpu_submit.sh DepthPro command instead of building the PointSet",
+    )
+    depth_points.set_defaults(func=_cmd_depth_points)
 
     return parser
 

@@ -399,3 +399,58 @@ RENDER_DEPTH_PERCENTILE_HIGH = 99.0
 # rendered image) so a shade-region coverage verdict never requires opening
 # a photo-derived image (AGENTS.md privacy rule).
 RENDER_CENTER_REGION_FRAC = 0.5
+# --- points/depth_io.py : Splats' DepthPro (depth_batch.py) integration ---
+# Source: ~/Splats/tools/ldi/depth_batch.py (READ ONLY -- never copied or
+# edited; trippy only shells out to it). Chosen over the alternative
+# ~/Splats/tools/va_depth/run_depthpro.py because depth_batch.py already
+# writes exactly the per-image <id>_depth.npy / <id>_mask.npy /
+# <id>_meta.json triple this module needs, driven by a plain JSON manifest
+# -- no extra per-scene glue script required. Verified working end to end
+# via the existing tools/ldi/jobs/run_depth_job.sh GPU-queue job (see
+# ~/Splats/tools/gpu_queue/logs/15-ldi-depth.log): ~1.5s/image on MPS,
+# apple/DepthPro-hf weights already in the local HF cache (HF_HUB_OFFLINE=1
+# set by depth_batch.py itself, so no network access).
+DEPTHPRO_VENV_PYTHON_REL = "tools/vggt/.venv/bin/python3"  # relative to SPLATS_ROOT
+DEPTHPRO_SCRIPT_REL = "tools/ldi/depth_batch.py"  # relative to SPLATS_ROOT
+
+# depth_batch.py's fixed output filename suffixes (per its own module
+# docstring) -- one instance of each per manifest record "id".
+DEPTHPRO_DEPTH_SUFFIX = "_depth.npy"
+DEPTHPRO_MASK_SUFFIX = "_mask.npy"
+DEPTHPRO_META_SUFFIX = "_meta.json"
+
+# --- points/monodepth.py ---
+
+# Every stride-th valid depth pixel (in both row and column) is
+# backprojected, so point density scales as ~1/stride^2 -- the main
+# density/runtime knob for MonoDepthSource.
+MONODEPTH_DEFAULT_STRIDE = 6
+
+# World-unit voxel edge length for MonoDepthSource's own dedupe pass over
+# its (potentially heavily overlapping-by-frame) backprojected points.
+MONODEPTH_DEFAULT_VOXEL = 0.03
+
+# Fixed per-point confidence -- points3D.txt carries no per-point
+# uncertainty and DepthPro's output here carries no calibrated per-pixel
+# uncertainty channel either, so every backprojected point gets this fixed
+# value, same pattern as points.colmap_sparse.COLMAP_DEFAULT_CONF0 but
+# deliberately lower (0.35 vs 0.5): monocular depth is a noisier signal
+# than triangulated SfM points.
+MONODEPTH_DEFAULT_CONF0 = 0.35
+
+# Only "median_ratio" (median of per-point z_colmap / d_pred) is
+# implemented; kept as a named mode string (not a bare literal) so a
+# future alternative (e.g. a least-squares affine scale+shift fit) has an
+# obvious place to plug in -- see research/README.md parked ideas.
+MONODEPTH_SCALE_MODE_MEDIAN_RATIO = "median_ratio"
+
+# Minimum number of COLMAP sparse points landing on valid depth pixels
+# needed before an image's median-ratio scale is trusted; frames below
+# this are dropped from the union and reported (not silently) in
+# MonoDepthSource.describe()'s per-image stats.
+MONODEPTH_MIN_SCALE_MATCHES = 5
+
+# `trippy depth-points --run-depth` exit code: "depth outputs are missing,
+# go run the printed GPU job first" -- distinct from argparse's own exit(2)
+# for bad arguments and the normal exit(0) success path.
+DEPTH_POINTS_MISSING_DEPTH_EXIT_CODE = 3
