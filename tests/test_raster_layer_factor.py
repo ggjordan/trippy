@@ -107,14 +107,23 @@ def test_layer_below_lower_returns_one_matching_the_cpp_source() -> None:
     """`if (layer < layer_lower) return 1.f;` -- PointBlending.h:96-100.
 
     docs/TRIPS_REFERENCE.md section 3 says this branch returns 0; the C++
-    returns 1. It is inert either way: TRIPS's point-size emission kernel
-    `CollectTiled2Pointsize` writes only `layer_lower` and `layer_higher`
-    (RenderForward.cu:2296-2360), and so does trippy's "trilinear" mode --
-    neither ever asks for a layer below `lower`. The port matches the
+    returns 1. This was once believed inert -- `CollectTiled2Pointsize` and
+    trippy's "trilinear" mode both write only `layer_lower` and
+    `layer_higher` (RenderForward.cu:2296-2360), so neither ever asks for a
+    layer below `lower`. It is NOT inert in mode "trips", the rule every
+    published checkpoint renders with: that mode writes layers
+    `0 .. layer_higher`, so this branch is what paints every *finer* layer
+    at full alpha, and it is worth 0.8 dB on tt_horse
+    (experiments/EXP-0002-horse-parity/README.md). The port matches the
     source, not the doc.
     """
     assert _factor(4.0, 0) == pytest.approx(1.0, abs=TOL)
     assert _factor(100.0, 3) == pytest.approx(1.0, abs=TOL)
+    # The worked example from docs/GEOMETRY.md, all five layers at once.
+    size = torch.tensor([5.0], dtype=torch.float64)
+    assert [float(layer_factor(size, layer, 8)) for layer in range(5)] == pytest.approx(
+        [1.0, 1.0, 0.75, 0.25, 0.25]
+    )
 
 
 def test_torch_and_numpy_implementations_agree() -> None:

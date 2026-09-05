@@ -200,16 +200,17 @@ def test_broadcast_mode_writes_every_layer_with_factor_one():
     assert layers[2][0, 1, 2].item() == pytest.approx(0.25 * conf)  # bilinear at (2.5, 1.5)
 
 
-def test_trips_mode_stops_at_layer_higher():
+@pytest.mark.parametrize("engine", parity.PARITY_ENGINES)
+def test_trips_mode_stops_at_layer_higher(engine: str):
     """A sub-pixel point reaches layer 0 only; a 5px point reaches layers 0..3."""
     view = _view()
     small = _points_at(10.0, 6.0, 4.0, view, [1.0], 1.0, 0.0, [0.0])
-    _l, aux_small = parity.render_trips_layers(small, view, num_layers=4, mode="trips")
+    _l, aux_small = parity.render_trips_layers(small, view, num_layers=4, mode="trips", engine=engine)
     assert aux_small["points_active"] == [1, 0, 0, 0]
 
     # size_px = fx * size / z = 100 * 0.2 / 4 = 5 -> ceil(log2 5) = 3.
     big = _points_at(10.0, 6.0, 4.0, view, [1.0], 1.0, 0.2, [0.0])
-    _l2, aux_big = parity.render_trips_layers(big, view, num_layers=4, mode="trips")
+    _l2, aux_big = parity.render_trips_layers(big, view, num_layers=4, mode="trips", engine=engine)
     assert aux_big["points_active"] == [1, 1, 1, 1]
 
 
@@ -227,28 +228,33 @@ def test_trips_mode_layer_factors_match_compute_point_size_fac():
 
     conf = 0.9  # see test_broadcast_mode_writes_every_layer_with_factor_one
     points = _points_at(10.0, 6.0, 4.0, view, [1.0], conf, 0.2, [0.0])
-    layers, _ = parity.render_trips_layers(points, view, num_layers=4, mode="trips")
-    assert layers[0][0, 6, 10].item() == pytest.approx(conf, rel=1e-5)
-    # layer 2: bilinear weight 0.25 at (2.5, 1.5) x layer factor 0.75.
-    assert layers[2][0, 1, 2].item() == pytest.approx(0.75 * 0.25 * conf, rel=1e-5)
+    for engine in parity.PARITY_ENGINES:
+        layers, _ = parity.render_trips_layers(
+            points, view, num_layers=4, mode="trips", engine=engine
+        )
+        assert layers[0][0, 6, 10].item() == pytest.approx(conf, rel=1e-5), engine
+        # layer 2: bilinear weight 0.25 at (2.5, 1.5) x layer factor 0.75.
+        assert layers[2][0, 1, 2].item() == pytest.approx(0.75 * 0.25 * conf, rel=1e-5), engine
 
 
-def test_points_behind_or_outside_the_layer0_frame_are_dropped():
+@pytest.mark.parametrize("engine", parity.PARITY_ENGINES)
+def test_points_behind_or_outside_the_layer0_frame_are_dropped(engine: str):
     view = _view()
     behind = _points_at(10.0, 6.0, 4.0, view, [1.0], 1.0, 0.0, [0.0])
     behind.xyz[:, 2] = -4.0
-    _l, aux = parity.render_trips_layers(behind, view, num_layers=2, mode="trips")
+    _l, aux = parity.render_trips_layers(behind, view, num_layers=2, mode="trips", engine=engine)
     assert aux["points_active"] == [0, 0]
 
     outside = _points_at(100.0, 6.0, 4.0, view, [1.0], 1.0, 0.0, [0.0])
-    _l2, aux2 = parity.render_trips_layers(outside, view, num_layers=2, mode="trips")
+    _l2, aux2 = parity.render_trips_layers(outside, view, num_layers=2, mode="trips", engine=engine)
     assert aux2["points_active"] == [0, 0]
 
 
-def test_empty_layer_is_pure_background():
+@pytest.mark.parametrize("engine", parity.PARITY_ENGINES)
+def test_empty_layer_is_pure_background(engine: str):
     view = _view()
     points = _points_at(10.0, 6.0, 4.0, view, [0.5, 0.25], 1.0, 0.0, [0.75, 0.125])
-    layers, _ = parity.render_trips_layers(points, view, num_layers=3, mode="trips")
+    layers, _ = parity.render_trips_layers(points, view, num_layers=3, mode="trips", engine=engine)
     assert layers[2].shape == (2, 4, 6)
     assert torch.allclose(layers[2][0], torch.full((4, 6), 0.75))
     assert torch.allclose(layers[2][1], torch.full((4, 6), 0.125))
@@ -265,10 +271,104 @@ def test_render_modes_are_all_reachable():
     view = _view()
     points = _points_at(10.0, 6.0, 4.0, view, [1.0, 0.0, 0.0, 0.0], 0.9, 0.05, [0.0] * 4)
     for mode in parity.RENDER_MODES:
-        layers, _ = parity.render_trips_layers(points, view, num_layers=3, mode=mode)
-        assert len(layers) == 3
+        for engine in parity.PARITY_ENGINES:
+            layers, _ = parity.render_trips_layers(points, view, num_layers=3, mode=mode, engine=engine)
+            assert len(layers) == 3
     with pytest.raises(ValueError, match="mode must be one of"):
         parity.render_trips_layers(points, view, num_layers=3, mode="nope")
+    with pytest.raises(ValueError, match="engine must be one of"):
+        parity.render_trips_layers(points, view, num_layers=3, mode="trips", engine="nope")
+
+
+# --- native vs per-layer engine ------------------------------------------
+
+
+def _random_scene(num_points: int, num_channels: int, seed: int, view: AdopView) -> parity.ScenePoints:
+    """A synthetic cloud filling `view`'s frustum, with a spread of sizes.
+
+    Sizes are chosen so `size_px = fx * size / z` spans the sub-pixel branch,
+    the interpolating branch and the top-layer clamp of
+    `compute_point_size_fac`, and positions so the layer-0 gate and the
+    per-layer `break` both bite on some points.
+    """
+    generator = torch.Generator().manual_seed(seed)
+    depth = torch.rand(num_points, generator=generator) * 6.0 + 1.0
+    fx, fy = float(view.K[0, 0]), float(view.K[1, 1])
+    cx, cy = float(view.K[0, 2]), float(view.K[1, 2])
+    # Slightly wider than the frame, so points fall off every edge.
+    ip_x = torch.rand(num_points, generator=generator) * (view.width * 1.2) - 0.1 * view.width
+    ip_y = torch.rand(num_points, generator=generator) * (view.height * 1.2) - 0.1 * view.height
+    xyz = torch.stack(
+        [(ip_x - cx) / fx * depth, (ip_y - cy) / fy * depth, depth], dim=1
+    ).to(torch.float32)
+    return parity.ScenePoints(
+        xyz=xyz,
+        size=(torch.rand(num_points, generator=generator) * 0.4).to(torch.float32),
+        feat=(torch.randn(num_points, num_channels, generator=generator) * 20.0).to(torch.float32),
+        conf=torch.sigmoid(torch.randn(num_points, generator=generator) * 2.0).to(torch.float32),
+        bg=torch.randn(num_channels, generator=generator).to(torch.float32),
+    )
+
+
+def test_native_engine_reproduces_the_per_layer_engine():
+    """The gate this whole change has to pass, on a synthetic scene.
+
+    Both engines must select the same points on the same layers (identical
+    `points_active` and fragment counts -- a discrete quantity, so this is
+    exact or it is wrong) and composite to the same feature images. The
+    residual is float32 rounding: `perlayer` computes the layer coordinate
+    as `fl(ip/2**l + fl(cx/2**l + 0.5)) - 0.5` and `native` as
+    `fl(ip) * 2**l`, which differ by about one ulp of a ~10**3 coordinate.
+    """
+    view = _view(height=96, width=128, fx=180.0, fy=180.0, cx=64.0, cy=48.0)
+    points = _random_scene(4000, num_channels=4, seed=0, view=view)
+    report = parity.engine_agreement(points, view, num_layers=6)
+
+    assert report["num_fragments"]["native"] == report["num_fragments"]["perlayer"] > 0
+    assert report["points_active"]["native"] == report["points_active"]["perlayer"]
+    assert report["points_active"]["native"][0] > 0
+    for row in report["levels"]:
+        assert row["max_rel_diff"] < 1e-5, row
+        assert row["pixels_over_1e_3"] == 0, row
+
+
+def test_native_engine_uses_integer_pixel_centres_not_a_shifted_cx():
+    """Sec. 6a's "a single multi-layer call cannot" is now false, and why.
+
+    Feeding the multi-layer rasteriser TRIPS's `K` with `cx, cy + 0.5` and
+    trippy's default half-integer centres puts every layer above 0 in the
+    wrong place; `pixel_center="integer"` is the correction that works at
+    every layer at once. This test shows the naive shift really does differ,
+    so the option is not decoration.
+    """
+    from trippy.raster.pyramid import render_pyramid
+
+    view = _view(height=64, width=64, fx=120.0, fy=120.0, cx=32.0, cy=32.0)
+    points = _random_scene(500, num_channels=3, seed=1, view=view)
+    shapes = parity.trips_layer_shapes(view.height, view.width, 4)
+    K = torch.as_tensor(view.K, dtype=torch.float32)
+    K_shift = K.clone()
+    K_shift[0, 2] += 0.5
+    K_shift[1, 2] += 0.5
+    common = {
+        "num_layers": 4,
+        "mode": "trips",
+        "bg": points.bg,
+        "alpha_min": 0.0,
+        "pyramid_halving": "ceil",
+    }
+    eye = torch.eye(3, dtype=torch.float32)
+    zero = torch.zeros(3, dtype=torch.float32)
+    args = (points.xyz, points.size, points.feat, points.conf)
+
+    correct, _ = render_pyramid(*args, K, eye, zero, shapes[0], pixel_center="integer", **common)
+    naive, _ = render_pyramid(*args, K_shift, eye, zero, shapes[0], pixel_center="half", **common)
+    # Layer 0 agrees to float32 rounding -- the shift *is* the convention there.
+    assert float((correct[0] - naive[0]).abs().max()) < 1e-3
+    # Every coarser layer is off by a whole feature magnitude: the residual
+    # offset is 2**(l-1) layer-0 pixels, i.e. half a pixel of *that* layer.
+    for layer in range(1, 4):
+        assert float((correct[layer] - naive[layer]).abs().max()) > 1.0, layer
 
 
 # --- metrics -------------------------------------------------------------

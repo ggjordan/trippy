@@ -174,7 +174,7 @@ def _compare(label: str, scene: dict, **render_kwargs) -> float:
     return worst
 
 
-@pytest.mark.parametrize("mode", ["trilinear", "broadcast"])
+@pytest.mark.parametrize("mode", ["trilinear", "broadcast", "trips"])
 @pytest.mark.parametrize("num_channels", [3, 4])
 def test_metal_gradients_match_reference(mode: str, num_channels: int) -> None:
     """All five gradients on MPS must match the float64 reference to 1e-3."""
@@ -184,6 +184,25 @@ def test_metal_gradients_match_reference(mode: str, num_channels: int) -> None:
         scene,
         num_layers=scene["num_layers"],
         mode=mode,
+    )
+    assert worst < GRAD_REL_TOL
+
+
+@pytest.mark.parametrize("pixel_center", ["half", "integer"])
+def test_metal_gradients_match_reference_trips_pixel_conventions(pixel_center: str) -> None:
+    """Mode "trips" gradients on MPS, in both pixel-centre conventions.
+
+    Mode "trips" is the trainer default, so this is the gradient path every
+    training step now takes; `pixel_center="integer"` additionally covers the
+    setting `trippy.render.parity`'s native engine renders with.
+    """
+    scene = make_smooth_scene(num_channels=4)
+    worst = _compare(
+        f"smooth trips {pixel_center}",
+        scene,
+        num_layers=scene["num_layers"],
+        mode="trips",
+        pixel_center=pixel_center,
     )
     assert worst < GRAD_REL_TOL
 

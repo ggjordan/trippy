@@ -60,10 +60,12 @@ from trippy.constants import (
     MONODEPTH_DEFAULT_VOXEL,
     PARITY_DEFAULT_INDICES,
     PARITY_DEFAULT_NUM_LAYERS,
+    RASTER_MODES,
     RASTER_NUM_LAYERS,
     RENDER_CACHE_SUBDIR,
     SHADE_FRAMES_KK,
     SMOKE_MPS_TEST_TENSOR_LEN,
+    TRAIN_DEFAULT_MODE,
     TRAIN_EXPORT_FILENAME,
 )
 from trippy.eval.audits import audit_report
@@ -322,6 +324,8 @@ def _cmd_parity(args: argparse.Namespace) -> int:
         modes=tuple(args.modes.replace(",", " ").split()),
         max_points=args.max_points,
         reference_dir=args.reference_dir,
+        engine=args.engine,
+        compare_engines=args.compare_engines,
     )
     report = run_parity(config)
     print(json.dumps(report["means"], indent=2))
@@ -479,7 +483,12 @@ def build_parser() -> argparse.ArgumentParser:
     render.add_argument(
         "--frames", required=True, help="comma-separated image filenames, e.g. IMG_3830.jpg,IMG_3700.jpg"
     )
-    render.add_argument("--mode", choices=["trilinear", "broadcast"], default="trilinear")
+    render.add_argument(
+        "--mode",
+        choices=list(RASTER_MODES),
+        default=TRAIN_DEFAULT_MODE,
+        help="pyramid layer-selection rule (see docs/GEOMETRY.md); 'trips' is TRIPS's own",
+    )
     render.add_argument("--layers", type=int, default=RASTER_NUM_LAYERS)
     render.add_argument("--out", required=True, help="output directory")
     render.add_argument("--device", choices=["cpu", "mps"], default=None)
@@ -552,6 +561,20 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="random point subsample (CPU smoke runs only -- NOT a parity result)",
+    )
+    parity.add_argument(
+        "--engine",
+        choices=["native", "perlayer"],
+        default="native",
+        help=(
+            "mode 'trips' implementation: 'native' = one render_pyramid(mode='trips') call, "
+            "'perlayer' = a loop of num_layers=1 calls (the original harness)"
+        ),
+    )
+    parity.add_argument(
+        "--compare-engines",
+        action="store_true",
+        help="also render both trips engines and report the per-level difference",
     )
     parity.add_argument(
         "--reference-dir",

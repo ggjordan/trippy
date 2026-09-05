@@ -159,7 +159,7 @@ influence the output, so their derivative is zero.
 | `feat` (N, C) | yes | `index_add_` of `d_feat` onto point ids |
 | `conf` (N,) | yes | linear factor of `alpha` |
 | `xyz` (N, 3) | yes | `uv` (bilinear weight) and `z` (`size_px`) |
-| `size` (N,) | yes in `trilinear` mode; **`None` in `broadcast`** | the layer factor is 1 everywhere in broadcast, so size feeds nothing (docs/TRIPS_REFERENCE.md §10.1) |
+| `size` (N,) | yes in `trips` and `trilinear` mode; **`None` in `broadcast`** | the layer factor is 1 everywhere in broadcast, so size feeds nothing (docs/TRIPS_REFERENCE.md §10.1) |
 | `bg` (C,) | yes | `out += T_final · bg`, ordinary torch |
 | `pose_delta` (6,) | yes | `se3_exp(delta) @ [R\|t]`, left-multiplicative (`trippy.geom.xform_b.compose`); see docs/LIMITATIONS.md for the zero-initialisation trap |
 | `K` (intrinsics) | no | out of scope; TRIPS computes it, we treat `K` as constant |
@@ -174,18 +174,28 @@ all switches. `tests/test_raster_bwd_scenes.py` is therefore a hand-built
 fixture that sits ≥ 0.05 away from every one of those switches (≈ 5·10⁴
 gradcheck steps), not a random scene.
 
-## Fragment emission and the two layer-selection modes
+## Fragment emission: three layer-selection modes and two conventions
 
-`render_pyramid(..., mode=...)` picks how a point is spread over the pyramid. Both modes are implemented and tested; neither is "the" TRIPS behaviour on its own.
+`render_pyramid(..., mode=..., pixel_center=..., pyramid_halving=...)` decides how a point is spread over the pyramid. All three modes are ports of real TRIPS code paths (`trippy.constants.RASTER_MODES`); the full derivation, with the exact `compute_point_size_fac` formula and its `path:line` citations, is in **docs/GEOMETRY.md** "Pyramid level selection and the layer factor".
 
 | mode | layers written | layer factor | fragments per point | corresponds to |
 |---|---|---|---|---|
-| `"trilinear"` | `[lower, upper]` from `floor/ceil(log2(size_px))`, clamped to `[0, L-1]` | TRIPS's `compute_point_size_fac` (see docs/GEOMETRY.md) | ≤ 2 × 4 = **8** | TRIPS's `use_layer_point_size=true` path, whose emission kernel `CollectTiled2Pointsize` writes exactly those two layers (`RenderForward.cu:2296-2360`) |
-| `"broadcast"` | **every** layer | 1 everywhere | L × 4 = **20** at L=5 | TRIPS's shipped default (`use_layer_point_size=false`) |
+| **`"trips"` (default)** | `0 … layer_higher` inclusive, `layer_higher = clamp(ceil(log2 size_px), 0, L-1)` | TRIPS's `compute_point_size_fac`: **1.0** on every layer below `layer_lower`, then the two interpolation weights | ≤ L × 4 = **20** at L=5 | `CountAndCollectTiled` / `RenderFast16` (`RenderForward.cu:168-368`, `:3511-3517`), selected by `use_layer_point_size = !fix_point_size = true` (`Settings.cpp:39`) |
+| `"trilinear"` | `[lower, upper]` from `floor/ceil(log2(size_px))`, clamped to `[0, L-1]` | same factor | ≤ 2 × 4 = **8** | `CollectTiled2Pointsize` (`RenderForward.cu:2296-2360`), the `combine_lists = true` branch |
+| `"broadcast"` | **every** layer | 1 everywhere | L × 4 = **20** at L=5 | `use_layer_point_size = false` |
 
-The distinction matters and was previously misdocumented here (docs/TRIPS_REFERENCE.md §10.1). `use_layer_point_size` has no `SAIGA_PARAM` entry, so **no shipped TRIPS `.ini` can turn the trilinear path on**: every TRIPS checkpoint in the wild was trained in broadcast mode, with each point splatted into all five layers at full alpha and the layers fused only inside the U-Net. `"trilinear"` is the mode the *paper* describes and the one that makes the per-point size parameter do any work, so trippy implements both and defaults to `"trilinear"`.
+**`"trips"` is what every published TRIPS checkpoint actually renders with**, and it is trippy's training default (`trippy.constants.TRAIN_DEFAULT_MODE`). This corrects two earlier readings of the source recorded here and in docs/TRIPS_REFERENCE.md §10.1: `use_layer_point_size` has no `SAIGA_PARAM` entry, but it is *derived* from one (`!optimizer_params.fix_point_size`), and `fix_point_size = false` in every published `params.ini`. The three modes score **22.27 / 21.47 / 15.14 dB** on the same three held-out `tt_horse` frames from the authors' own checkpoint (`experiments/EXP-0002-horse-parity/README.md`), so the choice is worth 7 dB, not a detail.
 
-Sizing consequence: fragment buffers must be sized for `4 · L` fragments per point in broadcast mode, not `4 · 2` (docs/TRIPS_REFERENCE.md §11).
+`"trips"` also carries TRIPS's own footprint gate — all four corners must be in bounds, and failing it at layer `l` `break`s out of every coarser layer — which the other two modes do not (docs/GEOMETRY.md).
+
+Two orthogonal convention options, both defaulting to trippy's own behaviour:
+
+| option | values | default | when to change it |
+|---|---|---|---|
+| `pixel_center` | `"half"` (centre of pixel `i` at `i + 0.5`) / `"integer"` (at `i`) | `"half"` | `"integer"` only to reproduce a TRIPS checkpoint bit-for-bit. trippy's scenes are undistorted in the `"half"` convention, so training on `"integer"` would render half a pixel off its own ground truth. |
+| `pyramid_halving` | `"ceil"` / `"floor"` | `"ceil"` | `"ceil"` is TRIPS's own branch for every published network; `"floor"` is its `MultiScaleUnet2d` branch. |
+
+Sizing consequence: fragment buffers must be sized for `4 · L` fragments per point in `"trips"` and `"broadcast"` modes, not `4 · 2` (docs/TRIPS_REFERENCE.md §11).
 
 ## Core principle: No atomics anywhere — a deliberate redesign, not a port
 
@@ -266,11 +276,11 @@ CPU pytest (before any GPU job):
 
 1. **Transform agreement**: `xform_a` (numpy) vs `xform_b` (torch) produce identical projects; reprojection of COLMAP `points3D` matches stored keypoints (~1 px, depth positive).
 2. **Geometry** (`tests/test_raster_bounds.py`): no emitted fragment lands outside its own pyramid layer; a footprint straddling the border keeps only its in-bounds corners; a point a few pixels off screen still draws in the coarse layers (so the cull is conservative); odd-sized images keep their last row/column.
-3. **Reference pair** (`tests/test_raster_ref.py`): `ref_numpy` (numpy, xform_a, explicit per-point/per-layer/per-corner loops) vs `ref_torch` (torch float64, xform_b, vectorised segment prefix sums) agree to <1e-6 on a 32×32 scene containing a pixel stacked past the 16-fragment cap and points on every border, in both modes.
+3. **Reference pair** (`tests/test_raster_ref.py`, `tests/test_raster_trips_mode.py`): `ref_numpy` (numpy, xform_a, explicit per-point/per-layer/per-corner loops) vs `ref_torch` (torch float64, xform_b, vectorised segment prefix sums) agree to <1e-6 on a 32×32 scene containing a pixel stacked past the 16-fragment cap and points on every border, in all three modes and in both pixel-centre and both pyramid-halving conventions.
 4. **Sort equivalence** (`tests/test_raster_sort.py`): the composite int64 key and the two-stable-sort fallback produce identical permutations, including on depth ties; both segment-offset methods agree.
 5. **Metal kernel vs torch reference** (`tests/test_raster_metal.py`, marked `gpu`): 32×32 synthetic scene, float32 Metal vs float64 CPU, max abs diff <1e-4.
 6. **Gradcheck** (`tests/test_raster_bwd_ref.py`, CPU): `torch.autograd.gradcheck` in float64 on `ref_torch`, w.r.t. all five learnable inputs (`xyz`, `size`, `conf`, `feat`, `pose_delta`), individually and jointly, on the smooth fixture. Plus a line-for-line python transcription of `blend_bwd.metal` checked against autograd on the very function it differentiates — so the *formulas* are pinned without a GPU, and the GPU job only has to validate the *Metal translation*.
-7. **Metal backward vs reference** (`tests/test_raster_bwd_metal.py`, marked `gpu`): float32 MPS gradients vs float64 CPU gradients, relative error < 1e-3, in both layer modes at C=3 and C=4; a case where both forward stop rules fire (16-fragment cap *and* transmittance cutoff) with an exact `n_used` agreement check; a 256×192 / 50k-point / C=4 / L=5 timing case; and 20 feature-only SGD steps whose loss must fall monotonically (features enter linearly, so the objective is exactly quadratic and any increase is a wrong gradient).
+7. **Metal backward vs reference** (`tests/test_raster_bwd_metal.py`, marked `gpu`): float32 MPS gradients vs float64 CPU gradients, relative error < 1e-3, in all three layer modes at C=3 and C=4 (and in mode `"trips"` under both pixel-centre conventions); a case where both forward stop rules fire (16-fragment cap *and* transmittance cutoff) with an exact `n_used` agreement check; a 256×192 / 50k-point / C=4 / L=5 timing case; and 20 feature-only SGD steps whose loss must fall monotonically (features enter linearly, so the objective is exactly quadratic and any increase is a wrong gradient).
 8. **U-Net shape**: odd-size crops, verify autograd.
 
 If any test fails, training is not submitted.
@@ -355,7 +365,7 @@ change here, since nothing in `trainer.py` inspects which backward path is activ
   calls `trippy.scene.dataset.crop()` for the crop-adjusted intrinsics and validity mask, and hands that
   adjusted `K` straight to `render_pyramid` with `image_hw = (crop, crop)` -- only the crop's own fragments
   are ever rasterised. `tests/test_train_crop_equivalence.py` proves this equals cropping a full render of
-  the same points/pose to <1e-5 (float64 compute), for both pyramid modes. A soft AABB extent penalty (not
+  the same points/pose to <1e-5 (float64 compute), for every pyramid mode. A soft AABB extent penalty (not
   in TRIPS) keeps `xyz` near the point source's initial bounding box, guarding docs/SPEC.md's "extent
   inflation" risk. `evaluate()` renders full frames for the held-out split, reports PSNR/SSIM (always) and
   LPIPS (only if `cfg.eval_lpips`, gated so CPU tests never require a network-reachable VGG backbone unless

@@ -190,7 +190,6 @@ the SO(3) generator, magnitude 1). A pose delta initialised at exactly zero woul
 translation but never rotation. Pinned by
 `tests/test_raster_bwd_ref.py::test_pose_delta_rotation_gradient_vanishes_at_zero`; the fix belongs in
 `xform_b.se3_exp` (and needs the xform_a/xform_b agreement test re-run), not in the rasteriser.
-<<<<<<< Updated upstream
 - 2026-09-05T13:24:52Z submitted job trippy-adop-parity-1 prio 13: bash -c cd /Users/nzbirdranch/trippy/.worktrees/adop-parity && PYTHONPATH=. /Users/nzbirdranch/trippy/.venv/bin/python -m trippy.cli parity --scene /Users/nzbirdranch/trippy/third_party/zenodo/scenes/tnt_scenes/tt_horse --checkpoint /Users/nzbirdranch/trippy/third_party/zenodo/tt_checkpoints/checkpoint_horse --epoch ep0600 --indices 8,120,144 --render-scale 1 --modes trips,broadcast,trilinear --device mps --out /Users/nzbirdranch/trippy/output/EXP-0002-horse-parity
 - 2026-09-05T13:26:40Z delivered EXP-0002-horse-parity: Authors' TRIPS horse checkpoint rendered through trippy's Metal rasteriser + U-Net vs ground truth (PSNR in the sheet). This is the public Tanks&Temples scene, not family data. (/Users/nzbirdranch/trippy/.worktrees/adop-parity/output/EXP-0002-horse-parity/summary_sheet.png)
 
@@ -231,8 +230,78 @@ Per frame (trips): 25.099 / 21.979 / 19.716 dB against the authors' 25.186 / 22.
 
 **Artifact**: `output/EXP-0002-horse-parity/` (summary sheet delivered to Jordan-Review; per-frame contact
 sheets carry GT | authors' render | ours | abs-diff | raw level-0 honesty panel).
-=======
 - 2026-09-05T13:29:37Z submitted job trippy-train-smoke-1 prio 16: bash -c PYTHONPATH=. /Users/nzbirdranch/trippy/.venv/bin/python -m trippy.cli train --config experiments/EXP-0003-kk-trips-train/config_smoke.yaml --device mps --max-minutes 25
->>>>>>> Stashed changes
 - 2026-09-05T13:34:01Z delivered EXP-0002-horse-parity: Authors' public TRIPS horse checkpoint rendered through trippy (Metal rasteriser + U-Net) vs ground truth: 22.27 dB, authors' own render 22.34 dB. Public Tanks&Temples data, not family photos. (/Users/nzbirdranch/trippy/output/EXP-0002-horse-parity/summary_sheet.png)
 - 2026-09-05T13:53:15Z submitted job trippy-train-smoke-2 prio 16: bash -c PYTHONPATH=. /Users/nzbirdranch/trippy/.venv/bin/python -m trippy.cli train --config experiments/EXP-0003-kk-trips-train/config_smoke.yaml --device mps --max-minutes 25
+- 2026-09-05T14:25:59Z submitted job trippy-trips-mode-gpu-2 prio 12: bash /tmp/trips_mode_gpu2.sh
+
+---
+
+## 2026-09-06 — feat/trips-mode: TRIPS's real layer rule as a native rasteriser mode
+
+**Question**: `trippy/render/parity.py` reproduced the published TRIPS horse render (22.27 dB) with a
+hand-written harness — TRIPS's layer selection, `compute_point_size_fac` weights and `valid_point` break
+all lived in that script, driving one `render_pyramid(num_layers=1, mode="broadcast")` call per pyramid
+level. Nothing the trainer ran shared that code. Can the same rule live in `trippy.raster.emit` as a
+first-class mode, so a single multi-layer `render_pyramid` call reproduces it — and does it still score
+22.27 dB?
+
+**Jobs**: `trippy-trips-mode-gpu-1` (prio 12, **rc 0**) — GPU raster tests + both engines on tt_horse;
+`trippy-trips-mode-gpu-2` (prio 12, **rc 0**) — re-run of the per-level engine diff after fixing an
+MPS float64 bug in the diagnostic itself.
+
+**What was added**
+- `mode="trips"` in `emit.py` / `ref_numpy.py` / `ref_torch.py`: layers `0 .. layer_higher` with
+  `layer_higher = clamp(ceil(log2 s), 0, L-1)` (`RenderForward.cu:334-338`), weight
+  `compute_point_size_fac(s, layer, L)` (`PointBlending.h:81-149` — **1.0** for every layer below
+  `layer_lower`, then the two interpolation weights), plus TRIPS's `valid_point` gate (all four footprint
+  corners in bounds) and its `break` to coarser layers (`:340-352`).
+- `pixel_center="half"|"integer"` — where the centre of pixel `i` sits (`i + 0.5` = trippy, `i` = TRIPS).
+  Applied *after* the per-layer halving, which is the whole trick: `docs/TRIPS_REFERENCE.md` §6a claimed a
+  single multi-layer call could not reproduce TRIPS because a fixed `cx + 0.5` shift becomes
+  layer-dependent once you halve. It does — so don't apply it to `cx`.
+- `pyramid_halving="ceil"|"floor"` — `ceil` is TRIPS's own branch for every published checkpoint
+  (`PointRenderer.cu:385-391`), so this stops being "a deviation" and becomes an option.
+- `trippy parity --engine native|perlayer --compare-engines`; trainer default `mode: trips`.
+
+**Numbers** (tt_horse `checkpoint_horse` @ ep0600, frames 8/120/144, 16 px border crop):
+
+| engine | mean PSNR vs GT | mean PSNR vs authors' render | mean SSIM |
+|---|---:|---:|---:|
+| perlayer (the original harness) | 22.264609482 | 36.988644313 | 0.8001590768 |
+| **native** (one `render_pyramid(mode="trips")` call) | **22.264609495** | **36.988644385** | 0.8001590768 |
+| Δ | **1.3e-08 dB** | 7.2e-08 dB | 0 |
+
+Per frame the gap is at most 1.4e-07 dB. The acceptance bar was 0.05 dB. Ablations reproduced exactly:
+`trilinear` 21.474 dB, `broadcast` 15.141 dB, authors' own render 22.335 dB.
+
+The discrete check is the stronger one: the two engines select **identical fragments**. Total counts match
+to the unit (10,351,708 / 7,039,440 / 6,711,744) and so does the per-layer active-point vector on every
+frame (frame 8: `[1091740, 863924, 428288, 150457, 46140, 6217, 1001, 160]` from both). `layer_higher`,
+the factor branch, the four-corner gate and the `break` either agree or they do not, over 2.2 M points x 8
+layers x 3 frames. The image residual is one float32 ulp of the layer coordinate (~1.2e-4 px at layer 0):
+`perlayer` computes `fl(ip·2^-l + fl(cx·2^-l + 0.5)) - 0.5`, `native` computes `fl(ip)·2^-l`.
+
+Level images (the U-Net's input, before any network runs): worst relative disagreement anywhere in the
+8-level pyramid is **5.5e-05**, on layer 0, on 4 pixels out of 2 073 600; mean absolute disagreement
+**~1e-07** per level; levels 1-7 have zero pixels differing by more than 1e-3 (feature channels range
+about [-100, 100]). The layer-0 outliers are `floor()` flips — a coordinate within one float32 ulp of an
+integer picks a different base pixel — not a rule difference.
+
+**Verdict: PASS.** The trainer, `trippy render` and the parity harness now share one rasteriser, and that
+rasteriser is validated against a real TRIPS checkpoint. `mode: trips` is worth **+0.79 dB** over trippy's
+old `trilinear` default and **+7.12 dB** over `broadcast`.
+
+**Two things worth remembering**
+1. `x.to("cpu", torch.float64)` on an MPS tensor does **not** raise and does **not** fall back — it casts
+   on MPS, which has no float64, and returns reinterpreted bytes. Job 1's engine-diff table printed 1.5e10
+   maxima, NaNs and float64 denormals for feature layers whose real range is about [-100, 100]. The render
+   was correct; only the diagnostic reading it was wrong. Always `.cpu()` first, then `.to(torch.float64)`.
+2. `mode="trips"` evaluates `valid_point` against the image being rendered, so a training **crop**'s edge
+   is a real image edge and crop/full-frame equivalence holds only in the crop's interior (exact one pixel
+   in; a `2**l`-wide band at layer l on the rim). This is TRIPS's own behaviour — it trains on crops with
+   the same rule — but it is new for trippy and it is in `docs/LIMITATIONS.md`.
+
+**Artifacts**: `output/EXP-0002-horse-parity-trips-mode/{perlayer,native,native2}/` (metrics.json, README
+with the per-level engine-agreement table, per-frame contact sheets). Job logs:
+`$SPLATS_ROOT/tools/gpu_queue/logs/trippy-trips-mode-gpu-{1,2}.log`. Nothing under `output/` is committed.

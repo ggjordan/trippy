@@ -365,6 +365,35 @@ RASTER_ALPHA_MAX_EPS = 1e-12
 # we ship {3,4,8} (4 is the shipped TRIPS default).
 RASTER_SUPPORTED_CHANNELS = (3, 4, 8)
 
+# Layer-selection modes the rasteriser implements (trippy.raster.emit.EMIT_MODES).
+# "trips"     -- the rule the published TRIPS checkpoints actually render with:
+#                use_layer_point_size = !fix_point_size = true, so each point is
+#                written into layers 0..layer_higher and weighted by
+#                compute_point_size_fac (RenderForward.cu:334-352 + :3511-3517).
+# "trilinear" -- only the two layers the projected size straddles
+#                (CollectTiled2Pointsize, RenderForward.cu:2296-2360).
+# "broadcast" -- every layer with factor 1 (use_layer_point_size = false).
+# Defined here, and not in trippy.raster.emit, so that trippy.train.config can
+# validate a YAML `mode:` without importing torch.
+RASTER_MODES = ("trilinear", "broadcast", "trips")
+
+# Where the rasteriser puts the centre of pixel index i on the continuous
+# coordinate axis, i.e. where the 2x2 bilinear footprint is anchored.
+# "half"    -- centre at i + 0.5 (docs/GEOMETRY.md, trippy's own convention;
+#              base = floor(uv/2**l - 0.5)).
+# "integer" -- centre at i (TRIPS's `ip`, PointBlending.h:216-240;
+#              base = floor(ip/2**l)). Needed only to reproduce a TRIPS
+#              checkpoint bit-for-bit; trippy's own scenes use "half".
+RASTER_PIXEL_CENTERS = ("half", "integer")
+
+# How a pyramid layer's size is derived from the one below.
+# "ceil"  -- h_{l+1} = ceil(h_l / 2). TRIPS for every network_version except the
+#            literal "MultiScaleUnet2d", i.e. for every published checkpoint
+#            (PointRenderer.cu:385-391), and trippy's default.
+# "floor" -- h_{l+1} = h_l // 2, TRIPS's `MultiScaleUnet2d` branch; loses the
+#            last row/column of an odd-sized layer.
+RASTER_PYRAMID_HALVINGS = ("ceil", "floor")
+
 # Bits reserved for the depth part of the composite int64 sort key. A float32
 # depth's IEEE bit pattern is monotonically increasing for positive values, so
 # key = layer_pixel * 2**32 + depth_bits sorts by (layer, pixel, depth).
@@ -542,12 +571,19 @@ TRAIN_DEFAULT_LR_RESPONSE = 1e-4
 TRAIN_LR_DECAY_FACTOR = 0.85
 TRAIN_LR_DECAY_PATIENCE = 10
 
-# docs/ARCHITECTURE.md's pyramid mode default: "trilinear" is the mode the TRIPS *paper*
-# describes and the only mode that makes the per-point size parameter do any work; TRIPS's
-# own shipped default is "broadcast" (use_layer_point_size=false, see that doc's mode
-# table). trippy's trainer defaults to "trilinear" so the size parameter it trains actually
-# affects rendering.
-TRAIN_DEFAULT_MODE = "trilinear"
+# "trips" is the layer rule the published TRIPS checkpoints were trained and rendered with
+# (`use_layer_point_size = !fix_point_size = true`, Settings.cpp:39; docs/TRIPS_REFERENCE.md
+# Sec. 3a). Measured on three held-out tt_horse frames it beats trippy's older "trilinear"
+# reading by 0.8 dB and the "broadcast" reading by 7.1 dB
+# (experiments/EXP-0002-horse-parity/README.md), so it is the trainer default.
+TRAIN_DEFAULT_MODE = "trips"
+
+# Pixel-centre and pyramid-halving conventions the trainer renders with. trippy's own
+# scenes are undistorted with pixel centres at i + 0.5 (docs/GEOMETRY.md), so training
+# stays on "half"; "integer" exists only to reproduce a TRIPS checkpoint (see
+# RASTER_PIXEL_CENTERS). "ceil" is both trippy's and TRIPS's halving for this network.
+TRAIN_DEFAULT_PIXEL_CENTER = "half"
+TRAIN_DEFAULT_PYRAMID_HALVING = "ceil"
 
 # ini num_input_layers=num_layers=5 (matches NET_DEFAULT_NUM_LAYERS/RASTER_NUM_LAYERS).
 TRAIN_DEFAULT_LAYERS = 5
