@@ -4,8 +4,6 @@ All notable changes to trippy. Format: Keep a Changelog. Versions: semver tags `
 ## [Unreleased]
 
 ## [v0.2.0] - 2026-09-06
-
-## [0.2.0] - 2026-09-06
 Milestone numbering note: the plan tied v0.2.0 to the Karekare shade verdict and v0.4.0 to the Mac viewer. The viewer landed first (the long Karekare trainings are still queued behind Splats' jobs), so this release carries the viewer and the complete trainer; the shade verdict will be recorded in the release where it lands.
 ### Added
 - Native Mac TRIPS viewer `trips-viewer` (pyramid -> U-Net -> camera -> screen) on wgpu: horse scene at 1920x1080 exact 204 ms; f16 U-Net + 0.75 render scale 45 ms = 22 fps; screenshot parity 82.7 dB vs the reference path. Launcher delivered (ADR-0006).
