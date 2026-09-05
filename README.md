@@ -17,14 +17,14 @@ Quick start (5 lines):
 
 ## For humans
 
-**Status: early skeleton (v0.1.0 not yet reached).** See `STATE.md` for what exists today and `docs/SPEC.md` for the plan.
+**Status (2026-09-06): v0.2.0.** The PyTorch-on-MPS port reproduces the TRIPS authors' public horse checkpoint to 0.07 dB; the Rust port (Burn/CubeCL on wgpu) matches it at 115 dB and drives a native Mac viewer at 22 fps at 1080p; a browser build renders the point pyramid via WebGPU (network view not yet possible in-browser). Training on private scenes is in progress. See `STATE.md` for the live picture, `research/trips-metal.md` for every number, `docs/SPEC.md` for the plan.
 
 The plan: a PyTorch-on-MPS port of TRIPS with the trilinear rasteriser as inline Metal kernels
 (`torch.mps.compile_shader`), trained on real outdoor scenes, then hybridised with Gaussian splats and
 ported into a fork of [Brush](https://github.com/ArthurBrussee/brush) for a native Mac viewer and a WebGPU web viewer.
 Nobody human edits this code: LLM agents run the repo under the rules in `AGENTS.md`.
 
-### What will be here
+### What is here
 - The Python package `trippy/` (geometry, point sources, Metal rasteriser, U-Net, trainer, renderers).
 - CPU-only tests under `tests/` (under 60 s); MPS tests are marked `gpu` and run only inside GPU-queue jobs.
 - Docs and decision records under `docs/`; the running experiment log in `research/`.
