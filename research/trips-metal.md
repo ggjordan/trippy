@@ -1478,3 +1478,57 @@ final  halfnet_s75_final.png vs halfnet_s75.png:  inf dB   (byte-identical)
 `$SPLATS_ROOT/tools/gpu_queue/logs/trippy-web-unet-gpu-{1,2,3,4}.log`;
 `$TRIPPY_OUTPUT/web/verify-chrome-release/` (beacon + two PNGs, public horse
 scene, not committed); `$TRIPPY_OUTPUT/brush/viewer/web-unet/halfnet_s75_after.png`.
+- 2026-09-05T18:48:36Z submitted job trippy-distill-full1-broadcast prio 70: bash /Users/nzbirdranch/trippy/output/runs/EXP-0008-distill/full1-broadcast/brush_train_job.sh
+
+## 2026-09-06 06:47 — EXP-0008 design-B distillation: render stage complete, brush training queued
+Question: (continued from the 05:57 entry) does the render stage produce a correct
+Brush-trainable image set, and what do the baseline/TRIPS-export audit numbers say before
+Brush training even starts?
+Job: trippy-distill-render-full1-broadcast (prio 15) rc=0, ~06:44:07-06:47:17 (~3m10s for
+422 frames at 1008 wide, MPS) -- 219 anchor + 203 interpolated cameras, 15 pairs skipped by
+the honesty guard (all "different camera_id"; the jump-distance guard never triggered on
+this scene). 300,000/5,736,619 TRIPS-export points written to points3D.txt.
+Job: trippy-distill-full1-broadcast (prio 70, brush-cli --total-train-iters 6000 --sh-degree
+0 --max-resolution 1008) submitted, submit.sh rc=0, queued behind Splats' own jobs and every
+trippy training already in the queue -- rc pending.
+Numbers (baseline kkc_15000.ply vs this checkpoint's TRIPS export, `trippy distill --stage
+compare`): point count 7,364,913 vs 5,736,619; shade dark-mass fraction 19.9% vs 36.2%;
+extent radius p99 52.21 vs 40.02, max 133.35 vs 124.48.
+Verdict: PASS on the pipeline (render + audit stages ran correctly end to end on a real
+scene); the checkpoint being distilled already reads *worse* than its own Gaussian baseline
+on shade dark-mass (36.2% vs 19.9%, matching the pre-existing EXP-0003 review-queue finding
+in STATE.md) -- expected, since this run deliberately uses the known-weak full1-broadcast
+checkpoint as a pipeline proof, not a candidate. Brush-trained "distilled" column still
+pending.
+Artifact: output/runs/EXP-0008-distill/full1-broadcast/{trips_export.ply, images/,
+sparse_txt/, distill_report.json, brush_train_job.sh}; experiments/EXP-0008-distill/README.md.
+- 2026-09-05T22:27:11Z delivered EXP-0008-distill-full1-broadcast: trippy distill (design B) PIPELINE PROOF from a weak checkpoint (EXP-0003 full1-broadcast, 40 epochs, 14.42 dB held-out, already flagged as not having fixed the shade cloud): Brush-trained (6000 iters, sh-degree 0) on 422 TRIPS-network renders (219 training-camera + 203 near-path interpolated, 15 pairs skipped by the honesty guard). Shade dark-mass 37.0% (distilled) vs 36.2% (TRIPS export) vs 19.9% (Gaussian baseline) -- the input checkpoint scored worse than its own baseline before distillation, so this number is NOT evidence Design B fixes the shade cloud. Not a scene-quality candidate; proves the render->COLMAP->Brush->audit pipeline runs end to end. (/Users/nzbirdranch/trippy/output/runs/EXP-0008-distill/full1-broadcast/brush_out/distilled_6000.ply)
+
+## 2026-09-06 10:26 — EXP-0008 design-B distillation: Brush training complete, full audit table
+Question: (continued) does the Brush-trained "distilled" PLY complete the pipeline, and what
+does the full baseline/TRIPS-export/distilled audit comparison read?
+Job: trippy-distill-full1-broadcast (prio 70) rc=0. Landed ahead of the five pre-existing
+prio-70 trippy trainings (alphabetical tie-break within the priority band), behind two
+sfm jobs and one hunua training. Brush's own log: training loop 857s (14m17s) for 6000
+iterations; splat count grew from the ~5.7M TRIPS-export init to 5,995,586; held-out eval
+(Brush's own split of the rendered image set) PSNR 23.51->24.69 dB, SSIM 0.799->0.866 across
+iters 1000->6000.
+Numbers (baseline kkc_15000.ply / TRIPS export / distilled_6000.ply, `trippy distill --stage
+compare`): point count 7,364,913 / 5,736,619 / 5,995,586; shade dark-mass fraction 19.9% /
+36.2% / 37.0%; extent radius p99 52.21 / 40.02 / 39.65; extent radius max 133.35 / 124.48 /
+161.36.
+Verdict: PASS on the pipeline (render rc=0 3m10s -> Brush training rc=0 14m17s -> audit
+compare, no manual stitching); INCONCLUSIVE/negative on shade quality by design -- the input
+checkpoint (EXP-0003 full1-broadcast) already scored worse than its own Gaussian baseline on
+shade dark-mass before distillation started (36.2% vs 19.9%, the pre-existing EXP-0003
+review-queue finding), and the distilled PLY carries that defect through almost unchanged
+(37.0%). This is expected and not a Design-B failure: distillation cannot exceed the
+checkpoint it came from (docs/LIMITATIONS.md "Distillation (design B)"). Extent max grew
+past both other clouds (161.36, vs baseline 133.35) -- Brush's own densification has no
+extent-penalty analogue to trippy's; worth watching on a future run. Delivered:
+distilled_6000.ply, explicitly labelled a pipeline proof from a weak checkpoint, not a
+scene-quality candidate.
+Artifact: output/runs/EXP-0008-distill/full1-broadcast/brush_out/distilled_6000.ply
+(delivered, linked at ~/Splats/output/Jordan-Review/2-open-in-brush/
+EXP-0008-distill-full1-broadcast.ply); experiments/EXP-0008-distill/README.md (full results
++ the publish-path invocation, documented not run).
