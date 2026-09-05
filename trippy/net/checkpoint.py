@@ -45,11 +45,24 @@ docs/LIMITATIONS.md as unverified until tried against a real checkpoint).
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
+
+from trippy.constants import (
+    TRIPS_CKPT_SCENE_FILES,
+    TRIPS_CONFIDENCE_SIGMOID_SCALE,
+    TRIPS_INTRINSICS_ROW_LEN,
+    TRIPS_SE3_DOUBLES_PER_POSE,
+    TRIPS_SOFTPLUS_BETA,
+    TRIPS_SOFTPLUS_THRESHOLD,
+)
+
+if TYPE_CHECKING:  # pragma: no cover -- import cycle guard only
+    from trippy.net.camera_model import NeuralCamera
 
 
 @dataclass
@@ -221,3 +234,364 @@ def try_load_trips_network(path: str | Path, target: nn.Module | None = None) ->
         reason=None if ok else "not every target tensor found a shape match",
         tensor_shapes_found=tensor_shapes,
     )
+
+
+# ---------------------------------------------------------------------------
+# Scene-state checkpoints (points / texture / poses / camera)
+#
+# Everything below was added by feat/adop-parity (EXP-0002) once the public
+# Zenodo Tanks & Temples checkpoints were on disk, so every mapping here is
+# verified against a real file, not inferred. See docs/TRIPS_REFERENCE.md
+# Sec. 9b for the field-by-field table and docs/LIMITATIONS.md for what is
+# still unverified.
+#
+# Observed contents of checkpoint_horse/ep0600 (2,218,471 points, 151 frames):
+#   scene_tt_horse_points.pth   t_position [N,4]  t_point_size [N,1]
+#                               t_index [N,1] i32 t_original_color [N,4]
+#   scene_tt_horse_texture.pth  texture [C,N]     background_color [C]
+#                               confidence_value_of_point [1,N]
+#   scene_tt_horse_poses.pth    tangent_poses [M,6] f64  poses_se3 [M,8] f64
+#   scene_tt_horse_intrinsics.pth  intrinsics [num_cameras,13]
+#   scene_tt_horse_ex.pth       "0" [M,1,1,1]        (exposure)
+#   scene_tt_horse_wb.pth       "0" [M,3,1,1]        (white balance)
+#   scene_tt_horse_response.pth response [1,3,1,25]
+#   scene_tt_horse_vignette.pth vignette_params [3] vignette_center [1,2,1,1]
+#
+# NAMING TRAP: NeuralPointTextureImpl registers its *raw* parameters under the
+# names of the derived tensors (NeuralTexture.cpp:52-55):
+#     register_parameter("texture", texture_raw)
+#     register_parameter("background_color", background_color_raw)
+#     register_parameter("confidence_value_of_point", confidence_raw)
+# so the file's "confidence_value_of_point" is pre-sigmoid (the horse file
+# ranges [-0.42, 1.17], impossible for a sigmoid output) and its "texture" is
+# pre-abs (ranges [-107.6, 95.9]). Use `.confidence()` / `.texture()` below,
+# never the raw fields, when feeding the rasteriser.
+# ---------------------------------------------------------------------------
+
+
+def read_module_tensors(path: str | Path) -> dict[str, torch.Tensor]:
+    """Read every named tensor out of one libtorch module archive.
+
+    Thin wrapper over the same `torch.jit.load` -> `torch.load` ladder
+    `try_load_trips_network` uses (docs/TRIPS_REFERENCE.md Sec. 9a), but
+    returning a plain name -> tensor dict instead of a load report.
+
+    Args:
+        path: path to a `torch::save(nn::Module)` archive.
+
+    Returns:
+        Mapping of the C++ module's registered parameter/buffer names to
+        CPU tensors.
+
+    Raises:
+        FileNotFoundError: if `path` does not exist.
+        ValueError: if neither reader could extract any tensor.
+    """
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(path)
+    reader, tensors, error = _try_read(path)
+    if reader is None:
+        raise ValueError(f"could not read {path} as a torch module archive: {error}")
+    return dict(tensors)
+
+
+def trips_confidence(confidence_raw: torch.Tensor, narrowing: float = 0.0) -> torch.Tensor:
+    """Raw confidence parameter -> the alpha multiplier the rasteriser uses.
+
+    `sigmoid((10 + narrowing) * confidence_raw)`
+    (NeuralTexture.h:38-42; docs/TRIPS_REFERENCE.md Sec. 2). `narrowing`
+    is `sigmoid_narrowing_factor * epoch`, 0 in every shipped config.
+    """
+    return torch.sigmoid((TRIPS_CONFIDENCE_SIGMOID_SCALE + narrowing) * confidence_raw)
+
+
+def trips_point_size(point_size_raw: torch.Tensor) -> torch.Tensor:
+    """Raw point-size parameter -> world-unit size: `softplus(raw)`.
+
+    `_softplus(t_point_size)` with beta 1 / threshold 20
+    (RenderForward.cu:154, NeuralPointCloudCuda.cpp:19-24). It exactly
+    inverts the `inverse_softplus(0.5 * knn_radius)` initialisation.
+    """
+    return nn.functional.softplus(point_size_raw, beta=TRIPS_SOFTPLUS_BETA, threshold=TRIPS_SOFTPLUS_THRESHOLD)
+
+
+@dataclass
+class TripsPoints:
+    """`scene_<scene>_points.pth` = a `NeuralPointCloudCuda` module.
+
+    Attributes:
+        position: (N, 3) float32 world positions (`t_position[:, :3]`).
+        dropout_radius: (N,) float32 (`t_position[:, 3]`); only read when
+            `drop_out_points_by_radius` is on, which it is not in any
+            published config.
+        point_size_raw: (N,) float32 pre-softplus size; use
+            `trips_point_size()`.
+        index: (N,) int64 render-order-id -> texture-column map
+            (`t_index`). Identity in the published horse checkpoint.
+    """
+
+    position: torch.Tensor
+    dropout_radius: torch.Tensor
+    point_size_raw: torch.Tensor
+    index: torch.Tensor
+
+    def __len__(self) -> int:
+        return int(self.position.shape[0])
+
+    def size(self) -> torch.Tensor:
+        """(N,) world-unit point size, `softplus(point_size_raw)`."""
+        return trips_point_size(self.point_size_raw)
+
+
+@dataclass
+class TripsTexture:
+    """`scene_<scene>_texture.pth` = a `NeuralPointTexture` module.
+
+    Attributes:
+        texture_raw: (C, N) float32, pre-`abs()`.
+        background_color_raw: (C,) float32, pre-`abs()`.
+        confidence_raw: (N,) float32, pre-sigmoid.
+        non_subzero_texture: mirrors `pipeline_params.non_subzero_texture`.
+
+    CORRECTION to docs/TRIPS_REFERENCE.md Sec. 2 (see Sec. 2a): that section
+    says "the `abs` flag is `!non_subzero_texture` in the pipeline (config
+    `non_subzero_texture=false` -> texture is abs'd)". The call site passes
+    the flag **straight through**, not negated::
+
+        scene.texture->PrepareTexture(params->pipeline_params.non_subzero_texture);
+            -- third_party/TRIPS/src/lib/models/Pipeline.cpp:257
+               (same at data/NeuralScene.cpp:1292)
+
+    and `PrepareTexture(bool abs)` only takes `abs()` when its argument is
+    true (NeuralTexture.h:44-57). So with `non_subzero_texture = false` --
+    the value in every shipped config *and* in the published Tanks & Temples
+    checkpoints -- the texture and background colour are used **raw, with
+    their negative values intact**. Taking `abs()` roughly triples the
+    composited feature magnitude and blows the U-Net's output past the
+    response LUT's [0, 1] domain (measured on tt_horse: PSNR 8.5 dB with
+    `abs()`, ~26 dB without).
+    """
+
+    texture_raw: torch.Tensor
+    background_color_raw: torch.Tensor
+    confidence_raw: torch.Tensor
+    non_subzero_texture: bool = False
+
+    def texture(self) -> torch.Tensor:
+        """(N, C) per-point features, ready for `render_pyramid(feat=...)`."""
+        tex = torch.abs(self.texture_raw) if self.non_subzero_texture else self.texture_raw
+        return tex.transpose(0, 1).contiguous()
+
+    def background_color(self) -> torch.Tensor:
+        """(C,) background feature, composited as `t_final * bg`."""
+        bg = self.background_color_raw
+        return torch.abs(bg) if self.non_subzero_texture else bg
+
+    def confidence(self, narrowing: float = 0.0) -> torch.Tensor:
+        """(N,) post-sigmoid confidence, ready for `render_pyramid(conf=...)`."""
+        return trips_confidence(self.confidence_raw, narrowing)
+
+
+@dataclass
+class TripsCameraState:
+    """The four `NeuralCameraImpl::SaveCheckpoint` files, already unpacked.
+
+    Attributes:
+        exposure: (M,) float32 per-frame EV; applied as `x * 2**-exposure`.
+        white_balance: (M, 3) float32 per-frame gains.
+        response: (1, 3, 1, P) float32 LUT control points, or None.
+        vignette_params: (3,) float32 radial polynomial, or None.
+        vignette_center: (1, 2, 1, 1) float32 uv centre, or None.
+    """
+
+    exposure: torch.Tensor
+    white_balance: torch.Tensor
+    response: torch.Tensor | None
+    vignette_params: torch.Tensor | None
+    vignette_center: torch.Tensor | None
+
+
+@dataclass
+class TripsSceneCheckpoint:
+    """Everything an `ep<NNNN>/` directory holds about one scene.
+
+    Attributes:
+        epoch_dir: the directory it was read from.
+        scene_name: the `scene_<name>_*.pth` infix.
+        points, texture, camera: see the dataclasses above.
+        poses_w2c: (M, 7) float64 `[qx, qy, qz, qw, tx, ty, tz]`
+            **world-to-camera** (PoseModuleImpl stores
+            `frame.pose.inverse()`, NeuralStructure.cpp:20-33). Note the
+            xyzw quaternion order, matching the on-disk ADOP convention;
+            `trippy.scene.adop_io.quat_xyzw_to_wxyz` converts.
+        intrinsics: (num_cameras, 13) float32 `fx fy cx cy s` + 8
+            distortion coefficients, or None.
+    """
+
+    epoch_dir: Path
+    scene_name: str
+    points: TripsPoints
+    texture: TripsTexture
+    camera: TripsCameraState
+    poses_w2c: torch.Tensor | None
+    intrinsics: torch.Tensor | None
+
+    def num_frames(self) -> int:
+        return int(self.camera.exposure.shape[0])
+
+
+def _first_tensor(tensors: dict[str, torch.Tensor], *names: str) -> torch.Tensor | None:
+    for name in names:
+        if name in tensors:
+            return tensors[name]
+    return None
+
+
+def load_trips_scene_checkpoint(
+    epoch_dir: str | Path, scene_name: str, non_subzero_texture: bool = False
+) -> TripsSceneCheckpoint:
+    """Load the point cloud / texture / poses / camera state of one epoch dir.
+
+    Args:
+        epoch_dir: e.g. `checkpoint_horse/ep0600`.
+        scene_name: the infix in `scene_<name>_points.pth` (e.g. `tt_horse`;
+            it is `train_params.scene_names` in the checkpoint's params.ini).
+        non_subzero_texture: mirrors `pipeline_params.non_subzero_texture`;
+            see `TripsTexture` (the published checkpoints all use `false`).
+
+    Returns:
+        A `TripsSceneCheckpoint`.
+
+    Raises:
+        FileNotFoundError: if the points or texture file is missing (they
+            are only absent when the run set `reduced_check_point=true`,
+            which the published checkpoints do not).
+    """
+    epoch_dir = Path(epoch_dir)
+
+    def _path(kind: str) -> Path:
+        return epoch_dir / TRIPS_CKPT_SCENE_FILES[kind].format(scene=scene_name)
+
+    pt = read_module_tensors(_path("points"))
+    position4 = pt["t_position"]
+    points = TripsPoints(
+        position=position4[:, :3].contiguous().float(),
+        dropout_radius=position4[:, 3].contiguous().float(),
+        point_size_raw=pt["t_point_size"].reshape(-1).float(),
+        index=pt["t_index"].reshape(-1).long(),
+    )
+
+    tx = read_module_tensors(_path("texture"))
+    texture = TripsTexture(
+        texture_raw=tx["texture"].float(),
+        background_color_raw=tx["background_color"].reshape(-1).float(),
+        confidence_raw=tx["confidence_value_of_point"].reshape(-1).float(),
+        non_subzero_texture=non_subzero_texture,
+    )
+
+    exposure_t = read_module_tensors(_path("exposure"))
+    exposure = _first_tensor(exposure_t, "0", "exposures_values")
+    assert exposure is not None, f"no exposure tensor in {_path('exposure')}: {list(exposure_t)}"
+    wb_t = read_module_tensors(_path("white_balance"))
+    white_balance = _first_tensor(wb_t, "0", "white_balance_values")
+    assert white_balance is not None, f"no white-balance tensor in {_path('white_balance')}: {list(wb_t)}"
+
+    response = None
+    if _path("response").exists():
+        response = read_module_tensors(_path("response"))["response"].float()
+    vignette_params = vignette_center = None
+    if _path("vignette").exists():
+        vig = read_module_tensors(_path("vignette"))
+        vignette_params = vig["vignette_params"].reshape(-1).float()
+        vignette_center = vig["vignette_center"].reshape(1, 2, 1, 1).float()
+
+    camera = TripsCameraState(
+        exposure=exposure.reshape(-1).float(),
+        white_balance=white_balance.reshape(-1, 3).float(),
+        response=response,
+        vignette_params=vignette_params,
+        vignette_center=vignette_center,
+    )
+
+    poses_w2c = None
+    if _path("poses").exists():
+        poses = read_module_tensors(_path("poses"))
+        # [M, 8]: Sophus::SE3d = quaternion(x,y,z,w) + translation(x,y,z) + 1 pad double.
+        se3 = poses["poses_se3"].double()
+        assert se3.shape[1] == TRIPS_SE3_DOUBLES_PER_POSE, f"unexpected poses_se3 shape {tuple(se3.shape)}"
+        tangent = poses.get("tangent_poses")
+        if tangent is not None and float(tangent.abs().max()) != 0.0:
+            # ApplyTangent() folds the tangent into poses_se3 after every optimizer
+            # step (NeuralStructure.cpp:47-49), so a saved checkpoint should have a
+            # zero tangent. Warn rather than silently render the wrong pose.
+            print(
+                f"WARNING: {_path('poses')} has a non-zero tangent_poses "
+                f"(max |.| = {float(tangent.abs().max()):.3e}); poses_se3 may be stale."
+            )
+        poses_w2c = se3[:, :7].contiguous()
+
+    intrinsics = None
+    if _path("intrinsics").exists():
+        intrinsics = read_module_tensors(_path("intrinsics"))["intrinsics"].float()
+        assert intrinsics.shape[1] == TRIPS_INTRINSICS_ROW_LEN, (
+            f"unexpected intrinsics shape {tuple(intrinsics.shape)}"
+        )
+
+    return TripsSceneCheckpoint(
+        epoch_dir=epoch_dir,
+        scene_name=scene_name,
+        points=points,
+        texture=texture,
+        camera=camera,
+        poses_w2c=poses_w2c,
+        intrinsics=intrinsics,
+    )
+
+
+def build_neural_camera(
+    state: TripsCameraState, image_height: int, image_width: int, config: object | None = None
+) -> NeuralCamera:
+    """Instantiate a `trippy.net.camera_model.NeuralCamera` holding `state`.
+
+    The response LUT / vignette parameters are copied in directly (they are
+    the same tensors, same shapes, in both implementations -- see
+    docs/TRIPS_REFERENCE.md Sec. 6). Exposure and white balance are passed
+    as the module's *initial* values, which is exactly what they are: the
+    published checkpoints' trained values.
+
+    Args:
+        state: as returned by `load_trips_scene_checkpoint`.
+        image_height, image_width: render resolution, needed for the
+            vignette's aspect correction.
+        config: optional `NeuralCameraConfig` override.
+
+    Returns:
+        A `NeuralCamera` in `eval()` mode (which disables the response
+        curve's training-only "leak" extrapolation, matching TRIPS's own
+        eval path).
+    """
+    from trippy.net.camera_model import NeuralCamera, NeuralCameraConfig
+
+    cfg = config if config is not None else NeuralCameraConfig()
+    assert isinstance(cfg, NeuralCameraConfig)
+    if state.response is not None:
+        cfg = replace(cfg, response_params=int(state.response.shape[-1]))
+
+    camera = NeuralCamera(
+        image_height=image_height,
+        image_width=image_width,
+        num_frames=int(state.exposure.shape[0]),
+        config=cfg,
+        initial_exposure=state.exposure.clone(),
+        initial_white_balance=state.white_balance.clone(),
+    )
+    with torch.no_grad():
+        if camera.camera_response is not None and state.response is not None:
+            camera.camera_response.response.copy_(state.response)
+        if camera.vignette_net is not None and state.vignette_params is not None:
+            camera.vignette_net.vignette_params.copy_(state.vignette_params)
+            if state.vignette_center is not None:
+                camera.vignette_net.vignette_center.copy_(state.vignette_center)
+    camera.eval()
+    return camera

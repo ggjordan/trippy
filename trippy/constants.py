@@ -624,3 +624,115 @@ TRAIN_EVAL_DIRNAME_FMT = "eval_ep{epoch:04d}"
 TRAIN_EVAL_SHEET_FILENAME = "sheet.png"
 TRAIN_EVAL_METRICS_FILENAME = "metrics.json"
 TRAIN_EXPORT_FILENAME = "export.ply"
+# --- scene/adop_io.py : ADOP scene directory + Saiga containers ---
+# Sources: third_party/TRIPS/src/lib/data/SceneData.{h,cpp} and the public MIT
+# Saiga tree at https://github.com/darglein/saiga @ ee7a4e6b658 (External/saiga/
+# is an empty dir in the vendored TRIPS checkout, so the Saiga files below were
+# fetched over the network -- same authorization as net/gated.py's constants).
+
+# Magic word at the head of every Saiga `compress()` container, e.g.
+# point_cloud.bin (saiga/core/util/zlib.cpp:16 `magic_value`).
+ADOP_POINT_CLOUD_MAGIC = 0x006712956A9725DE
+
+# Saiga's compressed-container header: three little-endian size_t values
+# (magic, compressed_size, decompressed_size), zlib.cpp:15 `header_size`.
+ADOP_COMPRESSED_HEADER_BYTES = 24
+
+# Vertex arrays a Saiga UnifiedMesh dumps, in serialization order, with their
+# float width (saiga/core/model/UnifiedMesh.{h:44-48,cpp:508-528}). Every
+# std::vector<T> is written as a size_t count followed by packed elements.
+ADOP_UNIFIED_MESH_VERTEX_FIELDS = (
+    ("position", 3),
+    ("normal", 3),
+    ("color", 4),
+    ("texture_coordinates", 2),
+    ("data", 4),
+)
+
+# Saiga's lens model carries exactly 8 coefficients, stored as
+# `k1 k2 k3 k4 k5 k6 p1 p2` (saiga/vision/cameraModel/Distortion.h:20-45) --
+# NOT OpenCV's `k1 k2 p1 p2 k3 k4 k5 k6` order.
+ADOP_DISTORTION_COEFFS = 8
+
+# RenderParams::dist_cutoff (third_party/TRIPS/src/lib/data/Settings.h:61):
+# distortNormalizedPoint maps any point with r2 > dist_cutoff**2 to the
+# sentinel 1e5, which the caller turns into z = 0 (i.e. "cull this point"),
+# PointRendererHelper.h:244-249.
+ADOP_DIST_CUTOFF = 20.0
+
+# Sentinel distortNormalizedPoint writes when r2 exceeds max_r**2
+# (Distortion.h:166-170).
+ADOP_DISTORTION_SENTINEL = 100000.0
+
+# --- net/checkpoint.py : TRIPS scene-checkpoint parametrisation ---
+
+# NeuralPointTextureImpl::PrepareConfidence (models/NeuralTexture.h:38-42):
+# `confidence = sigmoid((10 + sigmoid_narrowing_factor * epoch) * confidence_raw)`.
+# The narrowing term is 0 in every shipped config and in the public Tanks &
+# Temples checkpoints (params.ini `sigmoid_narrowing_factor = 0`).
+TRIPS_CONFIDENCE_SIGMOID_SCALE = 10.0
+
+# A Sophus::SE3d occupies 8 doubles: quaternion (x, y, z, w) + translation
+# (x, y, z) + one padding double, and PoseModuleImpl stores the batch as an
+# [N, 8] float64 tensor (data/NeuralStructure.cpp:25-33). The stored pose is
+# `frame.pose.inverse()`, i.e. WORLD-TO-CAMERA.
+TRIPS_SE3_DOUBLES_PER_POSE = 8
+
+# Softplus parameters used for the point-size parametrisation
+# (rendering/NeuralPointCloudCuda.cpp:19-24, RenderForward.cu:154):
+# `size_world = softplus(t_point_size)` with beta = 1, threshold = 20.
+TRIPS_SOFTPLUS_BETA = 1.0
+TRIPS_SOFTPLUS_THRESHOLD = 20.0
+
+# Layout of IntrinsicsModule's `intrinsics` row: fx fy cx cy s followed by the
+# 8 distortion coefficients (data/NeuralStructure.cpp, SceneData.h:209-241).
+TRIPS_INTRINSICS_ROW_LEN = 13
+
+# Filenames inside an `ep<NNNN>/` checkpoint directory (Sec. 9 of
+# docs/TRIPS_REFERENCE.md); `{scene}` is the scene name from params.ini.
+TRIPS_CKPT_NETWORK_FILE = "render_net.pth"
+TRIPS_CKPT_SCENE_FILES = {
+    "points": "scene_{scene}_points.pth",
+    "texture": "scene_{scene}_texture.pth",
+    "poses": "scene_{scene}_poses.pth",
+    "intrinsics": "scene_{scene}_intrinsics.pth",
+    "exposure": "scene_{scene}_ex.pth",
+    "white_balance": "scene_{scene}_wb.pth",
+    "response": "scene_{scene}_response.pth",
+    "vignette": "scene_{scene}_vignette.pth",
+}
+
+# --- render/parity.py : TRIPS-faithful forward render ---
+
+# num_input_layers / num_layers in the public Tanks & Temples checkpoints'
+# own params.ini (docs/TRIPS_REFERENCE.md Sec. 5a) -- not the 5 of
+# configs/train_normalnet.ini.
+PARITY_DEFAULT_NUM_LAYERS = 8
+
+# TRIPS indexes its bilinear footprint straight off `ip` (the 2x2 corners are
+# floor(ip) and floor(ip)+1, PointBlending.h:216-240), i.e. pixel *centres*
+# sit at integer coordinates. trippy's rasteriser uses the corner-origin
+# convention where pixel i's centre is at i + 0.5 (docs/GEOMETRY.md), so the
+# intrinsics handed to render_pyramid get cx, cy shifted by this much.
+PARITY_PIXEL_CENTRE_OFFSET = 0.5
+
+# Peak signal value for PSNR: images are compared in [0, 1].
+PARITY_PSNR_MAX = 1.0
+
+# PSNR of a numerically identical pair is +inf; report this instead so the
+# metrics JSON stays valid JSON.
+PARITY_PSNR_CAP_DB = 99.0
+
+# Held-out (test) frame indices this experiment renders by default. The
+# checkpoint's own test split is `modulo` with train_factor 0.125, i.e.
+# indices 0, 8, 16, ... 144 (checkpoint_horse/test_indices_tt_horse.txt);
+# these three sample the start, middle and end of that split.
+PARITY_DEFAULT_INDICES = (8, 120, 144)
+
+# Border (pixels, each side) TRIPS blacks out in the test images it writes at
+# checkpoint time -- `train_mask_border = 16` in the published
+# checkpoint_horse/params.ini, and measured directly on
+# checkpoint_horse/ep0600/test/*.jpg (15-16 all-zero rows/columns per side on
+# every frame checked). Any PSNR against those files must exclude it, or the
+# authors' own render scores 15 dB against its own ground truth.
+PARITY_EVAL_BORDER_PX = 16

@@ -47,6 +47,8 @@ from trippy.constants import (
     MONODEPTH_DEFAULT_CONF0,
     MONODEPTH_DEFAULT_STRIDE,
     MONODEPTH_DEFAULT_VOXEL,
+    PARITY_DEFAULT_INDICES,
+    PARITY_DEFAULT_NUM_LAYERS,
     RASTER_NUM_LAYERS,
     RENDER_CACHE_SUBDIR,
     SMOKE_MPS_TEST_TENSOR_LEN,
@@ -274,6 +276,39 @@ def _cmd_depth_points(args: argparse.Namespace) -> int:
         summary_path.write_text(json.dumps({"summary": summary, "describe": describe}, indent=2))
         print(f"wrote {out_path} and {summary_path}")
 
+def _cmd_parity(args: argparse.Namespace) -> int:
+    """Render published TRIPS checkpoint views through trippy and score them."""
+    # Deferred import: pulls in torch/PIL/lpips and the whole raster stack, which
+    # `trippy smoke` and `trippy density` have no need for.
+    from trippy.render.parity import ParityConfig, run_parity
+
+    indices: tuple[int, ...] = ()
+    if args.indices:
+        indices = tuple(int(tok) for tok in args.indices.replace(",", " ").split())
+    images: tuple[str, ...] = ()
+    if args.images:
+        images = tuple(tok for tok in args.images.replace(",", " ").split() if tok)
+    if not indices and not images:
+        indices = tuple(PARITY_DEFAULT_INDICES)
+
+    config = ParityConfig(
+        scene_dir=args.scene,
+        checkpoint_dir=args.checkpoint,
+        epoch=args.epoch,
+        scene_name=args.scene_name,
+        out_dir=args.out,
+        device=pick_device(args.device).type,
+        indices=indices,
+        images=images,
+        num_layers=args.num_layers,
+        render_scale=args.render_scale,
+        modes=tuple(args.modes.replace(",", " ").split()),
+        max_points=args.max_points,
+        reference_dir=args.reference_dir,
+    )
+    report = run_parity(config)
+    print(json.dumps(report["means"], indent=2))
+    print(f"wrote {Path(config.out_dir) / 'summary_sheet.png'}")
     return 0
 
 
@@ -347,6 +382,37 @@ def build_parser() -> argparse.ArgumentParser:
         help="prepare inputs + print the gpu_submit.sh DepthPro command instead of building the PointSet",
     )
     depth_points.set_defaults(func=_cmd_depth_points)
+    parity = sub.add_parser(
+        "parity",
+        help="render published TRIPS checkpoint views through trippy and score them vs the photos",
+    )
+    parity.add_argument("--scene", required=True, help="ADOP scene directory (dataset.ini, poses.txt, ...)")
+    parity.add_argument("--checkpoint", required=True, help="checkpoint dir containing params.ini and ep<NNNN>/")
+    parity.add_argument("--epoch", default="ep0600", help="epoch subdirectory name")
+    parity.add_argument("--scene-name", default=None, help="override the scene_<name>_*.pth infix")
+    parity.add_argument("--indices", default=None, help="comma-separated 0-based image indices")
+    parity.add_argument("--images", default=None, help="comma-separated image filenames from images.txt")
+    parity.add_argument("--out", required=True, help="output directory (under output/, gitignored)")
+    parity.add_argument("--device", choices=["cpu", "mps"], default=None)
+    parity.add_argument("--num-layers", type=int, default=PARITY_DEFAULT_NUM_LAYERS)
+    parity.add_argument("--render-scale", type=float, default=None, help="override dataset.ini render_scale")
+    parity.add_argument(
+        "--modes",
+        default="trips,broadcast,trilinear",
+        help="comma-separated render modes: trips (the published path), broadcast, trilinear",
+    )
+    parity.add_argument(
+        "--max-points",
+        type=int,
+        default=None,
+        help="random point subsample (CPU smoke runs only -- NOT a parity result)",
+    )
+    parity.add_argument(
+        "--reference-dir",
+        default=None,
+        help="directory of the authors' own renders (default: <checkpoint>/<epoch>/test)",
+    )
+    parity.set_defaults(func=_cmd_parity)
 
     return parser
 
