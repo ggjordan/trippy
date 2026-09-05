@@ -497,3 +497,60 @@ rather than the only defence.
   another, and reports the differences. The whole-frame number is measured directly
   and is the one to quote; the per-stage split inherits the noise of two
   measurements and each prefix charges its own barrier's readback.
+## Distillation (design B)
+
+- **A distilled splat can only be as good as the checkpoint it was distilled from.**
+  `trippy distill` samples the TRIPS network's own output and trains an ordinary 3DGS
+  model to reproduce it; it cannot exceed the checkpoint's own quality, and any defect
+  the checkpoint still has (including the shade cloud, if the checkpoint hasn't fixed
+  it yet) gets baked into the distilled PLY as an ordinary Gaussian, indistinguishable
+  from a directly-trained one. Design B is a fallback for viewer compatibility (D2),
+  never a quality upgrade over the checkpoint it came from.
+
+- **Distillation re-introduces Gaussian splat artefacts.** This is Jordan's own stated
+  worry (docs/SPEC.md D6) about porting a winning design into a Brush fork rather than
+  distilling: popping, view-dependent floaters, and the shade-cloud defect itself if
+  Gaussians alone cannot represent it well, all become possible again once the design-B
+  output is an ordinary Gaussian splat trained by an off-the-shelf 3DGS trainer. The
+  audit numbers (`trippy.distill.compare`) rank candidates; only Jordan's viewer verdict
+  on the distilled PLY (not the TRIPS checkpoint it came from) settles whether this
+  fallback is actually acceptable for a given scene.
+
+- **No pose refinement on interpolated (or anchor) cameras.** `trippy.distill.render_set`
+  renders every pose -- anchor and interpolated alike -- at each image's raw COLMAP pose,
+  never the checkpoint's own trained per-image pose-refinement delta
+  (`trippy.train.params.PoseParams`). This matches the existing convention
+  `trippy.render.dolly`/`trippy.render.offpath` already use for arbitrary poses, but it
+  means the rendered image set is very slightly mis-registered relative to what the
+  checkpoint was actually optimised against, by however much pose refinement moved that
+  frame. Not measured to matter in practice (pose-refinement deltas are typically far
+  sub-pixel), but not proven negligible either.
+
+- **The honesty guard is a heuristic, not a geometric proof.** `build_distill_camera_plan`
+  skips a consecutive anchor pair when its distance exceeds `--max-jump-multiplier` times
+  the scene's own median consecutive-pair distance, or when the two images use different
+  `camera_id`s. This catches the common failure modes (a registration gap, two separate
+  sweeps of the same scene, a lens change) but cannot detect every way two "consecutive"
+  registered images might not actually be adjacent along the walked path -- e.g. a capture
+  that revisits the same physical location twice at a similar spacing to the rest of the
+  walk. `skipped_pairs` in `distill_report.json` is the audit trail; nothing beyond the
+  two checks above is applied.
+
+- **Brush has no `--init-ply` flag.** "Init from the TRIPS export ply" (the task's own
+  phrasing) is implemented by writing the TRIPS export's point cloud into points3D.txt,
+  which Brush's COLMAP dataset loader reads as its initial splat means + SH-DC colours
+  (positions + colour only -- no size/opacity/rotation column exists in points3D.txt, and
+  Brush initialises those itself). This was verified by reading
+  `rust/brush-trips/crates/brush-dataset/src/formats/colmap.rs` (`init.actor.run(...)`
+  block), not by a `--help` flag, since neither `brush-cli --help` nor `apps/brush-cli/src/
+  lib.rs`'s `Cli`/`TrainStreamConfig` struct expose any point-cloud-initialisation flag at
+  all.
+
+- **The distilled PLY's colour is view-independent by choice, not by TRIPS's own limit.**
+  `trippy.distill.brush_runner`'s default `--sh-degree 0` means Brush trains flat RGB per
+  Gaussian, no higher-order spherical harmonics. A single TRIPS checkpoint distilled at a
+  fixed set of poses gives Brush no multi-view specular/view-dependent signal to recover
+  with a higher SH degree (every rendered "photo" of a given surface point already carries
+  whatever appearance the TRIPS network baked in for that pose), so degree 0 was chosen as
+  the honest default; a higher `--sh-degree` is a free CLI override if a future scene's
+  distillation shows visible view-dependent effects worth capturing.

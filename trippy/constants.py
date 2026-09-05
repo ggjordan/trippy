@@ -962,3 +962,106 @@ TRAIN_REPORT_FAILED_FILENAME = "REPORT_FAILED.txt"
 # (it mostly just copies a path reference into Splats' review queue and
 # appends one line to research/trips-metal.md, no heavy I/O).
 DELIVER_SUBPROCESS_TIMEOUT_S = 120.0
+
+# --- distill/ : design-B fallback pipeline (docs/SPEC.md D2, "A plain splat that
+# incorporates TRIPS learning (Design B) is a valid fallback path"; Quest honesty
+# note: "ship fallback: distilled Gaussians via the existing ~/Splats/tools/publish/
+# path"). Distils a trained TRIPS checkpoint into a plain-Gaussian PLY any existing
+# 3DGS viewer (Brush, Splats' publish path, Quest) can open unchanged, by (1)
+# rendering the TRIPS network output at the training cameras plus a small number of
+# near-path interpolated cameras and writing a COLMAP-text image set from those
+# renders, then (2) training an ordinary Brush/3DGS model on that image set.
+
+# trippy.distill.cameras.slerp: above this quaternion dot product (near-identical
+# rotations), fall back to a normalised linear interpolation to avoid a 0/0 in
+# sin(theta)/theta -- same pattern as EPS_QUAT_AXIS/EPS_SE3_ANGLE above, own constant
+# since it lives in a different module with its own precision requirements.
+DISTILL_SLERP_NEAR_IDENTICAL_DOT = 1.0 - 1e-6
+
+# Number of interpolated cameras generated between each pair of consecutive
+# registered training cameras (slerp rotation + lerp camera-centre translation).
+# 2 gives a denser camera path than the raw capture without inventing anything far
+# off it -- see DISTILL_MAX_JUMP_MULTIPLIER for the honesty guard that skips pairs
+# that are not really "consecutive along one continuous walk".
+DISTILL_DEFAULT_INTERP_K = 2
+
+# Honesty guard (AGENTS.md "Honesty rule"; task brief "only cameras close to the
+# capture path; no far off-path invention"): a consecutive pair of registered
+# cameras is only bridged with interpolated poses if their centre-to-centre
+# distance is at most this many times the scene's own median consecutive-pair
+# distance. A pair further apart than that (two different loops/sweeps of the same
+# scene, a registration gap, ...) is not really "consecutive along one continuous
+# walk" and interpolating between them would invent a camera path that was never
+# walked -- skipped instead, and recorded in trippy.distill.cameras.SkippedPair.
+DISTILL_MAX_JUMP_MULTIPLIER = 4.0
+
+# Filename template (no extension -- trippy.distill.cameras.image_filename appends
+# ".png") for a synthetic interpolated-camera pose: `{a}`/`{b}` are the two anchor
+# image stems and `{j:02d}` the 1-based intermediate index between them.
+DISTILL_INTERP_NAME_FMT = "INTERP_{a}_{b}_{j:02d}"
+
+# On-disk layout of one distill run's output directory (trippy.distill.render_set).
+DISTILL_IMAGES_DIRNAME = "images"
+DISTILL_SPARSE_DIRNAME = "sparse_txt"
+DISTILL_RENDERS_DIRNAME = "renders"  # render_candidate's own per-pose frames/ tree
+DISTILL_TRIPS_EXPORT_FILENAME = "trips_export.ply"
+DISTILL_REPORT_FILENAME = "distill_report.json"
+DISTILL_BRUSH_JOB_FILENAME = "brush_train_job.sh"
+DISTILL_BRUSH_OUT_DIRNAME = "brush_out"
+DISTILL_COMPARE_FILENAME = "compare.md"
+
+# COLMAP camera model the distilled image set is written with: every image
+# trippy.distill.render_set produces is already an undistorted pinhole render
+# (SceneDataset's own undistortion for anchor poses, or a synthetic interpolated
+# pose reusing the same intrinsics convention), so PINHOLE (no distortion
+# coefficients) is exact, never an approximation of the scene's real (usually
+# OPENCV) capture lenses.
+DISTILL_CAMERA_MODEL = "PINHOLE"
+
+# Decimal places intrinsics (fx, fy, cx, cy) are rounded to when grouping
+# CameraPoses into COLMAP "cameras" (trippy.distill.colmap_writer._camera_key) --
+# far finer than any real difference between two poses meant to share one camera,
+# just enough to absorb float roundoff from repeated K-matrix scaling.
+DISTILL_CAMERA_KEY_DECIMALS = 6
+
+# Dummy reprojection-error field written into every points3D.txt row (the COLMAP
+# text spec includes this column; trippy.geom.xform_a's reader parses but never
+# uses it, and Brush's colmap loader doesn't even read it -- see
+# trippy/distill/colmap_writer.py). Any finite value works; 0.0 rather than a
+# fabricated "confidence" number that could be misread as one.
+DISTILL_POINTS3D_DUMMY_ERROR = 0.0
+
+# Points3D.txt row cap: trippy.distill.colmap_writer randomly subsamples (seeded,
+# reproducible) the TRIPS export point cloud down to at most this many rows before
+# writing points3D.txt. A COLMAP sparse init cloud for a 3DGS trainer only needs to
+# seed initial gaussian positions (Brush densifies from there); writing all ~5-7M
+# TRIPS points would bloat points3D.txt for no benefit and slow Brush's dataset load.
+DISTILL_DEFAULT_MAX_INIT_POINTS = 300_000
+
+# `trippy distill`'s default `--brush-iters`: within the task brief's "5k-8k steps"
+# budget for a queue job that already sits behind several prio-70 trainings.
+DISTILL_DEFAULT_BRUSH_ITERS = 6000
+
+# Brush eval-split-every / eval-every defaults passed to brush-cli (docs/
+# EXPERIMENTS.md's own modulo-8 convention, MODULO_SPLIT_DEFAULT_K): 1 in 8
+# rendered frames held out from Brush's own training, evaluated every 1000 steps.
+DISTILL_BRUSH_EVAL_SPLIT_EVERY = 8
+DISTILL_BRUSH_EVAL_EVERY = 1000
+
+# sh_degree passed to brush-cli/brush: 0 (view-independent colour only). The TRIPS
+# network output already bakes tone-mapping/appearance per rendered view, and a
+# single-checkpoint distillation gives Brush no multi-view specular signal to
+# recover with higher SH orders, so degree 0 is the honest choice, not merely the
+# cheap one.
+DISTILL_BRUSH_SH_DEGREE = 0
+
+# Default export filename template handed to brush-cli/brush's --export-name
+# (its own `{iter}` interpolation, not a Python format field).
+DISTILL_BRUSH_EXPORT_NAME = "distilled_{iter}.ply"
+
+# Paths (relative to this repo's rust/ dir) to the two binaries brush_runner.py
+# will use, in preference order: the lean headless brush-cli over the full
+# brush-app GUI binary (rust/README.md "Building and testing"; both share the same
+# `Cli`/`TrainStreamConfig` flags, apps/brush-cli/src/lib.rs).
+DISTILL_BRUSH_CLI_BINARY_REL = "brush-trips/target/release/brush-cli"
+DISTILL_BRUSH_APP_BINARY_REL = "brush-trips/target/release/brush"

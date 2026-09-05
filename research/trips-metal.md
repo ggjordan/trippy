@@ -950,3 +950,26 @@ missing for v0.4.0: the backward pass (`blend_bwd`) and the viewer hook-in at
 exports at `output/brush/` (not committed: 411 KiB of weights, an 80 MB point set
 and a 50 MB expected frame). `scripts/test.sh` stays green at 43.6 s.
 - 2026-09-05T17:52:05Z submitted job trippy-brush-unet-gpu-6 prio 12: bash -c set -e; export TRIPPY_OUTPUT=/Users/nzbirdranch/trippy/output; cd /Users/nzbirdranch/trippy/rust && cargo run --release --example render_frame_full --features gpu --offline -- --points /Users/nzbirdranch/trippy/output/brush/horse/view_00008_points.npz --camera /Users/nzbirdranch/trippy/output/brush/horse/view_00008_camera.json --params /Users/nzbirdranch/trippy/output/brush/horse/view_00008_params.json --weights /Users/nzbirdranch/trippy/output/brush/horse/horse_unet.safetensors --out /Users/nzbirdranch/trippy/output/brush/horse/frame_00008.png --iters 10
+- 2026-09-05T17:57:36Z submitted job trippy-distill-render-full1-broadcast prio 15: trippy distill --checkpoint /Users/nzbirdranch/trippy/output/runs/EXP-0003-kk-trips-train/full1-broadcast/checkpoints/checkpoint_latest.pt --out /Users/nzbirdranch/trippy/output/runs/EXP-0008-distill/full1-broadcast --stage render --device mps --interp-k 1
+
+## 2026-09-06 05:57 — EXP-0008 design-B distillation pipeline (proof run)
+Question: does the full design-B pipeline (render TRIPS network output at training +
+near-path interpolated cameras -> Brush-trainable COLMAP image set -> Brush 3DGS training
+-> shade/extent audit comparison) run end to end, exercised once against the existing weak
+EXP-0003-kk-trips-train/full1-broadcast checkpoint (40 epochs, mode broadcast, 14.42 dB
+held-out)?
+Job: trippy-brush-cli-build (scripts/cpu_heavy.sh, not the GPU queue) rc=0, 2m44s --
+rust/brush-trips/target/release/brush-cli built (release, apps/brush-cli).
+Job: trippy-distill-render-full1-broadcast (prio 15) submitted, rc pending -- see
+experiments/EXP-0008-distill/README.md "GPU queue state" for the queue position at
+submission time (behind one already-running prio-60 job, ahead of two prio-30 and five
+prio-70 jobs).
+Numbers: none yet -- this entry records the pipeline build + first submission; a follow-up
+entry records the render job's rc/timing/frame counts, the Brush training job's rc/timing,
+and the baseline/TRIPS-export/distilled audit comparison table once available.
+Verdict: PASS on code + CPU tests (35 new distill tests + 5 new colmap_io writer tests, 670
+total CPU tests green, ruff clean, scripts/build.sh and scripts/test.sh both green); GPU
+pipeline execution in progress.
+Artifact: experiments/EXP-0008-distill/README.md; trippy/distill/ (cameras.py,
+colmap_writer.py, render_set.py, brush_runner.py, compare.py); trippy/scene/colmap_io.py
+(write_cameras_txt/write_images_txt/write_points3d_txt/save_colmap_model_txt).

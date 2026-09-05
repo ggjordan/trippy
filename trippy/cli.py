@@ -44,6 +44,23 @@ source (gaussian/colmap/union/npz, the same schema as a TrainConfig YAML's
 their own single source -- the generic entry point for building a
 "union" of a Gaussian PLY and a MonoDepth `.npz` with a voxel dedupe
 (EXP-0006). CPU-only; never touches MPS.
+
+`distill` runs the design-B fallback pipeline (docs/SPEC.md D2,
+docs/EXPERIMENTS.md "Distillation (design B)"): distils a trained TRIPS
+checkpoint into a plain-Gaussian PLY every existing viewer (Brush, Splats'
+publish path, Quest) can open. `--stage render` renders the checkpoint's
+network output at the training cameras plus near-path interpolated cameras
+and writes a Brush-trainable COLMAP image set (`trippy.distill.render_set`,
+MPS-capable, same "only via --device mps inside a GPU-queue job" rule as
+`train`/`render`); `--stage brush-cmd` resolves/prints the Brush CLI
+command and writes a queue-ready job script without running it
+(`trippy.distill.brush_runner` -- Brush's trainer must only run via
+`scripts/gpu_submit.sh --train`, never from this process); `--stage
+compare` runs Splats' shade/extent audits on the baseline, TRIPS-export,
+and (once Brush training has finished) distilled PLYs and prints a 3-column
+comparison table (`trippy.distill.compare`). `--stage all` (the default)
+runs render then compare, printing the brush-cmd stage's output in between
+so the exact GPU-training command to queue next is always in front of you.
 """
 
 from __future__ import annotations
@@ -71,6 +88,14 @@ from trippy.constants import (
     DEFAULT_DENSITY_GAUSSIAN_PLY,
     DEFAULT_MIN_OPACITY,
     DEPTH_POINTS_MISSING_DEPTH_EXIT_CODE,
+    DISTILL_BRUSH_JOB_FILENAME,
+    DISTILL_BRUSH_OUT_DIRNAME,
+    DISTILL_COMPARE_FILENAME,
+    DISTILL_DEFAULT_BRUSH_ITERS,
+    DISTILL_DEFAULT_INTERP_K,
+    DISTILL_DEFAULT_MAX_INIT_POINTS,
+    DISTILL_MAX_JUMP_MULTIPLIER,
+    DISTILL_SPARSE_DIRNAME,
     DOLLY_DEFAULT_POSE_NAME,
     GIT_DESCRIBE_MATCH_PATTERN,
     MONODEPTH_DEFAULT_CONF0,
@@ -582,6 +607,92 @@ def _cmd_candidate_report(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_distill(args: argparse.Namespace) -> int:
+    out_dir = Path(args.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stages = ("render", "brush-cmd", "compare") if args.stage == "all" else (args.stage,)
+
+    report: dict = {}
+    report_path = out_dir / "distill_report.json"
+    if "render" not in stages and report_path.exists():
+        # A later-only stage (brush-cmd/compare run on its own) reuses an earlier
+        # render stage's own report instead of requiring every flag again.
+        report = json.loads(report_path.read_text())
+
+    if "render" in stages:
+        from trippy.distill.render_set import render_distill_set
+
+        if args.checkpoint is None:
+            print("trippy distill: --checkpoint is required for --stage render/all", file=sys.stderr)
+            return 2
+        device = pick_device(args.device)
+        max_init_points = None if args.max_init_points < 0 else args.max_init_points
+        report = render_distill_set(
+            args.checkpoint,
+            out_dir,
+            device=str(device),
+            interp_k=args.interp_k,
+            max_jump_multiplier=args.max_jump_multiplier,
+            max_init_points=max_init_points,
+        )
+        print(
+            f"trippy distill: rendered {report['n_anchor_images']} anchor + "
+            f"{report['n_interpolated_images']} interpolated cameras "
+            f"({report['n_skipped_pairs']} pair(s) skipped by the honesty guard) -> {out_dir}"
+        )
+        print(f"trippy distill: TRIPS export -> {report['trips_export_ply']}")
+
+    if "brush-cmd" in stages:
+        from trippy.distill.brush_runner import (
+            brush_gpu_submit_command,
+            brush_train_command,
+            resolve_brush_binary,
+            write_brush_job_script,
+        )
+
+        binary = Path(args.brush_binary) if args.brush_binary else resolve_brush_binary()
+        width = report.get("width") if report else args.max_resolution
+        brush_out_dir = out_dir / DISTILL_BRUSH_OUT_DIRNAME
+        argv = brush_train_command(
+            binary if binary is not None else "<build rust/brush-trips first -- see rust/README.md>",
+            out_dir,
+            brush_out_dir,
+            total_train_iters=args.brush_iters,
+            max_resolution=width,
+        )
+        job_name = args.job_name or f"distill-{out_dir.name}"
+        script_path = write_brush_job_script(out_dir / DISTILL_BRUSH_JOB_FILENAME, argv)
+        print("trippy distill: brush training command")
+        print("  " + " ".join(str(a) for a in argv))
+        print(f"trippy distill: job script -> {script_path}")
+        print(f"trippy distill: queue it with -> {brush_gpu_submit_command(job_name, script_path)}")
+        if binary is None:
+            print(
+                "trippy distill: WARNING -- no brush binary found; build it first (rust/README.md, "
+                "'Building and testing')",
+                file=sys.stderr,
+            )
+
+    if "compare" in stages:
+        from trippy.distill.compare import audit_comparison_table, build_audit_columns
+
+        scene_root = Path(report["scene_root"]) if report.get("scene_root") else Path(args.scene_root)
+        sparse_txt_dir = scene_root / DISTILL_SPARSE_DIRNAME
+        trips_export_ply = report.get("trips_export_ply") or args.trips_export_ply
+        columns = build_audit_columns(
+            sparse_txt_dir,
+            baseline_ply=args.baseline_ply,
+            trips_export_ply=trips_export_ply,
+            distilled_ply=args.distilled_ply,
+        )
+        table = audit_comparison_table(columns)
+        (out_dir / DISTILL_COMPARE_FILENAME).write_text(table + "\n")
+        print("trippy distill: audit comparison")
+        print(table)
+
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="trippy")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -755,6 +866,42 @@ def build_parser() -> argparse.ArgumentParser:
     )
     candidate_report.add_argument("--device", choices=["cpu", "mps"], default=None, help="override the checkpoint's device")
     candidate_report.set_defaults(func=_cmd_candidate_report)
+
+    distill = sub.add_parser(
+        "distill",
+        help="design-B pipeline: distil a TRIPS checkpoint into a plain-Gaussian PLY via Brush",
+    )
+    distill.add_argument("--checkpoint", default=None, help="checkpoint .pt path (required for --stage render/all)")
+    distill.add_argument("--out", required=True, help="output directory")
+    distill.add_argument(
+        "--stage",
+        choices=["render", "brush-cmd", "compare", "all"],
+        default="all",
+        help="which pipeline step(s) to run (see trippy.cli module docstring)",
+    )
+    distill.add_argument("--device", choices=["cpu", "mps"], default=None, help="--stage render/all only")
+    distill.add_argument("--interp-k", type=int, default=DISTILL_DEFAULT_INTERP_K, help="near-path cameras per consecutive pair")
+    distill.add_argument(
+        "--max-jump-multiplier",
+        type=float,
+        default=DISTILL_MAX_JUMP_MULTIPLIER,
+        help="honesty guard: skip a consecutive pair further apart than this x the median pair distance",
+    )
+    distill.add_argument(
+        "--max-init-points",
+        type=int,
+        default=DISTILL_DEFAULT_MAX_INIT_POINTS,
+        help="cap on points3D.txt rows written from the TRIPS export (None via -1 writes every point)",
+    )
+    distill.add_argument("--brush-binary", default=None, help="override the auto-detected brush-cli/brush binary path")
+    distill.add_argument("--brush-iters", type=int, default=DISTILL_DEFAULT_BRUSH_ITERS, help="--total-train-iters for the printed brush command")
+    distill.add_argument("--max-resolution", type=int, default=None, help="--stage brush-cmd only, when not preceded by --stage render in this invocation")
+    distill.add_argument("--job-name", default=None, help="GPU-queue job name for --stage brush-cmd (default: distill-<out dirname>)")
+    distill.add_argument("--baseline-ply", default=None, help="--stage compare: the training run's own source PLY (e.g. kkc_15000.ply)")
+    distill.add_argument("--trips-export-ply", default=None, help="--stage compare only (without a preceding render stage): override the TRIPS export ply path")
+    distill.add_argument("--distilled-ply", default=None, help="--stage compare: the Brush-trained output PLY, once training has finished")
+    distill.add_argument("--scene-root", default=None, help="--stage compare only (without a preceding render stage): the scene root for sparse_txt/")
+    distill.set_defaults(func=_cmd_distill)
 
     return parser
 
