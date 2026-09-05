@@ -2,6 +2,8 @@
 All notable changes to trippy. Format: Keep a Changelog. Versions: semver tags `vX.Y.Z`. Every push also gets a `build-NNNN` tag.
 
 ## [Unreleased]
+### Milestone note
+- v0.3.0 = the web viewer milestone (plan's v0.5.0), released before the Karekare shade verdict because it landed first; the verdict will be recorded in the release where it lands.
 ### Added
 - **`brush_pyramid::gpu::UploadedPoints`: upload the point set once per bundle, not once per frame.** `render_pyramid` re-uploaded `xyz`/`size`/`conf`/`feat` on every call -- 80 MB per frame on the horse, for data that never changes. `UploadedPoints::new` + `render_pyramid_uploaded` split the upload out; the `PointSet` entry points still work and simply delegate. Worth a flat **12.2 ms of every frame**: at 1920x1080 on the public horse, `raw level-0` **45.4 -> 102.3 fps** and the shipped `--half-net --scale 0.75` view **21.7 -> 29.5 fps** (job `trippy-web-unet-gpu-3`, 30-frame medians). The `--screenshot` PNG is byte-identical before and after, and the GPU parity tests are unchanged (brush-pyramid 5/5, brush-unet 4/4, job `trippy-web-unet-gpu-2`).
 - `StageTimings::upload_ms`, so the upload can never hide inside stage 1 again. **`--profile` should be read in `--mode raw`**: in `network` mode the first stage's forced sync drains the previous frame's queued U-Net, which is what made the old "stage 1 = 178 ms" reading an artefact (the same stage is 0.4 ms).
