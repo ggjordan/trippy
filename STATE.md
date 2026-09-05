@@ -5,13 +5,15 @@ Last updated: 2026-09-05 (session 1, Orchestrator: Claude Fable 5.1)
 ## Done
 - Spec + plan grilled and approved 2026-09-05.
 - Phase 1 skeleton reviewed and pushed as `build-0001` (public repo github.com/ggjordan/trippy, 27 CPU tests green).
+- feat/points merged (build-0004): PointSet, GaussianPlySource (5.74M pts on kk-coherent, median nn 0.080), density CLI; 50 tests green.
+- docs/TRIPS_REFERENCE.md written from source (key finding: TRIPS's shipped default broadcasts every point into all 5 layers; the 2-layer trilinear path exists but is unreachable from configs).
 - Jordan set the goal (2026-09-05 ~22:50): finish all stages autonomously; anything needing Jordan goes in the review queue below.
 
 ## In flight
 - GPU-queue smoke job `trippy-smoke` (prio 15) queued behind a Hunua training; result -> ~/Splats/tools/gpu_queue/done/trippy-smoke.rc.
 - feat/scene-io (mid/normal): COLMAP bin+txt loader, undistort+cache dataset, splits.
-- feat/points (mid/normal): PointSource ABC, GaussianPlySource, kNN sizes, union, `trippy density`.
-- docs/TRIPS_REFERENCE.md (mid/normal): porting-grade extraction from third_party/TRIPS @ a59a65b.
+- feat/raster (large/high): layer-factor formula, fragment emission, sort/segments, Metal blend_fwd, numpy + torch references, GPU tests via queue.
+- feat/net (mid/high): U-Net, gated conv, neural camera, losses, checkpoint loader.
 - Background downloads: third_party/zenodo/tt_checkpoints.zip (2.7 GB), tt_scenes.zip (3.2 GB).
 
 ## Next (in order)
