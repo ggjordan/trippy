@@ -269,6 +269,9 @@ fn horse_frame_matches_the_python_parity_engine() {
             t_cutoff: params.t_cutoff,
             alpha_min: params.alpha_min,
             znear: params.znear,
+            // The parity path is the EXACT pipeline: every v0.4.0 performance
+            // lever stays at its default (see brush_pyramid::params).
+            ..PyramidParams::default()
         };
 
         let render = render_pyramid(

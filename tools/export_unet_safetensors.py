@@ -49,6 +49,7 @@ import torch
 from trippy.net.camera_model import NeuralCamera, NeuralCameraConfig
 from trippy.net.export_safetensors import export, write_safetensors
 from trippy.net.unet import MultiScaleUnet2dDecOnlySmallFixed, NetworkConfig
+from trippy.render.bundle import TRIPS_CHECKPOINT_NUM_LAYERS, load_trips_scene
 
 # --- fixture geometry (small on purpose; see tests/test_net_export_safetensors.py) ---
 #: Seed for every random tensor in the committed fixture. Changing it rewrites
@@ -64,7 +65,8 @@ FIXTURE_FRAMES = 3
 #: per-image exposure/white-balance lookup rather than row 0's identity).
 FIXTURE_FRAME_INDEX = 1
 #: Public Zenodo horse checkpoint: 8 pyramid levels (docs/TRIPS_REFERENCE.md Sec. 5).
-HORSE_NUM_LAYERS = 8
+#: Defined once in `trippy.render.bundle`, which owns the shared TRIPS loader.
+HORSE_NUM_LAYERS = TRIPS_CHECKPOINT_NUM_LAYERS
 
 
 def fixture_shapes(height: int, width: int, num_layers: int) -> list[tuple[int, int]]:
@@ -191,23 +193,25 @@ def build_fixture(out_dir: Path) -> dict:
 
 
 def _load_horse(checkpoint: Path, scene: Path, epoch: str):
-    """Load the horse checkpoint + scene through trippy's own parity code path."""
-    from trippy.net.checkpoint import build_neural_camera, load_trips_scene_checkpoint
-    from trippy.render.parity import (
-        _scene_name_from_params,
-        build_network,
-        build_scene_points,
-        resolve_intrinsics,
-        resolve_pose,
-    )
-    from trippy.scene.adop_io import load_adop_scene
+    """Load the horse checkpoint + scene through trippy's own parity code path.
 
-    adop = load_adop_scene(scene)
-    scene_name = _scene_name_from_params(checkpoint, None)
-    ckpt = load_trips_scene_checkpoint(checkpoint / epoch, scene_name)
-    points = build_scene_points(ckpt, torch.device("cpu"))
-    net, _ = build_network(checkpoint, epoch, HORSE_NUM_LAYERS, int(points.feat.shape[1]))
-    return adop, ckpt, points, net, resolve_pose, resolve_intrinsics, build_neural_camera
+    A thin adaptor over `trippy.render.bundle.load_trips_scene` (which owns
+    the loading logic, shared with `trippy export-bundle`), keeping this
+    module's original 7-tuple return shape.
+    """
+    from trippy.net.checkpoint import build_neural_camera
+    from trippy.render.parity import resolve_intrinsics, resolve_pose
+
+    loaded = load_trips_scene(checkpoint, scene, epoch, HORSE_NUM_LAYERS, torch.device("cpu"))
+    return (
+        loaded.adop,
+        loaded.ckpt,
+        loaded.points,
+        loaded.net,
+        resolve_pose,
+        resolve_intrinsics,
+        build_neural_camera,
+    )
 
 
 #: Views EXP-0002 measured parity on: the checkpoint's own held-out test split
@@ -313,18 +317,12 @@ def export_horse_e2e(
         # not the camera: brush-pyramid's `PyramidParams` fields plus the
         # background feature vector, so the Rust side never has to hardcode a
         # TRIPS threshold.
-        from trippy.constants import RASTER_MAX_FRAGS, RASTER_T_CUTOFF
-        from trippy.render.parity import PARITY_MIN_DEPTH
+        # `trips_params` is the single definition of TRIPS's own thresholds,
+        # shared with `trippy export-bundle` so the two exports cannot drift.
+        from trippy.render.bundle import trips_params
 
         params_json = {
-            "mode": "trips",
-            "num_layers": HORSE_NUM_LAYERS,
-            "pixel_center": "integer",
-            "halving": "ceil",
-            "max_frags": RASTER_MAX_FRAGS,
-            "t_cutoff": RASTER_T_CUTOFF,
-            "alpha_min": 0.0,
-            "znear": PARITY_MIN_DEPTH,
+            **trips_params(HORSE_NUM_LAYERS).to_json(),
             "frame_index": index,
             "num_channels": int(points.feat.shape[1]),
             "background": [float(v) for v in points.bg],

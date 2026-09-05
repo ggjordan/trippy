@@ -25,7 +25,7 @@
 # rust/README.md, docs/ARCHITECTURE.md ("Later: Brush fork mapping").
 [workspace]
 resolver = "2"
-members = ["crates/brush-pyramid", "crates/brush-unet"]
+members = ["crates/brush-pyramid", "crates/brush-unet", "crates/trips-viewer"]
 # `rust/brush-trips` physically lives inside this workspace's directory, and Cargo
 # auto-adopts any path dependency under the workspace root as a member. Without this
 # exclude, `brush-cube` & co. would be pulled into THIS workspace and their
@@ -65,6 +65,24 @@ serde = { version = "1.0.215", default-features = false, features = [
 ] }
 serde_json = { version = "1.0.133", default-features = false, features = ["std"] }
 tracing = "0.1.41"
+
+# The viewer's window/UI stack. Every spec here is a verbatim copy of
+# `rust/brush-trips/Cargo.toml`'s, for exactly the reason the burn specs above
+# are: `trips-viewer` binds Burn tensor buffers straight into egui's wgpu
+# render pass, which only works if both halves link the SAME wgpu (the patched
+# fork below). `eframe`'s feature list drops `persistence` -- the viewer has no
+# window state worth saving and it keeps `ron`/`serde` off the graph.
+egui = { version = "0.36" }
+eframe = { version = "0.36", default-features = false, features = [
+    "wgpu",
+    "wayland",
+    "x11",
+] }
+wgpu = { version = "30", default-features = false, features = ["naga-ir"] }
+anyhow = "1.0.94"
+log = "0.4.22"
+env_logger = "0.11"
+rfd = "0.17"
 
 # --- verbatim copy of rust/brush-trips/Cargo.toml's patch tables ---------------
 # wgpu fork (v30.0.0 + 2 commits): WebGPU subgroups feature mapping + the JS

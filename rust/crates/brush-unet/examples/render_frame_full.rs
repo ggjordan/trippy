@@ -219,6 +219,9 @@ async fn run() -> Result<(), String> {
         t_cutoff: view.t_cutoff,
         alpha_min: view.alpha_min,
         znear: view.znear,
+        // The parity path is the EXACT pipeline: every v0.4.0 performance
+        // lever stays at its default (see brush_pyramid::params).
+        ..PyramidParams::default()
     };
     let background = (!view.background.is_empty()).then_some(view.background.as_slice());
 

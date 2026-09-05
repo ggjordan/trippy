@@ -53,6 +53,11 @@ pub const MODE_BROADCAST: u32 = 1;
 /// [`crate::params::Mode::Trips`] as a comptime discriminant.
 pub const MODE_TRIPS: u32 = 2;
 
+/// [`crate::params::LayerFloor::Zero`] as a comptime discriminant.
+pub const LAYER_FLOOR_ZERO: u32 = 0;
+/// [`crate::params::LayerFloor::NearLower`] as a comptime discriminant.
+pub const LAYER_FLOOR_NEAR_LOWER: u32 = 1;
+
 /// Mirror of [`crate::cpu::MIN_SORT_DEPTH`], inlined for the kernels.
 pub const MIN_SORT_DEPTH: f32 = 1e-38;
 
@@ -113,6 +118,90 @@ pub struct PyramidUniforms {
     pub num_layers: u32,
     /// `P`; doubles as the sentinel key for a rejected fragment slot.
     pub total_layer_pixels: u32,
+    /// Saiga distortion `k1`. All eight are ignored unless the `distort`
+    /// comptime flag is set, which the host only does for a non-identity set.
+    pub d0: f32,
+    /// Saiga distortion `k2`.
+    pub d1: f32,
+    /// Saiga distortion `k3`.
+    pub d2: f32,
+    /// Saiga distortion `k4`.
+    pub d3: f32,
+    /// Saiga distortion `k5`.
+    pub d4: f32,
+    /// Saiga distortion `k6`.
+    pub d5: f32,
+    /// Saiga distortion `p1`.
+    pub d6: f32,
+    /// Saiga distortion `p2`.
+    pub d7: f32,
+    /// `log2(depth_range.lo)`, for [`crate::params::SortMode::PackedKey`].
+    pub depth_log_lo: f32,
+    /// `(2^depth_bits - 1) / (log2(hi) - log2(lo))`, the quantisation gain.
+    pub depth_log_gain: f32,
+    /// Largest depth bucket, `2^depth_bits - 1`.
+    pub depth_max_bucket: f32,
+    /// Bits the layer-pixel index is shifted left by in a packed key; 0 for
+    /// [`crate::params::SortMode::DepthThenKey`].
+    pub key_shift: u32,
+}
+
+/// `x^2 + y^2` past which [`distort`] returns the cull sentinel; mirror of
+/// [`crate::scene::DIST_CUTOFF`] squared.
+pub const DIST_CUTOFF_SQ: f32 = 400.0;
+/// Mirror of [`crate::scene::DISTORTION_SENTINEL`].
+pub const DISTORTION_SENTINEL: f32 = 100_000.0;
+
+/// Saiga's 8-parameter lens distortion; scalar twin of
+/// [`crate::scene::distort_normalized`], which carries the full citation.
+/// Returns the distorted `(x, y)`, or the cull sentinel past the cutoff.
+#[cube]
+fn distort(x: f32, y: f32, uniforms: PyramidUniforms) -> (f32, f32) {
+    let x2 = x * x;
+    let y2 = y * y;
+    let r2 = x2 + y2;
+    let r4 = r2 * r2;
+    let r6 = r4 * r2;
+    let two_xy = 2.0f32 * x * y;
+    let radial = (1.0f32 + uniforms.d0 * r2 + uniforms.d1 * r4 + uniforms.d2 * r6)
+        / (1.0f32 + uniforms.d3 * r2 + uniforms.d4 * r4 + uniforms.d5 * r6);
+    let xd = x * radial + (uniforms.d6 * two_xy + uniforms.d7 * (r2 + 2.0f32 * x2));
+    let yd = y * radial + (uniforms.d6 * (r2 + 2.0f32 * y2) + uniforms.d7 * two_xy);
+    (
+        select(r2 > DIST_CUTOFF_SQ, DISTORTION_SENTINEL, xd),
+        select(r2 > DIST_CUTOFF_SQ, DISTORTION_SENTINEL, yd),
+    )
+}
+
+/// `1 / 2^23`, the mantissa step of an f32 exponent field.
+pub const INV_MANTISSA_SCALE: f32 = 1.192_092_9e-7;
+
+/// A monotone, transcendental-free stand-in for `log2` on positive floats.
+///
+/// Reading the whole IEEE-754 bit pattern as an integer and scaling gives
+/// `floor(log2 x) + mantissa_fraction`, i.e. `log2` linearised inside each
+/// octave (exact at powers of two, at most 0.086 off in between). Two
+/// properties matter here and both are exact: it is **strictly increasing**
+/// in `x`, and the host computes the identical expression
+/// ([`crate::gpu::fast_log2`]) for the range endpoints, so a depth and the
+/// bucket edges are always compared on the same curve. CubeCL has no `log2`
+/// anyway (see the module invariants), and `ln` would cost a transcendental
+/// per fragment for an answer that is only used to pick a bucket.
+#[cube]
+fn fast_log2(x: f32) -> f32 {
+    (u32::reinterpret(x) as f32) * INV_MANTISSA_SCALE - 127.0f32
+}
+
+/// Depth to its bucket index, linear in `log2(depth)`.
+///
+/// See [`crate::params::DepthRange`] for why the mapping is logarithmic, and
+/// [`crate::params::SortMode::PackedKey`] for what the bucket is used for.
+#[cube]
+fn quantise_depth(depth: f32, uniforms: PyramidUniforms) -> u32 {
+    let safe = max(depth, MIN_SORT_DEPTH);
+    let bucket = (fast_log2(safe) - uniforms.depth_log_lo) * uniforms.depth_log_gain;
+    let clamped = min(max(bucket, 0.0f32), uniforms.depth_max_bucket);
+    clamped as u32
 }
 
 /// Height of `layer`, from the device-side geometry table.
@@ -203,6 +292,19 @@ fn layer_factor(size_px: f32, layer: u32, num_layers: u32) -> f32 {
     out
 }
 
+/// The finest layer mode `Trips` starts emitting at; twin of
+/// [`crate::cpu::trips_start_layer`]. `layer_floor` is comptime, so only one
+/// of the two arms is ever compiled into a given pipeline.
+#[cube]
+fn trips_start_layer(size_px: f32, num_layers: u32, #[comptime] layer_floor: u32) -> u32 {
+    let mut out = 0u32;
+    if comptime![layer_floor == LAYER_FLOOR_NEAR_LOWER] {
+        let lower = layer_lower(size_px, num_layers);
+        out = select(lower == 0u32, 0u32, lower - 1u32);
+    }
+    out
+}
+
 /// TRIPS's `valid_point`: all four footprint corners inside `layer`.
 #[cube]
 fn footprint_fits(
@@ -234,6 +336,7 @@ fn selected_layer_count(
     num_layers: u32,
     centre_shift: f32,
     #[comptime] mode: u32,
+    #[comptime] layer_floor: u32,
 ) -> u32 {
     let mut count = 0u32;
     if comptime![mode == MODE_BROADCAST] {
@@ -242,14 +345,21 @@ fn selected_layer_count(
         count = layer_upper(size_px, num_layers) - layer_lower(size_px, num_layers) + 1u32;
     } else {
         let upper = layer_upper(size_px, num_layers);
+        let start = trips_start_layer(size_px, num_layers, layer_floor);
         // A bounded `for` over every layer with an `alive` latch, rather than
         // a `while` with a compound condition and an early exit: same
         // semantics (once the gate fails, no coarser layer is counted), but
         // the loop trip count is a small comptime-ish bound and the control
         // flow is uniform, which is friendlier to every shader backend.
+        // Layers below `start` are skipped WITHOUT clearing the latch: with
+        // the default `LAYER_FLOOR_ZERO`, `start` is 0 and this is a no-op.
         let mut alive = true;
         for layer in 0u32..num_layers {
-            if alive && layer <= upper && footprint_fits(u_px, v_px, layer, layer_geom, centre_shift)
+            if layer < start {
+                // Not selected, and not a gate failure either.
+            } else if alive
+                && layer <= upper
+                && footprint_fits(u_px, v_px, layer, layer_geom, centre_shift)
             {
                 count += 1u32;
             } else {
@@ -273,6 +383,9 @@ pub fn project_and_count_kernel(
     counts: &mut Tensor<u32>,
     uniforms: PyramidUniforms,
     #[comptime] mode: u32,
+    #[comptime] layer_floor: u32,
+    #[comptime] distorted: bool,
+    #[comptime] frustum_cull: bool,
 ) {
     let gid = ABSOLUTE_POS as u32;
     if gid >= uniforms.num_points {
@@ -288,17 +401,30 @@ pub fn project_and_count_kernel(
     let zc = uniforms.r20 * x + uniforms.r21 * y + uniforms.r22 * z + uniforms.t2;
 
     // Written as a division, matching the CPU twin exactly.
-    let u_px = uniforms.fx * xc / zc + uniforms.cx;
-    let v_px = uniforms.fy * yc / zc + uniforms.cy;
+    let mut nx = xc / zc;
+    let mut ny = yc / zc;
+    if comptime![distorted] {
+        let (dx, dy) = distort(nx, ny, uniforms);
+        nx = dx;
+        ny = dy;
+    }
+    let u_px = uniforms.fx * nx + uniforms.cx;
+    let v_px = uniforms.fy * ny + uniforms.cy;
     // TRIPS uses fx only, never fy (`RenderForward.cu:1489`).
     let size_px = uniforms.fx * size[gid as usize] / max(zc, uniforms.znear);
 
-    let radius = 0.5f32 * size_px + uniforms.cull_slack;
-    let visible = zc > uniforms.znear
-        && u_px + radius > 0.0f32
-        && u_px - radius < uniforms.cull_padded_w
-        && v_px + radius > 0.0f32
-        && v_px - radius < uniforms.cull_padded_h;
+    // The near plane always culls; the box test is the measurable lever, and
+    // `frustum_cull` is comptime so turning it off removes the comparisons
+    // rather than branching over them.
+    let mut visible = zc > uniforms.znear;
+    if comptime![frustum_cull] {
+        let radius = 0.5f32 * size_px + uniforms.cull_slack;
+        visible = visible
+            && u_px + radius > 0.0f32
+            && u_px - radius < uniforms.cull_padded_w
+            && v_px + radius > 0.0f32
+            && v_px - radius < uniforms.cull_padded_h;
+    }
 
     let out_base = (gid * 4u32) as usize;
     proj[out_base] = u_px;
@@ -317,6 +443,7 @@ pub fn project_and_count_kernel(
                 uniforms.num_layers,
                 uniforms.centre_shift,
                 mode,
+                layer_floor,
             );
     }
     counts[gid as usize] = budget;
@@ -343,6 +470,8 @@ pub fn emit_fragments_kernel(
     point_ids: &mut Tensor<u32>,
     uniforms: PyramidUniforms,
     #[comptime] mode: u32,
+    #[comptime] layer_floor: u32,
+    #[comptime] packed: bool,
 ) {
     let gid = ABSOLUTE_POS as u32;
     if gid >= uniforms.num_points {
@@ -364,15 +493,24 @@ pub fn emit_fragments_kernel(
     let size_px = proj[read_base + 3];
     let confidence = conf[gid as usize];
 
-    // `Trilinear` starts at `lower`; the other two start at layer 0.
+    // `Trilinear` starts at `lower`; `Broadcast` at 0; `Trips` at whatever
+    // its layer floor says (0 for the exact rule).
     let mut start_layer = 0u32;
     if comptime![mode == MODE_TRILINEAR] {
         start_layer = layer_lower(size_px, uniforms.num_layers);
+    } else if comptime![mode == MODE_TRIPS] {
+        start_layer = trips_start_layer(size_px, uniforms.num_layers, layer_floor);
     }
 
     // Positive-float bit patterns order like the values themselves, so the
     // radix sort can order by depth directly.
     let depth_key = u32::reinterpret(max(depth, MIN_SORT_DEPTH));
+    // ... and in packed mode the same ordering, coarsened to `key_shift` bits
+    // so it can ride in the low half of the one and only sort key.
+    let mut depth_bucket = 0u32;
+    if comptime![packed] {
+        depth_bucket = quantise_depth(depth, uniforms);
+    }
 
     for selected in 0u32..num_selected {
         let layer = start_layer + selected;
@@ -419,8 +557,26 @@ pub fn emit_fragments_kernel(
             let flat = offset + safe_y * w_l + safe_x;
 
             let slot = (slot_base + selected * CORNERS_PER_LAYER + corner) as usize;
-            keys[slot] = select(keep, flat, uniforms.total_layer_pixels);
-            depth_keys[slot] = select(keep, depth_key, 0xFFFF_FFFFu32);
+            // `key_shift` is 0 in the exact two-pass mode, so this is the
+            // plain layer-pixel index; in packed mode the pixel moves into
+            // the high bits and the depth bucket fills the low ones. The
+            // sentinel `P << key_shift` still sorts after every real key,
+            // because a real key is at most `(P - 1) << key_shift | mask`.
+            let mut key = flat;
+            if comptime![packed] {
+                key = (flat << uniforms.key_shift) | depth_bucket;
+            }
+            keys[slot] = select(
+                keep,
+                key,
+                uniforms.total_layer_pixels << uniforms.key_shift,
+            );
+            // The separate depth key only exists for the two-pass sort; in
+            // packed mode the depth already rides in `key`, and writing a
+            // second 10M-element array per frame would be pure bandwidth.
+            if comptime![!packed] {
+                depth_keys[slot] = select(keep, depth_key, 0xFFFF_FFFFu32);
+            }
             alphas[slot] = select(keep, alpha, 0.0f32);
             point_ids[slot] = gid;
         }
@@ -442,6 +598,7 @@ pub fn emit_fragments_kernel(
 pub fn segment_bounds_kernel(
     num_fragments: u32,
     num_pixels: u32,
+    key_shift: u32,
     sorted_keys: &Tensor<u32>,
     segments: &mut Tensor<u32>,
 ) {
@@ -451,24 +608,29 @@ pub fn segment_bounds_kernel(
     for i in 0u32..SEGMENT_CHECKS_PER_ITER {
         let index = base_id + i;
         if index < num_fragments {
-            let key = sorted_keys[index as usize];
+            // The run boundary is a change of layer-PIXEL, not of key: in
+            // `SortMode::PackedKey` a key's low `key_shift` bits are the depth
+            // bucket, and two depths inside one pixel must not start a new
+            // segment. `key_shift` is 0 in the exact mode, where the shift is
+            // the identity and this is the original code.
+            let pixel = sorted_keys[index as usize] >> key_shift;
 
-            if index == num_fragments - 1u32 && key < num_pixels {
-                segments[(key * 2u32 + 1u32) as usize] = index + 1u32;
+            if index == num_fragments - 1u32 && pixel < num_pixels {
+                segments[(pixel * 2u32 + 1u32) as usize] = index + 1u32;
             }
 
             if index == 0u32 {
-                if key < num_pixels {
-                    segments[(key * 2u32) as usize] = 0u32;
+                if pixel < num_pixels {
+                    segments[(pixel * 2u32) as usize] = 0u32;
                 }
             } else {
-                let prev_key = sorted_keys[(index - 1u32) as usize];
-                if key != prev_key {
-                    if prev_key < num_pixels {
-                        segments[(prev_key * 2u32 + 1u32) as usize] = index;
+                let prev_pixel = sorted_keys[(index - 1u32) as usize] >> key_shift;
+                if pixel != prev_pixel {
+                    if prev_pixel < num_pixels {
+                        segments[(prev_pixel * 2u32 + 1u32) as usize] = index;
                     }
-                    if key < num_pixels {
-                        segments[(key * 2u32) as usize] = index;
+                    if pixel < num_pixels {
+                        segments[(pixel * 2u32) as usize] = index;
                     }
                 }
             }
@@ -481,15 +643,17 @@ pub fn segment_bounds_kernel(
 /// The direct twin of `trippy/raster/metal_src/blend_fwd.metal`. Every write
 /// goes to an address owned by exactly one thread, so there are no atomics.
 /// `num_channels` is comptime, so the accumulator lives in registers and both
-/// inner loops unroll.
+/// inner loops unroll. The feature buffer's element type `F` is generic so the
+/// same source serves [`crate::params::FeatureStore::F32`] and `F16`; the
+/// accumulator is always f32, so only the *stored* features are rounded.
 #[cube(launch)]
 #[allow(clippy::too_many_arguments)]
-pub fn blend_fwd_kernel(
+pub fn blend_fwd_kernel<F: Float>(
     segments: &Tensor<u32>,
     permutation: &Tensor<u32>,
     alphas: &Tensor<f32>,
     point_ids: &Tensor<u32>,
-    feat: &Tensor<f32>,
+    feat: &Tensor<F>,
     out: &mut Tensor<f32>,
     t_final: &mut Tensor<f32>,
     n_used: &mut Tensor<u32>,
@@ -529,7 +693,7 @@ pub fn blend_fwd_kernel(
             let feat_base = point * num_channels;
             #[unroll]
             for c in 0u32..num_channels {
-                acc[c as usize] += weight * feat[(feat_base + c) as usize];
+                acc[c as usize] += weight * f32::cast_from(feat[(feat_base + c) as usize]);
             }
             transmittance *= 1.0f32 - alpha;
             used += 1u32;

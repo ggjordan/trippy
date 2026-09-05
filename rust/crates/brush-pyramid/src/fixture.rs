@@ -141,6 +141,9 @@ impl Fixture {
             t_cutoff: params_json.t_cutoff,
             alpha_min: params_json.alpha_min,
             znear: params_json.znear,
+            // Fixtures pin the *exact* pipeline; the v0.4.0 performance levers
+            // are viewer settings and never come from a fixture.
+            ..PyramidParams::default()
         };
 
         let arrays = read_npz(&dir.join("expected.npz"))?;

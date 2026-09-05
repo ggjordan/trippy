@@ -53,9 +53,34 @@ pub fn upload<const D: usize>(host: &HostTensor, device: &Device) -> Result<Tens
     Ok(Tensor::from_data(data, device))
 }
 
-fn load_conv(conv: Conv2d, weights: &Weights, prefix: &str, device: &Device) -> Result<Conv2d, String> {
-    let weight: Tensor<4> = upload(weights.get(&format!("{prefix}.weight"))?, device)?;
-    let bias: Tensor<1> = upload(weights.get(&format!("{prefix}.bias"))?, device)?;
+/// The element type the network's tensors are held and computed in.
+///
+/// The weight file is always float32 (`trippy-unet-1`); this is a *runtime*
+/// choice about what to convert it to on the way to the device. See
+/// [`Unet::load_with_precision`].
+pub type Precision = burn::tensor::FloatDType;
+
+/// [`upload`], then convert to `precision`.
+///
+/// # Errors
+/// Returns `Err` if the host tensor's rank is not `D`.
+pub fn upload_as<const D: usize>(
+    host: &HostTensor,
+    device: &Device,
+    precision: Precision,
+) -> Result<Tensor<D>, String> {
+    Ok(upload::<D>(host, device)?.cast(precision))
+}
+
+fn load_conv(
+    conv: Conv2d,
+    weights: &Weights,
+    prefix: &str,
+    device: &Device,
+    precision: Precision,
+) -> Result<Conv2d, String> {
+    let weight: Tensor<4> = upload_as(weights.get(&format!("{prefix}.weight"))?, device, precision)?;
+    let bias: Tensor<1> = upload_as(weights.get(&format!("{prefix}.bias"))?, device, precision)?;
     Ok(Conv2d {
         weight: Param::from_tensor(weight),
         bias: Some(Param::from_tensor(bias)),
@@ -103,10 +128,22 @@ impl GatedBlock {
     ///
     /// # Errors
     /// Returns `Err` if any of the four keys is missing or mis-shaped.
-    pub fn load(self, weights: &Weights, prefix: &str, device: &Device) -> Result<Self, String> {
+    pub fn load(
+        self,
+        weights: &Weights,
+        prefix: &str,
+        device: &Device,
+        precision: Precision,
+    ) -> Result<Self, String> {
         Ok(Self {
-            feature: load_conv(self.feature, weights, &format!("{prefix}.feature"), device)?,
-            gate: load_conv(self.gate, weights, &format!("{prefix}.gate"), device)?,
+            feature: load_conv(
+                self.feature,
+                weights,
+                &format!("{prefix}.feature"),
+                device,
+                precision,
+            )?,
+            gate: load_conv(self.gate, weights, &format!("{prefix}.gate"), device, precision)?,
         })
     }
 
@@ -174,9 +211,17 @@ impl UpBlock {
     ///
     /// # Errors
     /// As [`GatedBlock::load`].
-    pub fn load(self, weights: &Weights, k: usize, device: &Device) -> Result<Self, String> {
+    pub fn load(
+        self,
+        weights: &Weights,
+        k: usize,
+        device: &Device,
+        precision: Precision,
+    ) -> Result<Self, String> {
         Ok(Self {
-            conv: self.conv.load(weights, &format!("unet.up.{k}"), device)?,
+            conv: self
+                .conv
+                .load(weights, &format!("unet.up.{k}"), device, precision)?,
         })
     }
 
@@ -249,20 +294,49 @@ impl Unet {
     /// # Errors
     /// Returns `Err` if any expected key is missing or mis-shaped.
     pub fn load(weights: &Weights, device: &Device) -> Result<Self, String> {
+        Self::load_with_precision(weights, device, Precision::F32)
+    }
+
+    /// [`Self::load`], converting every weight to `precision` on upload.
+    ///
+    /// `Precision::F16` halves the network's arithmetic and bandwidth. It is a
+    /// *display* choice: the weight file stays float32, the pyramid stays
+    /// float32, and [`Self::forward`] converts its inputs in and its output
+    /// back out, so nothing downstream has to know. The v0.4.0 measurement
+    /// that motivated it is in `research/trips-metal.md`: at 1080p the frame
+    /// is dominated by this network, not by the rasteriser's sort, and every
+    /// rasteriser-side lever measured within noise.
+    ///
+    /// # Errors
+    /// Returns `Err` if any expected key is missing or mis-shaped.
+    pub fn load_with_precision(
+        weights: &Weights,
+        device: &Device,
+        precision: Precision,
+    ) -> Result<Self, String> {
         let config = weights.unet;
         let net = Self::new(config, device);
-        let start = net.start.load(weights, "unet.start", device)?;
+        let start = net.start.load(weights, "unet.start", device, precision)?;
         let mut up = Vec::with_capacity(net.up.len());
         for (k, block) in net.up.into_iter().enumerate() {
-            up.push(block.load(weights, k, device)?);
+            up.push(block.load(weights, k, device, precision)?);
         }
-        let final_conv = load_conv(net.final_conv, weights, "unet.final", device)?;
+        let final_conv = load_conv(net.final_conv, weights, "unet.final", device, precision)?;
         Ok(Self {
             start,
             up,
             final_conv,
             config,
         })
+    }
+
+    /// The element type this graph's weights are held in.
+    ///
+    /// Read off the first convolution rather than stored, so it cannot go out
+    /// of sync with the tensors it describes.
+    #[must_use]
+    pub fn precision(&self) -> Precision {
+        self.start.feature.weight.val().dtype().into()
     }
 
     /// The architecture this graph was built for.
@@ -298,6 +372,18 @@ impl Unet {
             }
         }
 
+        // Convert the pyramid's float32 buffers to whatever the weights are
+        // held in, once, here — so `Precision::F16` is invisible to both the
+        // rasteriser upstream and the tone mapper downstream. At `F32` every
+        // one of these `cast`s is the identity and returns the same tensor
+        // (`burn-tensor/src/tensor/api/cast.rs:29-31`), so the default path
+        // allocates nothing extra.
+        let precision = self.precision();
+        let inputs: Vec<Tensor<4>> = inputs
+            .iter()
+            .map(|x| x.clone().cast(precision))
+            .collect();
+
         // Start block on the coarsest level; Networks.h:780 concatenates the
         // raw input back on, which is always the equal-size branch.
         let coarsest = inputs[config.num_layers - 1].clone();
@@ -307,6 +393,9 @@ impl Unet {
         for (k, block) in self.up.iter().enumerate() {
             state = block.forward(state, inputs[config.up_level(k)].clone());
         }
-        Ok(self.final_conv.forward(state))
+        Ok(self
+            .final_conv
+            .forward(state)
+            .cast(Precision::F32))
     }
 }

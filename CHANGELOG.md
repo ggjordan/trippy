@@ -3,10 +3,18 @@ All notable changes to trippy. Format: Keep a Changelog. Versions: semver tags `
 
 ## [Unreleased]
 ### Added
+- **Native Mac TRIPS viewer** (`rust/crates/trips-viewer`, ADR-0006): opens a trippy asset bundle from argv or a folder picker and renders it live -- pyramid rasteriser -> U-Net -> tone mapper -> screen -- at the window's size, with WASD/mouse flight, a `V` toggle between network / raw level-0 / coverage views, an on-screen ms+fps readout, and headless `--screenshot` / `--bench` / `--profile` paths for verification. A separate binary from Brush's own `brush`, which is untouched.
+- `trippy export-bundle --checkpoint ... --out <dir>`: writes a `trippy-bundle-1` directory (`bundle.json` + `points.npz` + `weights.safetensors`) from either a published TRIPS checkpoint or a trippy-native one, so any scene opens in the viewer with no Rust change.
+- `brush_pyramid::scene::Camera` gained an 8-parameter Saiga lens distortion (all-zeros = identity), applied on both the CPU reference and the CubeCL kernel, so bundles can store world-space points instead of one view's pre-distorted ones.
+- `Unet::load_with_precision`: the decoder can run in f16. **2.58x on the whole frame (204 -> 79 ms at 1080p) for 59.8 dB against the exact pipeline, i.e. visually free** -- the lever that actually matters, because the network is ~89% of the frame.
+- Six measured performance levers, every one defaulting to the exact pipeline: `frustum_cull`, `layer_floor` (fragment cap), `sort` (one packed 32-bit key instead of two radix passes), `feature_store` (f16 features), viewer-side render scaling, and the f16 network above.
+- `scripts/open_mac_viewer.sh`: generates the double-click `OPEN_TRIPS_MAC_<name>.command` launcher.
 - Native "trips" rasteriser mode (TRIPS's real layer rule), pixel_center/pyramid_halving options; native engine == per-layer parity to 1e-8 dB.
 - Candidate report: shade dolly, off-path poses, Splats audit wrappers, honesty sheet.
 - Brush fork as submodule (ggjordan/brush trippy-fork) + brush-pyramid/brush-unet crate skeletons (ADR-0005).
 - MonoDepthSource (DepthPro via GPU queue), EXP-0004 sheet.
+### Changed
+- **Corrected a wrong performance conclusion.** The first Mac timing read as "sort-dominated over 10.4M fragments"; the viewer's `raw level-0` view runs the identical rasteriser with the network removed and measures **21.6 ms (46 fps)** against a 204 ms frame, so the rasteriser is ~11% and the U-Net ~89%. Every rasteriser-side lever measures within noise. See `research/trips-metal.md`.
 ### Fixed
 - Trainer: exposure init relative to scene-mean EV, masked MSE normalisation (PSNR was 4.77 dB low), background, crop sampling inside image, seeding, non-finite gradient guard. Smoke run 1.6 -> 12.26 dB.
 - se3_exp rotation gradient at phi=0; dataset.crop float64 on MPS; MPS->float64 casts.

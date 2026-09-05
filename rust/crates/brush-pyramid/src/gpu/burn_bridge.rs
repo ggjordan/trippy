@@ -142,3 +142,34 @@ pub fn int_tensor<const D: usize>(tensor: CubeTensor<WgpuRuntime>) -> Tensor<D, 
     );
     Tensor::from_dispatch(bind(tensor, Kind::Int))
 }
+
+/// The reverse of [`float_tensor`]: drain a `Tensor<D>`'s pending fusion ops
+/// and hand back the concrete device buffer behind it.
+///
+/// This is what a viewer needs in order to bind the *network's* output — a
+/// `Tensor<4>` that came out of `brush_unet` — into a wgpu render pipeline,
+/// the same way [`crate::gpu::PyramidRender::feature_buffer`] hands over the
+/// rasteriser's own output. Line-for-line the same as `brush-render`'s
+/// `resolve_to_cube_float` (`burn_glue.rs:197-204`); it lives here so the
+/// viewer does not have to depend on the whole splat rasteriser for four
+/// lines of glue.
+///
+/// # Arguments
+/// - `tensor`: a non-autodiff float tensor on a wgpu device.
+///
+/// # Panics
+/// Panics if the tensor is not on a wgpu backend (an autodiff or CPU tensor
+/// has no single buffer to bind).
+#[must_use]
+pub fn resolve_to_cube_float<const D: usize>(tensor: Tensor<D>) -> CubeTensor<WgpuRuntime> {
+    let dispatch: DispatchTensor = tensor.into_dispatch();
+    let fusion = match dispatch.kind {
+        DispatchTensorKind::Wgpu(backend_tensor) => backend_tensor.float(),
+        other => panic!(
+            "resolve_to_cube_float expects a Wgpu tensor, got {:?}",
+            std::mem::discriminant(&other)
+        ),
+    };
+    let client = fusion.client.clone();
+    client.resolve_tensor_float::<MainBackendBase>(fusion)
+}
