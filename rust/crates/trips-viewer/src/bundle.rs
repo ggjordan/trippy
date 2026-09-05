@@ -246,14 +246,21 @@ impl Bundle {
         })
     }
 
-    /// The view the viewer opens at, clamped into range.
+    /// Array position of the view the viewer opens at, and the one the `R`
+    /// key returns to.
+    ///
+    /// The manifest's own `default_view` when it is in range. When it is not,
+    /// the view **nearest the centre of the camera box** rather than the last
+    /// one a clamp would land on: a broken manifest should still open on
+    /// something that looks at the scene.
     #[must_use]
-    pub fn default_view(&self) -> &BundleView {
-        let index = self
-            .manifest
-            .default_view
-            .min(self.manifest.views.len() - 1);
-        &self.manifest.views[index]
+    pub fn home_view_position(&self) -> usize {
+        let views = &self.manifest.views;
+        if self.manifest.default_view < views.len() {
+            self.manifest.default_view
+        } else {
+            SceneScale::most_central_view(views).unwrap_or(0)
+        }
     }
 
     /// The background feature vector, or `None` for a zero background.
@@ -306,6 +313,63 @@ const DEPTH_SPAN_SLACK: f32 = 1.05;
 const MIN_SPAN_RATIO: f32 = 1.01;
 
 impl Bounds {
+    /// The box's centre, world units.
+    #[must_use]
+    pub fn centre(&self) -> glam::Vec3 {
+        glam::Vec3::new(
+            0.5 * (self.min[0] + self.max[0]),
+            0.5 * (self.min[1] + self.max[1]),
+            0.5 * (self.min[2] + self.max[2]),
+        )
+    }
+
+    /// `point` moved to the nearest position inside the box.
+    #[must_use]
+    pub fn clamp_point(&self, point: glam::Vec3) -> glam::Vec3 {
+        let p = point.to_array();
+        let mut out = [0.0f32; 3];
+        for axis in 0..3 {
+            out[axis] = p[axis].clamp(self.min[axis], self.max[axis]);
+        }
+        glam::Vec3::from(out)
+    }
+
+    /// Is `point` inside the box (inclusive)?
+    #[must_use]
+    pub fn contains(&self, point: glam::Vec3) -> bool {
+        let p = point.to_array();
+        (0..3).all(|axis| p[axis] >= self.min[axis] && p[axis] <= self.max[axis])
+    }
+
+    /// The box scaled by `factor` about its own centre, with every half-extent
+    /// grown by at least `(factor - 1)` times the half-extent a cube of the
+    /// same diagonal would have.
+    ///
+    /// Used for the "you have flown out of the scene" test: a camera outside
+    /// `camera::LOST_BOX_FACTOR` times the capture box is somewhere no training view
+    /// ever saw, so the viewer offers the reset key rather than pretending the
+    /// black frame is a render.
+    ///
+    /// That floor is what makes the test usable on a real capture. A rig walked
+    /// round a subject at roughly one height -- the horse scene's cameras fill
+    /// 11.6 x 1.0 x 10.4 world units -- has an almost flat axis, and a pure
+    /// scaling would call the camera lost after rising 1.5 units while allowing
+    /// 17 sideways. For a cube the floor never bites, so `expanded` is then
+    /// exactly a scaling; for `factor <= 1` (shrinking) it is disabled.
+    #[must_use]
+    pub fn expanded(&self, factor: f32) -> Self {
+        let centre = self.centre().to_array();
+        let floor = 0.5 * (factor - 1.0).max(0.0) * self.diameter() / 3.0f32.sqrt();
+        let mut min = [0.0f32; 3];
+        let mut max = [0.0f32; 3];
+        for axis in 0..3 {
+            let half = (0.5 * (self.max[axis] - self.min[axis]) * factor).max(floor);
+            min[axis] = centre[axis] - half;
+            max[axis] = centre[axis] + half;
+        }
+        Self { min, max }
+    }
+
     /// The box's diagonal length, world units.
     #[must_use]
     pub fn diameter(&self) -> f32 {
@@ -354,6 +418,136 @@ impl Bounds {
         let near = lo.max(znear).max(f32::MIN_POSITIVE);
         let far = (hi * DEPTH_SPAN_SLACK).max(near * MIN_SPAN_RATIO);
         (near, far)
+    }
+}
+
+/// How the viewer's units are derived from a bundle: the box the capture
+/// cameras occupy and how far apart consecutive ones are.
+///
+/// This exists because the **point cloud** is not a scene scale. A TRIPS export
+/// carries an environment sphere of far-field points — on the horse bundle that
+/// sphere is 7500 units across each axis (a 12 990-unit box diagonal), while
+/// every capture camera fits in a box 15.6 units across — so a fly speed
+/// derived from the point bounding box is out by three orders of magnitude and
+/// one key tap leaves the scene. That is exactly the "fly 1948.53 u/s" Jordan
+/// was given on 2026-09-06. The cameras are the honest ruler: they are where a
+/// person could actually stand.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SceneScale {
+    /// Axis-aligned box containing every capture camera centre, world units.
+    pub bounds: Bounds,
+    /// Median distance between *consecutive* views in dataset order, world
+    /// units. Median rather than mean because capture sequences routinely
+    /// contain one huge jump between passes, which a mean would follow.
+    pub median_spacing: f32,
+}
+
+/// Default fly speed, as a multiple of [`SceneScale::median_spacing`] per
+/// second: one second of held `W` advances half the gap between two capture
+/// positions, which is a step, not a teleport.
+pub const BASE_SPEED_FRACTION: f32 = 0.5;
+
+/// Fallback spacing for a bundle whose views are all in one place: this
+/// fraction of the camera box's diagonal.
+const SPACING_FROM_BOX: f32 = 1.0 / 32.0;
+
+/// Last-resort spacing, world units, when there is neither a gap nor a box
+/// (a single view). Arbitrary, and only reachable from a one-view bundle.
+const SPACING_FALLBACK: f32 = 1.0;
+
+/// Below this a distance counts as zero, world units.
+const TINY: f32 = 1e-6;
+
+impl SceneScale {
+    /// Measure `views`.
+    ///
+    /// # Arguments
+    /// - `views`: every capture view, in dataset order (the order matters:
+    ///   the spacing is between *consecutive* entries).
+    #[must_use]
+    pub fn from_views(views: &[BundleView]) -> Self {
+        let mut min = [f32::INFINITY; 3];
+        let mut max = [f32::NEG_INFINITY; 3];
+        let mut previous: Option<glam::Vec3> = None;
+        let mut steps = Vec::with_capacity(views.len());
+        for view in views {
+            let position = view.position();
+            let p = position.to_array();
+            for axis in 0..3 {
+                min[axis] = min[axis].min(p[axis]);
+                max[axis] = max[axis].max(p[axis]);
+            }
+            if let Some(before) = previous {
+                let step = (position - before).length();
+                if step.is_finite() {
+                    steps.push(step);
+                }
+            }
+            previous = Some(position);
+        }
+        if !min[0].is_finite() {
+            min = [0.0; 3];
+            max = [0.0; 3];
+        }
+        steps.sort_by(f32::total_cmp);
+        let median_spacing = if steps.is_empty() {
+            0.0
+        } else {
+            steps[steps.len() / 2]
+        };
+        Self {
+            bounds: Bounds { min, max },
+            median_spacing,
+        }
+    }
+
+    /// Default fly speed for this scene, world units per second.
+    #[must_use]
+    pub fn base_speed(&self) -> f32 {
+        let spacing = if self.median_spacing > TINY {
+            self.median_spacing
+        } else {
+            let diagonal = self.bounds.diameter();
+            if diagonal > TINY {
+                diagonal * SPACING_FROM_BOX
+            } else {
+                SPACING_FALLBACK
+            }
+        };
+        BASE_SPEED_FRACTION * spacing
+    }
+
+    /// The camera box's diagonal: the number the HUD reports speed against and
+    /// the orbit distance is clamped by.
+    ///
+    /// A one-view bundle has a zero-size camera box, so this falls back to the
+    /// same ruler [`Self::base_speed`] used. Without that, "scene per second"
+    /// and the orbit clamps would divide by ~0.
+    #[must_use]
+    pub fn diameter(&self) -> f32 {
+        let diagonal = self.bounds.diameter();
+        if diagonal > TINY {
+            diagonal
+        } else {
+            self.base_speed() / BASE_SPEED_FRACTION
+        }
+    }
+
+    /// Array position of the view nearest the camera box's centre.
+    ///
+    /// Returns `None` for an empty slice.
+    #[must_use]
+    pub fn most_central_view(views: &[BundleView]) -> Option<usize> {
+        let centre = Self::from_views(views).bounds.centre();
+        views
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| {
+                (a.position() - centre)
+                    .length_squared()
+                    .total_cmp(&(b.position() - centre).length_squared())
+            })
+            .map(|(position, _)| position)
     }
 }
 
@@ -448,6 +642,18 @@ mod tests {
     }
 
     #[test]
+    fn an_out_of_range_default_view_falls_back_to_the_most_central_one() {
+        let mut m: Manifest = serde_json::from_str(&manifest_json(BUNDLE_FORMAT)).expect("parse");
+        assert_eq!(m.default_view, 1);
+        // Both views are pinhole-identity poses at (0,0,0) and (-1,-2,-3);
+        // whichever is nearest the box centre, it must be a real position.
+        m.default_view = 99;
+        let views = m.views.clone();
+        let fallback = SceneScale::most_central_view(&views).expect("a position");
+        assert!(fallback < views.len());
+    }
+
+    #[test]
     fn a_missing_manifest_is_an_error_not_a_panic() {
         let dir = std::env::temp_dir().join("trips-bundle-test-does-not-exist");
         assert!(Bundle::load(&dir).is_err());
@@ -512,5 +718,136 @@ mod bounds_tests {
     #[test]
     fn diameter_is_the_diagonal() {
         assert!((unit_box().diameter() - (12.0f32).sqrt()).abs() < 1e-5);
+    }
+
+    #[test]
+    fn a_box_clamps_contains_and_expands_about_its_centre() {
+        let b = Bounds {
+            min: [0.0, -2.0, 10.0],
+            max: [4.0, 2.0, 14.0],
+        };
+        assert!((b.centre() - glam::Vec3::new(2.0, 0.0, 12.0)).length() < 1e-6);
+        assert!(b.contains(glam::Vec3::new(2.0, 0.0, 12.0)));
+        assert!(!b.contains(glam::Vec3::new(2.0, 0.0, 20.0)));
+        let clamped = b.clamp_point(glam::Vec3::new(-5.0, 7.0, 12.5));
+        assert!((clamped - glam::Vec3::new(0.0, 2.0, 12.5)).length() < 1e-6);
+        // Expanding keeps the centre and triples the half-extents.
+        let wide = b.expanded(3.0);
+        assert!((wide.centre() - b.centre()).length() < 1e-5);
+        assert!((wide.min[0] + 4.0).abs() < 1e-5 && (wide.max[0] - 8.0).abs() < 1e-5);
+        assert!(wide.contains(glam::Vec3::new(2.0, 0.0, 17.0)));
+        assert!(!wide.contains(glam::Vec3::new(2.0, 0.0, 19.0)));
+    }
+}
+
+#[cfg(test)]
+mod scene_scale_tests {
+    use super::*;
+
+    /// `count` views spaced `step` apart along +X, each looking down +Z.
+    fn line(count: usize, step: f32) -> Vec<BundleView> {
+        (0..count)
+            .map(|i| BundleView {
+                index: i,
+                name: String::new(),
+                width: 64,
+                height: 48,
+                fx: 50.0,
+                fy: 50.0,
+                cx: 32.0,
+                cy: 24.0,
+                r: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+                // R = I, so the centre is -t.
+                t: [-(i as f32) * step, 0.0, 0.0],
+                ..zeroed()
+            })
+            .collect()
+    }
+
+    /// The distortion field, spelled once.
+    fn zeroed() -> BundleView {
+        BundleView {
+            index: 0,
+            name: String::new(),
+            width: 1,
+            height: 1,
+            fx: 1.0,
+            fy: 1.0,
+            cx: 0.0,
+            cy: 0.0,
+            r: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+            t: [0.0; 3],
+            distortion: [0.0; 8],
+        }
+    }
+
+    #[test]
+    fn the_camera_box_and_spacing_come_from_the_views() {
+        let views = line(5, 2.0);
+        let scene = SceneScale::from_views(&views);
+        assert!((scene.bounds.min[0] - 0.0).abs() < 1e-6);
+        assert!((scene.bounds.max[0] - 8.0).abs() < 1e-6);
+        assert!((scene.median_spacing - 2.0).abs() < 1e-6);
+        // 0.5 x the median spacing per second.
+        assert!((scene.base_speed() - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn one_outlier_jump_does_not_move_the_median() {
+        // Four views 1 unit apart, then one 1000 units away: a mean would call
+        // this scene 250x bigger than it is, which is the bug this guards.
+        let mut views = line(5, 1.0);
+        views[4].t[0] = -1000.0;
+        let scene = SceneScale::from_views(&views);
+        assert!((scene.median_spacing - 1.0).abs() < 1e-6, "{}", scene.median_spacing);
+        assert!((scene.base_speed() - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn expanding_a_flat_box_grows_its_flat_axis_too() {
+        // The horse capture's shape: wide, deep, and one unit tall.
+        let flat = Bounds {
+            min: [-5.8, -0.5, -5.2],
+            max: [5.8, 0.5, 5.2],
+        };
+        let wide = flat.expanded(3.0);
+        // The wide axes are simply tripled...
+        assert!((wide.max[0] - 3.0 * 5.8).abs() < 1e-3, "{}", wide.max[0]);
+        // ... and the flat one is grown to the floor, not to 1.5 units.
+        assert!(wide.max[1] > 5.0, "flat axis only grew to {}", wide.max[1]);
+        assert!(wide.contains(glam::Vec3::new(0.0, 5.0, 0.0)));
+        assert!(!wide.contains(glam::Vec3::new(0.0, 50.0, 0.0)));
+        // A cube is unaffected by the floor: expansion is exactly a scaling.
+        let cube = Bounds {
+            min: [-1.0; 3],
+            max: [1.0; 3],
+        };
+        assert!((cube.expanded(3.0).max[0] - 3.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn a_single_view_still_yields_a_usable_speed() {
+        let scene = SceneScale::from_views(&line(1, 1.0));
+        assert_eq!(scene.median_spacing, 0.0);
+        assert!(scene.base_speed() > 0.0 && scene.base_speed().is_finite());
+        // The zero-size camera box must not become a zero divisor: the HUD
+        // divides the speed by this, and so does the orbit clamp.
+        assert!(scene.diameter() > TINY && scene.diameter().is_finite());
+        assert!((scene.base_speed() / scene.diameter()).is_finite());
+    }
+
+    #[test]
+    fn views_all_in_one_place_fall_back_to_the_box() {
+        let views = line(4, 0.0);
+        let scene = SceneScale::from_views(&views);
+        assert_eq!(scene.median_spacing, 0.0);
+        assert!(scene.base_speed() > 0.0 && scene.base_speed().is_finite());
+    }
+
+    #[test]
+    fn the_most_central_view_is_the_middle_of_the_line() {
+        let views = line(5, 2.0);
+        assert_eq!(SceneScale::most_central_view(&views), Some(2));
+        assert_eq!(SceneScale::most_central_view(&[]), None);
     }
 }

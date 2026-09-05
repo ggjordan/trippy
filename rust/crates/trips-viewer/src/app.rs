@@ -9,6 +9,13 @@
 //!     - The camera starts **pinned** to the bundle's default view and stays
 //!       bit-identical to it until the user moves; see
 //!       [`crate::camera::Controller`].
+//!     - Mouse input is read from the scene [`egui::Response`] and NEVER gated
+//!       on `Context::egui_wants_pointer_input`. That predicate is true while
+//!       *any* widget is being interacted with — including this canvas, which
+//!       is allocated with `Sense::click_and_drag()` — so gating on it
+//!       swallowed every drag the moment the button went down. `dragged_by` is
+//!       already scoped to drags that started on this widget, which is the
+//!       test actually wanted, and is what Brush's own camera controls use.
 //!     - The render happens on the UI thread, blocking on the rasteriser's one
 //!       readback. That costs the CPU/GPU overlap a viewer would normally get
 //!       and is why the reported frame time is the honest one — nothing is
@@ -26,15 +33,19 @@ use eframe::egui;
 
 use crate::blit::{BlitCallback, BlitResources};
 use crate::bundle::Bundle;
-use crate::camera::Controller;
+use crate::camera::{Controller, Mode};
 use crate::renderer::{Renderer, Settings, ViewMode};
 
 /// How many recent frame intervals the fps readout averages over.
 const FPS_WINDOW: usize = 30;
 
-/// Initial fly speed as a fraction of the scene's bounding-box diagonal,
-/// per second: crossing the whole scene takes about seven seconds.
-const FLY_SPEED_FRACTION: f32 = 0.15;
+/// egui scroll units in one wheel notch. macOS trackpads report a continuous
+/// delta, so this is a divisor rather than a count.
+const SCROLL_NOTCH: f32 = 50.0;
+
+/// The orbit pivot counts as "at the edge of the capture box" once it leaves
+/// the box shrunk by this factor, i.e. within 0.1% of a wall.
+const EDGE_OF_BOX: f32 = 0.999;
 
 /// Render-scale presets the `-`/`=` keys step between.
 const SCALE_STEPS: [f32; 4] = [0.5, 0.75, 0.9, 1.0];
@@ -93,14 +104,15 @@ impl ViewerApp {
             bundle.manifest.name.clone()
         };
         let up = bundle.manifest.up;
-        let default_view = bundle.default_view().clone();
+        // The home view is a real capture pose, so the viewer opens on
+        // something a camera actually saw. Scale comes from the same place:
+        // never from `renderer.bounds()`, which is the POINT bounding box and
+        // on the horse bundle is 12 990 units across because of the far-field
+        // environment sphere -- the 1948 u/s fly speed Jordan was given.
+        let home = bundle.home_view_position();
 
         let renderer = Renderer::new(bundle, burn_device)?;
-        let controller = Controller::new(
-            &default_view,
-            up,
-            renderer.bounds().diameter() * FLY_SPEED_FRACTION,
-        );
+        let controller = Controller::new(&views, home, up);
 
         cc.egui_ctx
             .options_mut(|o| o.theme_preference = egui::ThemePreference::Dark);
@@ -123,6 +135,11 @@ impl ViewerApp {
     /// Set the initial view mode (from `--mode`).
     pub fn set_mode(&mut self, mode: ViewMode) {
         self.mode = mode;
+    }
+
+    /// Set the initial navigation mode (orbit by default, `--free` for fly).
+    pub fn set_navigation(&mut self, mode: Mode) {
+        self.controller.set_mode(mode);
     }
 
     /// Frames per second over the last [`FPS_WINDOW`] frames, or `None` before
@@ -155,25 +172,32 @@ impl ViewerApp {
 
     /// Consume keyboard and mouse for this frame.
     ///
-    /// The scene response is allocated *before* the settings window is drawn,
-    /// so a drag that lands on the panel would otherwise spin the camera as
-    /// well as move the slider. egui's `wants_*_input` answers "did a widget
-    /// take this?" for the previous frame, which is the standard idiom and is
-    /// exactly right here: one frame of latency on a click is invisible, and
-    /// the alternative is a camera that lurches whenever a checkbox is
-    /// touched.
+    /// Drags come from `response`, which egui has already scoped to this
+    /// widget *and* to gestures that started on it: a drag begun on the HUD
+    /// window never reaches the camera, and a drag begun on the canvas keeps
+    /// working after the pointer wanders over the HUD. That is the whole
+    /// contract, and it is why no `Context::egui_wants_pointer_input` check
+    /// appears here — see the module invariants for what that cost.
     fn handle_input(&mut self, ctx: &egui::Context, response: &egui::Response, dt: f32) {
-        let pointer_free = !ctx.egui_wants_pointer_input();
-        let keyboard_free = !ctx.egui_wants_keyboard_input();
-
-        if pointer_free
-            && (response.dragged_by(egui::PointerButton::Primary)
-                || response.dragged_by(egui::PointerButton::Secondary))
+        let viewport_height = response.rect.height();
+        let delta = response.drag_delta();
+        if response.dragged_by(egui::PointerButton::Primary) {
+            self.controller.drag(delta.x, delta.y);
+        } else if response.dragged_by(egui::PointerButton::Secondary)
+            || response.dragged_by(egui::PointerButton::Middle)
         {
-            let delta = response.drag_delta();
-            self.controller.look(delta.x, delta.y);
+            self.controller.pan(delta.x, delta.y, viewport_height);
         }
-        if !keyboard_free {
+        if response.dragged() {
+            ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+        } else if response.hovered() {
+            ctx.set_cursor_icon(egui::CursorIcon::Grab);
+        }
+
+        // Only a text field should be allowed to eat the movement keys. The
+        // broader `egui_wants_keyboard_input` is true whenever ANY widget holds
+        // focus, so clicking a checkbox in the panel would have killed WASD.
+        if ctx.text_edit_focused() {
             return;
         }
 
@@ -190,6 +214,18 @@ impl ViewerApp {
             if i.key_pressed(egui::Key::Equals) || i.key_pressed(egui::Key::Plus) {
                 self.step_scale(1);
             }
+            if i.key_pressed(egui::Key::F) {
+                self.controller.set_mode(self.controller.mode().toggled());
+            }
+            if i.key_pressed(egui::Key::R) {
+                self.controller.reset(&self.views);
+            }
+            if i.key_pressed(egui::Key::N) {
+                self.controller.step_view(&self.views, 1);
+            }
+            if i.key_pressed(egui::Key::P) {
+                self.controller.step_view(&self.views, -1);
+            }
 
             let axis = |positive: egui::Key, negative: egui::Key| -> f32 {
                 f32::from(i.key_down(positive)) - f32::from(i.key_down(negative))
@@ -202,8 +238,8 @@ impl ViewerApp {
             let up = axis(egui::Key::E, egui::Key::Q);
             self.controller.fly(forward, right, up, dt);
 
-            if pointer_free && response.hovered() && i.smooth_scroll_delta.y != 0.0 {
-                self.controller.adjust_speed(i.smooth_scroll_delta.y / 50.0);
+            if response.hovered() && i.smooth_scroll_delta.y != 0.0 {
+                self.controller.scroll(i.smooth_scroll_delta.y / SCROLL_NOTCH);
             }
         });
     }
@@ -280,16 +316,78 @@ impl ViewerApp {
         }
 
         ui.separator();
+        ui.horizontal(|ui| {
+            ui.label("navigate (F):");
+            let mut mode = self.controller.mode();
+            let mut changed = false;
+            for candidate in [Mode::Orbit, Mode::Free] {
+                changed |= ui
+                    .selectable_value(&mut mode, candidate, candidate.label())
+                    .changed();
+            }
+            if changed {
+                self.controller.set_mode(mode);
+            }
+        });
+        // Speed is quoted twice on purpose: world units per second is what the
+        // camera does, and "scenes per second" is what it MEANS. The second
+        // number is the same in every scene, which is exactly what the old
+        // "fly 1948.53 u/s" readout could not tell anyone.
+        let scene = self.controller.scene();
         ui.label(format!(
-            "{} points | fly {:.2} u/s (scroll) | WASD move, Q/E up/down, drag to look",
+            "{} points | capture area {:.1} u across | fly {:.3} u/s = {:.3} scene/s ({}) | \
+             pivot {:.2} u away",
             self.renderer.num_points(),
-            self.controller.move_speed
+            scene.diameter(),
+            self.controller.move_speed(),
+            self.controller.speed_in_scenes(),
+            if self.controller.mode() == Mode::Free {
+                "scroll changes it"
+            } else {
+                "scroll zooms"
+            },
+            self.controller.orbit_distance(),
         ));
+        ui.label(
+            "left-drag orbit/look | right- or middle-drag pan | WASD move, Q/E up/down\n\
+             R home view | N / P next / previous capture view | F orbit-free | V honesty view",
+        );
+        if self.controller.is_lost() {
+            ui.colored_label(
+                egui::Color32::from_rgb(255, 200, 120),
+                "you have flown outside the captured area — press R to reset",
+            );
+        }
+        // Orbit mode pins the pivot inside the camera box, so W eventually
+        // stops moving. Say so, rather than letting it look like a dead key.
+        if self.controller.mode() == Mode::Orbit
+            && !scene
+                .bounds
+                .expanded(EDGE_OF_BOX)
+                .contains(self.controller.target())
+        {
+            ui.colored_label(
+                egui::Color32::from_rgb(255, 200, 120),
+                "at the edge of the captured area — press F to fly past it",
+            );
+        }
+
+        ui.horizontal(|ui| {
+            if ui.button("R: home").clicked() {
+                self.controller.reset(&self.views);
+            }
+            if ui.button("P: prev").clicked() {
+                self.controller.step_view(&self.views, -1);
+            }
+            if ui.button("N: next").clicked() {
+                self.controller.step_view(&self.views, 1);
+            }
+        });
         egui::ComboBox::from_label("jump to view")
             .selected_text(if self.controller.is_pinned() {
                 format!("view {}", self.controller.reference().index)
             } else {
-                "free".to_owned()
+                format!("free (from view {})", self.controller.reference().index)
             })
             .show_ui(ui, |ui| {
                 // A hundred-plus dataset views: show them all, the combo box
@@ -301,13 +399,13 @@ impl ViewerApp {
                     } else {
                         format!("{} ({})", view.index, view.name)
                     };
-                    if ui.selectable_label(false, label).clicked() {
+                    let selected = position == self.controller.view_position();
+                    if ui.selectable_label(selected, label).clicked() {
                         chosen = Some(position);
                     }
                 }
                 if let Some(position) = chosen {
-                    let view = self.views[position].clone();
-                    self.controller.snap_to(&view);
+                    self.controller.snap_to_position(&self.views, position);
                 }
             });
     }
@@ -363,12 +461,20 @@ impl eframe::App for ViewerApp {
                 .fixed_pos(rect.min + egui::vec2(12.0, 12.0))
                 .show(ctx, |ui| {
                     let text = match (self.frame_ms(), self.fps()) {
-                        (Some(ms), Some(fps)) => {
-                            format!("{ms:.1} ms ({fps:.1} fps) — {}", self.mode.label())
-                        }
+                        (Some(ms), Some(fps)) => format!(
+                            "{ms:.1} ms ({fps:.1} fps) — {} — {}",
+                            self.mode.label(),
+                            self.controller.mode().label()
+                        ),
                         _ => "measuring...".to_owned(),
                     };
                     ui.label(egui::RichText::new(text).size(16.0).strong());
+                    if self.controller.is_lost() {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(255, 200, 120),
+                            "outside the captured area — press R to reset",
+                        );
+                    }
                 });
         }
 

@@ -2,6 +2,15 @@
 All notable changes to trippy. Format: Keep a Changelog. Versions: semver tags `vX.Y.Z`. Every push also gets a `build-NNNN` tag.
 
 ## [Unreleased]
+### Fixed
+- **Viewer input model** (from Jordan's 2026-09-06 test). Two bugs, both in the viewer only:
+  1. *Click-and-drag did nothing.* `app.rs` gated every drag on `Context::egui_wants_pointer_input()`, which is true whenever **any** widget is being interacted with -- including the render canvas itself, allocated with `Sense::click_and_drag()`. Pressing the button therefore disabled the camera for the whole drag. Drags now come from the scene `Response` (`dragged_by` / `drag_delta`), the same thing Brush's own camera controls use. The keyboard gate moved from `egui_wants_keyboard_input()` (true whenever any widget holds focus, so clicking a checkbox killed WASD) to `text_edit_focused()`.
+  2. *Fly speed was 1948 u/s in a 15.6-unit scene.* The speed came from the **point cloud** bounding box, which a TRIPS export fills with a far-field environment sphere 12 990 units across. Speed now comes from `bundle::SceneScale` -- the box the **capture cameras** occupy and the median distance between consecutive ones -- at 0.5 x that spacing per second (0.26 u/s on the horse, 0.15 u/s on Karekare), scroll x1.25 a notch within [0.01, 10] x base. The HUD shows the speed as a fraction of the captured area per second as well as in world units.
+### Added
+- Viewer navigation: **orbit** mode (the default) around a pivot pinned inside the camera box -- you cannot fly out of the scene -- and **free** fly as the alternative, `F` toggles. Right- or middle-drag pans; scroll zooms in orbit and changes speed in free. `R` returns to the view the viewer opened at, `N`/`P` step to the next/previous capture camera, and the "jump to view" dropdown tracks them. Free flight past 3x the camera box shows a "press R to reset" hint.
+- `trips-viewer --camera-yaw-deg <d>` and `--free`: a scripted camera change for headless verification.
+- The same speed fix reaches the **web** viewer (`trips-web`): `Controller::new` now takes the view list and derives the speed from `SceneScale` itself, and `Renderer::bounds()` — the point-cloud box that caused this bug in both viewers — is no longer public. `trips-web` opens in `Mode::Free`, which is what its `look`/`fly`/`adjust_speed` controls are.
+- `scripts/viewer_camera_check.sh`: renders one bundle twice through `--screenshot` with different camera yaws and fails if the two PNGs match, proving without a human that camera changes reach the renderer. Refuses any bundle that is not a known-public scene.
 
 ## [v0.2.0] - 2026-09-06
 Milestone numbering note: the plan tied v0.2.0 to the Karekare shade verdict and v0.4.0 to the Mac viewer. The viewer landed first (the long Karekare trainings are still queued behind Splats' jobs), so this release carries the viewer and the complete trainer; the shade verdict will be recorded in the release where it lands.

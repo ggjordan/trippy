@@ -86,10 +86,19 @@ cat > "$CMDFILE" <<LAUNCHER
 # Everything runs on this machine: a local binary reading local files. Nothing
 # is uploaded anywhere.
 #
-#   W A S D   move            Q / E    down / up
-#   drag      look around     scroll   change fly speed
-#   V         cycle view: network -> raw level-0 -> coverage
-#   - / =     render scale    TAB      hide the panel
+#   left-drag         turn around the scene (orbit) — or look around, in free mode
+#   right/middle-drag pan sideways
+#   scroll            orbit: closer / further      free: change fly speed
+#   W A S D           move           Q / E   down / up
+#   R                 back to the view it opened at
+#   N / P             next / previous real camera of the capture
+#   F                 orbit <-> free fly
+#   V                 cycle view: network -> raw level-0 -> coverage
+#   - / =             render scale   TAB     hide the panel
+#
+# It opens on a real camera of the capture and orbits inside it, so you cannot
+# get lost. Speed is set from how far apart the real cameras are, so one tap of
+# W is a step, not a teleport.
 #
 # The panel's top line is the frame time and fps. "coverage" is the honesty
 # view: dark means the rasteriser drew nothing there and the network invented

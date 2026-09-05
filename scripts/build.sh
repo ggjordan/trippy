@@ -36,6 +36,14 @@ if [ -f rust/Cargo.toml ]; then
   ( cd rust && cargo check -p brush-pyramid -p brush-unet )
   echo "▶ cargo check --features gpu --all-targets (type-check only; GPU tests run in queue jobs)"
   ( cd rust && cargo check -p brush-pyramid -p brush-unet --features gpu --all-targets --offline )
+  # trips-viewer only exists with the gpu feature graph, so it is checked here
+  # rather than in scripts/test.sh: `cargo check` reuses the metadata the line
+  # above just produced (seconds), while `cargo test` would have to codegen
+  # Burn/CubeCL/wgpu in debug (minutes). Its 37 unit tests are CPU-only and are
+  # run in release next to the viewer build:
+  #   cargo test --release -p trips-viewer
+  echo "▶ cargo check -p trips-viewer --all-targets (the viewer, incl. its tests)"
+  ( cd rust && cargo check -p trips-viewer --all-targets --offline )
 fi
 
 echo "✓ build OK"

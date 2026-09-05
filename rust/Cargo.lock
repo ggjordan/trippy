@@ -6690,7 +6690,7 @@ dependencies = [
 
 [[package]]
 name = "trips-web"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "brush-pyramid",
  "brush-unet",

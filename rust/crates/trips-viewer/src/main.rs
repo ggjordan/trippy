@@ -55,17 +55,24 @@ Options:
   --half-net           run the U-Net in f16 (the big one at 1080p)
   --view <n>           open at this dataset view index (default: the bundle's)
   --mode <m>           network | raw | coverage (default network)
+  --free               open in free-fly mode instead of orbit
 
 Headless (no window; used by the acceptance check and the perf table):
   --screenshot <o.png> render one frame to a PNG and exit
+  --camera-yaw-deg <d> yaw the camera off the chosen view by <d> degrees first;
+                       a scripted camera change, so two --screenshot runs can
+                       prove that moving the camera reaches the renderer
   --frames <n>         warm-up frames before the screenshot / benchmark (default 2)
   --bench <n>          time <n> frames and print ms + fps, then exit
 
 Keys:
-  W A S D  move        Q / E   down / up along the scene up axis
-  drag     look        scroll  fly speed
-  V        cycle network / raw level-0 / coverage
-  - / =    render scale        TAB  hide the panel
+  left-drag  orbit (or look, in free mode)   right/middle-drag  pan
+  W A S D    move        Q / E   down / up along the scene up axis
+  scroll     zoom in orbit mode, fly speed in free mode
+  F          orbit <-> free      R  back to the view it opened at
+  N / P      next / previous capture view
+  V          cycle network / raw level-0 / coverage
+  - / =      render scale        TAB  hide the panel
 ";
 
 /// wgpu runtime options for Burn. Copied from the Brush fork's
@@ -109,6 +116,10 @@ struct Args {
     screenshot: Option<PathBuf>,
     warmup: usize,
     bench: Option<usize>,
+    /// Degrees to yaw the camera off the chosen view before rendering.
+    camera_yaw_deg: Option<f32>,
+    /// Open in free-fly rather than the default orbit mode.
+    free: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -120,6 +131,8 @@ fn parse_args() -> Result<Args, String> {
         screenshot: None,
         warmup: 2,
         bench: None,
+        camera_yaw_deg: None,
+        free: false,
     };
     let mut argv = std::env::args().skip(1);
     while let Some(flag) = argv.next() {
@@ -148,6 +161,11 @@ fn parse_args() -> Result<Args, String> {
                 };
             }
             "--screenshot" => args.screenshot = Some(PathBuf::from(value()?)),
+            "--camera-yaw-deg" => {
+                args.camera_yaw_deg =
+                    Some(value()?.parse().map_err(|e| format!("--camera-yaw-deg: {e}"))?);
+            }
+            "--free" => args.free = true,
             "--frames" => args.warmup = value()?.parse().map_err(|e| format!("--frames: {e}"))?,
             "--bench" => args.bench = Some(value()?.parse().map_err(|e| format!("--bench: {e}"))?),
             "-h" | "--help" => return Err(USAGE.to_owned()),
@@ -179,7 +197,10 @@ fn resolve_bundle(explicit: Option<PathBuf>, headless: bool) -> Result<PathBuf, 
 /// Both create their **own** Burn device (there is no window to borrow one
 /// from) and run exactly the render path the window does.
 fn run_headless(args: &Args, bundle: Bundle) -> Result<(), String> {
-    let view = pick_view(&bundle, args.view)?;
+    let home = pick_view_position(&bundle, args.view)?;
+    let views = bundle.manifest.views.clone();
+    let up = bundle.manifest.up;
+    let view = views[home].clone();
     let device = block_on(async {
         burn_wgpu::init_setup_async::<burn_wgpu::graphics::AutoGraphicsApi>(
             &WgpuDevice::DefaultDevice,
@@ -194,7 +215,17 @@ fn run_headless(args: &Args, bundle: Bundle) -> Result<(), String> {
     let scale = args.settings.render_scale.clamp(0.1, 1.0);
     let width = ((camera_view.width as f32 * scale).round() as usize).max(16);
     let height = ((camera_view.height as f32 * scale).round() as usize).max(16);
-    let controller = crate::camera::Controller::new(&camera_view, [0.0, -1.0, 0.0], 1.0);
+    let mut controller = crate::camera::Controller::new(&views, home, up);
+    if args.free {
+        controller.set_mode(crate::camera::Mode::Free);
+    }
+    // A scripted camera change: `yaw` unpins even at zero degrees, so two runs
+    // with different angles differ only in the rotation, never in which code
+    // path built the camera.
+    if let Some(degrees) = args.camera_yaw_deg {
+        controller.yaw(degrees.to_radians());
+        eprintln!("camera yawed {degrees} deg off view {}", camera_view.index);
+    }
     let camera = controller.render_camera(width, height, &camera_view);
 
     eprintln!(
@@ -282,16 +313,16 @@ fn frame_device(frame: &crate::renderer::RenderedFrame) -> &WgpuDevice {
     &frame.buffer.device
 }
 
-/// Resolve `--view <dataset index>` to a view, defaulting to the bundle's.
-fn pick_view(bundle: &Bundle, index: Option<usize>) -> Result<crate::bundle::BundleView, String> {
+/// Resolve `--view <dataset index>` to an ARRAY POSITION in `manifest.views`,
+/// defaulting to the bundle's own `default_view` (which is already a position;
+/// see `crate::bundle::Manifest`).
+fn pick_view_position(bundle: &Bundle, index: Option<usize>) -> Result<usize, String> {
+    let views = &bundle.manifest.views;
     match index {
-        None => Ok(bundle.default_view().clone()),
-        Some(wanted) => bundle
-            .manifest
-            .views
+        None => Ok(bundle.home_view_position()),
+        Some(wanted) => views
             .iter()
-            .find(|v| v.index == wanted)
-            .cloned()
+            .position(|v| v.index == wanted)
             .ok_or_else(|| format!("no view with index {wanted} in this bundle")),
     }
 }
@@ -332,6 +363,11 @@ fn run() -> Result<(), String> {
     settings.render_scale = settings.render_scale.clamp(0.1, 1.0);
     let title = format!("TRIPS — {}", bundle.manifest.name);
     let mode = args.mode;
+    let navigation = if args.free {
+        crate::camera::Mode::Free
+    } else {
+        crate::camera::Mode::Orbit
+    };
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -347,6 +383,7 @@ fn run() -> Result<(), String> {
             let mut app = app::ViewerApp::new(cc, bundle, settings)
                 .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
             app.set_mode(mode);
+            app.set_navigation(navigation);
             Ok(Box::new(app))
         }),
     )
