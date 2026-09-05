@@ -285,10 +285,6 @@ def build_parser() -> argparse.ArgumentParser:
     smoke.add_argument("--device", choices=["cpu", "mps"], default=None)
     smoke.set_defaults(func=_cmd_smoke)
 
-    for name in ("train", "eval"):
-        stub = sub.add_parser(name, help=f"{name} (not implemented yet)")
-        stub.set_defaults(func=_cmd_not_implemented(name))
-
     render = sub.add_parser(
         "render", help="rasterise the TRIPS pyramid for chosen frames + a contact sheet (no U-Net yet)"
     )
@@ -307,10 +303,6 @@ def build_parser() -> argparse.ArgumentParser:
     render.add_argument("--out", required=True, help="output directory")
     render.add_argument("--device", choices=["cpu", "mps"], default=None)
     render.set_defaults(func=_cmd_render)
-    for name in ("render",):
-        stub = sub.add_parser(name, help=f"{name} (not implemented yet)")
-        stub.set_defaults(func=_cmd_not_implemented(name))
-
     train = sub.add_parser("train", help="train a TRIPS-style model from a YAML config")
     train.add_argument("--config", required=True, help="path to a TrainConfig YAML file")
     train.add_argument("--resume", default=None, help="checkpoint .pt path to resume from")
