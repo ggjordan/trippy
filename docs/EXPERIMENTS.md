@@ -544,34 +544,71 @@ returns, it:
    doesn't exist yet). Every cell that can't be computed (a failed/missing audit) reads `"n/a"`
    rather than being silently omitted or fabricated, so the table always renders even when an
    audit legitimately fails (e.g. the synthetic CPU test scene's empty `points3D.txt`).
-4. Delivers `dolly.mp4`, `honesty_sheet.png`, and `export.ply` via `scripts/deliver.sh`, each
-   with the same honest one-line summary as the "why" -- e.g. `"trippy train report
-   full1-broadcast: epoch 39, held-out PSNR 14.42 dB, shade dark-mass 36.2% vs baseline 19.9%"`.
-   No verdict language ("looks good", etc.) -- just the numbers, per AGENTS.md's honesty rule and
-   "Jordan's viewer verdict is final" above. `TRIPPY_DELIVER_DRY_RUN=1` skips the `deliver.sh`
-   subprocess entirely (recorded as `"skipped: TRIPPY_DELIVER_DRY_RUN=1"` in `report.json`'s
-   `deliveries` list) -- set by the CPU test suite so it never touches Splats' review queue or
-   `research/trips-metal.md`.
+4. Exports a **free-navigation viewer bundle** (`trippy.render.bundle.export_bundle`, the same
+   code `trippy export-bundle` runs) from this same final checkpoint into `<run_dir>/bundle/`,
+   and generates a Mac double-click launcher via `scripts/open_mac_viewer.sh`
+   (`OPEN_TRIPS_MAC_<run_name>.command` under `$TRIPPY_OUTPUT/deliver/<run_name>/`). Jordan: "fixed
+   dolly paths are hard to judge, I want to navigate freely" -- the dolly video is still delivered
+   (it is cheap and still useful), but the viewer bundle is the artifact that lets him fly through
+   the scene instead of judging it off one baked camera path. If the viewer binary
+   (`rust/target/release/trips-viewer`) hasn't been built yet, `trippy.render.report.
+   build_mac_viewer_launcher` never fails the run: it records the failure in `<run_dir>/report/
+   VIEWER_LAUNCHER_FAILED.txt` and the rest of the report still completes (`report.json`'s
+   `bundle.viewer` field carries the same status/note).
+5. Delivers the viewer launcher, `dolly.mp4`, `honesty_sheet.png`, and `export.ply` via
+   `scripts/deliver.sh`, **launcher first** (requirement: Jordan wants free navigation front and
+   centre, not buried under the fixed-path dolly video). Every delivery shares the same honest
+   one-line summary as the "why" -- e.g. `"trippy train report full1-broadcast: epoch 39, held-out
+   PSNR 14.42 dB, shade dark-mass 36.2% vs baseline 19.9%"` -- and the viewer launcher's delivery
+   appends `"; open in the free-navigation viewer; N/P step capture views"`
+   (`trippy.render.report.viewer_delivery_why`). No verdict language ("looks good", etc.) -- just
+   the numbers, per AGENTS.md's honesty rule and "Jordan's viewer verdict is final" above.
+   `TRIPPY_DELIVER_DRY_RUN=1` skips the `deliver.sh` subprocess entirely (recorded as
+   `"skipped: TRIPPY_DELIVER_DRY_RUN=1"` in `report.json`'s `deliveries` list, and prints the
+   `deliver.sh` command that would have run) -- set by the CPU test suite so it never touches
+   Splats' review queue or `research/trips-metal.md`.
 
 Output layout: `<run_dir>/report/` mirrors `candidate-report`'s own `<out>/` layout (`export.ply`
-is the run's own, not re-exported; `dolly/`, `offpath/`, `report.json`), plus the comparison
-table appended to `<run_dir>/README.md` and `report.json`'s extra `epoch`, `held_out`,
-`summary_line`, and `deliveries` fields.
+is the run's own, not re-exported; `dolly/`, `offpath/`, `report.json`), `<run_dir>/bundle/` holds
+the free-navigation viewer bundle (`bundle.json`, `points.npz`, `weights.safetensors`), and the
+comparison table plus a "### Deliveries" list (viewer launcher first) are appended to
+`<run_dir>/README.md`. `report.json` additionally carries `epoch`, `held_out`, `bundle`
+(`{"bundle_dir", "viewer"}`), `summary_line`, and `deliveries` (a 4-entry list, launcher first).
 
 **Never crashes the run** (requirement, not just a hope): `trippy.cli._run_train_report_safely`
 wraps the whole report step in a `try`/`except`. If reporting itself throws -- a broken audit
-tool, a missing scene sparse dir, `deliver.sh` refusing an artifact -- the exception is logged to
-stderr and written to `<run_dir>/REPORT_FAILED.txt`; `trippy train`'s exit code still reflects
-`fit()` alone (0 on a successful training run, regardless of `--report`'s outcome).
+tool, a missing scene sparse dir, a bundle export failure, `deliver.sh` refusing an artifact --
+the exception is logged to stderr and written to `<run_dir>/REPORT_FAILED.txt`; `trippy train`'s
+exit code still reflects `fit()` alone (0 on a successful training run, regardless of `--report`'s
+outcome). A missing/stale viewer *binary* specifically never reaches that path -- it is caught one
+level down, inside `build_mac_viewer_launcher`, per point 4 above.
 
 Tested end to end on CPU with the synthetic scene (`tests/test_cli_train_report.py`): `--report`
-writes `report.json` and the README table even though the synthetic scene's empty `points3D.txt`
-makes the shade audit degrade to `{"error": ...}` for both candidate and baseline (requirement 6);
-a separate unit test drives `_run_train_report_safely` with a monkeypatched `run_train_report`
-that raises, asserting `REPORT_FAILED.txt` is written and nothing propagates. The pure
-comparison-table/summary-line/dolly-stop-index functions are unit-tested directly in
-`tests/test_render_report.py` against synthetic dicts and coverage profiles, so those invariants
-don't depend on a full training run.
+writes `report.json`, the exported `bundle/` directory, and the README table (with its deliveries
+list, viewer launcher first) even though the synthetic scene's empty `points3D.txt` makes the
+shade audit degrade to `{"error": ...}` for both candidate and baseline (requirement 6); a
+separate unit test drives `_run_train_report_safely` with a monkeypatched `run_train_report` that
+raises, asserting `REPORT_FAILED.txt` is written and nothing propagates. The pure comparison-table/
+summary-line/dolly-stop-index/viewer-launcher functions are unit-tested directly in
+`tests/test_render_report.py` against synthetic dicts, coverage profiles, and a fake/missing
+viewer binary, so those invariants don't depend on a full training run.
+
+### `trippy bundle-launcher`: the same viewer bundle + launcher, for any checkpoint
+
+`trippy bundle-launcher --checkpoint <ckpt> --name <name> [--scene <adop scene>] [--epoch <ep>]
+[--out <dir>]` (`trippy.cli._cmd_bundle_launcher`, `trippy.render.report.
+export_bundle_and_viewer_launcher`) runs steps 4-5 above -- bundle export, Mac launcher, delivery
+-- against **any** checkpoint, not just a run's own just-finished final one: an older run that
+predates this feature, a checkpoint someone wants a fresh launcher for without re-training, or a
+TRIPS/ADOP checkpoint (`--scene` required, same auto-detection as `export-bundle`). `--out`
+defaults to `<run_dir>/bundle` when the checkpoint is `<run_dir>/checkpoints/checkpoint_*.pt`, else
+a `bundle/` alongside the checkpoint itself (`trippy.render.report.default_bundle_out_dir`).
+Exit code is always 0 with the bundle written even if the viewer-launcher step fails (same
+never-fails contract as `--report`'s own bundle step) -- CPU-only, same as `export-bundle`.
+
+Tested end to end on CPU with a synthetic trippy-native checkpoint
+(`tests/test_cli_bundle_launcher.py`, `--out` explicit and defaulted); run for real on a trained
+checkpoint the same way `train --report` runs it internally.
 
 ### `scripts/queue_training.sh`: submit a self-reporting run in one command
 

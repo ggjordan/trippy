@@ -1039,6 +1039,28 @@ TRAIN_REPORT_FAILED_FILENAME = "REPORT_FAILED.txt"
 # appends one line to research/trips-metal.md, no heavy I/O).
 DELIVER_SUBPROCESS_TIMEOUT_S = 120.0
 
+# Sub-directory of a training run's own `run_dir` that `train --report` (and the
+# standalone `trippy bundle-launcher` command, for a run-shaped checkpoint) writes the
+# free-navigation viewer bundle into (bundle.json/points.npz/weights.safetensors --
+# `trippy.render.bundle.export_bundle`), alongside the existing dolly/offpath/report.json
+# layout -- Jordan: "fixed dolly paths are hard to judge, I want to navigate freely."
+TRAIN_REPORT_BUNDLE_DIRNAME = "bundle"
+
+# Written under `<run_dir>/report/` (never raised past the caller) when
+# `scripts/open_mac_viewer.sh` cannot produce a launcher for the exported bundle --
+# most commonly because the viewer binary hasn't been built yet. Mirrors
+# TRAIN_REPORT_FAILED_FILENAME's "leave a visible trace, never fail the run" pattern,
+# scoped to just this one step so a missing binary never masks the rest of an
+# otherwise-successful report.
+VIEWER_LAUNCHER_FAILED_FILENAME = "VIEWER_LAUNCHER_FAILED.txt"
+
+# Appended (after "; ") to the honest one-line summary when delivering the Mac viewer
+# launcher, so the delivery queue entry says what makes this artifact different from
+# the dolly video: free navigation, not a fixed path, plus the keys (N/P) to jump
+# between the capture's own real cameras (docs/USER_GUIDE.md "How to open the native
+# TRIPS viewer").
+VIEWER_DELIVERY_WHY_SUFFIX = "open in the free-navigation viewer; N/P step capture views"
+
 # --- distill/ : design-B fallback pipeline (docs/SPEC.md D2, "A plain splat that
 # incorporates TRIPS learning (Design B) is a valid fallback path"; Quest honesty
 # note: "ship fallback: distilled Gaussians via the existing ~/Splats/tools/publish/

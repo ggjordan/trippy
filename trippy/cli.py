@@ -32,11 +32,17 @@ docs/EXPERIMENTS.md "Candidate report". It never opens an image itself
 `train --report` runs that same pipeline against the just-finished run's
 final checkpoint (`trippy.render.report.run_train_report`), plus a cached
 baseline audit of the run's own source PLY, a baseline-vs-candidate
-comparison table appended to the run's README.md, and delivery via
-`scripts/deliver.sh` -- see docs/EXPERIMENTS.md "Self-reporting training
-runs". Reporting failures are caught here and written to
-`<run_dir>/REPORT_FAILED.txt`; they never fail an otherwise-successful
-training run (`trippy train`'s exit code reflects `fit()` only).
+comparison table appended to the run's README.md, a free-navigation viewer
+bundle + Mac launcher exported from the same final checkpoint (Jordan:
+"fixed dolly paths are hard to judge, I want to navigate freely"), and
+delivery via `scripts/deliver.sh` (launcher first) -- see docs/EXPERIMENTS.md
+"Self-reporting training runs". Reporting failures are caught here and
+written to `<run_dir>/REPORT_FAILED.txt`; they never fail an
+otherwise-successful training run (`trippy train`'s exit code reflects
+`fit()` only). A missing/stale viewer binary alone never triggers that file --
+`trippy.render.report.build_mac_viewer_launcher` records it in
+`<run_dir>/report/VIEWER_LAUNCHER_FAILED.txt` instead and the rest of the
+report still completes.
 `points-build` builds any `trippy.train.config.PointSourceConfig`-described
 source (gaussian/colmap/union/npz, the same schema as a TrainConfig YAML's
 `point_source:` block, taken as the document root here) and writes it to
@@ -67,6 +73,14 @@ points stay in WORLD space and every camera of the scene is listed, so the
 viewer can fly freely rather than replay one baked view. It accepts either a
 TRIPS/ADOP checkpoint (with `--scene`) or a trippy-native checkpoint, and
 auto-detects which -- see `trippy.render.bundle`. CPU-only.
+
+`bundle-launcher` runs the same three steps `train --report` now runs from
+its own final checkpoint -- `export-bundle`, a Mac double-click launcher via
+`scripts/open_mac_viewer.sh`, and delivery via `scripts/deliver.sh` -- against
+any checkpoint passed on the command line (`trippy.render.report.
+export_bundle_and_viewer_launcher`), so a free-navigation launcher can be
+(re)built for an existing run without re-training. CPU-only; never fails on a
+missing/stale viewer binary (prints the failure and still writes the bundle).
 """
 
 from __future__ import annotations
@@ -494,6 +508,46 @@ def _cmd_export_bundle(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_bundle_launcher(args: argparse.Namespace) -> int:
+    """Standalone `bundle-launcher`: export-bundle + Mac viewer launcher + delivery, for any checkpoint.
+
+    Runs the same three steps `trippy train --report` now runs from its own
+    final checkpoint (`trippy.render.report.export_bundle_and_viewer_launcher`)
+    against whatever checkpoint is passed here -- so a free-navigation bundle
+    + launcher can be (re)built for an existing run without re-training, or
+    for a checkpoint `--report` never got the chance to touch.
+    """
+    # Deferred import: pulls in the render/audit stack `trippy export-bundle`
+    # alone has no need for.
+    from trippy.render.report import default_bundle_out_dir, export_bundle_and_viewer_launcher
+
+    checkpoint_path = Path(args.checkpoint)
+    out_dir = Path(args.out) if args.out else default_bundle_out_dir(checkpoint_path)
+    why_base = f"trippy bundle-launcher {args.name}: checkpoint {checkpoint_path}"
+
+    result = export_bundle_and_viewer_launcher(
+        checkpoint_path,
+        out_dir,
+        args.name,
+        why_base=why_base,
+        scene=args.scene,
+        epoch=args.epoch,
+    )
+    print(f"wrote bundle -> {result['bundle_dir']}")
+    if result["viewer"]["status"] == "ok":
+        print(f"wrote viewer launcher -> {result['viewer']['command_path']}")
+    else:
+        print(f"bundle-launcher: viewer launcher FAILED (bundle was still written): {result['viewer']['note']}", file=sys.stderr)
+    print(f"delivery: {result['delivery']['status']}")
+    print(
+        "JSON:"
+        + json.dumps(
+            {"bundle_dir": result["bundle_dir"], "viewer": result["viewer"], "delivery": result["delivery"]}
+        )
+    )
+    return 0
+
+
 def _candidate_report_readme(report: dict) -> str:
     """Human-readable summary of a `candidate-report` run: numbers + artifact paths only.
 
@@ -760,8 +814,9 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "after fit(), run the candidate report on the final checkpoint, audit the baseline "
             "source PLY (cached), append a baseline-vs-candidate table to the run's README.md, "
-            "and deliver dolly.mp4 + honesty_sheet.png + export.ply via scripts/deliver.sh -- "
-            "never fails the run (see REPORT_FAILED.txt if reporting itself breaks)"
+            "export a free-navigation viewer bundle + Mac launcher, and deliver the launcher + "
+            "dolly.mp4 + honesty_sheet.png + export.ply via scripts/deliver.sh -- never fails the "
+            "run (see REPORT_FAILED.txt if reporting itself breaks)"
         ),
     )
     train.set_defaults(func=_cmd_train)
@@ -897,6 +952,32 @@ def build_parser() -> argparse.ArgumentParser:
     export_bundle.add_argument("--out", required=True, help="bundle directory to write")
     export_bundle.add_argument("--name", default=None, help="scene label written into bundle.json")
     export_bundle.set_defaults(func=_cmd_export_bundle)
+
+    bundle_launcher = sub.add_parser(
+        "bundle-launcher",
+        help="export a bundle + generate/deliver a free-navigation Mac viewer launcher, for any checkpoint",
+    )
+    bundle_launcher.add_argument(
+        "--checkpoint",
+        required=True,
+        help=(
+            "TRIPS/ADOP checkpoint dir (params.ini + ep<NNNN>/, needs --scene), or a "
+            "trippy-native checkpoint .pt / run directory"
+        ),
+    )
+    bundle_launcher.add_argument("--scene", default=None, help="ADOP scene directory (TRIPS checkpoints only)")
+    bundle_launcher.add_argument(
+        "--epoch",
+        default=None,
+        help=f"epoch subdirectory name (TRIPS only; default {TRIPS_DEFAULT_EPOCH}, else the newest ep*/)",
+    )
+    bundle_launcher.add_argument("--name", required=True, help="bundle label, launcher name, and delivery name")
+    bundle_launcher.add_argument(
+        "--out",
+        default=None,
+        help="bundle directory to write (default: <run_dir>/bundle when detectable, else alongside the checkpoint)",
+    )
+    bundle_launcher.set_defaults(func=_cmd_bundle_launcher)
 
     candidate_report = sub.add_parser(
         "candidate-report",

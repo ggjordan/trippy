@@ -4,12 +4,19 @@ Module: tests.test_cli_train_report
 Invariants under test:
     - `python -m trippy.cli train --config <yaml> --device cpu --report`
       exits 0 on the synthetic scene, writes `<run_dir>/report/report.json`,
-      and appends a "## Report: epoch N" section (with the baseline-vs-
-      candidate comparison table) to `<run_dir>/README.md` -- this task's
-      brief requirement 6. The synthetic scene's `points3D.txt` is empty
-      (see tests/test_train_helpers.py), so the shade audit legitimately
-      degrades to `{"error": ...}`; the table must still render (no
-      exception, no missing section).
+      and appends a "## Report: epoch N" section (with a deliveries list and
+      the baseline-vs-candidate comparison table) to `<run_dir>/README.md`
+      -- this task's brief requirement 6. The synthetic scene's
+      `points3D.txt` is empty (see tests/test_train_helpers.py), so the
+      shade audit legitimately degrades to `{"error": ...}`; the table must
+      still render (no exception, no missing section).
+    - Jordan wants free navigation, not just a fixed dolly path: `--report`
+      also exports a `bundle/` directory (`trippy.render.bundle.export_bundle`'s
+      output, i.e. `bundle.json` at minimum) under the run dir and generates
+      a Mac double-click launcher (`OPEN_TRIPS_MAC_<run_name>.command` under
+      `$TRIPPY_OUTPUT/deliver/<run_name>/`), and lists that launcher FIRST
+      among the 4 deliveries (viewer, dolly, honesty, export) both in
+      `report.json["deliveries"]` and in the README's "### Deliveries" list.
     - `TRIPPY_DELIVER_DRY_RUN=1` (set for this whole test module) means
       every delivery is recorded as skipped rather than shelling out to
       scripts/deliver.sh -- this repo's forbidden list ("no GPU jobs";
@@ -83,14 +90,44 @@ def test_cli_train_report_end_to_end_on_synthetic_scene(tmp_path: Path) -> None:
     assert f"epoch {report['epoch']}" in report["summary_line"]
     assert "good" not in report["summary_line"].lower()
 
-    assert len(report["deliveries"]) == 3
+    # Requirements 1-3: a free-navigation bundle + Mac launcher, exported from this
+    # run's own final checkpoint, alongside the existing dolly/honesty artifacts.
+    assert "bundle" in report
+    bundle_dir = Path(report["bundle"]["bundle_dir"])
+    assert bundle_dir == run_dir / "bundle"
+    assert (bundle_dir / "bundle.json").exists()
+    assert (bundle_dir / "points.npz").exists()
+    assert (bundle_dir / "weights.safetensors").exists()
+
+    viewer = report["bundle"]["viewer"]
+    if viewer["status"] == "ok":
+        # The common case on the dev machine (rust/target/release/trips-viewer built).
+        command_path = Path(viewer["command_path"])
+        assert command_path.name == f"OPEN_TRIPS_MAC_{run_dir.name}.command"
+        assert command_path == Path(env["TRIPPY_OUTPUT"]) / "deliver" / run_dir.name / command_path.name
+        assert command_path.exists()
+        assert os.access(command_path, os.X_OK)
+        assert not (report_dir / "VIEWER_LAUNCHER_FAILED.txt").exists()
+    else:
+        # Viewer binary not built on whatever machine runs this suite -- requirement 2:
+        # this must never fail the run, just leave a visible note.
+        assert "note" in viewer
+        assert (report_dir / "VIEWER_LAUNCHER_FAILED.txt").read_text() == viewer["note"] + "\n"
+
+    # Requirement 4: viewer launcher listed FIRST, dolly/honesty/export kept (cheap).
+    assert len(report["deliveries"]) == 4
+    assert report["deliveries"][0]["name"] == f"{run_dir.name}-viewer"
     for delivery in report["deliveries"]:
-        assert delivery["status"].startswith("skipped")  # TRIPPY_DELIVER_DRY_RUN=1
+        assert delivery["status"].startswith("skipped") or delivery["status"].startswith("failed")
 
     readme_text = (run_dir / "README.md").read_text()
     assert f"## Report: epoch {report['epoch']}" in readme_text
+    assert "### Deliveries" in readme_text
     assert "| Metric | Baseline | Candidate |" in readme_text
     assert report["summary_line"] in readme_text
+    # The viewer launcher bullet must precede the dolly one in the README text.
+    deliveries_section = readme_text.split("### Deliveries", 1)[1]
+    assert deliveries_section.index(f"{run_dir.name}-viewer") < deliveries_section.index(f"{run_dir.name}-dolly")
 
 
 def test_cli_train_report_failure_writes_report_failed_but_never_raises(
