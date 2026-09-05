@@ -1,0 +1,35 @@
+# EXP-0003 smoke variant: first queue-job rehearsal. Small enough (max_points, half
+# width/crop, 2 epochs) to finish quickly on mps and prove the queue round-trip end to
+# end before committing to the full 150-epoch config.yaml run.
+#
+# Run via: trippy train --config experiments/EXP-0003-kk-trips-train/config_smoke.yaml
+# (through scripts/gpu_submit.sh, never invoked directly -- see AGENTS.md).
+
+scene_root: /Users/nzbirdranch/Splats/scenes/karekare/kk-coherent
+run_dir: output/runs/EXP-0003-kk-trips-train/EXP-0003-kk-trips-train_smoke
+
+width: 504
+crop: 256
+mode: trilinear
+layers: 5
+epochs: 2
+
+point_source:
+  type: gaussian
+  path: /Users/nzbirdranch/Splats/output/Training-Data/karekare/kk-coherent/kkc_15000.ply
+  min_opacity: 0.05
+  size_mode: scale
+  max_points: 200000
+
+forced_heldout:
+  - IMG_3828.jpg
+  - IMG_3829.jpg
+  - IMG_3830.jpg
+  - IMG_3831.jpg
+  - IMG_3832.jpg
+  - IMG_3833.jpg
+
+eval_every: 1
+checkpoint_every: 1
+device: mps
+seed: 0

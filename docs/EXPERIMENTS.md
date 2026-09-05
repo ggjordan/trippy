@@ -306,3 +306,78 @@ failing silently). `colorize` maps depth/coverage scalars to RGB with a
 hand-picked 5-stop viridis-like ramp implemented in numpy, so
 `docs/SPEC.md`'s honesty sheet (raw composite | network output |
 coverage/provenance map) needs no new plotting dependency.
+
+## Training runs
+
+`trippy train --config <cfg.yaml>` (`trippy/train/{config,params,trainer,eval,checkpoint_io}.py`) runs
+the crop/render/tone-map/loss loop described in `docs/ARCHITECTURE.md`'s "train/" section. This section
+covers the config file format and the on-disk run layout.
+
+### Config file format
+
+A config file is any subset of `TrainConfig`'s fields (see `trippy/train/config.py` and `trippy/
+constants.py`'s "train/" section for every default and its `train_normalnet.ini` citation); everything
+else keeps its scaled-for-trippy default:
+
+```yaml
+scene_root: /Users/nzbirdranch/Splats/scenes/karekare/kk-coherent
+run_dir: output/runs/EXP-0003-kk-trips-train/EXP-0003-kk-trips-train_1
+width: 1008
+crop: 384
+mode: trilinear
+layers: 5
+epochs: 150
+device: mps
+forced_heldout:
+  - IMG_3828.jpg   # ... SHADE_FRAMES_KK
+point_source:
+  type: gaussian
+  path: /Users/nzbirdranch/Splats/output/Training-Data/karekare/kk-coherent/kkc_15000.ply
+  min_opacity: 0.05
+  size_mode: scale
+```
+
+`point_source.type` is `gaussian` (`GaussianPlySource`), `colmap` (`ColmapSparseSource`), `union`
+(`UnionSource` of nested `sources:`), or `npz` (a `PointSet` previously dumped via `PointSet.save_npz`).
+`forced_heldout` should be `trippy.constants.SHADE_FRAMES_KK` for any karekare scene, so every eval reports
+a shade-region number rather than one that got lucky and landed in train.
+
+Resume a run: `trippy train --config <cfg.yaml> --resume <run_dir>/checkpoints/checkpoint_latest.pt`.
+Override the wall-clock budget from the CLI without editing the file: `--max-minutes 90`.
+
+### Output layout
+
+Matches the "Run location" table above -- a training run writes everything under its own `run_dir`
+(gitignored, never committed):
+
+```
+output/runs/<exp>/<run>/
+├── log.txt                       (one line per checkpoint/eval event -- see below)
+├── metrics.jsonl                 (one JSON object per train_step AND per evaluate() call)
+├── checkpoints/
+│   ├── checkpoint_ep0000.pt
+│   ├── checkpoint_ep0010.pt
+│   └── checkpoint_latest.pt      (always the most recent, for --resume)
+├── eval_ep0000/
+│   ├── metrics.json               ({"epoch", "n_images", "psnr_mean", "ssim_mean", "lpips_mean", "names"})
+│   └── sheet.png                  (honesty sheet: photo | render | raw L0 | coverage, up to 6 rows)
+├── eval_ep0010/
+│   └── ...
+├── export.ply                    (final trained point cloud, 3DGS-compatible)
+└── export.ply.provenance.npy     (per-point provenance sidecar)
+```
+
+`metrics.jsonl` is append-only and safe to `tail -f` during a run: per-step records have keys `step`,
+`epoch`, `image`, `zoom`, `loss`, `image_loss`, `extent_penalty`, `camera_reg`; per-eval records have
+`eval: true` plus the same fields as that eval's `metrics.json` (minus `names`, to keep each line short).
+`log.txt` gets one human-readable line per checkpoint save and per eval (`"epoch N: eval psnr=... ssim=..."`),
+plus a line when a `--max-minutes` budget cuts a run short.
+
+### Standalone evaluation
+
+`trippy eval --checkpoint <run_dir>/checkpoints/checkpoint_latest.pt [--images IMG_3830.jpg ...]`
+(`trippy.train.eval.evaluate_checkpoint`) re-evaluates a checkpoint without re-training, rebuilding the
+exact dataset/point-source/split the checkpoint was trained with from its own saved config. Omitting
+`--images` evaluates the checkpoint's own held-out split. `trippy.train.eval.render_offpath` renders
+honesty triplets (no ground truth) at arbitrary poses from a JSON file -- the stable API the dolly-camera-
+path generator (see "Dolly camera paths" above) will plug into once it exists.

@@ -286,3 +286,68 @@ The memory-notes section above ("U-Net: ~130k params, 5 levels") predates this v
 known to undercount the "params" figure's precision (true default is 59,675, not "~130k"); the "5 levels"
 figure is correct for the shipped `train_normalnet.ini` default (though not for the released checkpoints,
 which use 8).
+
+## train/ -- config, trainable params, trainer loop, eval, checkpointing (feat/train, 2026-09-06)
+
+`trippy/train/` is the CPU-testable trainer that drives `raster/` + `net/` end to end: sample a crop,
+render the pyramid, decode + tone-map, compute loss, backprop, step. Every render call goes through
+`trippy.raster.pyramid.render_pyramid` unmodified -- on `device="cpu"` that dispatches to the fully
+differentiable `ref_torch` path, so the whole loop (including gradients into points/pose/net/camera) is
+testable today; the Metal backward pass (`blend_bwd`) is developed concurrently and plugs in with no API
+change here, since nothing in `trainer.py` inspects which backward path is active.
+
+- **`trippy/train/config.py`**: `TrainConfig` -- every default is `configs/train_normalnet.ini`
+  (TRIPS @ a59a65b) scaled for trippy's smaller compute budget, or an explicit trippy addition; each is
+  cited in `trippy.constants`' "train/" section. Loaded via `TrainConfig.load_yaml(path)` =
+  `TrainConfig(**yaml.safe_load(...))` -- a config file only states what differs from the defaults.
+  Epoch-fraction fields (`lock_cameras_frac`, `lock_structure_frac`, `vgg_start_frac`) are stored as
+  fractions of `epochs`, not absolute counts, so the *proportion* of a run spent locked/pre-VGG matches
+  TRIPS (`lock_camera_params_epochs=100`, `lock_structure_params_epochs=10`,
+  `only_start_vgg_after_epochs=100`, all out of `num_epochs=600`) regardless of how many epochs a given
+  trippy run actually does. `PointSourceConfig` describes any `trippy.points.PointSource` (gaussian /
+  colmap / union / npz) from a config file.
+- **`trippy/train/params.py`**: `PointParams` -- the trainable point cloud. `xyz`, `raw_size`, `raw_conf`,
+  `feat` are `nn.Parameter`s; `size()` = `softplus(raw_size)` and `conf()` = `sigmoid(10 * raw_conf)` are
+  the *effective* (post-activation) values used at render time, exactly mirroring TRIPS's own raw/effective
+  split (docs/TRIPS_REFERENCE.md Sec. 2) -- including the `x10` confidence scale, which trippy keeps rather
+  than dropping (that section's Sec. 10.4 flags dropping it as a fidelity gap). `feat`'s first 3 channels
+  are seeded from the point source's `rgb0` (so the untrained U-Net immediately sees real colour); any
+  remaining channels get small Gaussian noise, not TRIPS's own full-range `Uniform(0,1)` texture init -- a
+  deliberate trippy simplification. `provenance` is a buffer, never a `Parameter`. `PoseParams` holds one
+  learnable SE(3) twist per training image, applied via `trippy.geom.xform_b.compose` at render time so
+  gradients reach the delta through the projection, never the frozen COLMAP pose itself.
+- **`trippy/train/trainer.py`**: `Trainer` -- owns the dataset, point source, `PointParams`/`PoseParams`,
+  `NeuralCamera`, the U-Net, and one `torch.optim.Adam` with one param group per learning rate in
+  `TrainConfig` (points, size, confidence, texture, background, poses, network, exposure, response --
+  vignette and white balance are frozen, matching TRIPS's `fix_vignette`/`fix_wb` defaults). Structure/
+  camera "locking" is implemented by toggling `requires_grad_` on the frozen parameters for the locked
+  epoch range (not by zeroing an optimizer-group lr), so it composes cleanly with the shared
+  `ReduceLROnPlateau` schedule (`mode="max"` on held-out PSNR, `factor`/`patience` from the ini).
+  **Crop strategy ("K-adjust", not "render-full-then-crop"):** `train_step` samples a crop centre/zoom,
+  calls `trippy.scene.dataset.crop()` for the crop-adjusted intrinsics and validity mask, and hands that
+  adjusted `K` straight to `render_pyramid` with `image_hw = (crop, crop)` -- only the crop's own fragments
+  are ever rasterised. `tests/test_train_crop_equivalence.py` proves this equals cropping a full render of
+  the same points/pose to <1e-5 (float64 compute), for both pyramid modes. A soft AABB extent penalty (not
+  in TRIPS) keeps `xyz` near the point source's initial bounding box, guarding docs/SPEC.md's "extent
+  inflation" risk. `evaluate()` renders full frames for the held-out split, reports PSNR/SSIM (always) and
+  LPIPS (only if `cfg.eval_lpips`, gated so CPU tests never require a network-reachable VGG backbone unless
+  asked), and writes a 4-column honesty contact sheet (photo | render | raw level-0 | coverage) for up to
+  `TRAIN_EVAL_MAX_SHEET_IMAGES` images, forced-held-out shade frames first. `save_checkpoint`/`resume`
+  round-trip through `trippy.train.checkpoint_io` (atomic write, one `torch.save`d dict of state_dicts).
+  `export_ply` writes the trained point cloud via `trippy.train.export.write_gaussian_ply`, using the
+  trained feature vector's first 3 channels (clamped to [0,1]) as an approximate colour -- the true
+  rendered appearance needs the trained U-Net decoding every pyramid level together, which no 3DGS viewer
+  can run. `fit()` runs the full epoch loop (locks, vgg start, eval/checkpoint cadence) with an optional
+  `max_minutes` wall-clock budget so a queue job ends cleanly (checkpoint + export always written before
+  returning).
+- **`trippy/train/eval.py`**: standalone, checkpoint-only evaluation -- `evaluate_checkpoint` rebuilds a
+  `Trainer` from the checkpoint's own saved `cfg` (so dataset/point-source/split reconstruct identically)
+  and loads the trained state, never re-training. `render_offpath` renders honesty triplets (raw | network
+  | coverage, no ground truth) at arbitrary poses from a JSON file -- the stable API a later dolly-camera-
+  path generator (docs/EXPERIMENTS.md "Dolly camera paths") plugs into.
+- **`trippy/train/checkpoint_io.py`**: a checkpoint is one `torch.save`d plain dict (`epoch`, `cfg`,
+  `point_params`, `pose_params`, `net`, `camera`, `background`, `optimizer`, `scheduler`), written to a
+  temp file and renamed into place so a killed job never leaves a half-written checkpoint.
+
+CLI: `trippy train --config cfg.yaml [--resume ckpt] [--max-minutes M] [--device cpu|mps]` and
+`trippy eval --checkpoint ckpt [--images ...] [--device cpu|mps]` (`trippy/cli.py`).
