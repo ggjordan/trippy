@@ -4,7 +4,7 @@ Module: tests.conftest
 Invariants: never reads/copies real scene data into the repo; only points
     at ~/Splats read-only, and skips cleanly when absent (this repo must
     run green on a machine without ~/Splats too).
-Related docs: /tmp/trippy-plan.md decision D12 (public repo, no photos/
+Related docs: docs/SPEC.md decision D12 (public repo, no photos/
     plys/checkpoints from Jordan's scenes ever committed; test fixtures
     synthetic only).
 """

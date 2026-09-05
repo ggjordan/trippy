@@ -17,7 +17,7 @@ se3_exp/compose use the twist convention xi = (rho, phi) with
     rho = xi[:3] (translation generator) and phi = xi[3:] (rotation vector,
     axis * angle in radians) -- the Sophus/g2o SE3 convention.
 Related docs: trippy.geom.xform_a (independent numpy implementation);
-    /tmp/trippy-plan.md "Technical design" (learnable SE(3) pose delta).
+    docs/SPEC.md "Technical design" (learnable SE(3) pose delta).
 """
 
 from __future__ import annotations

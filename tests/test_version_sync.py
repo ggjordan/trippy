@@ -4,7 +4,7 @@ Module: tests.test_version_sync
 Invariants under test: there is exactly one place a human/agent edits the
     version (VERSION); everything else (setuptools dynamic version,
     __version__, a future Rust workspace) derives from or matches it.
-Related docs: /tmp/trippy-plan.md "Scripts and hooks" item "Version truth";
+Related docs: docs/SPEC.md "Scripts and hooks" item "Version truth";
     scripts/release.sh (writes VERSION, mirrors Cargo workspace version).
 """
 

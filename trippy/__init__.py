@@ -3,7 +3,7 @@
 Module: trippy (package root)
 Invariants: __version__ resolves without raising even before the VERSION
     file or an installed distribution metadata exist.
-Related docs: /tmp/trippy-plan.md "Scripts and hooks" item "Version truth";
+Related docs: docs/SPEC.md "Scripts and hooks" item "Version truth";
     tests/test_version_sync.py.
 """
 

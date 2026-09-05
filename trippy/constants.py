@@ -4,7 +4,7 @@ Module: trippy.constants
 Invariants: pure Python literals only (no numpy/torch import) so both
     trippy.geom.xform_a (numpy-only) and trippy.geom.xform_b (torch-only)
     can import it without pulling in each other's dependency.
-Related docs: /tmp/trippy-plan.md "Technical design"; AGENTS.md review
+Related docs: docs/SPEC.md "Technical design"; AGENTS.md review
     checklist item "no magic numbers outside constants.py".
 """
 

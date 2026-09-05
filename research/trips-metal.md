@@ -27,3 +27,4 @@ Decisions D1–D12 locked. Repository skeleton created: AGENTS.md, CLAUDE.md, RE
 **Question**: Is the repo skeleton complete and ready for research work?
 **Verdict**: PASS
 **Artifact**: this commit; `git ls-files` confirms no images/plys/checkpoints.
+- 2026-09-05T10:49:54Z submitted job trippy-smoke prio 15: trippy smoke --device mps

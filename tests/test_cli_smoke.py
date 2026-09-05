@@ -4,7 +4,7 @@ Module: tests.test_cli_smoke
 Invariants under test: the CLI is invocable via `python -m trippy.cli`
     (not just as an installed console script), exits 0 on the CPU smoke
     path, and prints torch diagnostics.
-Related docs: /tmp/trippy-plan.md "Verification (end-to-end)" item 1
+Related docs: docs/SPEC.md "Verification (end-to-end)" item 1
     (`uv run trippy smoke` prints torch/MPS/compile_shader/build tag).
 """
 

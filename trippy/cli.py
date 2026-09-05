@@ -4,7 +4,7 @@ Module: trippy.cli
 Invariants: `smoke` only touches MPS when --device mps is explicitly passed
     (never a silent default); the `render`/`train`/`eval`/`density` stubs do
     no work and always exit 2.
-Related docs: /tmp/trippy-plan.md "Technical design", AGENTS.md forbidden
+Related docs: docs/SPEC.md "Technical design", AGENTS.md forbidden
     list (no direct GPU/MPS work outside scripts/gpu_submit.sh -- `smoke
     --device mps` is only ever invoked by the GPU-queue job itself).
 """

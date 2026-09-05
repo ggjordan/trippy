@@ -13,7 +13,7 @@ Coordinate frame: COLMAP world/camera convention throughout. World points
         x_cam = R(q) @ x_world + t
     This matches COLMAP's images.txt convention and
     ~/Splats/research/visual/render_offpath.py's qvec2R/viewmat.
-Related docs: /tmp/trippy-plan.md "Reference files" (render_offpath.py);
+Related docs: docs/SPEC.md "Reference files" (render_offpath.py);
     trippy.geom.xform_b (independent torch implementation).
 """
 

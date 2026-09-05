@@ -5,7 +5,7 @@ Invariants under test: two independently-written implementations of the
     same COLMAP camera convention must agree numerically (a), must NOT
     silently agree when fed a convention bug (b), and must agree on the
     sign of "in front of the camera" (c).
-Related docs: /tmp/trippy-plan.md "Verification (end-to-end)" item 1;
+Related docs: docs/SPEC.md "Verification (end-to-end)" item 1;
     AGENTS.md "geometry implemented twice and made to disagree first".
 """
 

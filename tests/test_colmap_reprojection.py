@@ -8,7 +8,7 @@ Invariants under test: both geometry implementations reproject a sparse
 Skips cleanly when ~/Splats/scenes/karekare/kk-coherent/sparse_txt is
     absent (see tests.conftest.splats_scene). Must finish in well under the
     suite's 60s CPU budget -- points are subsampled per image to stay fast.
-Related docs: /tmp/trippy-plan.md "Validation (CPU pytest, before any GPU
+Related docs: docs/SPEC.md "Validation (CPU pytest, before any GPU
     job)"; trippy.geom.camera.intrinsics_from_colmap_params (distortion
     handling note).
 """

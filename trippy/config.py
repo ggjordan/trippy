@@ -5,7 +5,7 @@ Invariants: load_settings() never raises (missing env vars fall back to
     documented defaults); pick_device() never silently falls back from mps
     to cpu -- requesting "mps" asserts torch.backends.mps.is_available()
     (AGENTS.md: "no silent MPS fallback").
-Related docs: /tmp/trippy-plan.md "Repository layout" (SPLATS_ROOT,
+Related docs: docs/SPEC.md "Repository layout" (SPLATS_ROOT,
     TRIPPY_OUTPUT), "D8" (own venv, reads Splats read-only).
 """
 

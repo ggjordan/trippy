@@ -44,3 +44,4 @@ third_party/
 
 # OS
 .DS_Store
+.worktrees/

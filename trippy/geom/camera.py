@@ -7,7 +7,7 @@ Invariants: numpy only; distort() is used only for undistortion later (per
 Coordinate frame: same COLMAP convention as trippy.geom.xform_a/xform_b.
     "Normalized" coordinates below means camera-frame x/z, y/z (i.e. pixel
     coordinates with fx=fy=1, cx=cy=0) -- not yet scaled by focal length.
-Related docs: /tmp/trippy-plan.md "Technical design" (dataset undistort);
+Related docs: docs/SPEC.md "Technical design" (dataset undistort);
     tests/test_colmap_reprojection.py (uses intrinsics_from_colmap_params
     to get fx,fy,cx,cy from any of PINHOLE/SIMPLE_PINHOLE/OPENCV/
     SIMPLE_RADIAL, ignoring distortion).
