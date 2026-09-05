@@ -579,4 +579,16 @@ def run_train_report(trainer: Trainer, held_out_metrics: dict) -> dict:
         "deliveries": deliveries,
     }
     (out_dir / CANDIDATE_REPORT_JSON_FILENAME).write_text(json.dumps(report, indent=2) + "\n")
+
+    # Jordan always has one up-to-date "trips-leaderboard" sheet: rebuild it from every
+    # run's report.json/metrics.jsonl (this one now included) and re-deliver under the
+    # same fixed name (scripts/deliver.sh's ln -sfn replaces the symlink each time, per
+    # docs/EXPERIMENTS.md "Leaderboard"). Deferred import (same reason as cli.py's own
+    # deferred `run_train_report` import: this pulls in PIL/yaml, no need for `trippy
+    # train` runs without --report to pay that cost) and never allowed to turn an
+    # otherwise-successful report into a REPORT_FAILED.txt (see
+    # `regenerate_and_deliver_safely`'s own docstring).
+    from trippy.render.leaderboard import regenerate_and_deliver_safely
+
+    report["leaderboard"] = regenerate_and_deliver_safely()
     return report

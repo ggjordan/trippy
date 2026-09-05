@@ -16,6 +16,26 @@ This file is the index. It has sections for each delivery:
 
 Artifacts **never** appear in the `trippy` repo itself; they live in the `Splats` review folder where you already review other experiments.
 
+## How to read the leaderboard
+
+`~/Splats/output/Jordan-Review/4-other/trips-leaderboard.png` (also `.md` next to it under
+`$TRIPPY_OUTPUT/leaderboard/`) is one table comparing every TRIPS training run that has finished
+a self-report against the plain-Gaussian baseline and Design C. It regenerates and re-delivers
+itself automatically at the end of every `trippy train --report` run, so it's always the
+newest run's own README plus every earlier run in one place -- open it first before digging into
+an individual run's own README/dolly video.
+
+Rows are sorted by shade dark-mass fraction ascending (lower/closer to the Gaussian baseline's
+19.9% first), then held-out PSNR descending -- the rows nearest the top are the closest to "no
+worse than plain Gaussians in the shade, and as sharp everywhere else". A run named with
+`(smoke)` was a queue-rehearsal run (a few epochs, proving the pipeline works), not a real result
+-- read it for "did the run complete", not for its numbers.
+
+One honest gap: the "held-out shade" PSNR/SSIM/LPIPS column is `n/a` for every real trippy run.
+The trainer only records one aggregate number over the whole held-out split (shade frames
+included), not a separate shade-only number, so there is nothing real to show there yet -- only
+the two fixed baseline rows (which come from a different, already-published experiment) have it.
+
 ## How to open a .command file
 
 A `.command` file is a macOS double-click shortcut:

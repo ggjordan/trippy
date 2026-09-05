@@ -81,6 +81,15 @@ any checkpoint passed on the command line (`trippy.render.report.
 export_bundle_and_viewer_launcher`), so a free-navigation launcher can be
 (re)built for an existing run without re-training. CPU-only; never fails on a
 missing/stale viewer binary (prints the failure and still writes the bundle).
+
+`leaderboard` scans every run directory under `$TRIPPY_OUTPUT/runs/**/` with a
+finished self-report (`report/report.json` or `candidate/report.json`) plus a
+`metrics.jsonl`, and writes one markdown + PNG comparison table across all of
+them plus the fixed Gaussian/Design-C baselines
+(`trippy.render.leaderboard.write_leaderboard`) -- see docs/EXPERIMENTS.md
+"Leaderboard". CPU-only; `--deliver` also hands the PNG to `scripts/deliver.sh`
+under the fixed `trips-leaderboard` name (the same thing `train --report`
+already does automatically at the end of every run).
 """
 
 from __future__ import annotations
@@ -548,6 +557,27 @@ def _cmd_bundle_launcher(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_leaderboard(args: argparse.Namespace) -> int:
+    """`trippy leaderboard --out <dir> [--deliver]`: one comparison table across every run."""
+    # Deferred import: pulls in PIL/yaml, which `trippy smoke`/`density` have no need for.
+    from trippy.render.leaderboard import (
+        default_leaderboard_out_dir,
+        regenerate_and_deliver,
+        write_leaderboard,
+    )
+
+    out_dir = Path(args.out) if args.out else default_leaderboard_out_dir()
+    if args.deliver:
+        result = regenerate_and_deliver(out_dir)
+    else:
+        result = write_leaderboard(out_dir)
+
+    print(f"trippy leaderboard: {len(result['rows'])} row(s) -> {result['markdown_path']}, {result['png_path']}")
+    if "delivery" in result:
+        print(f"trippy leaderboard: delivery {result['delivery']['status']}")
+    return 0
+
+
 def _candidate_report_readme(report: dict) -> str:
     """Human-readable summary of a `candidate-report` run: numbers + artifact paths only.
 
@@ -978,6 +1008,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="bundle directory to write (default: <run_dir>/bundle when detectable, else alongside the checkpoint)",
     )
     bundle_launcher.set_defaults(func=_cmd_bundle_launcher)
+
+    leaderboard = sub.add_parser(
+        "leaderboard",
+        help="scan every run with a self-report and write one comparison table (markdown + PNG)",
+    )
+    leaderboard.add_argument(
+        "--out",
+        default=None,
+        help="output directory (default: $TRIPPY_OUTPUT/leaderboard)",
+    )
+    leaderboard.add_argument(
+        "--deliver",
+        action="store_true",
+        help="also deliver the PNG via scripts/deliver.sh under the fixed 'trips-leaderboard' name",
+    )
+    leaderboard.set_defaults(func=_cmd_leaderboard)
 
     candidate_report = sub.add_parser(
         "candidate-report",

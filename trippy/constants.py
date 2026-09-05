@@ -1163,3 +1163,91 @@ DISTILL_BRUSH_EXPORT_NAME = "distilled_{iter}.ply"
 # `Cli`/`TrainStreamConfig` flags, apps/brush-cli/src/lib.rs).
 DISTILL_BRUSH_CLI_BINARY_REL = "brush-trips/target/release/brush-cli"
 DISTILL_BRUSH_APP_BINARY_REL = "brush-trips/target/release/brush"
+
+# --- render/leaderboard.py : `trippy leaderboard`, one comparison table across every run ---
+
+# Convention used by the real EXP-0003 full1-broadcast candidate-report invocation
+# (docs/EXPERIMENTS.md "Candidate report") -- `trippy candidate-report --out
+# <run_dir>/candidate` -- so `trippy leaderboard`'s scan checks exactly this
+# relative path (alongside `TRAIN_REPORT_DIRNAME`/report.json for `train --report`
+# runs) rather than an unbounded recursive search for any file named report.json.
+LEADERBOARD_CANDIDATE_REPORT_DIRNAME = "candidate"
+
+LEADERBOARD_OUT_DIRNAME = "leaderboard"
+LEADERBOARD_MARKDOWN_FILENAME = "leaderboard.md"
+LEADERBOARD_PNG_FILENAME = "leaderboard.png"
+
+# Delivered artifact name: fixed so `scripts/deliver.sh`'s `ln -sfn` always replaces
+# the same symlink (`review_add.sh`) instead of accumulating one per training run --
+# Jordan always has exactly one up-to-date "trips-leaderboard" sheet to open.
+LEADERBOARD_DELIVER_NAME = "trips-leaderboard"
+LEADERBOARD_DELIVER_WHY = (
+    "One table of every TRIPS run so far vs the Gaussian baseline: held-out PSNR, "
+    "shade dark-mass, extent, coverage. Regenerated after every training."
+)
+
+# Row sort: shade dark-mass fraction ascending (lower is better -- closer to/below
+# the Gaussian baseline's 19.9%), then held-out PSNR descending within ties/unknowns.
+# Rows missing either number (a failed audit, or a baseline with no held-out concept)
+# sort to the end of their respective key rather than crashing the sort or silently
+# dropping the row.
+LEADERBOARD_SORT_MISSING_KEY = float("inf")
+
+# --- Fixed baseline rows (not scanned from $TRIPPY_OUTPUT/runs -- neither is a
+# trippy-native training run with its own metrics.jsonl/report.json). Numbers are
+# real, already-published results copied verbatim from the cited experiment READMEs
+# (AGENTS.md honesty rule: no re-derivation, no rounding beyond the source's own).
+
+# Gaussian point-source baseline (`kkc_15000.ply`, the trained-3DGS PLY every
+# EXP-0003/EXP-0005/EXP-0009 point source 1 config reads). PSNR/SSIM/LPIPS are
+# EXP-0005's own "Baseline (raw render vs photo)" row (docs/EXPERIMENTS.md hybrid
+# design C section; experiments/EXP-0005-hybrid-c/README.md "Verdict" table) --
+# the plain Gaussian rendered with Splats' gsrender.py, no TRIPS/U-Net involved.
+# Dark-mass fraction and extent are Splats' own shade-audit/extent-gate numbers on
+# the same PLY (experiments/EXP-0003-kk-trips-train/README.md "full1-broadcast
+# candidate numbers", baseline column; extent p99/max per this task's brief).
+LEADERBOARD_BASELINE_GAUSSIAN_NAME = "Gaussians kkc_15000 (baseline PLY)"
+LEADERBOARD_BASELINE_GAUSSIAN_PSNR_ALL = 15.53
+LEADERBOARD_BASELINE_GAUSSIAN_SSIM_ALL = 0.431
+LEADERBOARD_BASELINE_GAUSSIAN_LPIPS_ALL = 0.477
+LEADERBOARD_BASELINE_GAUSSIAN_PSNR_SHADE = 14.94
+LEADERBOARD_BASELINE_GAUSSIAN_SSIM_SHADE = 0.427
+LEADERBOARD_BASELINE_GAUSSIAN_LPIPS_SHADE = 0.526
+LEADERBOARD_BASELINE_GAUSSIAN_DARK_MASS = 0.199
+LEADERBOARD_BASELINE_GAUSSIAN_EXTENT_P99 = 52.2
+LEADERBOARD_BASELINE_GAUSSIAN_EXTENT_MAX = 133.4
+
+# Design C (EXP-0005): render->photo U-Net refinement of the same kkc_15000.ply
+# render. Numbers are EXP-0005's own "Refined (U-Net vs photo)" row, final eval
+# (epoch 1125). No point cloud/extent of its own to audit (experiments/
+# EXP-0005-hybrid-c/README.md: "Design C has no points/extent to audit").
+LEADERBOARD_BASELINE_DESIGN_C_NAME = "Design C: render->photo U-Net (EXP-0005)"
+LEADERBOARD_BASELINE_DESIGN_C_PSNR_ALL = 15.54
+LEADERBOARD_BASELINE_DESIGN_C_SSIM_ALL = 0.476
+LEADERBOARD_BASELINE_DESIGN_C_LPIPS_ALL = 0.461
+LEADERBOARD_BASELINE_DESIGN_C_PSNR_SHADE = 12.97
+LEADERBOARD_BASELINE_DESIGN_C_SSIM_SHADE = 0.442
+LEADERBOARD_BASELINE_DESIGN_C_LPIPS_SHADE = 0.519
+
+# --- PNG table rendering (PIL only, no matplotlib -- AGENTS.md "no new dependencies",
+# same rule trippy.render.sheets follows). A monospace system font is preferred so
+# columns of numbers align visually; PIL's built-in bitmap font is the fallback on a
+# machine without one, since `render_table_png` must never raise for a missing font.
+LEADERBOARD_PNG_FONT_CANDIDATES = (
+    "/System/Library/Fonts/Supplemental/Menlo.ttc",
+    "/System/Library/Fonts/Menlo.ttc",
+    "/Library/Fonts/Courier New.ttf",
+)
+LEADERBOARD_PNG_FONT_SIZE = 16
+LEADERBOARD_PNG_TITLE_FONT_SIZE = 22
+LEADERBOARD_PNG_CELL_PAD_X = 12
+LEADERBOARD_PNG_CELL_PAD_Y = 8
+LEADERBOARD_PNG_MARGIN = 18
+LEADERBOARD_PNG_BG = (255, 255, 255)
+LEADERBOARD_PNG_HEADER_BG = (32, 38, 58)
+LEADERBOARD_PNG_HEADER_FG = (255, 255, 255)
+LEADERBOARD_PNG_ROW_BG = (255, 255, 255)
+LEADERBOARD_PNG_ROW_BG_ALT = (237, 240, 247)
+LEADERBOARD_PNG_BASELINE_ROW_BG = (255, 244, 224)  # tinted so fixed baselines read as "not scanned"
+LEADERBOARD_PNG_TEXT_COLOR = (25, 25, 30)
+LEADERBOARD_PNG_TITLE_COLOR = (20, 20, 24)
