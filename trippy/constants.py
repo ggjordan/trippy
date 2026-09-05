@@ -241,3 +241,62 @@ FFMPEG_OUTPUT_PIX_FMT = "yuv420p"
 # software fallback.
 FFMPEG_VIDEOTOOLBOX_ENCODER = "h264_videotoolbox"
 FFMPEG_LIBX264_ENCODER = "libx264"
+# --- raster/ : pyramid rasteriser (forward pass) ---
+# Sources for the TRIPS-derived values below are quoted in
+# docs/TRIPS_REFERENCE.md sections 3 and 10; `path:line` refers to
+# third_party/TRIPS @ a59a65b.
+
+# Number of pyramid layers rendered per image. TRIPS: net_params.
+# num_input_layers = 5 (configs/train_normalnet.ini, RenderModule.cpp:11).
+RASTER_NUM_LAYERS = 5
+
+# Points with camera-space depth z <= this (world units) are culled before
+# projection. TRIPS rejects z <= 0 only; we use a small positive near plane
+# so that s = fx * size / z cannot overflow float32 for points sitting on
+# the optical centre.
+RASTER_ZNEAR = 1e-3
+
+# Slack, in *coarsest-layer* pixels, added around the image when deciding
+# whether a point is fully outside it. The coarse cull must never remove a
+# point that any layer's exact per-fragment bounds test would have kept: a
+# fragment at layer l needs uv/2**l within (-1.5, w_l + 0.5), so 2 coarsest
+# pixels of slack (= 2 * 2**(L-1) layer-0 pixels) is strictly conservative.
+RASTER_CULL_MARGIN_COARSE_PX = 2.0
+
+# Fragments whose alpha is below this are dropped at emission time. TRIPS has
+# no such rule (every in-bounds bilinear corner is written); we drop them
+# because they cost a slot in the 16-deep per-pixel list while changing the
+# composite by at most this value times the feature magnitude.
+RASTER_ALPHA_MIN = 1e-5
+
+# Transmittance below which front-to-back compositing stops for a pixel.
+# TRIPS ALPHA_DEST_CUTOFF = 0.001 (RenderForward.cu:3522).
+RASTER_T_CUTOFF = 1e-3
+
+# Maximum number of fragments composited per layer-pixel. TRIPS
+# ELEMENTS_PER_PIXEL / max_pixels_per_list = 16 (PointRenderer.h:178).
+RASTER_MAX_FRAGS = 16
+
+# Floor on the layer blend factor for sub-pixel points:
+# layer_factor = (1 - c) * exp(s - 1) + c with c = this value
+# (PointBlending.h:106, `cutoff_value = 0.25f`).
+RASTER_SMALL_POINT_CUTOFF = 0.25
+
+# Alpha is clamped below 1 by this epsilon before log1p(-alpha) in the
+# vectorised float64 reference, so a fragment with alpha == 1 cannot produce
+# log(0) = -inf. 1 - 1e-12 is still exactly representable in float64.
+RASTER_ALPHA_MAX_EPS = 1e-12
+
+# Feature channel counts the Metal blend_fwd kernel is templated for. TRIPS
+# dispatches per num_texture_channels in {3,4,8,16} (RenderForward.cu:3808);
+# we ship {3,4,8} (4 is the shipped TRIPS default).
+RASTER_SUPPORTED_CHANNELS = (3, 4, 8)
+
+# Bits reserved for the depth part of the composite int64 sort key. A float32
+# depth's IEEE bit pattern is monotonically increasing for positive values, so
+# key = layer_pixel * 2**32 + depth_bits sorts by (layer, pixel, depth).
+RASTER_SORT_DEPTH_BITS = 32
+
+# Largest flat layer-pixel index the composite sort key can hold without
+# overflowing int64: 2**63 / 2**RASTER_SORT_DEPTH_BITS.
+RASTER_SORT_MAX_LAYER_PIXELS = 1 << 31

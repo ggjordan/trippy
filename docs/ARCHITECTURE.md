@@ -7,8 +7,10 @@ trippy/
 ├── scene/       COLMAP i/o, dataset loading, train/val/test splits
 ├── geom/        transforms (xform_a numpy, xform_b torch), camera models
 ├── points/      Gaussian PLY source, monocular depth source, union, kNN size estimation
-├── raster/      Metal rasteriser (blend_fwd/blend_bwd kernels), pyramid.py autograd.Function
-│                numpy and torch reference implementations, tests
+├── raster/      pyramid rasteriser: emit.py (project + layer select + 2x2 splat),
+│                sort.py (order by layer/pixel/depth, segment offsets),
+│                metal_src/blend_fwd.metal + metal_lib.py (Metal compositing),
+│                pyramid.py (device dispatch), ref_numpy.py / ref_torch.py
 ├── net/         U-Net decoder, gated ELU convolutions, perceptual loss
 ├── train/       trainer loop, config, eval harness, export to 3DGS PLY
 ├── render/      dolly camera paths, off-path rendering, video export, honesty sheets
@@ -22,25 +24,36 @@ COLMAP poses + intrinsics → colmap_io.load()
                           ↓
           GaussianPlySource / MonoDepthSource / UnionSource
                           ↓
-    PyTorch tensor: positions [N, 3], sizes [N, 3], colours [N, 3],
-                    confidence [N, 1], camera pose SE(3) delta
+    PyTorch tensor: positions [N, 3], sizes [N] (world units, post-softplus),
+                    features [N, C], confidence [N] (post-sigmoid),
+                    camera pose SE(3) delta
                           ↓
-                    xform_b.project()     (torch: poses + intrinsics → 2D locations)
+        raster.emit.project_points()   (xform_b: pose + K → uv [N,2], depth [N],
+                                        size_px = fx · size / z)
                           ↓
-                emit_fragments()          (PyTorch: emit ≤8 fragments per point,
-                                            2 pyramid levels × 2×2 bilinear weights,
-                                            alpha = bilinear weight × sigmoid(conf)
-                                            × layer_factor; drop out-of-bounds,
-                                            never clamp)
+        raster.emit.cull_points()      (z ≤ znear, or footprint fully off the
+                                        padded coarsest layer)
                           ↓
-              int64 argsort by (layer, pixel, depth)
-            (fallback: two stable 32-bit sorts)
+        raster.emit.emit_fragments()   (per selected layer: uv_l = uv / 2^l,
+                                        2×2 bilinear footprint anchored on pixel
+                                        centres, alpha = β · conf · layer_factor;
+                                        drop out-of-bounds and alpha < ALPHA_MIN,
+                                        never clamp)
                           ↓
-            segment offsets per (layer, pixel)
+        raster.sort.sort_fragments()   (one int64 argsort on
+                                        layer_pixel · 2^32 + float32_bits(depth);
+                                        fallback: two stable sorts)
                           ↓
-                blend_fwd Metal kernel
-            (one thread per layer-pixel, front-to-back,
-             cap 16 fragments, accumulate over, writes features + T_final)
+        raster.sort.segment_offsets()  (searchsorted or bincount+cumsum, into a
+                                        flat layer-pixel space of length
+                                        Σ_l h_l·w_l, offsets array length P+1)
+                          ↓
+              blend_fwd Metal kernel (metal_src/blend_fwd.metal)
+            (one thread per layer-pixel, front-to-back, cap 16 fragments,
+             stop at T < 0.001; writes out [P,C], T_final [P], n_used [P],
+             depth_sum [P]; CPU dispatches to raster.ref_torch instead)
+                          ↓
+              background in torch: out += T_final · bg
                           ↓
             U-Net decoder (PyTorch, torch.nn.Conv2d)
                           ↓
@@ -67,9 +80,22 @@ Autograd backprop to positions, sizes, colours, confidence, pose
 (PyTorch handles these for free once per-point gradients arrive)
 ```
 
-## Core principle: No atomics anywhere
+## Fragment emission and the two layer-selection modes
 
-**64-bit atomics do not compile in Metal via `torch.mps.compile_shader`.** TRIPS's reference implementation uses atomic depth/id packing. We avoid atomics entirely:
+`render_pyramid(..., mode=...)` picks how a point is spread over the pyramid. Both modes are implemented and tested; neither is "the" TRIPS behaviour on its own.
+
+| mode | layers written | layer factor | fragments per point | corresponds to |
+|---|---|---|---|---|
+| `"trilinear"` | `[lower, upper]` from `floor/ceil(log2(size_px))`, clamped to `[0, L-1]` | TRIPS's `compute_point_size_fac` (see docs/GEOMETRY.md) | ≤ 2 × 4 = **8** | TRIPS's `use_layer_point_size=true` path, whose emission kernel `CollectTiled2Pointsize` writes exactly those two layers (`RenderForward.cu:2296-2360`) |
+| `"broadcast"` | **every** layer | 1 everywhere | L × 4 = **20** at L=5 | TRIPS's shipped default (`use_layer_point_size=false`) |
+
+The distinction matters and was previously misdocumented here (docs/TRIPS_REFERENCE.md §10.1). `use_layer_point_size` has no `SAIGA_PARAM` entry, so **no shipped TRIPS `.ini` can turn the trilinear path on**: every TRIPS checkpoint in the wild was trained in broadcast mode, with each point splatted into all five layers at full alpha and the layers fused only inside the U-Net. `"trilinear"` is the mode the *paper* describes and the one that makes the per-point size parameter do any work, so trippy implements both and defaults to `"trilinear"`.
+
+Sizing consequence: fragment buffers must be sized for `4 · L` fragments per point in broadcast mode, not `4 · 2` (docs/TRIPS_REFERENCE.md §11).
+
+## Core principle: No atomics anywhere — a deliberate redesign, not a port
+
+**TRIPS uses `atomicAdd` extensively** — for per-pixel list counting and slot allocation in `CountTiled`/`CollectTiled2`, and for every gradient reduction in `RenderBackward.cu`. We do **not**, by design: 64-bit atomics do not compile in Metal via `torch.mps.compile_shader`, so the atomic list-building step is replaced by a global sort. Nothing below describes TRIPS's own algorithm; TRIPS's fragment counts and list caps do not carry over to an atomic-free formulation without re-deriving them (docs/TRIPS_REFERENCE.md §10.3).
 
 1. **Sorting by (layer, pixel, depth)** happens once, on CPU or GPU, before any parallel writes.
 2. **Parallel read-only access** in `blend_fwd`: each thread reads a contiguous segment of sorted fragments for its (layer, pixel).
@@ -117,9 +143,11 @@ The viewer loads a trained `.ply` and runs the full forward pass (emit → sort 
 CPU pytest (before any GPU job):
 
 1. **Transform agreement**: `xform_a` (numpy) vs `xform_b` (torch) produce identical projects; reprojection of COLMAP `points3D` matches stored keypoints (~1 px, depth positive).
-2. **Geometry**: padding test (no fragment outside crop); pyramid level selection agrees between reference and Metal.
-3. **Metal kernel vs numpy reference**: 32×32 synthetic scene, compare `blend_fwd` output <1e-5.
-4. **Gradcheck**: float64 on CPU via `ref_torch`, then Metal grads vs reference <1e-3 (gradient magnitudes must match).
-5. **U-Net shape**: odd-size crops, verify autograd.
+2. **Geometry** (`tests/test_raster_bounds.py`): no emitted fragment lands outside its own pyramid layer; a footprint straddling the border keeps only its in-bounds corners; a point a few pixels off screen still draws in the coarse layers (so the cull is conservative); odd-sized images keep their last row/column.
+3. **Reference pair** (`tests/test_raster_ref.py`): `ref_numpy` (numpy, xform_a, explicit per-point/per-layer/per-corner loops) vs `ref_torch` (torch float64, xform_b, vectorised segment prefix sums) agree to <1e-6 on a 32×32 scene containing a pixel stacked past the 16-fragment cap and points on every border, in both modes.
+4. **Sort equivalence** (`tests/test_raster_sort.py`): the composite int64 key and the two-stable-sort fallback produce identical permutations, including on depth ties; both segment-offset methods agree.
+5. **Metal kernel vs torch reference** (`tests/test_raster_metal.py`, marked `gpu`): 32×32 synthetic scene, float32 Metal vs float64 CPU, max abs diff <1e-4.
+6. **Gradcheck** (v0.2.0): float64 on CPU via `ref_torch`, then Metal grads vs reference <1e-3 (gradient magnitudes must match). The Metal forward path is not differentiable until `blend_bwd` lands — see docs/LIMITATIONS.md.
+7. **U-Net shape**: odd-size crops, verify autograd.
 
 If any test fails, training is not submitted.
