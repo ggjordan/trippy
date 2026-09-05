@@ -745,6 +745,7 @@ Artifacts: `output/logs/web-build-verify.log`.
 - 2026-09-05T16:50:59Z delivered EXP-0003-full1-broadcast-points: Same candidate exported as a 3DGS-style ply (isotropic points, no network): open in Brush to see where TRIPS put its points after 40 epochs. (/Users/nzbirdranch/trippy/output/runs/EXP-0003-kk-trips-train/full1-broadcast/candidate/export.ply)
 
 - 2026-09-06 EXP-0003 full1-broadcast candidate report (job cand-full1-broadcast rc 0): held-out 14.42 dB; dolly coverage 0.46 -> 0.08 -> 0.00 along the path (camera exits the geometry); shade audit (walkable shade volume, 6 frames): baseline kkc_15000.ply mass 336874, dark(lum<0.25) 67069 (19.9%); TRIPS full1-broadcast export mass 342813, dark(lum<0.25) 124120 (36.2%). Read: after 40 epochs the point cloud carries MORE dark mass in the shade volume than the Gaussians it started from; the U-Net paints over it (hallucination risk). Extent p99 40.0, max 124.5 (baseline to compare next). Delivered: dolly.mp4, honesty_sheet.png, export.ply.
+<<<<<<< Updated upstream
 - 2026-09-05T16:55:52Z submitted job trippy-depthpro-kk-coherent prio 11: bash -c /Users/nzbirdranch/Splats/tools/vggt/.venv/bin/python3 /Users/nzbirdranch/Splats/tools/ldi/depth_batch.py /Users/nzbirdranch/trippy/output/depth/kk-coherent-all/manifest.json
 - 2026-09-05T17:20:24Z submitted job trippy-train-union-broadcast prio 70: trippy train --config experiments/EXP-0006-union/config_broadcast.yaml --max-minutes 330 --run-dir /Users/nzbirdranch/trippy/output/runs/EXP-0006-union/broadcast
 - 2026-09-05T17:20:26Z submitted job trippy-train-union-trips prio 70: trippy train --config experiments/EXP-0006-union/config_trips.yaml --max-minutes 330 --run-dir /Users/nzbirdranch/trippy/output/runs/EXP-0006-union/trips
@@ -808,3 +809,9 @@ before `TRIPPY_OUTPUT` was pinned to the main checkout), the main checkout's
 `output/jobs/trippy-train-union-{broadcast,trips}.sh` (submitted with
 `TRIPPY_OUTPUT=/Users/nzbirdranch/trippy/output` so the queue's own copy lands there),
 `experiments/EXP-0006-union/README.md`.
+=======
+- 2026-09-05T17:17:05Z submitted job trippy-full2-trips prio 70: trippy train --config experiments/EXP-0003-kk-trips-train/config_full2_trips.yaml --report --max-minutes 330
+- 2026-09-05T17:17:05Z submitted job trippy-full2-broadcast prio 70: trippy train --config experiments/EXP-0003-kk-trips-train/config_full2_broadcast.yaml --report --max-minutes 330
+>>>>>>> Stashed changes
+- 2026-09-05T17:27:20Z submitted job trippy-broadcast prio 70: trippy train --config experiments/EXP-0006-union/config_broadcast.yaml --report --max-minutes 330
+- 2026-09-05T17:27:20Z submitted job trippy-trips prio 70: trippy train --config experiments/EXP-0006-union/config_trips.yaml --report --max-minutes 330
