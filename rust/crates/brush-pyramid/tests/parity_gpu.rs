@@ -134,6 +134,7 @@ fn an_empty_point_set_renders_a_pure_background() {
             cy: 6.0,
             r: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
             t: [0.0, 0.0, 0.0],
+            distortion: [0.0; 8],
         };
         let params = PyramidParams {
             num_layers: 2,

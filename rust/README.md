@@ -309,6 +309,118 @@ cargo run --release --example render_frame_full --features gpu -- \
   --out /tmp/frame.png --iters 10
 ```
 
+## `trips-viewer`: the native Mac viewer
+
+`rust/crates/trips-viewer` is the third crate in the thin workspace and the thing
+the other two exist for: a window that renders a TRIPS scene live, at the window's
+own size, with the real forward pass in the middle.
+
+```
+crates/trips-viewer/
+├── src/main.rs        argv, the eframe launch, and the headless --screenshot/--bench paths
+├── src/bundle.rs      the `trippy-bundle-1` reader (bundle.json + points.npz + weights)
+├── src/camera.rs      the fly camera; how a drag becomes (R, t)
+├── src/renderer.rs    one frame: pyramid -> U-Net -> tone map, or a diagnostic buffer
+├── src/app.rs         the egui shell: input, the ms/fps readout, the lever checkboxes
+├── src/blit.rs        the egui paint callback that binds a Burn buffer, no copy
+└── src/shaders/blit.wgsl
+```
+
+**It is a separate binary, not a panel inside `apps/brush-app`.** That was the open
+question ADR-0005 left; `docs/decisions/ADR-0006-viewer-integration.md` decides it and
+says why. The practical consequence: `rust/brush-trips` is untouched at its pinned
+commit, so Brush's own `brush` binary and its `.ply` viewing cannot have regressed.
+
+### How the buffer gets on screen
+
+eframe creates the `wgpu::Device`; `burn_wgpu::init_device` hands that same device to
+Burn (exactly as `brush_process::burn_init_device` does for `brush-app`); the
+rasteriser's `(P, C)` output buffer — or, in network mode,
+`burn_bridge::resolve_to_cube_float` of the tone mapper's output — is bound as a
+read-only storage buffer in an egui paint callback, and a fullscreen triangle samples
+it. Nothing round-trips through host memory.
+
+`resolve_to_cube_float` (the reverse of the existing `float_tensor`) and `gpu::sync`
+were added to `brush-pyramid` for this, so the viewer needs no dependency on
+`brush-render`.
+
+### Building and running
+
+```bash
+bash scripts/cpu_heavy.sh trips-viewer-build -- bash -c \
+  'cd rust && cargo build --release -p trips-viewer'
+
+rust/target/release/trips-viewer $TRIPPY_OUTPUT/brush/horse_bundle
+```
+
+Running the window **is GPU work**: keep it to a few seconds for a functional check,
+and take every number through the queue (below). Unit tests (13, pure logic, no GPU)
+are not on the push path — see `docs/LIMITATIONS.md` — and run with:
+
+```bash
+bash scripts/cpu_heavy.sh trips-viewer-test -- bash -c \
+  'cd rust && cargo test -p trips-viewer --release'
+```
+
+### Headless, for correctness and timing
+
+The same binary renders without a window, which is how the viewer is verified given
+that no agent may look at a render:
+
+```bash
+bash scripts/gpu_submit.sh --prio 12 --wait mac-viewer-gpu-N -- bash -c \
+  'rust/target/release/trips-viewer $TRIPPY_OUTPUT/brush/horse_bundle \
+     --view 8 --frames 3 --bench 7 --screenshot /tmp/frame.png'
+```
+
+- `--screenshot out.png` writes one frame through the identical render path. The
+  acceptance check is PSNR between that PNG and `render_frame_full`'s.
+- `--bench N` times `N` frames, each ended by a real device sync (`gpu::sync`) rather
+  than a readback, so the number is the render's and not a 24 MB transfer's.
+- `--profile` prints per-stage milliseconds (a device sync per stage; a profile, not a
+  frame time).
+- `--half-net`, `--scale F`, `--no-cull`, `--cap-fragments`, `--fp16`,
+  `--packed-sort` are the performance levers, all off / 1.0 by default.
+  `docs/LIMITATIONS.md` says what each costs and `research/trips-metal.md` has
+  the measured table.
+
+### Where the frame time actually goes (measured 2026-09-06, M3 Ultra)
+
+The viewer's `raw level-0` view runs the **identical** rasteriser and stops
+before the network, which makes the split free to measure:
+
+| what | 1920x1080, horse bundle |
+|---|---|
+| whole frame (`network` view, exact) | 204 ms — 4.9 fps |
+| pyramid rasteriser alone (`raw` / `coverage` view) | **21.5 ms — 46.6 fps** |
+
+So the rasteriser, 10.4 M fragments and two 32-bit radix sorts included, is about
+**11 %** of the frame; the U-Net and tone mapper are the other **89 %**. This
+contradicts the "sort-dominated" reading of the first Mac timing recorded in
+`research/trips-metal.md` (which timed cumulative prefixes and could not separate
+the last stage from the whole). Every rasteriser-side lever consequently measures
+within noise, and the levers that move the number are the two that reduce the
+*network's* work: `--scale` and `--half-net`.
+
+### The bundle format
+
+The viewer knows nothing about checkpoints or ADOP scenes. It reads a directory:
+
+```
+<bundle>/bundle.json          format "trippy-bundle-1"; params + every camera
+<bundle>/points.npz           xyz (N,3) WORLD space, size (N,), feat (N,C), conf (N,)
+<bundle>/weights.safetensors  format "trippy-unet-1", unchanged
+```
+
+written by `trippy export-bundle --checkpoint <ckpt> --out <dir>`. World space, not
+the camera-space pre-distorted points `tools/export_unet_safetensors.py horse-e2e`
+writes, because a free camera cannot use points with one view's pose baked in. Lens
+distortion therefore had to move into the renderer: `brush_pyramid::scene::Camera`
+gained `distortion: [f32; 8]` (Saiga order `k1 k2 k3 k4 k5 k6 p1 p2`, all-zeros =
+identity = the old behaviour) and both the CPU reference and the CubeCL kernel apply
+it. On the horse (`k1 = -0.064`, `k2 = 0.044`) ignoring it would move a corner pixel
+by ~21 px.
+
 ## Parity testing
 
 The Rust forward pass is checked against trippy's Python forward on identical

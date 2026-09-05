@@ -89,5 +89,7 @@ pub mod gpu;
 
 pub use grid::LayerGrid;
 pub use output::{LayerImage, PyramidImages};
-pub use params::{Mode, PixelCenter, PyramidHalving, PyramidParams};
+pub use params::{
+    DepthRange, FeatureStore, LayerFloor, Mode, PixelCenter, PyramidHalving, PyramidParams, SortMode,
+};
 pub use scene::{Camera, PointSet};

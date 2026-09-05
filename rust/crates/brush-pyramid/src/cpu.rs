@@ -32,7 +32,7 @@
 use crate::factor::{layer_bounds, layer_factor};
 use crate::grid::LayerGrid;
 use crate::output::{LayerImage, PyramidImages};
-use crate::params::{Mode, PyramidParams, CULL_MARGIN_COARSE_PX};
+use crate::params::{FeatureStore, LayerFloor, Mode, PyramidParams, SortMode, CULL_MARGIN_COARSE_PX};
 use crate::scene::{Camera, PointSet};
 
 /// Smallest positive float32. Depth is clamped to it before its bit pattern
@@ -98,10 +98,16 @@ pub fn project_point(
     size: f32,
     grid: &LayerGrid,
     znear: f32,
+    frustum_cull: bool,
 ) -> Projected {
     let (xc, yc, zc) = camera.world_to_cam(x, y, z);
-    let u = camera.fx * xc / zc + camera.cx;
-    let v = camera.fy * yc / zc + camera.cy;
+    // TRIPS divides by the raw `z` and distorts the normalised point before
+    // the intrinsics (`PointRendererHelper.h:232-253`). With the identity
+    // coefficients — every fixture, and any plain pinhole camera — the two
+    // extra lines below are exactly `xc / zc`, so this is the previous code.
+    let (nx, ny) = crate::scene::distort_normalized(xc / zc, yc / zc, &camera.distortion);
+    let u = camera.fx * nx + camera.cx;
+    let v = camera.fy * ny + camera.cy;
     // TRIPS uses fx only, not fy (`RenderForward.cu:1489`).
     let size_px = camera.fx * size / zc.max(znear);
 
@@ -112,11 +118,14 @@ pub fn project_point(
     let padded_w = w_coarse as f32 * coarse;
     let radius = 0.5 * size_px + CULL_MARGIN_COARSE_PX * coarse;
 
+    // The near plane always culls -- a point behind the camera projects to a
+    // mirrored, meaningless pixel. The box test is the measurable lever.
     let visible = zc > znear
-        && u + radius > 0.0
-        && u - radius < padded_w
-        && v + radius > 0.0
-        && v - radius < padded_h;
+        && (!frustum_cull
+            || (u + radius > 0.0
+                && u - radius < padded_w
+                && v + radius > 0.0
+                && v - radius < padded_h));
 
     Projected {
         u,
@@ -167,7 +176,7 @@ pub fn selected_layers(
             // (`RenderForward.cu:340-352`). The gate requires all four
             // footprint corners in bounds, and it is a BREAK: failing at
             // layer l suppresses every coarser layer as well.
-            for layer in 0..=upper {
+            for layer in trips_start_layer(p.size_px, num_layers, params.layer_floor)..=upper {
                 let (h_l, w_l) = grid.shapes()[layer as usize];
                 let scale = 1.0 / (1u32 << layer) as f32;
                 let base_x = (p.u * scale - shift).floor();
@@ -184,6 +193,26 @@ pub fn selected_layers(
         }
     }
     layers_out.len() as u32 * 4
+}
+
+/// The finest layer mode [`Mode::Trips`] starts its emission loop at.
+///
+/// [`LayerFloor::Zero`] is TRIPS itself (`RenderForward.cu:340`): the loop
+/// starts at layer 0, because `compute_point_size_fac` returns 1.0 for every
+/// layer below `layer_lower`. [`LayerFloor::NearLower`] is the fragment-cap
+/// lever: it starts one layer below `layer_lower` instead, dropping the
+/// full-alpha finer copies a large point would otherwise paint.
+///
+/// # Arguments
+/// - `size_px`: projected point size in layer-0 pixels.
+/// - `num_layers`: `L`.
+/// - `floor`: which rule to apply.
+#[must_use]
+pub fn trips_start_layer(size_px: f32, num_layers: usize, floor: LayerFloor) -> u32 {
+    match floor {
+        LayerFloor::Zero => 0,
+        LayerFloor::NearLower => layer_bounds(size_px, num_layers).0.saturating_sub(1),
+    }
 }
 
 /// The four corner fragments a point contributes at one layer.
@@ -284,6 +313,7 @@ pub fn slot_budgets(
             points.size[i],
             &grid,
             params.znear,
+            params.frustum_cull,
         );
         budgets.push(selected_layers(&p, &grid, params, &mut layers_buf));
         projected.push(p);
@@ -319,6 +349,7 @@ pub fn fragments_per_pixel(
             points.size[i],
             &grid,
             params.znear,
+            params.frustum_cull,
         );
         selected_layers(&p, &grid, params, &mut layers_buf);
         for &layer in &layers_buf {
@@ -353,6 +384,23 @@ pub fn render_pyramid_cpu(
     params: &PyramidParams,
     background: Option<&[f32]>,
 ) -> Result<PyramidImages, String> {
+    // `sort` and `feature_store` are GPU *storage and ordering* strategies
+    // whose whole point is to trade exactness for speed. The CPU path is the
+    // reference and always sorts exactly on f32; rather than silently ignore
+    // a lever the caller set, refuse. (`layer_floor` IS implemented here: it
+    // changes which fragments exist, so the reference has to model it.)
+    if params.sort != SortMode::DepthThenKey {
+        return Err(format!(
+            "the CPU reference only implements SortMode::DepthThenKey, not {:?}",
+            params.sort
+        ));
+    }
+    if params.feature_store != FeatureStore::F32 {
+        return Err(format!(
+            "the CPU reference only implements FeatureStore::F32, not {:?}",
+            params.feature_store
+        ));
+    }
     let channels = points.num_channels;
     if let Some(bg) = background {
         if bg.len() != channels {
@@ -375,6 +423,7 @@ pub fn render_pyramid_cpu(
                 points.size[i],
                 &grid,
                 params.znear,
+                params.frustum_cull,
             )
         })
         .collect();
@@ -491,6 +540,7 @@ mod tests {
             cy: height as f32 / 2.0,
             r: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
             t: [0.0, 0.0, 0.0],
+            distortion: [0.0; 8],
         }
     }
 

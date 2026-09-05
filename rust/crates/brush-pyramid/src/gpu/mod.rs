@@ -84,12 +84,23 @@ pub fn block_on<F: std::future::Future>(future: F) -> F::Output {
 
 use crate::grid::LayerGrid;
 use crate::output::{LayerImage, PyramidImages};
-use crate::params::{Mode, PyramidParams, CULL_MARGIN_COARSE_PX, SUPPORTED_CHANNELS};
-use crate::scene::{Camera, PointSet};
+use crate::params::{
+    FeatureStore, LayerFloor, Mode, PyramidParams, SortMode, CULL_MARGIN_COARSE_PX,
+    SUPPORTED_CHANNELS,
+};
+use crate::scene::{is_identity_distortion, Camera, PointSet};
 use kernels::{PyramidUniformsLaunch, CORNERS_PER_LAYER, LAYER_GEOM_LANES, WG_SIZE};
 
 /// The backend these kernels run on: Burn's CubeCL/wgpu backend.
 pub type Backend = MainBackendBase;
+
+/// The half-precision element type [`FeatureStore::F16`] stores features as.
+pub type HalfF32 = burn::tensor::f16;
+
+/// Fewest depth buckets [`SortMode::PackedKey`] is worth using: with under
+/// this many bits left under the pixel index, every fragment in a pixel would
+/// land in the same bucket and the "sort" would be emission order.
+pub const MIN_PACKED_DEPTH_BITS: u32 = 4;
 
 /// A rendered pyramid, still on the device.
 ///
@@ -289,6 +300,72 @@ impl PyramidRender {
     }
 }
 
+/// Wall-clock cost of each forward-pass stage, milliseconds.
+///
+/// Only produced by [`render_pyramid_timed`], which inserts a real device
+/// `sync` at every stage boundary. Those syncs cost a few hundred microseconds
+/// each and destroy the pipelining a viewer relies on, so the numbers are a
+/// *profile*, not a frame time: read [`Self::total_ms`] as an upper bound and
+/// use [`render_pyramid`] plus one barrier for the honest whole-frame figure.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct StageTimings {
+    /// Stage 1, project + cull + count slots.
+    pub project_count_ms: f64,
+    /// Stage 2, prefix sum, including the one host readback of the total.
+    pub prefix_ms: f64,
+    /// Stage 3, emit fragments.
+    pub emit_ms: f64,
+    /// Stage 4, the radix sort(s).
+    pub sort_ms: f64,
+    /// Stage 5, segment bounds.
+    pub segment_ms: f64,
+    /// Stages 6 and 7, blend and background.
+    pub blend_ms: f64,
+    /// Sum of the above.
+    pub total_ms: f64,
+    /// Fragment slots reserved, i.e. how much the sort actually moved.
+    pub fragment_slots: u32,
+    /// Radix passes performed (four bits each).
+    pub radix_passes: u32,
+}
+
+/// A monotone stand-in for `log2` on positive floats, identical to the
+/// kernels' [`kernels::fast_log2`] down to the last bit.
+///
+/// Used to place [`crate::params::DepthRange`]'s endpoints on the same curve
+/// the depth quantisation uses, so a depth exactly at `lo` lands in bucket 0
+/// and one exactly at `hi` in the last bucket.
+///
+/// # Arguments
+/// - `x`: a positive float.
+#[must_use]
+pub fn fast_log2(x: f32) -> f32 {
+    (x.to_bits() as f32) * kernels::INV_MANTISSA_SCALE - 127.0
+}
+
+/// Wait for every kernel queued on `device` to finish.
+///
+/// The honest end-of-frame barrier for a benchmark: unlike reading a tensor
+/// back, it moves no data, so the measured time is the render's and not the
+/// readback's.
+///
+/// # Arguments
+/// - `device`: the device to drain.
+///
+/// # Errors
+/// Returns `Err` if the device reports a failure while draining.
+pub async fn sync(device: &WgpuDevice) -> Result<(), String> {
+    WgpuRuntime::<burn_wgpu::AutoCompiler>::client(device)
+        .sync()
+        .await
+        .map_err(|e| format!("device sync failed: {e:?}"))
+}
+
+/// Bits the layer-pixel index needs, i.e. the width of the exact sort key.
+fn key_bits_for(total_pixels: usize) -> u32 {
+    (u32::BITS - (total_pixels as u32).leading_zeros()).max(1)
+}
+
 /// Render one image as an `L`-layer alpha-composited pyramid, on the GPU.
 ///
 /// # Arguments
@@ -296,8 +373,9 @@ impl PyramidRender {
 ///   the system default — Metal on macOS).
 /// - `points`: the point set; `points.num_channels` sets `C` and must be one
 ///   of [`SUPPORTED_CHANNELS`], because the blend kernel specialises on it.
-/// - `camera`: intrinsics and world-to-camera pose.
-/// - `params`: layer-selection mode, pyramid depth and stop rules.
+/// - `camera`: intrinsics, lens distortion and world-to-camera pose.
+/// - `params`: layer-selection mode, pyramid depth, stop rules and the
+///   performance levers.
 /// - `background`: `C` values composited as `out += t_final * bg`; `None`
 ///   means a zero background.
 ///
@@ -311,6 +389,38 @@ pub async fn render_pyramid(
     params: &PyramidParams,
     background: Option<&[f32]>,
 ) -> Result<PyramidRender, String> {
+    let (render, _) = render_inner(device, points, camera, params, background, false).await?;
+    Ok(render)
+}
+
+/// [`render_pyramid`] with a device `sync` at every stage boundary, returning
+/// the per-stage wall times as well.
+///
+/// # Errors
+/// As [`render_pyramid`], plus any device synchronisation failure.
+pub async fn render_pyramid_timed(
+    device: &WgpuDevice,
+    points: &PointSet,
+    camera: &Camera,
+    params: &PyramidParams,
+    background: Option<&[f32]>,
+) -> Result<(PyramidRender, StageTimings), String> {
+    let (render, timings) = render_inner(device, points, camera, params, background, true).await?;
+    Ok((render, timings.unwrap_or_default()))
+}
+
+// `clock` is reassigned by the last `mark!` and then dropped; that final
+// assignment is dead by construction and rewriting the macro to avoid it would
+// make every other stage's timing harder to read.
+#[allow(clippy::too_many_lines, unused_assignments)]
+async fn render_inner(
+    device: &WgpuDevice,
+    points: &PointSet,
+    camera: &Camera,
+    params: &PyramidParams,
+    background: Option<&[f32]>,
+    timed: bool,
+) -> Result<(PyramidRender, Option<StageTimings>), String> {
     let channels = points.num_channels;
     if !SUPPORTED_CHANNELS.contains(&channels) {
         return Err(format!(
@@ -331,22 +441,49 @@ pub async fn render_pyramid(
     let num_points = points.len();
     let client = WgpuRuntime::client(device);
 
+    let key_bits = key_bits_for(total_pixels);
+    // `PackedKey` needs room for at least a couple of depth buckets under the
+    // pixel index. If the pyramid is so large that it does not have it, fall
+    // back to the exact two-pass sort rather than silently losing depth
+    // ordering altogether.
+    let depth_bits = 32 - key_bits;
+    let packed = params.sort == SortMode::PackedKey && depth_bits >= MIN_PACKED_DEPTH_BITS;
+    let key_shift = if packed { depth_bits } else { 0 };
+
+    let mut timings = timed.then(StageTimings::default);
+    let mut clock = std::time::Instant::now();
+    // A real device sync, not a one-element readback: these are eager CubeCL
+    // launches, so `sync` genuinely waits for the queue to drain.
+    macro_rules! mark {
+        ($field:ident) => {
+            if let Some(t) = timings.as_mut() {
+                client
+                    .sync()
+                    .await
+                    .map_err(|e| format!("device sync failed: {e:?}"))?;
+                t.$field = clock.elapsed().as_secs_f64() * 1e3;
+                clock = std::time::Instant::now();
+            }
+        };
+    }
+
     // --- upload -----------------------------------------------------------
     // `.max(1)`: a zero-length buffer is not a valid binding.
     let xyz = create_tensor_from_slice(pad1(&points.xyz), device, DType::F32);
     let size = create_tensor_from_slice(pad1(&points.size), device, DType::F32);
     let conf = create_tensor_from_slice(pad1(&points.conf), device, DType::F32);
-    let feat = create_tensor_from_slice(pad1(&points.feat), device, DType::F32);
+    let feat = match params.feature_store {
+        FeatureStore::F32 => create_tensor_from_slice(pad1(&points.feat), device, DType::F32),
+        FeatureStore::F16 => {
+            let half: Vec<HalfF32> = pad1(&points.feat).iter().copied().map(HalfF32::from_f32).collect();
+            create_tensor_from_slice(&half, device, DType::F16)
+        }
+    };
 
     // (L, 4) u32: height, width, flat offset, unused padding lane.
     let mut geom = Vec::with_capacity(grid.num_layers() * LAYER_GEOM_LANES as usize);
     for (layer, &(h_l, w_l)) in grid.shapes().iter().enumerate() {
-        geom.extend_from_slice(&[
-            h_l as u32,
-            w_l as u32,
-            grid.offsets()[layer] as u32,
-            0,
-        ]);
+        geom.extend_from_slice(&[h_l as u32, w_l as u32, grid.offsets()[layer] as u32, 0]);
     }
     let layer_geom = create_tensor_from_slice(&geom, device, DType::U32);
 
@@ -356,8 +493,14 @@ pub async fn render_pyramid(
         Mode::Broadcast => kernels::MODE_BROADCAST,
         Mode::Trips => kernels::MODE_TRIPS,
     };
+    let floor_code = match params.layer_floor {
+        LayerFloor::Zero => kernels::LAYER_FLOOR_ZERO,
+        LayerFloor::NearLower => kernels::LAYER_FLOOR_NEAR_LOWER,
+    };
+    let distorted = !is_identity_distortion(&camera.distortion);
     let cube_dim = CubeDim::new_1d(WG_SIZE);
     let points_dispatch = calc_cube_count_1d(num_points.max(1) as u32, WG_SIZE);
+    let uniforms = |grid: &LayerGrid| build_uniforms(camera, params, grid, num_points, key_shift);
 
     // --- stage 1: project & count ----------------------------------------
     let proj = create_tensor([num_points.max(1) * 4], device, DType::F32);
@@ -371,9 +514,13 @@ pub async fn render_pyramid(
         layer_geom.clone().into_tensor_arg(),
         proj.clone().into_tensor_arg(),
         counts.clone().into_tensor_arg(),
-        build_uniforms(camera, params, &grid, num_points),
+        uniforms(&grid),
         mode_code,
+        floor_code,
+        distorted,
+        params.frustum_cull,
     );
+    mark!(project_count_ms);
 
     // --- stage 2: prefix sum ---------------------------------------------
     let cum_counts = prefix_sum(counts.clone());
@@ -387,10 +534,17 @@ pub async fn render_pyramid(
         read_u32(last).await?[0]
     };
     let buffer_len = (num_slots as usize).max(1);
+    mark!(prefix_ms);
 
     // --- stage 3: emit ----------------------------------------------------
     let keys = create_tensor([buffer_len], device, DType::U32);
-    let depth_keys = create_tensor([buffer_len], device, DType::U32);
+    // Only the two-pass sort has a separate depth key. `PackedKey` still needs
+    // a bindable buffer for the kernel argument, but one element of it.
+    let depth_keys = create_tensor(
+        [if packed { 1 } else { buffer_len }],
+        device,
+        DType::U32,
+    );
     let alphas = create_tensor([buffer_len], device, DType::F32);
     let point_ids = create_tensor([buffer_len], device, DType::U32);
     if num_slots > 0 {
@@ -407,12 +561,15 @@ pub async fn render_pyramid(
             depth_keys.clone().into_tensor_arg(),
             alphas.clone().into_tensor_arg(),
             point_ids.clone().into_tensor_arg(),
-            build_uniforms(camera, params, &grid, num_points),
+            uniforms(&grid),
             mode_code,
+            floor_code,
+            packed,
         );
     }
+    mark!(emit_ms);
 
-    // --- stage 4: sort by depth, then by (layer, pixel) -------------------
+    // --- stage 4: order the fragments ------------------------------------
     let identity = create_tensor([buffer_len], device, DType::U32);
     kernels::iota_kernel::launch::<WgpuRuntime>(
         &client,
@@ -421,15 +578,24 @@ pub async fn render_pyramid(
         identity.clone().into_tensor_arg(),
         buffer_len as u32,
     );
-    // Pass 1: order by depth. Positive-float bit patterns sort like the
-    // values, and the sentinel slots carry 0xFFFFFFFF so they trail.
-    let (_, by_depth) = radix_argsort(depth_keys, identity, 32);
-    // Pass 2: order by key. LSB radix is stable, so the depth order survives
-    // inside every layer-pixel run — which is exactly Brush's own
-    // depth-then-tile pattern.
-    let keys_by_depth = Backend::int_gather(0, keys, by_depth.clone());
-    let key_bits = (u32::BITS - (total_pixels as u32).leading_zeros()).max(1);
-    let (sorted_keys, permutation) = radix_argsort(keys_by_depth, by_depth, key_bits);
+    let (sorted_keys, permutation, radix_passes) = if packed {
+        // One pass: the key already carries the (quantised) depth in its low
+        // bits, so a single ascending sort puts every layer-pixel run in
+        // depth order.
+        let (k, v) = radix_argsort(keys, identity, 32);
+        (k, v, 32u32.div_ceil(4))
+    } else {
+        // Pass 1: order by depth. Positive-float bit patterns sort like the
+        // values, and the sentinel slots carry 0xFFFFFFFF so they trail.
+        let (_, by_depth) = radix_argsort(depth_keys, identity, 32);
+        // Pass 2: order by key. LSB radix is stable, so the depth order
+        // survives inside every layer-pixel run — which is exactly Brush's
+        // own depth-then-tile pattern.
+        let keys_by_depth = Backend::int_gather(0, keys, by_depth.clone());
+        let (k, v) = radix_argsort(keys_by_depth, by_depth, key_bits);
+        (k, v, 32u32.div_ceil(4) + key_bits.div_ceil(4))
+    };
+    mark!(sort_ms);
 
     // --- stage 5: segment offsets ----------------------------------------
     let segments = Backend::int_zeros([total_pixels, 2].into(), device, IntDType::U32);
@@ -440,39 +606,61 @@ pub async fn render_pyramid(
             cube_dim,
             num_slots,
             total_pixels as u32,
+            key_shift,
             sorted_keys.into_tensor_arg(),
             segments.clone().into_tensor_arg(),
         );
     }
+    mark!(segment_ms);
 
     // --- stage 6: blend ---------------------------------------------------
     let out = create_tensor([total_pixels, channels], device, DType::F32);
     let t_final = create_tensor([total_pixels], device, DType::F32);
     let n_used = create_tensor([total_pixels], device, DType::U32);
-    kernels::blend_fwd_kernel::launch::<WgpuRuntime>(
-        &client,
-        calc_cube_count_1d(total_pixels as u32, WG_SIZE),
-        cube_dim,
-        segments.clone().into_tensor_arg(),
-        permutation.into_tensor_arg(),
-        alphas.into_tensor_arg(),
-        point_ids.into_tensor_arg(),
-        feat.into_tensor_arg(),
-        out.clone().into_tensor_arg(),
-        t_final.clone().into_tensor_arg(),
-        n_used.clone().into_tensor_arg(),
-        total_pixels as u32,
-        params.max_frags,
-        params.t_cutoff,
-        channels as u32,
-    );
+    let blend_dispatch = calc_cube_count_1d(total_pixels as u32, WG_SIZE);
+    match params.feature_store {
+        FeatureStore::F32 => kernels::blend_fwd_kernel::launch::<f32, WgpuRuntime>(
+            &client,
+            blend_dispatch.clone(),
+            cube_dim,
+            segments.clone().into_tensor_arg(),
+            permutation.into_tensor_arg(),
+            alphas.into_tensor_arg(),
+            point_ids.into_tensor_arg(),
+            feat.into_tensor_arg(),
+            out.clone().into_tensor_arg(),
+            t_final.clone().into_tensor_arg(),
+            n_used.clone().into_tensor_arg(),
+            total_pixels as u32,
+            params.max_frags,
+            params.t_cutoff,
+            channels as u32,
+        ),
+        FeatureStore::F16 => kernels::blend_fwd_kernel::launch::<HalfF32, WgpuRuntime>(
+            &client,
+            blend_dispatch.clone(),
+            cube_dim,
+            segments.clone().into_tensor_arg(),
+            permutation.into_tensor_arg(),
+            alphas.into_tensor_arg(),
+            point_ids.into_tensor_arg(),
+            feat.into_tensor_arg(),
+            out.clone().into_tensor_arg(),
+            t_final.clone().into_tensor_arg(),
+            n_used.clone().into_tensor_arg(),
+            total_pixels as u32,
+            params.max_frags,
+            params.t_cutoff,
+            channels as u32,
+        ),
+    }
 
     // --- stage 7: background, added after the blend ----------------------
     if let Some(bg) = background {
         let bg_tensor = create_tensor_from_slice(bg, device, DType::F32);
         kernels::add_background_kernel::launch::<WgpuRuntime>(
             &client,
-            calc_cube_count_1d(total_pixels as u32, WG_SIZE),
+            blend_dispatch,
             cube_dim,
             bg_tensor.into_tensor_arg(),
             t_final.clone().into_tensor_arg(),
@@ -481,17 +669,32 @@ pub async fn render_pyramid(
             channels as u32,
         );
     }
+    mark!(blend_ms);
 
-    Ok(PyramidRender {
-        grid,
-        channels,
-        num_fragment_slots: num_slots,
-        out,
-        t_final,
-        n_used,
-        segments,
-        counts: counts_for_readback,
-    })
+    if let Some(t) = timings.as_mut() {
+        t.fragment_slots = num_slots;
+        t.radix_passes = radix_passes;
+        t.total_ms = t.project_count_ms
+            + t.prefix_ms
+            + t.emit_ms
+            + t.sort_ms
+            + t.segment_ms
+            + t.blend_ms;
+    }
+
+    Ok((
+        PyramidRender {
+            grid,
+            channels,
+            num_fragment_slots: num_slots,
+            out,
+            t_final,
+            n_used,
+            segments,
+            counts: counts_for_readback,
+        },
+        timings,
+    ))
 }
 
 /// A zero-length slice cannot be bound as a buffer; substitute one element.
@@ -508,11 +711,26 @@ fn build_uniforms(
     params: &PyramidParams,
     grid: &LayerGrid,
     num_points: usize,
+    key_shift: u32,
 ) -> PyramidUniformsLaunch<WgpuRuntime> {
     let num_layers = grid.num_layers();
     let coarse = (1usize << (num_layers - 1)) as f32;
     let (h_coarse, w_coarse) = grid.shapes()[num_layers - 1];
     let r = &camera.r;
+    // Depth quantisation for `SortMode::PackedKey`. `key_shift == 0` means the
+    // exact two-pass sort, where none of these three lanes is read.
+    let max_bucket = ((1u64 << key_shift) - 1) as f32;
+    let depth_log_lo = fast_log2(params.depth_range.lo.max(f32::MIN_POSITIVE));
+    // No widening here: the caller chose the range, and silently stretching it
+    // would spend depth buckets on empty space. A degenerate `hi <= lo` falls
+    // through to gain 0, i.e. one bucket, which is the documented worst case
+    // (emission order inside a pixel) rather than a divide by zero.
+    let depth_log_hi = fast_log2(params.depth_range.hi.max(params.depth_range.lo));
+    let depth_log_gain = if depth_log_hi > depth_log_lo {
+        max_bucket / (depth_log_hi - depth_log_lo)
+    } else {
+        0.0
+    };
     PyramidUniformsLaunch::new(
         r[0],
         r[1],
@@ -539,6 +757,18 @@ fn build_uniforms(
         num_points as u32,
         num_layers as u32,
         grid.total() as u32,
+        camera.distortion[0],
+        camera.distortion[1],
+        camera.distortion[2],
+        camera.distortion[3],
+        camera.distortion[4],
+        camera.distortion[5],
+        camera.distortion[6],
+        camera.distortion[7],
+        depth_log_lo,
+        depth_log_gain,
+        max_bucket,
+        key_shift,
     )
 }
 
@@ -561,3 +791,50 @@ async fn read_u32(tensor: CubeTensor<WgpuRuntime>) -> Result<Vec<u32>, String> {
 /// Fragment slots reserved per selected pyramid layer (the 2x2 footprint).
 /// Re-exported so tests can reason about buffer sizes.
 pub const CORNERS: u32 = CORNERS_PER_LAYER;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fast_log2_is_exact_at_powers_of_two_and_monotone() {
+        for exponent in -20i32..=20 {
+            let x = 2.0f32.powi(exponent);
+            assert!(
+                (fast_log2(x) - exponent as f32).abs() < 1e-4,
+                "2^{exponent}: {}",
+                fast_log2(x)
+            );
+        }
+        let mut previous = f32::NEG_INFINITY;
+        let mut x = 1e-6f32;
+        while x < 1e6 {
+            let value = fast_log2(x);
+            assert!(value > previous, "not monotone at {x}");
+            previous = value;
+            x *= 1.031; // an irrational-ish step, so it lands mid-octave too
+        }
+    }
+
+    #[test]
+    fn the_packed_key_leaves_room_for_depth_at_every_plausible_pyramid_size() {
+        // 1920x1080 with 8 levels and `ceil` halving.
+        let total_1080p = 2_073_600 + 518_400 + 129_600 + 32_400 + 8_160 + 2_040 + 510 + 135;
+        let bits = key_bits_for(total_1080p);
+        assert_eq!(bits, 22, "1080p pyramid needs 22 key bits, got {bits}");
+        assert!(32 - bits >= MIN_PACKED_DEPTH_BITS);
+        // The sentinel must still fit in a u32 and sort past every real key.
+        let shift = 32 - bits;
+        let sentinel = (total_1080p as u64) << shift;
+        let biggest_real = (((total_1080p - 1) as u64) << shift) | ((1u64 << shift) - 1);
+        assert!(sentinel <= u64::from(u32::MAX), "sentinel overflows u32");
+        assert!(biggest_real < sentinel);
+    }
+
+    #[test]
+    fn a_4k_pyramid_still_has_depth_bits() {
+        // 3840x2160, 8 levels: four times the pixels, one more key bit.
+        let total_4k = 8_294_400 + 2_073_600 + 518_400 + 129_600 + 32_400 + 8_160 + 2_040 + 510;
+        assert!(32 - key_bits_for(total_4k) >= MIN_PACKED_DEPTH_BITS);
+    }
+}

@@ -95,3 +95,110 @@ fn every_mode_and_pixel_centre_combination_is_covered() {
         }
     }
 }
+
+/// The invariant the `trippy-bundle-1` format is built on.
+///
+/// `tools/export_unet_safetensors.py horse-e2e` writes *camera-space,
+/// pre-distorted* points and a pinhole camera at the origin. A bundle writes
+/// **world-space** points and each view's real `(R, t)` and Saiga coefficients,
+/// and lets the renderer distort. If those two are not the same render, then
+/// either the viewer disagrees with `render_frame_full` or the horse bundle is
+/// silently wrong — and both have looked fine in every other test.
+///
+/// The distortion here is the public Tanks & Temples horse's own
+/// (`third_party/zenodo/scenes/tnt_scenes/tt_horse/camera0.ini`), which is
+/// large enough to move a corner pixel by ~21 px at 1920x1080.
+#[test]
+fn world_points_plus_distortion_equal_pre_distorted_camera_space_points() {
+    use brush_pyramid::cpu::render_pyramid_cpu;
+    use brush_pyramid::params::PyramidParams;
+    use brush_pyramid::scene::{distort_normalized, Camera, PointSet};
+
+    const N: usize = 400;
+    const C: usize = 4;
+    const HORSE_DISTORTION: [f32; 8] = [-6.404_954e-2, 4.441_944e-2, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+
+    // A deterministic scatter in front of a camera that is neither at the
+    // origin nor axis-aligned, so the pose is genuinely exercised.
+    let mut state = 0x2026_0906_u64;
+    let mut next = || {
+        state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        ((state >> 33) as f32) / ((1u64 << 31) as f32) - 0.5
+    };
+    let (mut xyz, mut size, mut feat, mut conf) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for _ in 0..N {
+        xyz.extend_from_slice(&[next() * 4.0, next() * 4.0, next() * 4.0]);
+        size.push(0.01 + (next() + 0.5) * 0.15);
+        conf.push(0.05 + (next() + 0.5) * 0.9);
+        for _ in 0..C {
+            feat.push(next());
+        }
+    }
+    let world = PointSet::new(xyz.clone(), size.clone(), feat.clone(), conf.clone(), C)
+        .expect("world point set");
+
+    // A 20-degree yaw, and a camera pulled back along -Z.
+    let (c, s) = (20.0f32.to_radians().cos(), 20.0f32.to_radians().sin());
+    let camera = Camera {
+        width: 320,
+        height: 240,
+        fx: 190.0,
+        fy: 190.0,
+        cx: 160.0,
+        cy: 120.0,
+        r: [c, 0.0, s, 0.0, 1.0, 0.0, -s, 0.0, c],
+        t: [0.1, -0.2, 6.0],
+        distortion: HORSE_DISTORTION,
+    };
+
+    // The other half of the equivalence: transform + distort on the host, then
+    // render with an identity pose and no distortion, exactly as the per-view
+    // export does.
+    let mut baked = Vec::with_capacity(N * 3);
+    for i in 0..N {
+        let (xc, yc, zc) = camera.world_to_cam(xyz[i * 3], xyz[i * 3 + 1], xyz[i * 3 + 2]);
+        let (nx, ny) = distort_normalized(xc / zc, yc / zc, &HORSE_DISTORTION);
+        baked.extend_from_slice(&[nx * zc, ny * zc, zc]);
+    }
+    let pre_distorted = PointSet::new(baked, size, feat, conf, C).expect("baked point set");
+    let identity = Camera {
+        r: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+        t: [0.0, 0.0, 0.0],
+        distortion: [0.0; 8],
+        ..camera
+    };
+
+    let params = PyramidParams {
+        num_layers: 4,
+        ..PyramidParams::default()
+    };
+    let bg = [0.1f32, 0.2, 0.3, 0.4];
+    let a = render_pyramid_cpu(&world, &camera, &params, Some(&bg)).expect("world render");
+    let b = render_pyramid_cpu(&pre_distorted, &identity, &params, Some(&bg)).expect("baked render");
+
+    assert_eq!(a.num_fragments, b.num_fragments, "fragment counts differ");
+    assert!(a.num_fragments > 1_000, "the fixture must actually draw something");
+    for (layer, (la, lb)) in a.layers.iter().zip(&b.layers).enumerate() {
+        assert_eq!(la.n_used, lb.n_used, "layer {layer}: n_used differs");
+        for (i, (x, y)) in la.feature.iter().zip(&lb.feature).enumerate() {
+            assert!(
+                (x - y).abs() < TOL,
+                "layer {layer} value {i}: {x} vs {y}"
+            );
+        }
+    }
+
+    // ...and the distortion must not be inert, or the test proves nothing.
+    let undistorted = Camera {
+        distortion: [0.0; 8],
+        ..camera
+    };
+    let c0 = render_pyramid_cpu(&world, &undistorted, &params, Some(&bg)).expect("pinhole render");
+    let worst = a.layers[0]
+        .feature
+        .iter()
+        .zip(&c0.layers[0].feature)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max);
+    assert!(worst > TOL, "the horse's distortion changed nothing: {worst}");
+}

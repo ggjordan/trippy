@@ -554,3 +554,155 @@ rather than the only defence.
   whatever appearance the TRIPS network baked in for that pose), so degree 0 was chosen as
   the honest default; a higher `--sh-degree` is a free CLI override if a future scene's
   distillation shows visible view-dependent effects worth capturing.
+
+## Native Mac viewer (v0.4.0, `rust/crates/trips-viewer`)
+
+### The frame is rendered on the UI thread
+
+`ViewerApp::ui` calls `render_pyramid` and blocks on its one device readback (the
+fragment count) before it can even launch the sort. Brush's own splat backbuffer
+instead runs the render on an `AsyncMap` actor and paints whatever the last finished
+image was, so its UI stays responsive while a frame is in flight. The consequence
+here is that the displayed fps *is* the render's fps — there is no queue hiding
+work, which makes the readout honest — but a slow frame also freezes the mouse. If
+the viewer ever needs to stay smooth on a heavier scene, the fix is Brush's: move
+the render to an actor and accept a frame of latency.
+
+### The frame is network-bound, not sort-bound — measured, 2026-09-06
+
+This is the most important thing in this section, because the whole v0.4.0 brief
+(and `research/trips-metal.md`'s first Mac timing) assumed the opposite.
+
+At 1920x1080 on the horse bundle, on this M3 Ultra:
+
+- whole frame, exact: **204 ms**
+- the same frame in `raw level-0` or `coverage` view, i.e. **the identical
+  rasteriser with the U-Net removed**: **21.5 ms (46.6 fps)**
+
+So the pyramid rasteriser — projection, emission, both radix sorts over 10.4 M
+fragments, the segment scan and the blend — is **~11 %** of the frame, and the
+U-Net plus tone mapper are the other **~89 %**. Every rasteriser-side lever below
+therefore measured *within run-to-run noise* of the baseline, and the two levers
+that move the number are the two that reduce the network's work: fewer pixels
+(`render_scale`) and cheaper arithmetic (`half_net`).
+
+~82 GFLOP of 3x3 convolutions in 182 ms is about 450 GFLOP/s on a GPU that peaks
+near 21.5 TFLOPS — 2 % of peak. That is the real finding, and it is a
+`cubek-convolution`/CubeCL question, not a TRIPS one.
+
+### The performance levers, and what each costs
+
+Everything except `render_scale` and `half_net` is a
+`brush_pyramid::params::PyramidParams` field with a serde default equal to the
+**exact** pipeline, so an old `params.json` or bundle is unaffected and the parity
+tests never see them.
+
+| lever | field | what it changes | exactness |
+|---|---|---|---|
+| **f16 network** | `Settings::half_net` (viewer) | runs the U-Net's convolutions in f16; the weights are uploaded twice at load, so it is a runtime toggle | **approximate**, and the only arithmetic lever that targets the actual bottleneck |
+| **render scale** | viewer only | rasterise *and convolve* at a fraction of the window, upsample in the blit | **approximate**, and a resolution choice rather than an arithmetic one — but it is the lever with the largest effect, because it scales the network quadratically |
+| frustum + znear cull | `frustum_cull` | skips the visibility box test | on by default; **exact either way** in `trips` mode, because a point outside the image fails `footprint_fits` at layer 0 anyway. Confirmed: identical PNG. Kept only so the perf table can say what it is worth (nothing). |
+| fragment cap | `layer_floor` | `Trips` starts emission at `layer_lower - 1` instead of layer 0 | **approximate**, 41 dB. TRIPS's `compute_point_size_fac` returns 1.0 below `layer_lower`, so this drops full-alpha copies of big points from the finest layers. Buys nothing measurable. |
+| f16 features | `feature_store` | uploads and gathers point features as `f16` | **approximate**, 76 dB (essentially free). Buys nothing measurable. |
+| packed sort key | `sort` | one 32-bit radix sort over `layer_pixel << d \| quantise(depth)` instead of two (32-bit float depth, then the key) | **approximate**, 34 dB — the worst quality/benefit ratio of the five, because 14 four-bit radix passes become 8 in a stage that is already only a fraction of 11 % of the frame. Depth ties inside a bucket fall back to emission order. |
+
+The three rasteriser levers are kept, documented and default-off rather than
+deleted: they are correct, they are the right levers for a scene with far more
+fragments than this one, and a measurement that says "this is not where the time
+goes" is worth keeping the apparatus that proved it. (The packed sort key *is*
+worth 3.8 ms of the rasteriser's 21.6 — 17 % — it is simply invisible under the
+network.)
+
+### The point set is re-uploaded every frame
+
+`brush_pyramid::gpu::render_pyramid` takes `points: &PointSet`, a host-side struct,
+and calls `create_tensor_from_slice` on `xyz`, `size`, `conf` and `feat` on **every
+frame**. On the horse that is 80 MB of host-to-device traffic per frame for data that
+never changes. The `--profile` output makes it visible: stage 1 reads 178 ms when a
+device sync is forced right after it, against a whole-rasteriser cost of 21.6 ms
+without barriers — the sync is flushing the upload mid-frame instead of letting wgpu
+batch it with the compute submission, so 178 ms is an artefact, but the upload it is
+flushing is real work being redone 20 times a second.
+
+Fixing it means an API that separates "upload this point set" from "render a frame
+of it" — an `UploadedPoints` handle the viewer keeps. That was not needed to reach
+the frame-rate target and is the single most obvious next optimisation.
+
+### Shipped configuration
+
+`scripts/open_mac_viewer.sh` writes `--half-net --scale 0.75` into the launcher:
+**45.3 ms, 22.1 fps** in a 1080p window. `--half-net` is free (59.8 dB); the 31.5 dB
+against the 1080p reference is entirely the 0.75 resolution, and `-`/`=` change it
+live. `--packed-sort` and `--cap-fragments` are deliberately **not** shipped: 1.7 ms
+for 0.75 dB, and nothing at all for 42 dB, respectively.
+
+Two things about the packed key are worth knowing before trusting it:
+
+- The depth quantisation is linear in a **fast `log2`** — the float's bit pattern read
+  as an integer and scaled — which is monotone by construction and computed by the
+  identical expression on host and device (`gpu::fast_log2` /
+  `kernels::fast_log2`). It is not a call to `log2`, which CubeCL does not have.
+- The range it quantises over comes from the **point cloud's bounding box**, not from
+  the frame's actual depths, because measuring the latter would need a device
+  reduction and a readback per frame — the very thing the lever exists to remove. A
+  camera much further out than the scene's diameter therefore loses depth resolution.
+
+### The CPU reference does not implement two of them
+
+`render_pyramid_cpu` **returns an error** for `SortMode::PackedKey` and
+`FeatureStore::F16` rather than silently rendering something else. They are GPU
+storage and ordering strategies with no meaning for a `sort_by_key` on a `Vec`.
+`layer_floor` *is* implemented on both paths, because it changes which fragments
+exist and the reference has to be able to model that.
+
+### `trips-viewer` is not on the push path
+
+`scripts/build.sh` and `scripts/test.sh` still only compile `brush-pyramid` and
+`brush-unet` without the `gpu` feature (ADR-0005's whole point). `trips-viewer` pulls
+Burn, CubeCL, wgpu, egui and eframe, so its 13 unit tests run only on demand:
+
+```bash
+bash scripts/cpu_heavy.sh trips-viewer-test -- bash -c \
+  'cd rust && cargo test -p trips-viewer --release'
+```
+
+They are pure-logic tests (manifest parsing, the camera controller's orthonormality,
+the shader/enum agreement) and need no GPU — but they do need the whole tree built.
+
+### What `--screenshot` does *not* cover
+
+The offscreen PNG is produced by `Renderer::render_to_host`, which reads the tone
+mapper's tensor back with `into_data_async` — a path that understands strides. The
+**window** instead binds that tensor's raw buffer into a wgpu render pass and lets
+`blit.wgsl` index it. So a PSNR of 115 dB against `render_frame_full` proves the
+whole forward pass and says nothing at all about whether the blit's indexing is
+right; a transposed or channel-swapped display would score exactly the same.
+
+Three things stand in for the check nobody can run:
+
+1. The shader reads the network's output in its **native planar NCHW layout**
+   rather than a permuted one, so there is no re-layout to get wrong. An earlier
+   version did `permute` + `reshape` into channel-last, which is correct only if
+   the backend materialises the copy rather than re-describing the strides —
+   unverifiable from here, and it was removed for that reason.
+2. `Renderer::render` **errors** rather than displaying anything if the resolved
+   buffer is not contiguous.
+3. `blit::tests::shader_codes_match_the_wgsl_constants` asserts the Rust `ViewMode`
+   discriminants equal the WGSL `MODE_*` constants, so adding a view mode cannot
+   silently render as an older one.
+
+That is honest but not complete: the remaining gap is a render-to-texture readback
+of the actual egui pass, which would need a headless eframe harness.
+
+### Still missing
+
+- **No backward pass**, so nothing can be trained from the viewer. Same gap as the
+  rest of v0.4.0.
+- **Only `trips` mode is exercised.** The viewer renders whatever `mode` the bundle's
+  manifest names, but every bundle written so far says `trips`.
+- **One frame index for the tone mapper.** The per-image exposure and white balance
+  come from the *reference view* the camera was last pinned or snapped to, so flying
+  far from that view keeps its exposure. There is no principled alternative — a
+  free-flown camera has no image of its own — but it means the colour grade is a
+  choice, not a measurement, and it changes when you jump views.
+- **No `.ply` or splat rendering.** That is Brush's binary, which this does not touch.

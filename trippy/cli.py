@@ -61,6 +61,12 @@ and (once Brush training has finished) distilled PLYs and prints a 3-column
 comparison table (`trippy.distill.compare`). `--stage all` (the default)
 runs render then compare, printing the brush-cmd stage's output in between
 so the exact GPU-training command to queue next is always in front of you.
+`export-bundle` writes a `trippy-bundle-1` directory (bundle.json +
+points.npz + weights.safetensors) that the native Rust viewer opens: the
+points stay in WORLD space and every camera of the scene is listed, so the
+viewer can fly freely rather than replay one baked view. It accepts either a
+TRIPS/ADOP checkpoint (with `--scene`) or a trippy-native checkpoint, and
+auto-detects which -- see `trippy.render.bundle`. CPU-only.
 """
 
 from __future__ import annotations
@@ -123,6 +129,8 @@ from trippy.points.gaussian_ply import GaussianPlySource
 from trippy.points.monodepth import MonoDepthSource
 from trippy.points.source import PointSource
 from trippy.render import pyramid_render
+from trippy.render.bundle import TRIPS_DEFAULT_EPOCH
+from trippy.render.bundle import export_bundle as write_export_bundle
 from trippy.render.candidate import render_candidate
 from trippy.render.dolly import shade_dolly_poses
 from trippy.render.offpath import offpath_poses
@@ -467,6 +475,22 @@ def _cmd_parity(args: argparse.Namespace) -> int:
     report = run_parity(config)
     print(json.dumps(report["means"], indent=2))
     print(f"wrote {Path(config.out_dir) / 'summary_sheet.png'}")
+    return 0
+
+
+def _cmd_export_bundle(args: argparse.Namespace) -> int:
+    """Write a self-contained `trippy-bundle-1` directory for the native viewer."""
+    bundle_dir, document = write_export_bundle(
+        checkpoint=args.checkpoint,
+        out=args.out,
+        scene=args.scene,
+        epoch=args.epoch,
+        name=args.name,
+    )
+    summary = {k: v for k, v in document.items() if k != "views"}
+    summary["num_views"] = len(document["views"])
+    print(json.dumps(summary, indent=2))
+    print(f"wrote {bundle_dir}")
     return 0
 
 
@@ -849,6 +873,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="directory of the authors' own renders (default: <checkpoint>/<epoch>/test)",
     )
     parity.set_defaults(func=_cmd_parity)
+
+    export_bundle = sub.add_parser(
+        "export-bundle",
+        help="write a self-contained bundle dir (bundle.json + points.npz + weights.safetensors)",
+    )
+    export_bundle.add_argument(
+        "--checkpoint",
+        required=True,
+        help=(
+            "TRIPS/ADOP checkpoint dir (params.ini + ep<NNNN>/, needs --scene), or a "
+            "trippy-native checkpoint .pt / run directory"
+        ),
+    )
+    export_bundle.add_argument(
+        "--scene", default=None, help="ADOP scene directory (TRIPS checkpoints only)"
+    )
+    export_bundle.add_argument(
+        "--epoch",
+        default=None,
+        help=f"epoch subdirectory name (TRIPS only; default {TRIPS_DEFAULT_EPOCH}, else the newest ep*/)",
+    )
+    export_bundle.add_argument("--out", required=True, help="bundle directory to write")
+    export_bundle.add_argument("--name", default=None, help="scene label written into bundle.json")
+    export_bundle.set_defaults(func=_cmd_export_bundle)
 
     candidate_report = sub.add_parser(
         "candidate-report",

@@ -1,0 +1,37 @@
+# trips-viewer — the native Mac TRIPS viewer (v0.4.0).
+#
+# Lives in trippy's OWN thin workspace, not in the Brush fork's, and depends on
+# the fork only through `brush-pyramid`'s existing path dependencies. See
+# docs/decisions/ADR-0006-viewer-integration.md for why the alternative (moving
+# brush-pyramid/brush-unet into `rust/brush-trips/crates` so `apps/brush-app`
+# could reach them) was not taken. Consequence worth knowing: Brush's own
+# `brush` binary is untouched, so its .ply viewing cannot regress.
+[package]
+name = "trips-viewer"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "trips-viewer"
+path = "src/main.rs"
+
+[dependencies]
+brush-pyramid = { path = "../brush-pyramid", features = ["gpu"] }
+brush-unet = { path = "../brush-unet", features = ["gpu"] }
+
+burn.workspace = true
+burn-wgpu.workspace = true
+
+eframe.workspace = true
+egui.workspace = true
+wgpu.workspace = true
+
+glam.workspace = true
+bytemuck.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+log.workspace = true
+env_logger.workspace = true
+rfd.workspace = true

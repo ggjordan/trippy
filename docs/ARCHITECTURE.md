@@ -312,6 +312,13 @@ rust/
 │       ├── src/camera.rs            NeuralCamera tone mapper (Burn) | `gpu` feature
 │       ├── examples/render_frame_full.rs  whole frame -> PNG + per-stage ms
 │       └── tests/{schema_cpu,parity_gpu}.rs
+│   └── trips-viewer/                the native Mac viewer (v0.4.0, ADR-0006)
+│       ├── src/bundle.rs            the `trippy-bundle-1` reader
+│       ├── src/camera.rs            fly camera -> brush_pyramid::Camera per frame
+│       ├── src/renderer.rs          one frame; the performance levers
+│       ├── src/app.rs               egui shell, ms/fps readout, view toggle
+│       ├── src/blit.rs + shaders/   bind a Burn buffer into egui's render pass
+│       └── src/main.rs              window, --screenshot, --bench, --profile
 └── brush-trips/                    git submodule -> github.com/ggjordan/brush,
                                      branch trippy-fork (upstream 8b7f5c6c + Splats'
                                      robust/appearance/surface patches, merged)
@@ -377,9 +384,57 @@ Two decisions are worth carrying forward:
   That is *more* accurate than the Python reference and differs from it only within
   ~1e-6 relative of a power of two (`docs/LIMITATIONS.md`).
 
-Still open for v0.4.0: the backward pass, the real U-Net Burn graph + safetensors
-loader, wrapping the output as `burn::Tensor<4>`, and the `splat_backbuffer.rs`
-viewer hook-in.
+#### The viewer, and where it attaches (v0.4.0, ADR-0006)
+
+`crates/trips-viewer` closes the loop. Per frame:
+
+```
+fly camera (WASD/drag)  -> brush_pyramid::Camera  (R row-major, t, fx/fy/cx/cy,
+                                                   8-param Saiga distortion)
+   -> render_pyramid                       the six kernels above
+   -> Unet + NeuralCamera                  (view mode "network" only)
+   -> resolve_to_cube_float                back to one bindable buffer
+   -> egui paint callback + blit.wgsl      fullscreen triangle samples it
+```
+
+and the view toggle picks *which* buffer is blitted, from the **same** render:
+
+| view | buffer | meaning |
+|---|---|---|
+| network | the tone mapper's `[1, 3, H, W]`, permuted to channel-last | the displayed frame |
+| raw level-0 | rows `0 .. h*w` of the rasteriser's `(P, C)` output — no copy, level 0 is already at offset 0 | the evidence, before the network |
+| coverage | `t_final`, shown as `1 - t_final` | which pixels the network invented |
+
+The viewer does **not** live in `apps/brush-app`, and the crates did **not** move into
+the fork. `docs/decisions/ADR-0006-viewer-integration.md` records that decision and its
+costs; the short version is that a separate binary needed no fork push, keeps
+`scripts/build.sh` fast, and makes "Brush's own `.ply` viewing still works" true by
+construction rather than by test.
+
+Two things changed *outside* the viewer to make it possible, and both are visible to
+the rest of the pipeline:
+
+- **`Camera` gained lens distortion.** A bundle stores world-space points and each
+  view's Saiga coefficients, where the older per-view export baked one view's pose and
+  distortion into the point positions. All-zeros is the identity, so every fixture and
+  parity test is unaffected.
+- **`PyramidParams` gained four performance levers** (`frustum_cull`, `layer_floor`,
+  `sort`, `feature_store`, plus `depth_range` which configures `sort`), each defaulting
+  to the exact pipeline, each with a serde default so older JSON still loads. The CPU
+  reference implements `layer_floor` and *refuses* the two GPU-only ones rather than
+  ignoring them.
+- **`Unet::load_with_precision`** lets the decoder run in f16. This is the lever that
+  matters: measuring the viewer's `raw level-0` view — the identical rasteriser with the
+  network removed — gives **21.6 ms against a 204 ms frame**, so the rasteriser is ~11 %
+  and the network ~89 %, and the f16 network alone is 2.58x for 59.8 dB (visually free).
+  Every rasteriser-side lever measures within run-to-run noise. `docs/LIMITATIONS.md`
+  and `research/trips-metal.md` carry the table; this overturns the "sort-dominated"
+  reading of the first Mac timing.
+
+Still open for v0.4.0: the backward pass (`blend_bwd`) in Rust; an API that uploads a
+point set **once** instead of re-uploading 80 MB every frame (the next obvious
+optimisation, see `docs/LIMITATIONS.md`); and wiring TRIPS into the web build
+(`docs/WEB_VIEWER.md`).
 
 ## Validation strategy
 

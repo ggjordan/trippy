@@ -162,6 +162,74 @@ pub struct Camera {
     /// World-to-camera translation, world units.
     #[serde(rename = "t")]
     pub t: [f32; 3],
+    /// Saiga's 8-parameter lens distortion, in **Saiga order**
+    /// `k1 k2 k3 k4 k5 k6 p1 p2` (*not* OpenCV's), applied to the normalised
+    /// image point before the intrinsics — see [`distort_normalized`].
+    ///
+    /// All zeros (the default, and what every fixture writes) is the identity,
+    /// so an undistorted pinhole camera is exactly the previous behaviour and
+    /// every existing `camera.json` keeps loading.
+    #[serde(default)]
+    pub distortion: [f32; 8],
+}
+
+/// Radius, in normalised image coordinates, beyond which a point is culled
+/// rather than distorted (`trippy.constants.ADOP_DIST_CUTOFF`,
+/// `RenderParams::dist_cutoff`, `Settings.h:61`).
+pub const DIST_CUTOFF: f32 = 20.0;
+
+/// What [`distort_normalized`] returns past [`DIST_CUTOFF`]
+/// (`trippy.constants.ADOP_DISTORTION_SENTINEL`). Large enough that the
+/// projected pixel lands far outside every cull box, so the caller's ordinary
+/// visibility test drops the point.
+pub const DISTORTION_SENTINEL: f32 = 100_000.0;
+
+/// True when `distortion` is the identity, so callers can skip the work.
+#[must_use]
+pub fn is_identity_distortion(distortion: &[f32; 8]) -> bool {
+    distortion.iter().all(|c| *c == 0.0)
+}
+
+/// Saiga's 8-parameter lens distortion applied to one normalised image point.
+///
+/// Exact port of `distortNormalizedPoint`
+/// (saiga @ ee7a4e6b658, `src/saiga/vision/cameraModel/Distortion.h:130-171`)
+/// and the scalar twin of `trippy.render.parity.distort_normalized`. The
+/// coefficient order is Saiga's `k1 k2 k3 k4 k5 k6 p1 p2`.
+///
+/// # Arguments
+/// - `x`, `y`: `x_cam / z_cam`, `y_cam / z_cam`, dimensionless.
+/// - `distortion`: the 8 coefficients.
+///
+/// # Returns
+/// The distorted `(x, y)`, or `(DISTORTION_SENTINEL, DISTORTION_SENTINEL)`
+/// when `x^2 + y^2` exceeds `DIST_CUTOFF^2`.
+#[must_use]
+pub fn distort_normalized(x: f32, y: f32, distortion: &[f32; 8]) -> (f32, f32) {
+    let (k1, k2, k3, k4, k5, k6, p1, p2) = (
+        distortion[0],
+        distortion[1],
+        distortion[2],
+        distortion[3],
+        distortion[4],
+        distortion[5],
+        distortion[6],
+        distortion[7],
+    );
+    let x2 = x * x;
+    let y2 = y * y;
+    let r2 = x2 + y2;
+    if r2 > DIST_CUTOFF * DIST_CUTOFF {
+        return (DISTORTION_SENTINEL, DISTORTION_SENTINEL);
+    }
+    let two_xy = 2.0 * x * y;
+    let r4 = r2 * r2;
+    let r6 = r4 * r2;
+    let radial = (1.0 + k1 * r2 + k2 * r4 + k3 * r6) / (1.0 + k4 * r2 + k5 * r4 + k6 * r6);
+    (
+        x * radial + (p1 * two_xy + p2 * (r2 + 2.0 * x2)),
+        y * radial + (p1 * (r2 + 2.0 * y2) + p2 * two_xy),
+    )
 }
 
 impl Camera {
@@ -200,6 +268,7 @@ mod tests {
             cy: 24.0,
             r: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
             t: [0.0, 0.0, 0.0],
+            distortion: [0.0; 8],
         }
     }
 
@@ -215,6 +284,43 @@ mod tests {
         assert!((x - 1.0).abs() < 1e-6, "{x}");
         assert!((y - 3.0).abs() < 1e-6, "{y}");
         assert!((z - 3.0).abs() < 1e-6, "{z}");
+    }
+
+    #[test]
+    fn zero_distortion_is_the_identity() {
+        for (x, y) in [(0.0f32, 0.0f32), (0.3, -0.7), (1.9, 0.4)] {
+            let (xd, yd) = distort_normalized(x, y, &[0.0; 8]);
+            assert!((xd - x).abs() < 1e-7 && (yd - y).abs() < 1e-7);
+        }
+        assert!(is_identity_distortion(&[0.0; 8]));
+        assert!(!is_identity_distortion(&[1e-9, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]));
+    }
+
+    #[test]
+    fn saiga_radial_matches_hand_computation() {
+        // tt_horse's camera0.ini: k1 = -0.06404954, k2 = 0.04441944.
+        let d = [-6.404_954e-2, 4.441_944e-2, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let (x, y) = (0.824_5f32, 0.463_7f32);
+        let r2 = x * x + y * y;
+        let radial = 1.0 + d[0] * r2 + d[1] * r2 * r2;
+        let (xd, yd) = distort_normalized(x, y, &d);
+        assert!((xd - x * radial).abs() < 1e-6, "{xd}");
+        assert!((yd - y * radial).abs() < 1e-6, "{yd}");
+    }
+
+    #[test]
+    fn beyond_the_cutoff_returns_the_sentinel() {
+        let (xd, yd) = distort_normalized(DIST_CUTOFF + 1.0, 0.0, &[0.1; 8]);
+        assert_eq!(xd, DISTORTION_SENTINEL);
+        assert_eq!(yd, DISTORTION_SENTINEL);
+    }
+
+    #[test]
+    fn camera_json_without_distortion_defaults_to_the_identity() {
+        let json = r#"{"width":4,"height":3,"fx":1.0,"fy":1.0,"cx":2.0,"cy":1.5,
+                       "R":[1,0,0,0,1,0,0,0,1],"t":[0,0,0]}"#;
+        let cam: Camera = serde_json::from_str(json).expect("deserialise");
+        assert_eq!(cam.distortion, [0.0; 8]);
     }
 
     #[test]

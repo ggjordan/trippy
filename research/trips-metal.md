@@ -973,3 +973,172 @@ pipeline execution in progress.
 Artifact: experiments/EXP-0008-distill/README.md; trippy/distill/ (cameras.py,
 colmap_writer.py, render_set.py, brush_runner.py, compare.py); trippy/scene/colmap_io.py
 (write_cameras_txt/write_images_txt/write_points3d_txt/save_colmap_model_txt).
+
+## 2026-09-06 — `trippy export-bundle`: world-space asset bundles for the native viewer
+
+**Question.** The Rust viewer needs to fly a camera around a trained scene. The existing
+export (`tools/export_unet_safetensors.py horse-e2e`) bakes one view's pose *and* its lens
+distortion into the point positions so `brush_pyramid`'s pinhole `Camera` reproduces TRIPS's
+projection — correct for a single-frame parity test, useless for orbiting. What does a
+self-contained, pose-free bundle look like, and does it actually reproduce the baked export?
+
+**What ran.** New `trippy/render/bundle.py` + `trippy export-bundle`, writing a
+`trippy-bundle-1` directory of exactly three files: `bundle.json` (params, scene up vector,
+`default_view`, and every camera as row-major world-to-camera `R`/`t` + 8 Saiga distortion
+coefficients), `points.npz` (**world-space** `xyz`, effective `size`/`conf`, `feat`) and
+`weights.safetensors` (the unchanged `trippy-unet-1` schema). Two loaders, one schema: the
+public TRIPS/ADOP checkpoint layout (sharing `load_trips_scene` with
+`tools/export_unet_safetensors.py`, which now imports it rather than duplicating it) and
+trippy-native `trippy train` checkpoints. CPU only, no GPU job needed.
+
+```
+TRIPPY_OUTPUT=... PYTHONPATH=. TRIPS_DEVICE=cpu .venv/bin/python -m trippy.cli export-bundle \
+  --checkpoint third_party/zenodo/tt_checkpoints/checkpoint_horse \
+  --scene third_party/zenodo/scenes/tnt_scenes/tt_horse \
+  --out output/brush/horse_bundle --name horse
+```
+
+**Numbers.** Horse bundle: 2,218,471 points, C=4, `num_layers=8`, **151 views** (all of them),
+`default_view = 8` (array position of dataset index 8 = `00009.jpg`, the EXP-0002 parity view),
+`params` byte-identical to `view_00008_params.json`. 79.9 MB `points.npz`, 412 KiB weights,
+114 KiB `bundle.json`.
+
+The world-space claim, checked against the existing baked export: apply `project_adop` to the
+bundle's world `xyz` with view 8's `R`/`t`/`K`/distortion, form `[ndc_x*z, ndc_y*z, z]`, and
+compare to `output/brush/horse/view_00008_points.npz`.
+
+| quantity | value |
+|---|---:|
+| max abs difference | **0.0** |
+| mean abs difference | 0.0 |
+| max relative difference | 0.0 |
+| `size` / `feat` / `conf` identical | yes |
+
+Bit-exact, not merely within 1e-4: both paths run the same float32 `project_adop` on the same
+`ScenePoints.xyz`, so the only difference is *where* the transform happens — exporter (old) vs
+viewer (new). Horse distortion is `k1 = -0.06405, k2 = 0.04442`, rest zero, so this is a real
+distortion round trip, not a no-op.
+
+**Verdict.** PASS. A free-flying viewer can now open one directory and reproduce the parity
+engine's frame for any of the 151 real camera positions. `scripts/test.sh` green in **54.0 s**
+(643 Python tests passed, 74 gpu-marked deselected, plus the brush-pyramid/brush-unet cargo
+tests). One transient: an intermediate run failed `cargo check` on a concurrent in-flight edit
+to `rust/crates/brush-pyramid` (`PyramidParams` gained `depth_range`/`feature_store`/
+`layer_floor` before `fixture.rs` was updated); nothing under `rust/` was touched by this work
+and the rerun was clean.
+
+**Artefacts:** `output/brush/horse_bundle/{bundle.json,points.npz,weights.safetensors}`
+(not committed: 80 MB). Test: `tests/test_render_bundle.py` (synthetic, tmp_path only).
+- 2026-09-05T18:07:35Z submitted job trippy-mac-viewer-gpu-1 prio 12: bash /Users/nzbirdranch/trippy/output/brush/viewer/sweep.sh
+- 2026-09-05T18:44:41Z submitted job trippy-mac-viewer-gpu-2 prio 12: bash /Users/nzbirdranch/trippy/output/brush/viewer/sweep2.sh
+
+## v0.4.0 native Mac viewer: where the frame time actually goes (2026-09-06)
+
+**Question.** The v0.4.0 brief, and this log's own first Mac timing, said the 193 ms
+frame was "sort-dominated over 10.4 M fragments" and specified five rasteriser-side
+levers against that. Are they worth anything?
+
+**Jobs.** `trippy-mac-viewer-gpu-1` (12 configs, bench + screenshot + PSNR),
+`trippy-mac-viewer-gpu-2` (the network levers). Both run the *viewer binary itself*
+headlessly — `trips-viewer <bundle> --view 8 --frames 3 --bench 7 --screenshot x.png` —
+so the numbers are the viewer's, not a separate harness's. Each frame is ended by a
+real device sync (`brush_pyramid::gpu::sync`), never a readback, so nothing is charged
+for a 24 MB transfer the window never pays. Median of 7 after 3 warm-up frames.
+Scene: the public Tanks & Temples horse bundle, 2,218,471 points, C = 4, L = 8, view 8.
+Machine: M3 Ultra, 60 GPU cores, wgpu/Metal.
+
+### The answer: it is the network, not the sort
+
+The viewer's `raw level-0` view runs the **identical** rasteriser and stops before the
+U-Net, which makes the split free to measure:
+
+| | 1920x1080 | fps |
+|---|---:|---:|
+| whole frame, exact (`network` view) | 203.96 ms | 4.90 |
+| **rasteriser alone** (`raw` / `coverage` view) | **21.60 ms** | **46.30** |
+| rasteriser alone, packed sort key | 17.84 ms | 56.05 |
+
+So the pyramid rasteriser — projection, emission, both radix sorts over 10,351,708
+fragment slots, the segment scan and the blend — is **11 %** of the frame. The U-Net
+and tone mapper are the other **89 %** (~182 ms). ~82 GFLOP of 3x3 convolutions in
+182 ms is ~450 GFLOP/s on a GPU that peaks near 21.5 TFLOPS: **2 % of peak.**
+
+The earlier "sort-dominated" reading was not a bad measurement, it was an
+unresolvable one: it timed cumulative prefixes, and a prefix that ends before the
+dominant stage still has to wait for the barrier semantics of the stage after it. A
+view mode that renders the pyramid and stops settles it in one run.
+
+### Lever table — ms, and PSNR against the exact pipeline
+
+All at 1920x1080 unless the size says otherwise. PSNR is measured against
+`render_frame_full`'s PNG of the same view; for a lever that changes resolution the
+image is bilinearly upsampled to 1920x1080 first, so its number includes the
+resolution loss.
+
+| lever | ms | fps | PSNR vs exact | verdict |
+|---|---:|---:|---:|---|
+| **exact (baseline)** | 203.96 | 4.90 | 82.68 dB * | — |
+| (1) frustum + znear cull **off** | 201.41 | 4.97 | 82.68 dB | no cost, no benefit: in `trips` mode an off-screen point already fails `footprint_fits` at layer 0. **Bit-identical image.** |
+| (2) fragment cap (`layer_floor = near_lower`) | 208.14 | 4.80 | 40.97 dB | costs 42 dB, buys nothing |
+| (3) render at 0.75 scale | 104.80 | 9.54 | 31.54 dB | halves the frame — because it halves the *network* |
+| (4) f16 point features | 209.00 | 4.78 | 75.63 dB | quality is free, speed is nil |
+| (5) packed 32-bit sort key (14 radix passes -> 8) | 203.12 | 4.92 | 33.98 dB | 3.8 ms of the 21.6 ms rasteriser (17 %), invisible in the whole frame; costs 49 dB |
+| **(6) f16 U-Net** (added after the above) | **78.96** | **12.66** | **59.79 dB** | **2.58x, and visually free** |
+
+\* the exact viewer screenshot vs `render_frame_full` is 82.68 dB, i.e. the two 8-bit
+PNGs differ in a handful of pixels by one LSB. This is the **acceptance check** for the
+viewer (bar: > 40 dB) and it also validates the whole `trippy-bundle-1` path: the
+viewer renders *world-space* points with the view's Saiga distortion applied in the
+projection kernel, where `render_frame_full` renders the same scene from *camera-space,
+pre-distorted* points. Same picture.
+
+### Resolution ladder with the f16 network (the shipped configuration)
+
+| render scale | rendered size | ms | fps | PSNR vs exact 1080p |
+|---|---|---:|---:|---:|
+| 1.00 | 1920x1080 | 78.96 | 12.66 | 59.79 dB |
+| 0.90 | 1728x972 | 65.14 | 15.35 | 35.57 dB |
+| **0.75** | **1440x810** | **45.27** | **22.09** | **31.54 dB** |
+| 0.60 | 1152x648 | 33.60 | 29.76 | 27.64 dB |
+| 0.50 | 960x540 | 27.91 | 35.83 | 25.61 dB |
+
+The f16 network's own error is invisible in this ladder: `--half-net --scale 0.75` and
+plain `--scale 0.75` score **31.54 dB each**, and 0.60 scores 27.64 dB either way — to
+two decimal places. Every dB lost below 1.00 is resolution, not precision.
+Adding the packed sort and f16 features on top (`all_s75`) buys 1.7 ms and costs
+0.75 dB, so neither is shipped.
+
+**Shipped: `--half-net --scale 0.75` — 45.3 ms, 22.1 fps in a 1080p window**
+(target was >= 20; 30 is one press of `-` away, at 0.60).
+
+### Per-stage profile, and one thing it exposed
+
+`--profile` inserts a real device sync at every stage boundary. It is a profile, not a
+frame time, and one number in it is an artefact worth naming:
+
+```
+exact        project 178.1 | prefix 0.8 | emit 0.5 | sort 7.4 (14 passes) | segment 0.5 | blend 1.5
+packed key   project 177.8 | prefix 0.7 | emit 0.4 | sort 4.5 ( 8 passes) | segment 0.6 | blend 1.4
+```
+
+The sort numbers are real and match the whole-rasteriser measurement (21.6 -> 17.8 ms
+when 14 passes become 8). "project" is not: the whole rasteriser measures 21.6 ms
+without barriers, so 178 ms cannot be a real stage cost. What that sync forces is the
+**per-frame upload of the entire 80 MB point set** — `render_pyramid` calls
+`create_tensor_from_slice` on `xyz`/`size`/`conf`/`feat` every single frame — flushed
+mid-frame instead of batched with the compute submission. **The obvious next
+optimisation is to upload the point set once and keep it**, which the current API
+(`render_pyramid(points: &PointSet, ...)`) does not allow. It is not needed to hit the
+target, and it is the first thing to do if more is wanted.
+
+### Verdict and artefacts
+
+**PASS.** Viewer opens the horse bundle and renders; offscreen screenshot matches
+`render_frame_full` at **82.68 dB** (bar 40); **22.1 fps at 1080p** (bar 20).
+Rasteriser-side levers 1, 2, 4 and 5 are implemented, measured, documented and
+default-off; the honest finding is that they are not where the time is.
+
+**Artefacts:** `$SPLATS_ROOT/tools/gpu_queue/logs/trippy-mac-viewer-gpu-{1,2}.log`;
+screenshots and the sweep scripts under `$TRIPPY_OUTPUT/brush/viewer/` (not committed);
+launcher at `$TRIPPY_OUTPUT/deliver/trips-horse/`.
+- 2026-09-05T18:51:17Z delivered trips-mac-viewer-horse: Native Mac TRIPS viewer (Brush fork): the public Tanks&Temples horse scene rendered live through the pyramid rasteriser + U-Net. Use WASD/mouse; V toggles network/raw/coverage. 22 fps at 1920x1080 on this Mac (rendered at 1440x810 and upscaled; press = for full resolution, - for 30 fps). (/Users/nzbirdranch/trippy/output/deliver/trips-horse/OPEN_TRIPS_MAC_trips-horse.command)
