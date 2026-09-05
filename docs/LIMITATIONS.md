@@ -497,33 +497,40 @@ rather than the only defence.
   another, and reports the differences. The whole-frame number is measured directly
   and is the one to quote; the per-stage split inherits the noise of two
   measurements and each prefix charges its own barrier's readback.
-## Web viewer (v0.5.0, `rust/crates/trips-web` + `web/`)
+## Web viewer (`rust/crates/trips-web` + `web/`)
 
 The whole diagnosis, with the exact error strings, is in `docs/WEB_VIEWER.md`.
-This is the short list of what the browser build cannot do.
+This is the short list of what the browser build costs and cannot do. As of
+this entry it renders all three views, including the U-Net's.
 
-### The U-Net view does not run in a browser at all
+### The U-Net view runs in a browser, but the first frame autotunes for ~20 s
 
-`raw level-0` and `coverage` render; **`network` does not**. Both ways of getting
-the U-Net's `burn::Tensor<4>` into a buffer the blit can bind —
-`burn_bridge::resolve_to_cube_float` (burn-fusion `submit_blocking`) and
-`Tensor::into_data_async` (burn-dispatch, whose `float_into_data` calls
-`read_sync` *inside* the async function) — end at CubeCL's `read_sync`, which on
-`wasm32-unknown-unknown` is `embassy_futures::poll_once` and fails unless the
-future is already complete. It is an unrecoverable wasm trap, not an error
-return. The rasteriser's own views bind `PyramidRender`'s `CubeTensor`s
-directly and never go near it, which is why they work.
+**Fixed since v0.5.0, and the v0.5.0 diagnosis was wrong.** That release
+recorded the browser's `network` view as blocked by CubeCL's `read_sync` on the
+route from the U-Net's `burn::Tensor<4>` to a bindable buffer, and substituted
+`raw level-0`. Neither `burn_bridge::resolve_to_cube_float` nor
+`Tensor::into_data_async` calls `read_sync` on these pinned revisions. The trap
+was CubeCL's **convolution autotuner**: its roofline bounds generator calls
+`cubecl_std::throughput::measure_peak_throughput`, whose own doc comment says
+"Native only, panics on WASM". `docs/WEB_VIEWER.md` blocker 4 has the stack and
+how it was read.
 
-`trips-web` therefore substitutes `raw level-0` for `network` and **says so** on
-screen and in its status JSON (`networkBlocked: true`); `?force-network=1`
-reproduces the trap for whoever revisits this. The fix is upstream: an async
-resolve in burn-fusion, or an async `into_data` in burn-dispatch. Nothing in
-trippy's code can route around it.
+What is left is the cost of the way round it. `with_bounds` registers no bounds
+generator only at `AutotuneLevel::Full`, so that is the level
+`brush_pyramid::gpu::disable_autotune_roofline_bounds()` sets, and `Full` means
+"benchmark every candidate, no roofline short circuit". **The first frame of a
+new convolution shape therefore takes about 20 seconds in the browser**, once
+per shape per session; every frame after it is unaffected. `web/trips.js` says
+so on the canvas while it happens. There is no cheaper level: `Minimal`,
+`Balanced` and `Extensive` all install the generator that traps.
 
-**Consequence for the acceptance check:** there is no browser-side PNG of the
-*network* frame, so there is no PSNR against
-`output/brush/viewer/halfnet_s75.png`. The pixel evidence that does exist is a
-2 MB `canvas.toBlob()` capture of the rasteriser's level-0 view at 1440x810.
+Two smaller consequences:
+
+- The autotune result is not cached across page loads (the persistent cache is
+  a filesystem cache), so every reload pays the ~20 s again.
+- The kernel autotune picks in the browser is not necessarily the one it picks
+  natively, which is part of why the browser's frame matches the native
+  reference at 62 dB rather than exactly.
 
 ### Two shims in `web/trips.js` compensate for dependency bugs
 
@@ -564,23 +571,26 @@ Note the contrast with the v0.5.0 groundwork, where Safari ran the *stock*
 Brush splat viewer fine — Brush's Gaussian rasteriser and trippy's TRIPS
 rasteriser share no kernels.
 
-### The web frame pays for one copy the Mac app does not
+### The browser is much slower than the Mac app
 
-`trips_viewer::renderer::resolve_network_output` is `cfg`-split; the web branch
-reads the frame back and re-uploads it (`3 * H * W * 4` bytes each way, 14 MB at
-1440x810). Dead code today because the network view is blocked, but it is the
-shape of the fix if the upstream read is ever made async.
+Measured in Chrome 152 on this M3 Ultra, 1440x810, view 8, release build,
+**while a Splats training was running on the same GPU** (so both browser
+numbers are lower bounds):
 
-### The browser is much slower than the Mac app, and the point upload is why
+| view | Chrome | native `trips-viewer` |
+|---|---|---|
+| `network`, `--half-net` equivalent | **1.09 fps** (6 frames / 5.49 s) | 29.46 fps |
+| `raw level-0` | **3.32 fps** (17 frames / 5.12 s) | 116.21 fps |
 
-Measured in Chrome 152 on this M3 Ultra, 1440x810, `raw level-0`, **while a
-Splats training was running on the same GPU**: **2.90 fps** over 15 frames in
-5.18 s (~345 ms/frame), against **46.6 fps** for the identical view natively. Most of
-that gap is not the GPU: `render_inner` re-uploads the whole point set every
-frame (~80 MB — see "The point set is re-uploaded every frame" above), and in a
-browser each upload crosses the wasm/JS boundary into a `GPUQueue.writeBuffer`
-instead of being a memcpy into unified memory. Caching the uploaded point
-buffers between frames is the obvious fix and would help the native viewer too.
+The v0.5.0 entry here blamed the per-frame point upload for most of the gap.
+That upload is now gone (`brush_pyramid::gpu::UploadedPoints`, below), and the
+browser's `raw level-0` went 2.90 → 3.32 fps while the native number more than
+doubled — so on this stack the upload was **not** the browser's main cost. What
+is left is unexplained and unmeasured from inside the page: a wasm build has no
+`Instant`, `?trace=1` only times whole stages, and Chrome's own profiler is an
+interactive tool. Candidates, in no measured order: WGSL compiled by the
+browser rather than MSL, the error-scope shim adding a promise round trip per
+kernel launch, and WebGPU's own per-dispatch validation.
 
 ## Distillation (design B)
 
@@ -660,18 +670,21 @@ This is the most important thing in this section, because the whole v0.4.0 brief
 
 At 1920x1080 on the horse bundle, on this M3 Ultra:
 
-- whole frame, exact: **204 ms**
+- whole frame, exact: **190 ms** (204 ms before `UploadedPoints`)
 - the same frame in `raw level-0` or `coverage` view, i.e. **the identical
-  rasteriser with the U-Net removed**: **21.5 ms (46.6 fps)**
+  rasteriser with the U-Net removed**: **9.8 ms (102 fps)** (21.5 ms / 46.6 fps
+  before `UploadedPoints`)
 
 So the pyramid rasteriser — projection, emission, both radix sorts over 10.4 M
-fragments, the segment scan and the blend — is **~11 %** of the frame, and the
-U-Net plus tone mapper are the other **~89 %**. Every rasteriser-side lever below
+fragments, the segment scan and the blend — is **~5 %** of the frame, and the
+U-Net plus tone mapper are the other **~95 %**. (It was 11 % / 89 % before the
+point upload was taken out of the rasteriser's side of the split; the change
+moved the ratio, not the conclusion.) Every rasteriser-side lever below
 therefore measured *within run-to-run noise* of the baseline, and the two levers
 that move the number are the two that reduce the network's work: fewer pixels
 (`render_scale`) and cheaper arithmetic (`half_net`).
 
-~82 GFLOP of 3x3 convolutions in 182 ms is about 450 GFLOP/s on a GPU that peaks
+~82 GFLOP of 3x3 convolutions in 180 ms is about 450 GFLOP/s on a GPU that peaks
 near 21.5 TFLOPS — 2 % of peak. That is the real finding, and it is a
 `cubek-convolution`/CubeCL question, not a TRIPS one.
 
@@ -695,28 +708,55 @@ The three rasteriser levers are kept, documented and default-off rather than
 deleted: they are correct, they are the right levers for a scene with far more
 fragments than this one, and a measurement that says "this is not where the time
 goes" is worth keeping the apparatus that proved it. (The packed sort key *is*
-worth 3.8 ms of the rasteriser's 21.6 — 17 % — it is simply invisible under the
-network.)
+worth 3.8 ms of the rasteriser's then-21.6 ms — 17 % — it is simply invisible
+under the network. The rasteriser is now 9.8 ms, so the same 3.8 ms would be a
+much larger share of it; that has not been re-measured, and the frame is still
+network-bound either way.)
 
-### The point set is re-uploaded every frame
+### The point set is uploaded once per bundle (was: every frame)
 
-`brush_pyramid::gpu::render_pyramid` takes `points: &PointSet`, a host-side struct,
-and calls `create_tensor_from_slice` on `xyz`, `size`, `conf` and `feat` on **every
-frame**. On the horse that is 80 MB of host-to-device traffic per frame for data that
-never changes. The `--profile` output makes it visible: stage 1 reads 178 ms when a
-device sync is forced right after it, against a whole-rasteriser cost of 21.6 ms
-without barriers — the sync is flushing the upload mid-frame instead of letting wgpu
-batch it with the compute submission, so 178 ms is an artefact, but the upload it is
-flushing is real work being redone 20 times a second.
+**Fixed.** `brush_pyramid::gpu::render_pyramid` used to take a host-side
+`PointSet` and call `create_tensor_from_slice` on `xyz`, `size`, `conf` and
+`feat` on **every frame** — 80 MB of host-to-device traffic per frame, on the
+horse, for data that never changes. `gpu::UploadedPoints` is that upload as a
+handle: `trips_viewer::Renderer` builds one when the bundle loads and binds it
+every frame through `gpu::render_pyramid_uploaded`. The `PointSet` entry points
+are unchanged and still work; they upload and delegate.
 
-Fixing it means an API that separates "upload this point set" from "render a frame
-of it" — an `UploadedPoints` handle the viewer keeps. That was not needed to reach
-the frame-rate target and is the single most obvious next optimisation.
+Worth **12.2 ms of every frame** at any resolution — a fixed cost, so it
+matters most where the frame is cheapest (job `trippy-web-unet-gpu-3`, public
+horse, 30-frame medians):
+
+| view | before | after |
+|---|---|---|
+| 1080p `network` exact | 4.93 fps | 5.28 fps |
+| 1080p `network --half-net` | 12.45 fps | 14.64 fps |
+| 1440x810 `network --half-net` (shipped) | 21.72 fps | **29.46 fps** |
+| 1080p `raw level-0` | 45.40 fps | **102.31 fps** |
+| 1440x810 `raw level-0` | 46.17 fps | **116.21 fps** |
+
+The screenshot the new binary writes is byte-identical to the old one.
+
+What remains: **the f16-features lever re-uploads.** `FeatureStore::F16` is a
+different buffer, not a different binding, so toggling `--fp16` at runtime
+rebuilds the handle (one 40 MB upload, once per toggle) and the host copy of
+the point set is kept alive for exactly that reason — the native viewer's
+panel has an "f16 features" checkbox, so this is a real path, not a
+hypothetical one. The browser front end does not expose the lever, so on wasm
+that host copy is 80 MB of dead weight in the heap.
+
+**And the old "stage 1 reads 178 ms" number in this file was an artefact**, not
+a measurement of the upload: `--profile` was run in `network` mode, where the
+first stage's forced device sync drains the previous warm-up frame's still
+queued U-Net. Profiled in `raw` mode the same stage read 12.1 ms before the
+change and 0.4 ms after it. `StageTimings` now carries a separate `upload_ms`
+so the cost cannot hide inside stage 1 again.
 
 ### Shipped configuration
 
 `scripts/open_mac_viewer.sh` writes `--half-net --scale 0.75` into the launcher:
-**45.3 ms, 22.1 fps** in a 1080p window. `--half-net` is free (59.8 dB); the 31.5 dB
+**34.0 ms, 29.5 fps** in a 1080p window (45.3 ms / 22.1 fps before
+`UploadedPoints`). `--half-net` is free (59.8 dB); the 31.5 dB
 against the 1080p reference is entirely the 0.75 resolution, and `-`/`=` change it
 live. `--packed-sort` and `--cap-fragments` are deliberately **not** shipped: 1.7 ms
 for 0.75 dB, and nothing at all for 42 dB, respectively.

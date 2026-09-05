@@ -99,6 +99,25 @@ impl Gpu {
     /// browser has no `navigator.gpu`, if no adapter is available, or if the
     /// device request is refused.
     pub async fn create(canvas: web_sys::HtmlCanvasElement) -> Result<Self, String> {
+        // BEFORE any CubeCL device exists, and the reason the U-Net view runs
+        // in a browser at all. CubeCL autotunes `conv2d`, and the tuner's
+        // roofline bounds generator probes the device through
+        // `measure_peak_throughput`, which upstream documents as "Native only,
+        // panics on WASM" -- it ends in `block_on`/`read_sync`. Setting the
+        // autotune level to `Full` registers no bounds generator, so the probe
+        // never happens. See `brush_pyramid::gpu` and `docs/WEB_VIEWER.md`.
+        let autotune_configured = brush_pyramid::gpu::disable_autotune_roofline_bounds();
+        if !autotune_configured {
+            // Not fatal, but it means something read the CubeCL config first
+            // and the roofline probe may still fire; say so rather than let a
+            // later trap look mysterious.
+            web_sys::console::warn_1(&wasm_bindgen::JsValue::from_str(
+                "trips-web: CubeCL's config was already initialised, so the \
+                 autotune roofline bounds could not be turned off; the U-Net \
+                 view may trap in read_sync (docs/WEB_VIEWER.md)",
+            ));
+        }
+
         let instance = Instance::new(wgpu::InstanceDescriptor {
             // WebGPU only -- see the module invariants.
             backends: wgpu::Backends::BROWSER_WEBGPU,

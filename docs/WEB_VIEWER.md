@@ -65,6 +65,13 @@ compute shader and WebGL2 has none, so a WebGL path could not render the scene
 bash scripts/web_build.sh --check --trips        # verify the toolchain, build nothing
 bash scripts/cpu_heavy.sh trips-web -- bash -c \
   'TRIPPY_OUTPUT=$PWD/output bash scripts/web_build.sh --trips'
+
+# When a wasm PANIC has to be read: --profiling keeps release codegen and the
+# wasm name section, which --release's wasm-opt strips. Add wasm-pack's
+# --no-opt (run it directly) if even -O is losing frames, and set
+# `Error.stackTraceLimit = 300` in the page, or the trace stops at panic_fmt.
+bash scripts/cpu_heavy.sh trips-web -- bash -c \
+  'TRIPPY_OUTPUT=$PWD/output bash scripts/web_build.sh --trips --profiling'
 ```
 
 `scripts/web_build.sh --trips`:
@@ -93,7 +100,7 @@ Output: `$TRIPPY_OUTPUT/web/trips-dist/`, ~100 MB, of which 80 MB is
 | the same, incremental after a one-crate edit | 9–23 s |
 | `wasm-bindgen` + `wasm-opt -Oz --converge` (68 MB → **24.4 MB** `trips_web_bg.wasm`) | ~40 s |
 | **total `--trips --release`, cold** | **2 m 14 s wall** (20 m 16 s user) |
-| `--profiling` variant (wasm-opt `-O`, keeps more names; 27 MB) | 23–31 s |
+| `--profiling` variant (wasm-opt `-O`; 27 MB). Note `-O` **still strips the name section** — add `wasm-pack --no-opt` (75 MB, loads fine over loopback) when a stack trace has to be readable | 23–31 s |
 
 ## Running it
 
@@ -109,7 +116,7 @@ Controls are the native viewer's (`docs/USER_GUIDE.md`). Query parameters:
 | `?bundle=<url>` | `./bundle` | bundle directory URL |
 | `?scale=<f>` | `0.75` | render scale — the shipped default, same as `scripts/open_mac_viewer.sh` |
 | `?half=0\|1` | `1` | f16 decoder — the shipped default, same as the native launcher |
-| `?mode=` | `network` | `network` / `raw` / `coverage`, the same three honesty views |
+| `?mode=` | `network` | `network` / `raw` / `coverage`, the same three honesty views. All three render; `network` costs ~20 s of autotune on its first frame |
 | `?view=<n>` | bundle's | dataset view index |
 | `?screenshot=1` | off | run the verification sequence (below) and stop |
 | `?trace=1` | off | POST a stage-by-stage progress trace |
@@ -140,10 +147,20 @@ into a readable trace. The delivered `.command` launcher uses a plain
 `http.server`, which answers 501 to those POSTs; the page catches that and
 carries on.
 
+`beacon_server.py` also takes `POST /__trips_log?s=<stage>` and appends the
+**untruncated** body to `trace.log`. A `__trips_stage` GET is capped at 400
+characters, which is fine for a stage name and useless for a wasm panic's
+stack trace — that is what the POST is for, and it is how blocker 4 below was
+finally read. `web/trips.js` does not send it: the diagnostic is two lines
+added to the *copy* of `trips.js` inside a scratch dist, next to
+`Error.stackTraceLimit = 300`, so the shipped page stays free of it.
+
 ## Blockers hit, and what each one turned out to be
 
-All four were found in this session, in this order. None of them is in TRIPS
-code; three are in the pinned dependency stack and one is a real browser gap.
+All four were found in this order. None of them is in TRIPS code; three are in
+the pinned dependency stack and one is a real browser gap. **Blocker 4 was
+misdiagnosed in v0.5.0 and is fixed** — its entry below is the corrected one,
+kept in full because the wrong reading is instructive.
 
 ### 1. `std::time::Instant` and `block_on` panic on wasm32 (ours, fixed)
 
@@ -217,7 +234,7 @@ Safari is a separate case: it does **not** advertise `subgroups` at all, yet
 accepts the directive and the builtins once they are declared. It gets further
 than it did without the shim, and then fails elsewhere — see the matrix.
 
-### 4. `read_sync` cannot work on wasm — the U-Net view is still blocked
+### 4. CubeCL's autotune roofline probe traps on wasm — the U-Net view (FIXED)
 
 ```
 panicked at cubecl-environment/src/future/reader.rs:9:22:
@@ -225,33 +242,109 @@ Failed to read tensor data synchronously. This can happen on platforms that
 don't support blocking futures like WASM.
 ```
 
-Getting the U-Net's `burn::Tensor<4>` into a buffer the blit can bind means
-reading it, and **both** available routes end at CubeCL's `read_sync`, which on
-`wasm32-unknown-unknown` is `embassy_futures::poll_once` and fails unless the
-future is already complete:
+**v0.5.0 read this wrongly and shipped `networkBlocked: true` because of it.**
+The message names `read_sync`, the two obvious suspects were both readbacks of
+the U-Net's output tensor, and the entry this replaces named them: the trap was
+said to be in `burn_bridge::resolve_to_cube_float` (through burn-fusion's
+`submit_blocking`) and in `Tensor::into_data_async` (through burn-dispatch's
+`float_into_data`). **Neither is true on the pinned revisions.** Two things
+settled it:
 
-- `burn_bridge::resolve_to_cube_float` — the native zero-copy path — goes
-  through burn-fusion's `FusionClient::resolve_tensor_float` ->
-  `submit_blocking`;
-- `Tensor::into_data_async` — tried as a readback-and-re-upload replacement —
-  goes through burn-dispatch, whose `float_into_data`
-  (`burn-dispatch/src/ops/tensor.rs:54`) calls `read_sync` *inside* the async
-  function. Awaiting it does not help.
+1. Reading the sources. `FusionClient::resolve_tensor_float`
+   (`burn-fusion/src/client.rs:362`) calls `DeviceHandle::submit_blocking`,
+   which is only a channel round trip when cubecl's `multi_threading` cfg is
+   on — and `cubecl-common/build.rs:11` defines that cfg as
+   `all(feature = "std", not(target_family = "wasm"))`. On wasm the handle is
+   `ReentrantMutexDeviceHandle`, whose `submit_blocking`
+   (`cubecl-common/src/device/handle/reentrant.rs:51`) runs the closure inline
+   under a reentrant mutex: no thread parks, no future is polled. There is no
+   `read_sync` in `burn-fusion`, `burn-cubecl-fusion` or `burn-ir` at all. And
+   `burn-dispatch`'s `read_sync` (`ops/tensor.rs:54`) is in `float_to_device`,
+   the cross-backend move, not in `float_into_data` (`ops/tensor.rs:29`, a
+   plain `.await`).
+2. Reading the **stack**, which is how it was actually found. A wasm panic's
+   stack is a list of `wasm-function[N]` unless the name section survives, and
+   `wasm-opt` strips it. `scripts/web_build.sh --profiling` plus
+   `wasm-pack --no-opt` keeps it, and `Error.stackTraceLimit = 300` makes the
+   trace long enough to reach past `panic_fmt`.
 
-It is an unrecoverable wasm trap, not an error return, so it cannot be caught.
-There is no async resolve in burn-fusion and no async `into_data` in
-burn-dispatch; nothing in trippy's code can route around it.
+The real path, bottom up:
 
-The rasteriser's own views never go near it — `RawLevel0` and `Coverage` bind
-`PyramidRender`'s `CubeTensor`s directly — which is why they render.
-`trips-web` therefore substitutes `raw level-0` for `network`, says so on
-screen and in its status JSON (`networkBlocked: true`), and keeps
-`?force-network=1` so the trap stays reproducible. The `cfg`-split
-`resolve_network_output` in `trips_viewer::renderer` (readback + re-upload
-through the new `brush_pyramid::gpu::upload_f32`) is the shape of the fix and
-is kept for the day the upstream read becomes async.
+```
+trips_viewer::renderer::Renderer::render
+  brush_unet::camera::NeuralCamera::forward
+    brush_unet::camera::linspace_centered
+      Tensor::<1>::from_data  ->  Fusion::float_from_data  ->  client.register(NoOp)
+        MultiStream::register -> Processor::process -> execute_block_optimization
+          OrderedExecution::execute_operations -> Conv2dOps::execute      <-- the queued U-Net conv
+            burn_cubecl::kernel::conv::forward::tune::conv_autotune
+              LocalTuner::execute -> BoundsGenerator::generate
+                burn_cubecl::kernel::autotune_bounds::with_bounds
+                  cubecl_std::throughput::measure_peak_throughput          <-- "Native only, panics on WASM"
+                    ComputeClient::measure_throughput
+                      ThroughputBenchmarker::measure
+                        compute_direct::build_kernel
+                          cubecl_environment::future::base::block_on       <-- read_sync -> trap
+```
+
+It is **not the output tensor at all**. `Tensor::from_data` inside the tone
+mapper's `linspace_centered` is merely what drains the fusion stream; the
+queued operation that runs is the U-Net's first `conv2d`, and CubeCL autotunes
+it. The tuner's *roofline bounds generator* asks the device for its peak
+throughput first, and `cubecl-std/src/throughput/base.rs` says of that function,
+in its own doc comment, **"Native only, panics on WASM"**. That is why
+`raw level-0` and `coverage` were fine: they run no convolution, so nothing is
+ever autotuned.
+
+**The fix, and it needs no fork and no `[patch]`.**
+`burn-cubecl/src/kernel/autotune_bounds.rs::with_bounds` registers **no**
+bounds generator when the autotune level is `AutotuneLevel::Full`:
+
+```rust
+if configured_thresholds().is_none() {   // None <=> AutotuneLevel::Full
+    return set;
+}
+```
+
+So `brush_pyramid::gpu::disable_autotune_roofline_bounds()` sets
+`CubeClRuntimeConfig { autotune.level = Full, .. }` through the supported
+`RuntimeConfig::try_set`, and `trips_web::gpu::Gpu::create` calls it **before
+the first CubeCL device exists** (`try_set` refuses to override a config that
+has already been read; the return value is checked and a failure is warned
+about on the console). Autotune itself still runs — its wasm path
+(`tune_fixed_samples`, resolved through `wasm_bindgen_futures::spawn_local`) is
+asynchronous throughout.
+
+**What `Full` costs.** "Full" means "benchmark every candidate, no roofline
+short circuit", so the **first** frame that meets a new convolution shape pays
+for the whole candidate set: ~20 s on this Mac, once, per shape. Every frame
+after it is unaffected. `web/trips.js` says so on the canvas while it happens,
+because 20 s of blank canvas is indistinguishable from a hang. There is no
+cheaper level available: `Minimal`, `Balanced` and `Extensive` all install the
+generator that traps.
+
+**Consequence for `trips_viewer::renderer`.** `resolve_network_output` is no
+longer `cfg`-split: both front ends now call
+`burn_bridge::resolve_to_cube_float`, so the browser's frame goes from the
+U-Net to the blit with **no readback and no re-upload**, exactly as the Mac
+app's does. `brush_pyramid::gpu::upload_f32` — added in v0.5.0 for the
+re-upload half of the old web path — is kept because it is a reasonable
+primitive, but nothing in the viewer calls it any more.
+
+**Measured result.** Chrome 152 renders the network view of the public horse
+scene at 1440x810, and the GPU-readback PNG it produces (the same
+`png::feature_to_rgb8` the native `--screenshot` runs) matches
+`output/brush/viewer/halfnet_s75.png`, the native
+`trips-viewer --screenshot --half-net --scale 0.75` reference, at
+**PSNR 62.04 dB** (`canvas.toBlob()` capture: 62.03 dB). The residual is f16
+rounding plus a different autotune-selected convolution kernel, not a
+difference in the picture.
 
 ### Browser support matrix (this Mac, 2026-09-06, release build, view 8, 1440x810)
+
+Chrome's row was re-measured after the blocker-4 fix and the point-upload
+change; Safari's is unchanged from the first measurement (it is not worth
+re-running — it draws a wrong image either way).
 
 | | Chrome 152.0.7977.83 | Safari 26.6.2 |
 |---|---|---|
@@ -260,10 +353,13 @@ is kept for the day the upstream read becomes async.
 | 80 MB bundle fetch + inflate + wasm init + Burn on the shared device | yes | yes |
 | `shader-f16` granted | yes | yes |
 | `subgroups` granted | **yes** | **no** (not in `GPUAdapter.features`) |
-| shaders needing the injected `enable subgroups;` | 4 | 4 |
+| shaders needing the injected `enable subgroups;` | 4-5 | 4 |
 | frames produced | yes | yes |
-| fps over a 5 s window (`raw level-0`) | **2.90** (15 frames / 5.18 s) | **3.25** (17 frames / 5.24 s) |
-| `canvas.toBlob()` PNG | 2,003,242 bytes | 1,068,451 bytes |
+| **`network` (the U-Net view)** | **yes** — 1.09 fps (6 frames / 5.49 s) | not tried; the picture is wrong anyway |
+| fps over a 5 s window (`raw level-0`) | **3.32** (17 frames / 5.12 s), was 2.90 | **3.25** (17 frames / 5.24 s) |
+| `canvas.toBlob()` PNG | 2,024,635 bytes (`network`) | 1,068,451 bytes (`raw`) |
+| GPU-readback PNG (`screenshot_png`) | 2,547,624 bytes | 0 (never reached) |
+| **PSNR vs the native `--half-net --scale 0.75` frame** | **62.04 dB** | — |
 | **is the picture right?** | **YES — the horse** | **NO — garbage** |
 
 **Chrome renders the scene correctly.** The 1440x810 `canvas.toBlob()` capture
@@ -299,22 +395,28 @@ Safari for this viewer.** Two things follow:
    not advertise the feature. It then fails elsewhere, on f16. Both statements
    were true when measured; this table is the final one.
 
-### Not measured
+### Measured, and how
 
-- **No PSNR against `output/brush/viewer/halfnet_s75.png`.** That reference is
-  the *network* frame, and the browser cannot produce a network frame
-  (blocker 4). Comparing it with a `raw level-0` capture is meaningless — the
-  two hold different quantities, and measured they correlate at r = -0.05.
-  A like-for-like check would need a native `trips-viewer --screenshot --mode
-  raw` reference, which is GPU work and a Splats training held the queue.
-  The pixel evidence that does exist is the capture itself, checked directly
-  (the horse scene is the public Zenodo one, which `AGENTS.md` permits
-  viewing).
-- **fps was measured with a Splats training running on the same GPU**
-  (`60-hunua-clip5250-train`), so both numbers are lower bounds. The 5 s window
-  is deliberate: AGENTS.md's GPU rule caps an unqueued browser check at ~10 s.
+**PSNR is now a like-for-like number.** The browser produces a *network* frame,
+and `screenshot_png()` encodes it with the same `png::feature_to_rgb8` the
+native `--screenshot` runs, so it is directly comparable with
+`output/brush/viewer/halfnet_s75.png` (`trips-viewer --screenshot --half-net
+--scale 0.75`, view 8, 1440x810). **62.04 dB** for the readback PNG, 62.03 dB
+for the `canvas.toBlob()` capture — the same picture, with f16 rounding and a
+different autotune-chosen convolution kernel between them.
+
+### Still not measured
+
+- **fps was measured with a Splats training running on the same GPU**, so every
+  browser number is a lower bound. The 5 s window is deliberate: AGENTS.md's
+  GPU rule caps an unqueued browser check at ~10 s.
 - **Interactive fps at window size** — every number here is the fixed 1440x810
   screenshot canvas.
+- **Why the browser is ~27x slower than the Mac app on the same view.** The
+  per-frame point upload was the obvious suspect and it is now gone; `raw
+  level-0` in Chrome moved only 2.90 → 3.32 fps while the native number went
+  46.2 → 116.2 fps, so it was not the browser's main cost. See
+  `docs/LIMITATIONS.md`.
 
 ---
 
@@ -510,20 +612,23 @@ Nothing was measured on a Quest — none is here. What changed today is that the
 *desktop* result now bounds the Quest question much harder than the paper
 argument below did, and in the wrong direction.
 
-The web viewer renders trippy's real rasteriser in a browser at **2.9 fps at
-1440x810**, on an M3 Ultra, with the **U-Net not running at all**. The network
-is ~89 % of a native frame (`docs/LIMITATIONS.md`), so a complete browser frame
-on this machine would be some way under 1 fps before any Quest is involved. A
-Quest's mobile GPU is one to two orders of magnitude slower than this desktop.
-Interactive TRIPS in Quest Browser is therefore not a "measure it and see"
-question any more; it is arithmetic, and the answer is no.
+The web viewer now renders trippy's **complete** frame — rasteriser and U-Net —
+in Chrome on an M3 Ultra at **1.09 fps at 1440x810**, and the rasteriser alone
+at 3.32 fps. That was measured with a Splats training on the same GPU, so call
+it a lower bound; it is still about 27x slower than the same view in the Mac
+app (29.5 fps). A Quest's mobile GPU is one to two orders of magnitude slower
+than this desktop. Interactive TRIPS in Quest Browser is therefore not a
+"measure it and see" question; it is arithmetic, and the answer is no.
 
-Three separate walls stand between here and a Quest, and each is enough on its
-own:
+The first of the three walls below came down this session — the U-Net does run
+in a browser now — and the arithmetic did not move. Two remain, and each is
+enough on its own:
 
-1. **The U-Net cannot run in a browser at all** on this dependency stack
-   (CubeCL's `read_sync`, blocker 4). Until that is fixed upstream there is no
-   finished frame to be slow *at*.
+1. ~~**The U-Net cannot run in a browser at all**~~ — fixed (blocker 4 was
+   CubeCL's autotune roofline probe, not the tensor read). It costs ~20 s of
+   autotune on the first frame, once per convolution shape per page load, and
+   then runs. This is what turned "no finished frame at all" into "a finished
+   frame at 1.09 fps", which is the number the argument now rests on.
 2. **Two dependency bugs already need JavaScript shims** to get any frame out of
    a desktop browser (blockers 2 and 3), and one of the two browsers here still
    draws a wrong image. Quest Browser is a third WebGPU implementation with its
@@ -536,13 +641,14 @@ own:
    research is unchanged and is kept below.
 
 So: **do not promise interactive Quest performance, and do not spend a session
-on Quest hardware yet.** The honest sequencing is (a) get the U-Net running in
-a desktop browser, (b) cache the per-frame point upload so a desktop browser
-frame is tens of milliseconds rather than hundreds, (c) *then* ask what a Quest
-does with it. Until (a) and (b) land, the shipped Quest answer stays the
-fallback that already exists and does not depend on WebGPU at all: distilled
-Gaussians via `~/Splats/tools/publish/publish_splat.sh`, or `tools/flythrough.py`
-MP4s.
+on Quest hardware yet.** Steps (a) "get the U-Net running in a desktop browser"
+and (b) "cache the per-frame point upload" are both done, and a desktop browser
+frame is still ~900 ms rather than the tens of milliseconds (b) was supposed to
+buy — the upload turned out not to be the browser's bottleneck. Finding what
+is, is now the prerequisite, and it is a separate piece of work. Until then the
+shipped Quest answer stays the fallback that already exists and does not depend
+on WebGPU at all: distilled Gaussians via
+`~/Splats/tools/publish/publish_splat.sh`, or `tools/flythrough.py` MP4s.
 
 The on-device checklist below is still the right checklist for the day (c)
 arrives, and the "does it even get a WebGPU device on a flat page" question is

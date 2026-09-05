@@ -24,9 +24,11 @@
 //! Related docs: `rust/README.md`; `docs/LIMITATIONS.md`;
 //!     `docs/decisions/ADR-0006-viewer-integration.md`.
 
-#[cfg(not(target_family = "wasm"))]
 use brush_pyramid::gpu::burn_bridge;
-use brush_pyramid::gpu::{render_pyramid, render_pyramid_timed, StageTimings, WgpuDevice};
+use brush_pyramid::gpu::{
+    render_pyramid_uploaded, render_pyramid_uploaded_timed, StageTimings, UploadedPoints,
+    WgpuDevice,
+};
 use brush_pyramid::params::{DepthRange, FeatureStore, LayerFloor, PyramidParams, SortMode};
 use brush_pyramid::scene::{Camera, PointSet};
 use brush_unet::camera::NeuralCamera;
@@ -35,50 +37,42 @@ use burn_wgpu::{CubeTensor, WgpuRuntime};
 
 use crate::bundle::{Bounds, Bundle};
 
-/// Get the network's frame into a buffer the blit can bind.
+/// Get the network's frame into a buffer the blit can bind, **without a
+/// readback**, on native and in the browser alike.
 ///
-/// Natively this is free: `burn_bridge::resolve_to_cube_float` hands back the
-/// tensor's own allocation and the frame never leaves the GPU.
+/// `burn_bridge::resolve_to_cube_float` drains the tensor's fusion stream and
+/// hands back the allocation the last kernel wrote to, so the frame never
+/// leaves the GPU.
 ///
-/// # Errors
-/// Returns `Err` if the readback fails (web path only).
-#[cfg(not(target_family = "wasm"))]
-async fn resolve_network_output(
-    rgb: burn::tensor::Tensor<4>,
-    _device: &WgpuDevice,
-) -> Result<CubeTensor<WgpuRuntime>, String> {
-    Ok(burn_bridge::resolve_to_cube_float(rgb))
-}
-
-/// The web twin of the above, and the one place the browser pays for a copy
-/// the native viewer does not.
+/// # Why this is no longer `cfg`-split
 ///
-/// `resolve_to_cube_float` goes through burn-fusion's
-/// `FusionClient::resolve_tensor_float`, which calls `submit_blocking`, which
-/// calls `cubecl`'s `read_sync` — and `read_sync` *cannot* work on
-/// `wasm32-unknown-unknown`, where a future may not block the only thread
-/// there is. It panics with "Failed to read tensor data synchronously".
+/// v0.5.0 shipped a wasm twin of this function that read the frame back with
+/// `into_data_async` and re-uploaded it, because
+/// `resolve_to_cube_float` was believed to end in CubeCL's `read_sync`, which
+/// cannot block on `wasm32-unknown-unknown`. Reading the pinned revisions
+/// settled it: it does not.
 ///
-/// So on the web the finished frame is read back asynchronously and
-/// re-uploaded: an extra `3 * H * W * 4` bytes each way per frame (14 MB at
-/// 1440x810), which is real but small next to the network itself. The pixels
-/// are identical — this changes where the bytes travel, not what they are.
-/// See `docs/WEB_VIEWER.md`.
+/// - `FusionClient::resolve_tensor_float` (`burn-fusion/src/client.rs:362`)
+///   calls `DeviceHandle::submit_blocking`, then `drain_stream` +
+///   `get_float_tensor`.
+/// - `submit_blocking` is only a channel round trip when cubecl's
+///   `multi_threading` cfg is on, and `cubecl-common/build.rs:11` defines that
+///   as `all(feature = "std", not(target_family = "wasm"))`. On wasm the
+///   handle is `ReentrantMutexDeviceHandle`, whose `submit_blocking`
+///   (`cubecl-common/src/device/handle/reentrant.rs:51`) runs the closure
+///   inline under a reentrant mutex — no thread parks, no future is polled.
+/// - `drain_stream` only launches kernels; there is no `read_sync` anywhere in
+///   `burn-fusion`, `burn-cubecl-fusion` or `burn-ir`.
 ///
-/// # Errors
-/// Returns `Err` if the readback fails or the data is not f32.
-#[cfg(target_family = "wasm")]
-async fn resolve_network_output(
-    rgb: burn::tensor::Tensor<4>,
-    device: &WgpuDevice,
-) -> Result<CubeTensor<WgpuRuntime>, String> {
-    let data = rgb
-        .into_data_async()
-        .await
-        .map_err(|e| format!("network readback: {e:?}"))?
-        .into_vec::<f32>()
-        .map_err(|e| format!("network output was not f32: {e:?}"))?;
-    Ok(brush_pyramid::gpu::upload_f32(&data, device))
+/// The `read_sync` trap the browser really hit is CubeCL's autotune roofline
+/// probe, three layers below this; see `docs/WEB_VIEWER.md` blocker 4 and
+/// `brush_pyramid::gpu::disable_autotune_roofline_bounds`.
+///
+/// # Panics
+/// Panics if `rgb` is not on a wgpu backend, which is a programming error at
+/// the call site rather than a runtime condition.
+fn resolve_network_output(rgb: burn::tensor::Tensor<4>) -> CubeTensor<WgpuRuntime> {
+    burn_bridge::resolve_to_cube_float(rgb)
 }
 
 /// A monotonic clock that is a no-op on the web.
@@ -279,7 +273,24 @@ pub struct RenderedFrame {
 /// Everything needed to render, loaded once.
 pub struct Renderer {
     device: WgpuDevice,
+    /// The host copy, kept **only** so the f16-features lever can re-upload.
+    /// Nothing in a frame reads it.
     points: PointSet,
+    /// The points as device buffers, uploaded once per bundle.
+    ///
+    /// This is the fix for the viewer's single biggest fixed cost:
+    /// `render_pyramid` used to push all ~80 MB of the horse bundle's four
+    /// point arrays across the bus **every frame**, worth a flat 12.2 ms —
+    /// which is 55 % of a `raw level-0` frame at 1080p and took the shipped
+    /// `--half-net --scale 0.75` view from 21.7 to 29.5 fps. See
+    /// `research/trips-metal.md`.
+    ///
+    /// A `RefCell` because the f16-features lever is a runtime
+    /// toggle and the feature buffer's element type is fixed at upload time,
+    /// so flipping `half_features` has to re-upload. The borrow is never held
+    /// across an `await`: [`UploadedPoints`] is cloned out first, which costs
+    /// a handle clone, not the bytes.
+    uploaded: std::cell::RefCell<UploadedPoints>,
     base_params: PyramidParams,
     background: Option<Vec<f32>>,
     /// The **point cloud's** world-space box, used only for
@@ -306,7 +317,7 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    /// Upload the bundle's weights and keep its points for per-frame upload.
+    /// Upload the bundle's weights **and its points**, once.
     ///
     /// # Arguments
     /// - `bundle`: the loaded scene.
@@ -330,9 +341,17 @@ impl Renderer {
         let tone = NeuralCamera::load(&bundle.weights, &burn_device)?;
         let bounds = bundle.bounds();
         let background = bundle.background().map(<[f32]>::to_vec);
+        // The one upload. `FeatureStore::F32` is `Settings::default()`'s
+        // precision; turning `--fp16` on re-uploads once, in `render`.
+        let uploaded = UploadedPoints::new(
+            &bundle.points,
+            brush_pyramid::params::FeatureStore::F32,
+            &device,
+        )?;
         Ok(Self {
             device,
             points: bundle.points,
+            uploaded: std::cell::RefCell::new(uploaded),
             base_params: bundle.manifest.params,
             background,
             bounds,
@@ -359,6 +378,33 @@ impl Renderer {
             (true, Some(half)) => half,
             _ => &self.net,
         }
+    }
+
+    /// The device-resident points, at the feature precision `params` asks
+    /// for, re-uploading only if the `--fp16` lever just changed.
+    ///
+    /// Returns a clone so no `RefCell` borrow is alive across the `await` in
+    /// [`Self::render`]; the clone is four `CubeTensor` handles.
+    ///
+    /// # Errors
+    /// Returns `Err` if a re-upload fails.
+    fn resident_points(&self, params: &PyramidParams) -> Result<UploadedPoints, String> {
+        {
+            let current = self.uploaded.borrow();
+            if current.feature_store() == params.feature_store {
+                return Ok(current.clone());
+            }
+        }
+        let fresh = UploadedPoints::new(&self.points, params.feature_store, &self.device)?;
+        *self.uploaded.borrow_mut() = fresh.clone();
+        Ok(fresh)
+    }
+
+    /// Bytes of device memory the point set occupies — the per-frame upload
+    /// this viewer no longer pays for.
+    #[must_use]
+    pub fn resident_point_bytes(&self) -> usize {
+        self.uploaded.borrow().device_bytes()
     }
 
     /// Why the f16 network is unavailable on this device, if it is.
@@ -395,21 +441,15 @@ impl Renderer {
             self.bounds.depth_span(camera, self.base_params.znear),
         );
         let background = self.background.as_deref();
+        let points = self.resident_points(&params)?;
         let clock = SubmitClock::start();
 
         let (render, stages) = if settings.profile {
-            let (r, t) = render_pyramid_timed(
-                &self.device,
-                &self.points,
-                camera,
-                &params,
-                background,
-            )
-            .await?;
+            let (r, t) =
+                render_pyramid_uploaded_timed(&points, camera, &params, background).await?;
             (r, Some(t))
         } else {
-            let r =
-                render_pyramid(&self.device, &self.points, camera, &params, background).await?;
+            let r = render_pyramid_uploaded(&points, camera, &params, background).await?;
             (r, None)
         };
 
@@ -450,7 +490,7 @@ impl Renderer {
                 // property of the backend, and getting it wrong shows up as a
                 // scrambled window that no test and no agent may look at. Below
                 // the layout is asserted instead of assumed.
-                let buffer = resolve_network_output(rgb, &self.device).await?;
+                let buffer = resolve_network_output(rgb);
                 if !buffer.is_contiguous() {
                     return Err(
                         "the network's output buffer is not contiguous; the blit                          shader's planar indexing would be wrong"
@@ -508,14 +548,9 @@ impl Renderer {
             self.base_params,
             self.bounds.depth_span(camera, self.base_params.znear),
         );
-        let render = render_pyramid(
-            &self.device,
-            &self.points,
-            camera,
-            &params,
-            self.background.as_deref(),
-        )
-        .await?;
+        let points = self.resident_points(&params)?;
+        let render =
+            render_pyramid_uploaded(&points, camera, &params, self.background.as_deref()).await?;
         let rgb = self
             .tone
             .forward(self.net(settings).forward(&render.layer_tensors())?, frame_index)?;

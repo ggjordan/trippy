@@ -142,6 +142,28 @@ def test_trips_check_mode_prints_the_trips_plan(tmp_path: Path) -> None:
     assert "vite build" not in result.stdout
 
 
+def test_trips_profiling_flag_selects_the_profiling_build(tmp_path: Path) -> None:
+    """`--profiling` is what makes a wasm panic's stack trace readable.
+
+    wasm-opt strips the name section in a `--release` build, so a browser
+    stack is a list of `wasm-function[N]`. `--profiling` keeps release
+    codegen and the names, which is how the CubeCL autotune roofline trap was
+    located (docs/WEB_VIEWER.md blocker 4). The flag has to keep existing for
+    the next person who has to read one.
+    """
+    _toolchain_or_skip()
+    bundle = _fake_bundle(tmp_path)
+    result = subprocess.run(
+        ["bash", str(SCRIPT), "--check", "--trips", "--profiling", "--bundle", str(bundle)],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "--profiling" in result.stdout
+
+
 def test_trips_out_flag_overrides_the_output_directory(tmp_path: Path) -> None:
     _toolchain_or_skip()
     bundle = _fake_bundle(tmp_path)

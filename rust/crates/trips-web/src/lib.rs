@@ -81,9 +81,6 @@ struct Viewer {
     /// Set once, the first time an f16 render fails and the viewer falls back
     /// to f32. `None` means f16 is working (or was never asked for).
     half_net_fallback: Option<String>,
-    /// True when `network` was asked for and swapped for `raw` — see
-    /// [`NETWORK_MODE_BLOCKED`].
-    network_blocked: bool,
     frames: u64,
 }
 
@@ -135,9 +132,6 @@ struct Options {
     mode: ViewMode,
     /// A **dataset** view index (`views[i].index`), not a position.
     view: Option<usize>,
-    /// Run [`ViewMode::Network`] anyway, trap and all, so the blocker stays
-    /// reproducible from the page rather than only from this comment.
-    force_network: bool,
 }
 
 impl Default for Options {
@@ -147,7 +141,6 @@ impl Default for Options {
             half_net: true,
             mode: ViewMode::Network,
             view: None,
-            force_network: false,
         }
     }
 }
@@ -177,29 +170,9 @@ impl Options {
         if let Some(mode) = value.get("mode").and_then(serde_json::Value::as_str) {
             out.mode = parse_mode(mode)?;
         }
-        if let Some(force) = value.get("forceNetwork").and_then(serde_json::Value::as_bool) {
-            out.force_network = force;
-        }
         Ok(out)
     }
 }
-
-/// Why [`ViewMode::Network`] cannot run in a browser on this dependency stack.
-///
-/// The U-Net's output is a `burn::Tensor<4>`, and getting it into a buffer the
-/// blit can bind means reading it — either `burn_bridge::resolve_to_cube_float`
-/// (burn-fusion `submit_blocking`) or `Tensor::into_data_async` (burn-dispatch,
-/// whose `float_into_data` calls `read_sync` *inside* the async fn). Both end
-/// at CubeCL's `read_sync`, which on `wasm32-unknown-unknown` is
-/// `embassy_futures::poll_once` and fails unless the future is already
-/// complete: **"Failed to read tensor data synchronously"**, an unrecoverable
-/// wasm trap that takes the page down.
-///
-/// The rasteriser's own views do not go near it — they bind
-/// `PyramidRender`'s `CubeTensor`s directly — so `raw` and `coverage` render
-/// fine, which is what the browser viewer shows today. See
-/// `docs/WEB_VIEWER.md` "Blockers hit".
-pub const NETWORK_MODE_BLOCKED: &str = "the U-Net view cannot run in a browser on this build: getting a Burn tensor into a bindable buffer needs CubeCL's read_sync, which cannot block on wasm32 (see docs/WEB_VIEWER.md). Showing the rasteriser's raw level-0 view instead; add &force-network=1 to reproduce the trap.";
 
 /// `network` / `raw` / `coverage`, the same three the native viewer's `--mode`
 /// and its `V` key cycle through.
@@ -356,15 +329,11 @@ pub async fn start(
         _ => None,
     };
 
-    // The one substitution this viewer makes, and it says so: see
-    // NETWORK_MODE_BLOCKED.
-    let network_blocked = options.mode == ViewMode::Network && !options.force_network;
-    let mode = if network_blocked {
-        web_sys::console::warn_1(&JsValue::from_str(NETWORK_MODE_BLOCKED));
-        ViewMode::RawLevel0
-    } else {
-        options.mode
-    };
+    // No substitution any more: `network` is the default and it renders.
+    // v0.5.0 swapped in `raw level-0` here because the U-Net view trapped on
+    // wasm; the trap was CubeCL's autotune roofline probe, and
+    // `Gpu::create` now turns that probe off. See `docs/WEB_VIEWER.md`.
+    let mode = options.mode;
 
     let viewer = Viewer {
         renderer: Rc::new(renderer),
@@ -381,7 +350,6 @@ pub async fn start(
         scene_name,
         num_points,
         half_net_fallback,
-        network_blocked,
         frames: 0,
     };
     let status = viewer_status(&viewer);
@@ -496,11 +464,6 @@ pub async fn frame() -> Result<String, JsValue> {
 #[wasm_bindgen]
 pub async fn screenshot_png() -> Result<Vec<u8>, JsValue> {
     let (renderer, camera, frame_index, settings) = with_state(|v| {
-        // `render_to_host` runs the U-Net, so it hits NETWORK_MODE_BLOCKED for
-        // exactly the same reason the network view does.
-        if v.network_blocked {
-            return Err(NETWORK_MODE_BLOCKED.to_owned());
-        }
         Ok((
             v.renderer.clone(),
             v.camera(),
@@ -567,10 +530,6 @@ pub fn snap_to_view() -> Result<(), JsValue> {
 pub fn cycle_mode() -> Result<String, JsValue> {
     with_state(|v| {
         v.mode = v.mode.next();
-        if v.network_blocked && v.mode == ViewMode::Network {
-            // Skip it rather than trap; the status says why.
-            v.mode = v.mode.next();
-        }
         Ok(v.mode.label().to_owned())
     })
     .map_err(js)
@@ -581,9 +540,6 @@ pub fn cycle_mode() -> Result<String, JsValue> {
 pub fn set_mode(name: &str) -> Result<(), JsValue> {
     let mode = parse_mode(name).map_err(js)?;
     with_state(|v| {
-        if v.network_blocked && mode == ViewMode::Network {
-            return Err(NETWORK_MODE_BLOCKED.to_owned());
-        }
         v.mode = mode;
         Ok(())
     })
@@ -646,7 +602,7 @@ fn viewer_status(v: &Viewer) -> String {
         Some(reason) => serde_json::Value::String(reason.clone()).to_string(),
     };
     format!(
-        r#"{{"scene":{},"points":{},"adapter":{{"name":{},"vendor":{},"backend":"{:?}","device_type":"{:?}"}},"canvas":[{},{}],"render":[{},{}],"scale":{},"halfNet":{},"shaderF16":{},"subgroups":{},"networkBlocked":{},"halfNetFallback":{},"mode":"{}","view":{},"pinned":{},"frames":{}}}"#,
+        r#"{{"scene":{},"points":{},"adapter":{{"name":{},"vendor":{},"backend":"{:?}","device_type":"{:?}"}},"canvas":[{},{}],"render":[{},{}],"scale":{},"halfNet":{},"shaderF16":{},"subgroups":{},"halfNetFallback":{},"mode":"{}","view":{},"pinned":{},"frames":{}}}"#,
         serde_json::Value::String(v.scene_name.clone()),
         v.num_points,
         serde_json::Value::String(info.name.clone()),
@@ -661,7 +617,6 @@ fn viewer_status(v: &Viewer) -> String {
         v.settings.half_net,
         v.gpu.has_f16,
         v.gpu.has_subgroups,
-        v.network_blocked,
         fallback,
         v.mode.label(),
         v.reference().index,

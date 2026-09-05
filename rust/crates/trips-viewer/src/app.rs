@@ -273,8 +273,9 @@ impl ViewerApp {
             ));
             if let Some(s) = stats.stages {
                 ui.label(format!(
-                    "project {:.1} | prefix {:.1} | emit {:.1} | sort {:.1} ({} passes) | \
-                     segment {:.1} | blend {:.1} ms",
+                    "upload {:.1} | project {:.1} | prefix {:.1} | emit {:.1} | sort {:.1} \
+                     ({} passes) | segment {:.1} | blend {:.1} ms",
+                    s.upload_ms,
                     s.project_count_ms,
                     s.prefix_ms,
                     s.emit_ms,

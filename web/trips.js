@@ -309,9 +309,6 @@ function drawHud(frameInfo) {
       `  ·  ${frameInfo.mode}  ·  net ${frameInfo.halfNet ? "f16" : "f32"}`,
   );
   parts.push(`WebGPU: ${lastStatus.adapter?.name ?? "?"} (${lastStatus.adapter?.backend ?? "?"})`);
-  if (lastStatus.networkBlocked) {
-    parts.push("U-Net view unavailable in-browser (docs/WEB_VIEWER.md); showing the rasteriser");
-  }
   if (lastStatus.halfNetFallback) parts.push(`f32 fallback: ${lastStatus.halfNetFallback}`);
   if (gpuErrors.length > 0) {
     parts.push(
@@ -397,8 +394,8 @@ async function screenshotRun() {
   //    `png::feature_to_rgb8` the native --screenshot uses. Belt and braces:
   //    toBlob on a WebGPU canvas is not guaranteed to capture a presented
   //    frame, and a blank capture would look like a rendering failure.
-  // The GPU-readback PNG needs the U-Net, so it is unavailable whenever
-  // `networkBlocked` is set; the canvas capture above is the pixel check then.
+  //    It runs the U-Net, which is what makes it directly comparable with the
+  //    native `trips-viewer --screenshot --half-net --scale 0.75` reference.
   let readback = null;
   try {
     readback = await trips.screenshot_png();
@@ -508,7 +505,6 @@ async function main() {
     mode: params.get("mode") ?? "network",
   };
   if (params.has("view")) options.view = Number(params.get("view"));
-  if (params.get("force-network") === "1") options.forceNetwork = true;
 
   const bundleUrl = params.get("bundle") ?? "./bundle";
   hud.textContent = `fetching ${bundleUrl} …`;
@@ -517,6 +513,14 @@ async function main() {
   try {
     lastStatus = JSON.parse(await trips.start(canvas, bundleUrl, JSON.stringify(options)));
     mark("started", lastStatus.adapter?.name ?? "?");
+    // The first network frame runs CubeCL's convolution autotune at
+    // `AutotuneLevel::Full` -- the level that registers no roofline bounds
+    // generator, which is what keeps the U-Net view off wasm's `read_sync`
+    // trap (docs/WEB_VIEWER.md). Full means every candidate is benchmarked,
+    // so the first frame is tens of seconds and every later one is not. A
+    // blank canvas for that long looks like a hang unless the page says so.
+    hud.textContent =
+      "first frame: autotuning the convolutions (once per shape, ~20 s) …";
   } catch (e) {
     fail(`could not start the viewer:\n\n${e}`);
     return;
