@@ -72,7 +72,7 @@ Subagents **never** run `git commit`, `git push`, `git merge`, `git tag`, or `gh
 - Branch per work unit: `feat/…`, `fix/…`, `spike/…`, `docs/…`, `wip/…`.
 - PR via `gh pr create --fill`; Orchestrator merges with `gh pr merge --squash --delete-branch` after review.
 - **Push `main` only with `scripts/push.sh`** (build check → `build-NNNN` tag → push with tags). Feature branches may be pushed with plain `git push origin <branch>` so a PR can be opened; the pre-push hook still enforces the trailer, file guard and tests. Never push `main` bare.
-- Parallel subagents work in git worktrees under `.worktrees/<name>` (gitignored) on their own branch; the Orchestrator merges (squash) and removes the worktree.
+- Parallel subagents work in git worktrees under `.worktrees/<name>` (gitignored) on their own branch; the Orchestrator merges (squash) and removes the worktree with `scripts/worktree_rm.sh <name>` (rescues any output/ left inside). Subagents always export `TRIPPY_OUTPUT=/Users/nzbirdranch/trippy/output` so artefacts never live inside a worktree.
 - Releases: `scripts/release.sh vX.Y.Z` (bumps `VERSION`, tags, `gh release create` from `CHANGELOG.md`). Cut a release when a field-testable milestone lands.
 - Commit messages: imperative subject ≤ 72 chars, body explains why, trailer `Reviewed-by:`.
 
