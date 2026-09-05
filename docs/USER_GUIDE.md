@@ -47,17 +47,41 @@ It is a separate app from Brush; Brush still opens `.ply` files exactly as befor
 
 **Double-click** `OPEN_TRIPS_MAC_<name>.command` in your review folder. That's it.
 
+It opens **on a real camera of the capture**, looking at what that camera saw, and it
+starts in **orbit** mode: left-drag turns you around the scene rather than spinning you
+on the spot, and you cannot leave the area the real cameras covered. That is the mode
+for judging a scene. Press `F` when you want to fly through it instead.
+
 Controls:
 
 | | |
 |---|---|
+| **left-drag** | **orbit** the scene — or look around, in free mode |
+| **right-drag** or **middle-drag** | pan sideways / up and down |
+| **scroll** | orbit: move closer or further · free: change how fast you fly |
 | `W` `A` `S` `D` | move forward / left / back / right |
 | `Q` / `E` | move down / up |
-| drag the mouse | look around |
-| scroll | change how fast you fly |
+| `R` | back to the view it opened at (use this whenever you are lost) |
+| `N` / `P` | jump to the next / previous real camera of the capture |
+| `F` | switch between **orbit** and **free fly** |
 | `V` | cycle the view: **network** -> **raw level-0** -> **coverage** |
 | `-` / `=` | render at a smaller / larger fraction of the window |
 | `TAB` | hide the panel |
+
+**Speed is set from the scene, not guessed.** The viewer measures how far apart the real
+cameras are and flies at half that distance per second, so one tap of `W` is a step, not
+a teleport, whether the scene is a horse on a plinth or a whole beach. The panel shows
+both numbers: world units per second, and the same speed as a fraction of the captured
+area per second. Scroll changes it by 25% a notch, between 1/100 and 10 times the
+default.
+
+If you do fly out of the captured area in free mode, the panel says so and tells you to
+press `R`. In orbit mode you cannot: the point you are turning around is pinned inside
+the box the real cameras occupy, and the camera moves with it.
+
+The "jump to view" dropdown lists every real camera in the capture; picking one puts you
+exactly where that photograph was taken, which is the fair place to compare the render
+with the photograph.
 
 The three views are the honesty sheet, live:
 

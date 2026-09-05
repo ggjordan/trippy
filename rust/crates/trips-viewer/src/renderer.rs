@@ -282,6 +282,11 @@ pub struct Renderer {
     points: PointSet,
     base_params: PyramidParams,
     background: Option<Vec<f32>>,
+    /// The **point cloud's** world-space box, used only for
+    /// [`Bounds::depth_span`]. Deliberately not exposed: it is not a scene
+    /// scale, because a TRIPS export's environment sphere makes it thousands
+    /// of units across. Anything the camera controller needs comes from
+    /// [`crate::bundle::SceneScale`], which measures the capture cameras.
     bounds: Bounds,
     /// The float32 network.
     net: Unet,
@@ -364,12 +369,6 @@ impl Renderer {
     #[must_use]
     pub fn half_net_error(&self) -> Option<&str> {
         self.half_net_error.as_deref()
-    }
-
-    /// The scene's world-space bounding box.
-    #[must_use]
-    pub fn bounds(&self) -> Bounds {
-        self.bounds
     }
 
     /// Render one frame.

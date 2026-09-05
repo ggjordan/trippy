@@ -43,16 +43,12 @@ use std::rc::Rc;
 use brush_pyramid::png;
 use brush_pyramid::scene::Camera;
 use trips_viewer::bundle::{Bundle, BundleView, Manifest};
-use trips_viewer::camera::Controller;
+use trips_viewer::camera::{Controller, Mode};
 use trips_viewer::renderer::{Renderer, Settings, ViewMode};
 use wasm_bindgen::prelude::*;
 
 use crate::blit::Blit;
 use crate::gpu::Gpu;
-
-/// Initial fly speed as a fraction of the scene's bounding-box diagonal, per
-/// second. Same constant as the native viewer's `app.rs`.
-const FLY_SPEED_FRACTION: f32 = 0.15;
 
 /// Render-scale presets the `-`/`=` keys step between, as in the native app.
 const SCALE_STEPS: [f32; 4] = [0.5, 0.75, 0.9, 1.0];
@@ -337,8 +333,13 @@ pub async fn start(
     let num_points = bundle.points.len();
 
     let renderer = Renderer::new(bundle, gpu.burn.clone()).map_err(js)?;
-    let move_speed = renderer.bounds().diameter() * FLY_SPEED_FRACTION;
-    let controller = Controller::new(&views[view_pos], up, move_speed);
+    // Fly speed comes from `bundle::SceneScale` -- the box the capture cameras
+    // occupy -- and never from the point cloud, whose far-field environment
+    // sphere is thousands of units across (see the 2026-09-06 entry in
+    // research/trips-metal.md). `Mode::Free` because this page's controls are
+    // the free-fly verbs: `look`, `fly`, `adjust_speed`.
+    let mut controller = Controller::new(&views, view_pos, up);
+    controller.set_mode(Mode::Free);
 
     let blit = Blit::new(&gpu.device, gpu.config.format);
 
@@ -554,8 +555,7 @@ pub fn adjust_speed(notches: f32) -> Result<(), JsValue> {
 #[wasm_bindgen]
 pub fn snap_to_view() -> Result<(), JsValue> {
     with_state(|v| {
-        let view = v.views[v.view_pos].clone();
-        v.controller.snap_to(&view);
+        v.controller.snap_to_position(&v.views, v.view_pos);
         Ok(())
     })
     .map_err(js)

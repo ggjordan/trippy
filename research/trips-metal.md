@@ -1185,3 +1185,89 @@ reference is the *network* frame, which the browser cannot produce; comparing
 it with a `raw level-0` capture is meaningless (measured r = -0.05). A
 like-for-like check needs a native `--mode raw` reference, i.e. GPU queue time.
 - 2026-09-05T20:07:31Z delivered trips-web-viewer-horse: Desktop web TRIPS viewer (WebGPU, wasm): the public horse scene rendered live in the browser at 3.4 fps in Chrome on this Mac. Double-click; nothing leaves the machine (127.0.0.1). Open it in Chrome, not Safari -- the page will tell you why. Shows the rasteriser's raw level-0 view; the U-Net view cannot run in a browser yet (docs/WEB_VIEWER.md). (/Users/nzbirdranch/trippy/output/web/trips-dist)
+- 2026-09-05T19:31:11Z submitted job trippy-viewer-camera-check prio 12: bash /Users/nzbirdranch/trippy/.worktrees/viewer-input/scripts/viewer_camera_check.sh /Users/nzbirdranch/trippy/output/brush/horse_bundle /Users/nzbirdranch/trippy/output/brush/viewer/camera-check
+- 2026-09-05T19:48:10Z submitted job trippy-viewer-camera-check2 prio 12: bash /Users/nzbirdranch/trippy/.worktrees/viewer-input/scripts/viewer_camera_check.sh /Users/nzbirdranch/trippy/output/brush/horse_bundle /Users/nzbirdranch/trippy/output/brush/viewer/camera-check
+- 2026-09-05T20:02:47Z delivered trips-mac-viewer-horse-v2: Mac TRIPS viewer v2 (fixes from Jordan's test): left-drag looks/orbits, right-drag pans, scroll changes speed, WASD/QE fly at scene scale, R resets to training view 0, N/P step views, F toggles orbit/free, V toggles network/raw/coverage. (/Users/nzbirdranch/trippy/output/deliver/trips-horse/OPEN_TRIPS_MAC_trips-horse.command)
+- 2026-09-05T20:02:53Z delivered trips-mac-viewer-karekare-full1: Karekare TRIPS candidate (EXP-0003, 40 epochs, 14.4 dB) in the free-navigation viewer: start at a training view, N/P to step through the capture, orbit or fly toward the shade under the trees. Early and rough; the network output is 'invented' wherever the coverage view is dark. (/Users/nzbirdranch/trippy/output/deliver/trips-kk-full1/OPEN_TRIPS_MAC_trips-kk-full1.command)
+
+## 2026-09-06 — viewer input model: why drag did nothing and why fly speed was 1948 u/s
+
+**Question.** Jordan's first field test of the delivered Mac viewer (`trips-mac-viewer-horse`)
+reported (1) click-and-drag never moved the viewpoint and (2) WASD "broke the scene
+immediately", with the HUD reading `fly 1948.53 u/s (scroll)`. Both root causes, and the
+fix, without a human in the loop.
+
+**Root cause 1 — the drag was gated on a predicate that is true while dragging.**
+`app.rs` allocated the render area with `Sense::click_and_drag()` and then only fed the
+camera when `!ctx.egui_wants_pointer_input()`. In egui 0.36 that method is
+`egui_is_using_pointer() || (is_pointer_over_egui() && !any_button_down)`, and
+`egui_is_using_pointer()` is `potential_click_id.is_some() || potential_drag_id.is_some()`
+— which the render canvas itself sets the instant the button goes down. So the guard was
+false for the entire drag, every time, and `Controller::look` was never called. Hover-only
+input (the scroll wheel) still worked, which is why the symptom was "drag does nothing"
+rather than "the mouse does nothing". Brush's own `ui/camera_controls.rs` has no such
+guard: it reads `response.dragged_by(..)` / `response.drag_delta()`, which egui has already
+scoped to gestures that started on that widget. The viewer now does the same. The keyboard
+guard had the same shape (`egui_wants_keyboard_input()` is true whenever *any* widget holds
+focus, so clicking a panel checkbox disabled WASD) and is now `text_edit_focused()`.
+
+**Root cause 2 — the fly speed was measured off the environment sphere, not the scene.**
+Speed was `bundle.bounds().diameter() * 0.15`, i.e. 0.15 x the **point cloud's** box
+diagonal. A TRIPS export's point set includes a far-field environment sphere:
+
+| bundle | point-cloud box diagonal | camera box diagonal | median camera spacing | old fly speed | new fly speed |
+|---|---|---|---|---|---|
+| horse (public) | 12 990 u (sphere at r = 3750; 37% of 2.22 M points beyond r = 20) | 15.63 u | 0.516 u | **1948.5 u/s** | **0.258 u/s** |
+| karekare-full1-broadcast | 272.5 u | 15.56 u | 0.303 u | 40.9 u/s | 0.151 u/s |
+
+The **web viewer shipped the same bug** (`trips-web/src/lib.rs` copied
+`FLY_SPEED_FRACTION` and `renderer.bounds()` verbatim); rebasing this branch onto PR #21
+carried the fix into it, because `Controller::new` now takes the view list and derives the
+speed itself. `Renderer::bounds()` is gone: exposing the point-cloud box as scene scale
+caused this bug twice, so the only public ruler is now `SceneScale`.
+
+At 1948 u/s a single 16 ms frame moves the camera 32 units — twice the width of the whole
+capture — so one tap of `W` put Jordan inside the environment sphere, which is the
+"translucent dome with the horse nowhere obvious" he described. Scale now comes from
+`bundle::SceneScale`: the box the **capture cameras** occupy and the median distance
+between consecutive ones, at 0.5 x that spacing per second, scroll x1.25 a notch within
+[0.01, 10] x base. Look sensitivity stays in radians per pixel and is scene-independent
+(unit-tested against a scene 1000x bigger).
+
+**Also changed.** Orbit is now the default navigation mode, around a pivot clamped inside
+the camera box (so orbiting, panning and WASD cannot leave the captured area); `F` toggles
+to free fly; `R` returns to the view the viewer opened at; `N`/`P` step capture views;
+right/middle-drag pans; free flight past 3x the camera box shows a "press R to reset"
+hint. The HUD reports speed both in world units and as a fraction of the captured area per
+second, which is the number that means the same thing in every scene.
+
+**Verification.** 38 unit tests in `trips-viewer` (17 before; the 21 new ones cover
+yaw/pitch per pixel, the pitch clamp in both directions, orbit distance invariance, the
+orbit/pan clamp, the lost test, base speed from a synthetic 24-camera ring, scroll
+clamping, orbit zoom, reset, N/P wrap-around and the scripted yaw). `scripts/test.sh`
+green (687 pytest + rust). Functional proof without a human, job
+**`trippy-viewer-camera-check2`** (prio 12, rc=0): the same binary renders the horse bundle
+twice through `--screenshot`, once at view 8 and once yawed 12 deg off it, and the two PNGs
+are compared:
+
+```
+CAMERA-DIFF mean|a-b| = 43.674/255   changed pixels = 98.5%   rms = 64.066   size = 672x378
+PASS: a scripted camera change reaches the renderer (threshold 1.0)
+```
+
+Re-run after rebasing onto PR #21 (job **`trippy-viewer-camera-check3`**, rc=0) to check the
+library split and the wasm cfg paths changed nothing: **byte-identical numbers**
+(43.674 / 98.5% / 64.066). The pre-fix viewer could not have produced that from a mouse
+drag at all. Re-runnable as
+`scripts/viewer_camera_check.sh <bundle> <outdir>`, which refuses any bundle that is not a
+known-public scene (it writes PNGs).
+
+**Verdict.** PASS on the code; **Jordan's viewer verdict is still the verdict** — the
+question the delivery asks is whether the drag now turns the scene and whether one tap of
+`W` is a step.
+
+**Artefacts.** `$SPLATS_ROOT/tools/gpu_queue/logs/trippy-viewer-camera-check2.log`;
+`$TRIPPY_OUTPUT/brush/viewer/camera-check/camera-yaw-{0,12}.png` (public horse scene, not
+committed); launchers at `$TRIPPY_OUTPUT/deliver/trips-horse/` and
+`$TRIPPY_OUTPUT/deliver/trips-kk-full1/`.
+- 2026-09-05T20:20:14Z submitted job trippy-viewer-camera-check3 prio 12: bash /Users/nzbirdranch/trippy/.worktrees/viewer-input/scripts/viewer_camera_check.sh /Users/nzbirdranch/trippy/output/brush/horse_bundle /Users/nzbirdranch/trippy/output/brush/viewer/camera-check-rebased
