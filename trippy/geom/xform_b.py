@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import torch
 
-from trippy.constants import EPS_QUAT_AXIS, EPS_SE3_ANGLE
+from trippy.constants import EPS_QUAT_AXIS
 
 
 def _skew(v: torch.Tensor) -> torch.Tensor:
@@ -108,29 +108,69 @@ def project_pinhole(
     return uv, depth
 
 
-def _so3_exp_coeffs(theta: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Rodrigues/SE3 series coefficients A, B, C for rotation-vector magnitude theta.
+# Below this rotation-vector magnitude (radians), _so3_exp_coeffs uses the
+# Taylor series for A, B, C instead of the closed form. This is a numerical
+# -stability threshold, not a differentiability one (see _so3_exp_coeffs):
+# float64 already loses precision computing 1 - cos(theta) for theta below
+# ~1e-4 rad, because cos(theta) rounds too close to 1.0 to recover the
+# theta^2/2 term (theta^2/2 ~= 5e-9 at theta = 1e-4, near the edge of what
+# float64's ~1e-16 relative precision can resolve against 1.0). Kept local to
+# this module (not trippy/constants.py) because it is an implementation
+# detail of this one series expansion, not a cross-module convention.
+_SE3_TAYLOR_THETA = 1e-4
 
-    A*K + B*K@K gives the SO(3) exponential; the additional C term gives the
-    SE(3) "V" matrix that maps the translation generator to the true
-    translation. Uses the small-angle Taylor expansion below EPS_SE3_ANGLE
-    to avoid a 0/0 division at theta == 0 (the common case of a zero pose
-    delta before any refinement).
+
+def _so3_exp_coeffs(phi: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Rodrigues/SE3 series coefficients A, B, C for rotation vector phi.
+
+    A*K + B*K@K gives the SO(3) exponential (K = skew(phi)); the additional
+    C term gives the SE(3) "V" matrix that maps the translation generator to
+    the true translation:
+        A = sin(t)/t, B = (1 - cos t)/t^2, C = (1 - A)/t^2,   t = |phi|.
+
+    A, B, C are each even, smooth functions of t and can be written as smooth
+    functions of t^2 = phi . phi alone (a polynomial in phi with no square
+    root involved) -- so the branch below is taken on t^2 = phi @ phi rather
+    than on t = |phi|, deliberately avoiding torch.linalg.norm(phi) (whose
+    gradient phi/|phi| has a 0/0 singularity at phi == 0). This keeps every
+    branch differentiable *through the coefficients* everywhere, including
+    at phi == 0 (where dA/dphi = dB/dphi = dC/dphi = 0, correctly -- A, B, C
+    are stationary at the origin because they are even in t). The rotation
+    gradient at phi == 0 instead comes entirely from K = skew(phi), which is
+    linear in phi and differentiates to the SO(3) generator there; see
+    se3_exp and tests/test_raster_bwd_ref.py::
+    test_pose_delta_rotation_gradient_matches_generator_at_zero.
+
+    Uses the small-angle Taylor expansion below _SE3_TAYLOR_THETA to avoid
+    the float64 cancellation in (1 - cos t) for tiny t (see that constant's
+    comment); the exact 0/0 at t == 0 is avoided the same way, as a special
+    case of the same small-angle guard.
     """
-    if theta.item() < EPS_SE3_ANGLE:
-        theta2 = theta * theta
+    theta2 = torch.dot(phi, phi)
+    if theta2.item() < _SE3_TAYLOR_THETA * _SE3_TAYLOR_THETA:
         a = 1.0 - theta2 / 6.0
         b = 0.5 - theta2 / 24.0
         c = 1.0 / 6.0 - theta2 / 120.0
     else:
+        theta = torch.sqrt(theta2)
         a = torch.sin(theta) / theta
-        b = (1.0 - torch.cos(theta)) / (theta * theta)
-        c = (theta - torch.sin(theta)) / (theta * theta * theta)
+        b = (1.0 - torch.cos(theta)) / theta2
+        c = (1.0 - a) / theta2
     return a, b, c
 
 
 def se3_exp(delta: torch.Tensor) -> torch.Tensor:
     """SE(3) exponential map for a pose-refinement twist.
+
+    Builds R and V directly from K = skew(phi) (not from a normalized axis
+    scaled back up by theta): axis = phi / max(|phi|, eps) is exactly
+    second-order in phi at phi == 0 (an axis times a magnitude that is
+    itself ~|phi|), which zeroed the rotation gradient at the identity
+    delta -- see docs/LIMITATIONS.md history and
+    tests/test_raster_bwd_ref.py::
+    test_pose_delta_rotation_gradient_matches_generator_at_zero. Using
+    K = skew(phi) directly is first-order in phi (linear), so its gradient
+    at phi == 0 is the SO(3) generator, as it should be.
 
     Args:
         delta: shape (6,), twist xi = (rho, phi): rho = delta[:3] is the
@@ -142,15 +182,13 @@ def se3_exp(delta: torch.Tensor) -> torch.Tensor:
     """
     rho = delta[0:3]
     phi = delta[3:6]
-    theta = torch.linalg.norm(phi)
-    theta_safe = torch.clamp(theta, min=EPS_SE3_ANGLE)
-    axis = phi / theta_safe
-    a, b, c = _so3_exp_coeffs(theta)
+    a, b, c = _so3_exp_coeffs(phi)
 
-    K = _skew(axis)
+    K = _skew(phi)
+    KK = K @ K
     eye = torch.eye(3, dtype=delta.dtype, device=delta.device)
-    R = eye + a * theta * K + b * theta * theta * (K @ K)
-    V = eye + b * theta * K + c * theta * theta * (K @ K)
+    R = eye + a * K + b * KK
+    V = eye + b * K + c * KK
 
     T = torch.eye(4, dtype=delta.dtype, device=delta.device)
     T[:3, :3] = R

@@ -167,21 +167,25 @@ def test_pose_delta_reaches_render_pyramid_on_cpu() -> None:
     assert delta.grad is not None and delta.grad.abs().max() > 0.0
 
 
-def test_pose_delta_rotation_gradient_vanishes_at_zero() -> None:
-    """KNOWN WART, pinned deliberately: se3_exp is flat in phi at phi == 0.
+def test_pose_delta_rotation_gradient_matches_generator_at_zero() -> None:
+    """Regression test for a fixed bug: se3_exp used to be flat in phi at
+    phi == 0.
 
-    trippy.geom.xform_b.se3_exp writes its rotation as
-    `a * |phi| * skew(phi / max(|phi|, EPS))`, which is second order in phi at
-    the origin, so autograd hands back an exactly zero gradient for
-    `delta[3:]` there. The true derivative is the SO(3) generator (magnitude
-    1), as the finite difference below shows. Consequence for the trainer: a
-    pose delta initialised at exactly zero will never learn rotation, only
-    translation. Fixing it means changing xform_b.se3_exp (and re-running the
-    xform_a/xform_b agreement test), which is out of scope for the backward
-    pass; this test exists so the next person finds it immediately instead of
-    debugging a pose refinement that silently does not rotate.
+    trippy.geom.xform_b.se3_exp used to write its rotation as
+    `a * |phi| * skew(phi / max(|phi|, EPS))`, which is second order in phi
+    at the origin, so autograd handed back an exactly zero gradient for
+    `delta[3:]` there even though the true derivative -- the SO(3) generator,
+    magnitude 1 -- is nonzero (shown by the finite difference below).
+    Consequence for the trainer: a pose delta initialised at exactly zero
+    would never learn rotation, only translation.
 
-    Away from the origin the gradient is correct -- that is what
+    Fixed by building R and V directly from K = skew(phi) (linear in phi,
+    so its own gradient at phi == 0 is the generator) with Taylor-guarded
+    Rodrigues coefficients A(phi.phi), B(phi.phi), C(phi.phi) that are even
+    (and hence stationary, contributing zero gradient) at the origin -- see
+    trippy.geom.xform_b._so3_exp_coeffs and se3_exp.
+
+    Away from the origin the gradient was already correct -- that is what
     test_gradcheck_reference_render[pose_delta] verifies, at |phi| ~ 0.037.
     """
     from trippy.geom.xform_b import se3_exp
@@ -196,8 +200,13 @@ def test_pose_delta_rotation_gradient_vanishes_at_zero() -> None:
     numeric = float((se3_exp(plus)[2, 1] - se3_exp(minus)[2, 1]) / (2.0 * step))
 
     assert abs(numeric - 1.0) < 1e-8, "the true derivative is the generator"
-    assert float(analytic[3]) == 0.0, "autograd currently returns zero here"
-    # Translation, by contrast, is right at the origin.
+    assert abs(float(analytic[3]) - 1.0) < 1e-8, "analytic must match the finite difference"
+    assert abs(float(analytic[3]) - numeric) < 1e-8, "analytic and numeric must agree"
+    # Every other rotation component of d(rotation[2,1])/d(delta) is zero at
+    # the origin: rotation[2,1] = skew(phi)[2,1] + O(phi^2) = phi[0] + O(phi^2).
+    for i in (0, 1, 2, 4, 5):
+        assert abs(float(analytic[i])) < 1e-12, f"unexpected nonzero gradient at index {i}"
+    # Translation was already right at the origin, and must remain so.
     translation = torch.autograd.grad(se3_exp(zero)[0, 3], zero)[0]
     assert abs(float(translation[0]) - 1.0) < 1e-12
 
