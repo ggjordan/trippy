@@ -6,6 +6,7 @@ Last updated: 2026-09-05 (session 1, Orchestrator: Claude Fable 5.1)
 - Spec + plan grilled and approved 2026-09-05.
 - Phase 1 skeleton reviewed and pushed as `build-0001` (public repo github.com/ggjordan/trippy, 27 CPU tests green).
 - feat/points merged (build-0004): PointSet, GaussianPlySource (5.74M pts on kk-coherent, median nn 0.080), density CLI; 50 tests green.
+- Merged: self-reporting trainings (build-0028), union point set (EXP-0006: monodepth 3.79M, union 5.89M), web toolchain. Baseline shade audit on kkc_15000: dark(lum<0.25) 19.9% of region mass.
 - EXP-0003 full1-broadcast (40 ep, 11 min): held-out 14.42 dB / SSIM 0.39 / LPIPS 0.51, still rising -> long runs queued. Hybrid C (EXP-0005) negative for shade (-1.96 dB). brush-pyramid CubeCL port merged (GPU parity 2e-6). Raster NaN guard merged.
 - Trainer fixed (smoke 12.26 dB), native trips mode merged, candidate-report merged. Finding: with Gaussian-scale sizes the U-Net invents ~90% of every frame (t_final 0.93); full runs use kNN sizes.
 - v0.1.0 RELEASED on GitHub. Merged since: Brush fork submodule (ggjordan/brush trippy-fork) + crate skeletons, candidate-report (dolly/off-path/audits), se3_exp fix.
@@ -15,9 +16,9 @@ Last updated: 2026-09-05 (session 1, Orchestrator: Claude Fable 5.1)
 - Jordan set the goal (2026-09-05 ~22:50): finish all stages autonomously; anything needing Jordan goes in the review queue below.
 
 ## In flight
-- GPU queue (in order): brush-pyramid-gpu-5 (re-confirm after merge), cand-full1-broadcast (first shade audit + dolly on a TRIPS checkpoint), train-full1 (trips, 40 ep), train-full2-trips + train-full2-broadcast (300 ep, train_factor 1.0, ~2.5 h each).
-- feat/brush-unet (large/high): Burn U-Net + camera model, safetensors export, CubeTensor->Burn bridge, end-to-end horse parity + first Mac ms numbers.
-- feat/web-build (mid): Brush web app build toolchain, 127.0.0.1 launcher, Quest assessment on paper.
+- GPU queue (prio 70, self-reporting, in order): full2-broadcast, full2-trips (EXP-0003, 300 ep), union-broadcast, union-trips (EXP-0006), full-trips (EXP-0007 Hunua clip4982). Each delivers dolly/honesty/ply + audit table to Jordan-Review on completion.
+- feat/brush-unet (large/high): Burn U-Net + camera, safetensors export, end-to-end horse parity on wgpu + first Mac ms numbers (GPU jobs 1-4 rc 0; gpu-5 queued).
+- feat/distill (mid/high): design B fallback -- distil a TRIPS checkpoint into plain Gaussians with the Brush fork for Quest/publish.
 
 ## Next (in order)
 1. Merge scene-io + points; launch feat/raster (large/high: numpy reference + Metal blend_fwd + pyramid forward) and feat/net (mid/high: U-Net + tone mapper ports) once TRIPS_REFERENCE.md lands.

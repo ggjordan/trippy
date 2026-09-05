@@ -814,3 +814,4 @@ before `TRIPPY_OUTPUT` was pinned to the main checkout), the main checkout's
 - 2026-09-05T17:27:20Z submitted job trippy-trips prio 70: trippy train --config experiments/EXP-0006-union/config_trips.yaml --report --max-minutes 330
 - 2026-09-05T17:29:17Z submitted job trippy-union-broadcast prio 70: trippy train --config experiments/EXP-0006-union/config_broadcast.yaml --report --max-minutes 330
 - 2026-09-05T17:29:17Z submitted job trippy-union-trips prio 70: trippy train --config experiments/EXP-0006-union/config_trips.yaml --report --max-minutes 330
+- 2026-09-05T17:31:52Z submitted job trippy-full-trips prio 70: trippy train --config experiments/EXP-0007-hunua-clip4982/config.yaml --report --max-minutes 240

@@ -1,0 +1,22 @@
+# EXP-0007: second scene from the brief -- Hunua clip4982 (88 frames, 100% registered).
+# Same recipe as EXP-0003 full2 (trips mode, knn sizes, train_factor 1.0). No known shade
+# frames here, so the report's dolly anchors on the first held-out image; treat the shade
+# audit columns as not applicable for this scene.
+scene_root: /Users/nzbirdranch/Splats/scenes/hunua/clips/clip4982
+run_dir: output/runs/EXP-0007-hunua-clip4982/full-trips
+
+width: 1008
+crop: 384
+mode: trips
+layers: 5
+epochs: 300
+train_factor: 1.0
+
+point_source:
+  type: gaussian
+  path: /Users/nzbirdranch/Splats/output/Training-Data/hunua/clip4982/clip4982_12000.ply
+  min_opacity: 0.05
+  size_mode: knn
+
+device: mps
+seed: 0
