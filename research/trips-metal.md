@@ -1142,3 +1142,46 @@ default-off; the honest finding is that they are not where the time is.
 screenshots and the sweep scripts under `$TRIPPY_OUTPUT/brush/viewer/` (not committed);
 launcher at `$TRIPPY_OUTPUT/deliver/trips-horse/`.
 - 2026-09-05T18:51:17Z delivered trips-mac-viewer-horse: Native Mac TRIPS viewer (Brush fork): the public Tanks&Temples horse scene rendered live through the pyramid rasteriser + U-Net. Use WASD/mouse; V toggles network/raw/coverage. 22 fps at 1920x1080 on this Mac (rendered at 1440x810 and upscaled; press = for full resolution, - for 30 fps). (/Users/nzbirdranch/trippy/output/deliver/trips-horse/OPEN_TRIPS_MAC_trips-horse.command)
+
+## 2026-09-06 — v0.5.0: the TRIPS pipeline in a browser (feat/web-trips)
+
+**Question:** can `brush-pyramid` + `brush-unet` run on `wasm32-unknown-unknown`
+over WebGPU, and how fast?
+
+**Job:** `cpu_heavy.sh trips-wasm-*` (builds), `output/web/verify.sh` (browser
+checks, 5 s render window each — a Splats training `60-hunua-clip5250-train`
+held the GPU throughout, so every fps here is a lower bound).
+
+**Numbers**
+
+| | |
+|---|---|
+| cold wasm build (`scripts/web_build.sh --trips`) | 2 m 14 s wall, 20 m 16 s user |
+| `trips_web_bg.wasm` after `wasm-opt -Oz --converge` | 68 MB -> 24.4 MB |
+| dist total (incl. the 80 MB `points.npz`) | 100 MB |
+| page load -> first frame, Chrome (80 MB fetch + inflate + 2.2 M-point upload + shader compilation) | ~15 s |
+| **Chrome 152, 1440x810, raw level-0** | **2.90 fps** (15 frames / 5.18 s) |
+| Safari 26.6.2, same | 3.25 fps — **but the image is wrong** (stripe noise) |
+| native, same view/mode/size | 46.6 fps |
+| shaders needing an injected `enable subgroups;` | 4 (`sort_reduce/scan/scan_add/scatter`) |
+
+**Verdict:** the rasteriser works in Chrome — the `canvas.toBlob()` capture is
+the public horse statue from view 8, checked at the pixels. The **U-Net does
+not run in a browser at all**: every route from a Burn tensor to a bindable
+buffer ends at CubeCL's `read_sync`, which cannot block on wasm32. Four
+blockers were found and named; two needed JavaScript shims around dependency
+bugs (wgpu's `JsOption`/`JsNullable` mix-up on clean error-scope pops; CubeCL's
+missing `enable subgroups;`). Safari compiles further than it used to but one
+CubeCL shader fails there ("Expected 'f16'") and it draws garbage — the page
+now shows WebGPU errors on screen in red rather than presenting an invented
+picture silently.
+
+**Artifacts:** `output/web/trips-dist/` (delivered), `output/web/verify-chrome/`
+(`beacon.json` + `shot_canvas.png`), `output/web/verify-safari/` (same),
+`docs/WEB_VIEWER.md` for the full diagnosis.
+
+**Not measured:** PSNR against `output/brush/viewer/halfnet_s75.png` — that
+reference is the *network* frame, which the browser cannot produce; comparing
+it with a `raw level-0` capture is meaningless (measured r = -0.05). A
+like-for-like check needs a native `--mode raw` reference, i.e. GPU queue time.
+- 2026-09-05T20:07:31Z delivered trips-web-viewer-horse: Desktop web TRIPS viewer (WebGPU, wasm): the public horse scene rendered live in the browser at 3.4 fps in Chrome on this Mac. Double-click; nothing leaves the machine (127.0.0.1). Open it in Chrome, not Safari -- the page will tell you why. Shows the rasteriser's raw level-0 view; the U-Net view cannot run in a browser yet (docs/WEB_VIEWER.md). (/Users/nzbirdranch/trippy/output/web/trips-dist)

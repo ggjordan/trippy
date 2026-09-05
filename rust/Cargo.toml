@@ -25,7 +25,12 @@
 # rust/README.md, docs/ARCHITECTURE.md ("Later: Brush fork mapping").
 [workspace]
 resolver = "2"
-members = ["crates/brush-pyramid", "crates/brush-unet", "crates/trips-viewer"]
+members = [
+    "crates/brush-pyramid",
+    "crates/brush-unet",
+    "crates/trips-viewer",
+    "crates/trips-web",
+]
 # `rust/brush-trips` physically lives inside this workspace's directory, and Cargo
 # auto-adopts any path dependency under the workspace root as a member. Without this
 # exclude, `brush-cube` & co. would be pulled into THIS workspace and their
@@ -83,6 +88,21 @@ anyhow = "1.0.94"
 log = "0.4.22"
 env_logger = "0.11"
 rfd = "0.17"
+
+# The web viewer's stack (`crates/trips-web`, wasm32-unknown-unknown only).
+# Same specs as `rust/brush-trips/Cargo.toml`'s, for the same reason as every
+# block above: `wasm-bindgen` in particular must be ONE version across the
+# graph or `wasm-bindgen-cli` refuses the module ("schema version mismatch"),
+# and `web-sys` must match the one `wgpu`'s WebGPU backend links against or
+# the `HtmlCanvasElement` handed to `SurfaceTarget::Canvas` is a different
+# type. Nothing here is a new capability -- it is the browser's own API
+# surface plus the panic hook that turns a wasm trap into a readable console
+# message. See docs/WEB_VIEWER.md.
+wasm-bindgen = "0.2.100"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3.74"
+web-sys = { version = "0.3.74" }
+console_error_panic_hook = "0.1"
 
 # --- verbatim copy of rust/brush-trips/Cargo.toml's patch tables ---------------
 # wgpu fork (v30.0.0 + 2 commits): WebGPU subgroups feature mapping + the JS

@@ -24,9 +24,9 @@
 //! Related docs: `rust/README.md`; `docs/LIMITATIONS.md`;
 //!     `docs/decisions/ADR-0006-viewer-integration.md`.
 
-use brush_pyramid::gpu::{
-    burn_bridge, render_pyramid, render_pyramid_timed, StageTimings, WgpuDevice,
-};
+#[cfg(not(target_family = "wasm"))]
+use brush_pyramid::gpu::burn_bridge;
+use brush_pyramid::gpu::{render_pyramid, render_pyramid_timed, StageTimings, WgpuDevice};
 use brush_pyramid::params::{DepthRange, FeatureStore, LayerFloor, PyramidParams, SortMode};
 use brush_pyramid::scene::{Camera, PointSet};
 use brush_unet::camera::NeuralCamera;
@@ -34,6 +34,85 @@ use brush_unet::net::Unet;
 use burn_wgpu::{CubeTensor, WgpuRuntime};
 
 use crate::bundle::{Bounds, Bundle};
+
+/// Get the network's frame into a buffer the blit can bind.
+///
+/// Natively this is free: `burn_bridge::resolve_to_cube_float` hands back the
+/// tensor's own allocation and the frame never leaves the GPU.
+///
+/// # Errors
+/// Returns `Err` if the readback fails (web path only).
+#[cfg(not(target_family = "wasm"))]
+async fn resolve_network_output(
+    rgb: burn::tensor::Tensor<4>,
+    _device: &WgpuDevice,
+) -> Result<CubeTensor<WgpuRuntime>, String> {
+    Ok(burn_bridge::resolve_to_cube_float(rgb))
+}
+
+/// The web twin of the above, and the one place the browser pays for a copy
+/// the native viewer does not.
+///
+/// `resolve_to_cube_float` goes through burn-fusion's
+/// `FusionClient::resolve_tensor_float`, which calls `submit_blocking`, which
+/// calls `cubecl`'s `read_sync` — and `read_sync` *cannot* work on
+/// `wasm32-unknown-unknown`, where a future may not block the only thread
+/// there is. It panics with "Failed to read tensor data synchronously".
+///
+/// So on the web the finished frame is read back asynchronously and
+/// re-uploaded: an extra `3 * H * W * 4` bytes each way per frame (14 MB at
+/// 1440x810), which is real but small next to the network itself. The pixels
+/// are identical — this changes where the bytes travel, not what they are.
+/// See `docs/WEB_VIEWER.md`.
+///
+/// # Errors
+/// Returns `Err` if the readback fails or the data is not f32.
+#[cfg(target_family = "wasm")]
+async fn resolve_network_output(
+    rgb: burn::tensor::Tensor<4>,
+    device: &WgpuDevice,
+) -> Result<CubeTensor<WgpuRuntime>, String> {
+    let data = rgb
+        .into_data_async()
+        .await
+        .map_err(|e| format!("network readback: {e:?}"))?
+        .into_vec::<f32>()
+        .map_err(|e| format!("network output was not f32: {e:?}"))?;
+    Ok(brush_pyramid::gpu::upload_f32(&data, device))
+}
+
+/// A monotonic clock that is a no-op on the web.
+///
+/// `std::time::Instant::now()` panics on `wasm32-unknown-unknown` ("time not
+/// implemented on this platform"), and the browser front end measures frames
+/// with `requestAnimationFrame` timestamps anyway, so on wasm this reports
+/// 0 ms and [`FrameStats::frame_ms`] is simply not populated there. The native
+/// viewer is unchanged. See `docs/WEB_VIEWER.md`.
+#[derive(Debug, Clone, Copy)]
+struct SubmitClock {
+    #[cfg(not(target_family = "wasm"))]
+    start: std::time::Instant,
+}
+
+impl SubmitClock {
+    fn start() -> Self {
+        Self {
+            #[cfg(not(target_family = "wasm"))]
+            start: std::time::Instant::now(),
+        }
+    }
+
+    fn elapsed_ms(self) -> f64 {
+        #[cfg(not(target_family = "wasm"))]
+        {
+            self.start.elapsed().as_secs_f64() * 1e3
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            0.0
+        }
+    }
+}
 
 /// What the viewer draws.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -206,10 +285,18 @@ pub struct Renderer {
     bounds: Bounds,
     /// The float32 network.
     net: Unet,
-    /// The same weights in f16. Both are built at load time — the file is
-    /// 411 KiB, so keeping two copies costs nothing and makes the precision a
-    /// *runtime* toggle rather than a restart.
-    net_half: Unet,
+    /// The same weights in f16. Built at load time alongside the f32 copy —
+    /// the file is 411 KiB, so keeping two copies costs nothing and makes the
+    /// precision a *runtime* toggle rather than a restart.
+    ///
+    /// `None` when this device cannot hold f16 tensors at all. That never
+    /// happens on Metal, but a WebGPU adapter without the `shader-f16`
+    /// feature is a real possibility (`docs/WEB_VIEWER.md`), and refusing to
+    /// open the scene would be a worse answer than rendering it in f32 and
+    /// saying so — see [`Self::half_net_error`].
+    net_half: Option<Unet>,
+    /// Why [`Self::net_half`] is `None`, verbatim from Burn.
+    half_net_error: Option<String>,
     tone: NeuralCamera,
 }
 
@@ -225,11 +312,16 @@ impl Renderer {
     pub fn new(bundle: Bundle, device: WgpuDevice) -> Result<Self, String> {
         let burn_device = device.clone().into();
         let net = Unet::load(&bundle.weights, &burn_device)?;
-        let net_half = Unet::load_with_precision(
+        // An f16 load failure degrades to f32 rather than refusing the scene;
+        // see the `net_half` field.
+        let (net_half, half_net_error) = match Unet::load_with_precision(
             &bundle.weights,
             &burn_device,
             brush_unet::net::Precision::F16,
-        )?;
+        ) {
+            Ok(half) => (Some(half), None),
+            Err(e) => (None, Some(e)),
+        };
         let tone = NeuralCamera::load(&bundle.weights, &burn_device)?;
         let bounds = bundle.bounds();
         let background = bundle.background().map(<[f32]>::to_vec);
@@ -241,6 +333,7 @@ impl Renderer {
             bounds,
             net,
             net_half,
+            half_net_error,
             tone,
         })
     }
@@ -252,12 +345,25 @@ impl Renderer {
     }
 
     /// The decoder to run this frame, at the requested precision.
+    ///
+    /// Falls back to f32 when the f16 copy could not be built at all, so
+    /// `half_net` is a request, not a promise. [`Self::half_net_error`] is
+    /// what makes the difference visible instead of silent.
     fn net(&self, settings: &Settings) -> &Unet {
-        if settings.half_net {
-            &self.net_half
-        } else {
-            &self.net
+        match (settings.half_net, self.net_half.as_ref()) {
+            (true, Some(half)) => half,
+            _ => &self.net,
         }
+    }
+
+    /// Why the f16 network is unavailable on this device, if it is.
+    ///
+    /// `None` on every device that can hold f16 tensors, which is every Metal
+    /// GPU this project has run on. A WebGPU adapter that reports no
+    /// `shader-f16` support is the case this exists for.
+    #[must_use]
+    pub fn half_net_error(&self) -> Option<&str> {
+        self.half_net_error.as_deref()
     }
 
     /// The scene's world-space bounding box.
@@ -290,7 +396,7 @@ impl Renderer {
             self.bounds.depth_span(camera, self.base_params.znear),
         );
         let background = self.background.as_deref();
-        let clock = std::time::Instant::now();
+        let clock = SubmitClock::start();
 
         let (render, stages) = if settings.profile {
             let (r, t) = render_pyramid_timed(
@@ -345,7 +451,7 @@ impl Renderer {
                 // property of the backend, and getting it wrong shows up as a
                 // scrambled window that no test and no agent may look at. Below
                 // the layout is asserted instead of assumed.
-                let buffer = burn_bridge::resolve_to_cube_float(rgb);
+                let buffer = resolve_network_output(rgb, &self.device).await?;
                 if !buffer.is_contiguous() {
                     return Err(
                         "the network's output buffer is not contiguous; the blit                          shader's planar indexing would be wrong"
@@ -370,7 +476,7 @@ impl Renderer {
             height,
             mode,
             stats: FrameStats {
-                frame_ms: clock.elapsed().as_secs_f64() * 1e3,
+                frame_ms: clock.elapsed_ms(),
                 fragment_slots: render.num_fragment_slots(),
                 width: width as usize,
                 height: height as usize,

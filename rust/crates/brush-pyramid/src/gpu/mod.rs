@@ -46,6 +46,24 @@ pub fn default_device() -> WgpuDevice {
     WgpuDevice::DefaultDevice
 }
 
+/// Upload a host slice as a contiguous f32 device buffer.
+///
+/// Exposed for the web viewer, which cannot use
+/// [`burn_bridge::resolve_to_cube_float`]: burn-fusion resolves a tensor
+/// through `submit_blocking`, and `cubecl`'s `read_sync` cannot block on
+/// `wasm32` ("Failed to read tensor data synchronously"). There the network's
+/// output is read back asynchronously and re-uploaded through this instead.
+/// See `docs/WEB_VIEWER.md`.
+///
+/// # Arguments
+/// - `data`: the values, in the layout the consumer expects.
+/// - `device`: the device to allocate on.
+#[must_use]
+pub fn upload_f32(data: &[f32], device: &WgpuDevice) -> CubeTensor<WgpuRuntime> {
+    // `.max(1)`: a zero-length buffer is not a valid binding.
+    create_tensor_from_slice(pad1(data), device, DType::F32)
+}
+
 /// Drive a future to completion on the calling thread.
 ///
 /// [`render_pyramid`] and [`PyramidRender::to_host`] are `async` only because
@@ -55,8 +73,16 @@ pub fn default_device() -> WgpuDevice {
 /// thread and lets the waker unpark it. A real application (the viewer) already
 /// has a runtime and should `await` normally instead.
 ///
+/// **Native only.** On `wasm32-unknown-unknown` there is nothing to park: the
+/// browser's single JS thread is the one that would have to run the wgpu
+/// callback that resolves the future, so parking it deadlocks the page. The
+/// web viewer awaits normally from `wasm_bindgen_futures` instead, and this
+/// function is `cfg`-ed away so that mistake cannot compile. See
+/// `docs/WEB_VIEWER.md`.
+///
 /// # Arguments
 /// - `future`: the future to run to completion.
+#[cfg(not(target_family = "wasm"))]
 pub fn block_on<F: std::future::Future>(future: F) -> F::Output {
     use std::sync::Arc;
     use std::task::{Context, Poll, Wake, Waker};
@@ -451,18 +477,24 @@ async fn render_inner(
     let key_shift = if packed { depth_bits } else { 0 };
 
     let mut timings = timed.then(StageTimings::default);
-    let mut clock = std::time::Instant::now();
+    // `std::time::Instant::now()` PANICS on wasm32-unknown-unknown ("time not
+    // implemented on this platform"), so the clock is constructed only when
+    // per-stage timings were actually asked for. The web viewer never asks
+    // (it has no profiler panel and gets its frame interval from
+    // `requestAnimationFrame`), which is what makes `render_pyramid` usable in
+    // a browser at all. See docs/WEB_VIEWER.md.
+    let mut clock = timed.then(std::time::Instant::now);
     // A real device sync, not a one-element readback: these are eager CubeCL
     // launches, so `sync` genuinely waits for the queue to drain.
     macro_rules! mark {
         ($field:ident) => {
-            if let Some(t) = timings.as_mut() {
+            if let (Some(t), Some(c)) = (timings.as_mut(), clock.as_mut()) {
                 client
                     .sync()
                     .await
                     .map_err(|e| format!("device sync failed: {e:?}"))?;
-                t.$field = clock.elapsed().as_secs_f64() * 1e3;
-                clock = std::time::Instant::now();
+                t.$field = c.elapsed().as_secs_f64() * 1e3;
+                *c = std::time::Instant::now();
             }
         };
     }

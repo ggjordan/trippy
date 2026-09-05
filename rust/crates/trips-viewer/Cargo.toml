@@ -12,6 +12,13 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 
+# The platform-neutral half (bundle loading, camera, the per-frame pipeline).
+# `rust/crates/trips-web` depends on THIS target to render the same scene the
+# same way in a browser; see src/lib.rs's invariants for what may not go in it.
+[lib]
+name = "trips_viewer"
+path = "src/lib.rs"
+
 [[bin]]
 name = "trips-viewer"
 path = "src/main.rs"
@@ -23,15 +30,21 @@ brush-unet = { path = "../brush-unet", features = ["gpu"] }
 burn.workspace = true
 burn-wgpu.workspace = true
 
-eframe.workspace = true
-egui.workspace = true
-wgpu.workspace = true
-
 glam.workspace = true
 bytemuck.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-anyhow.workspace = true
 log.workspace = true
+
+# The window/UI stack, and only the binary needs it. Kept out of the wasm graph
+# on purpose: `eframe` drags in winit and `rfd` a native file dialog, neither of
+# which builds for wasm32-unknown-unknown, and the web viewer has no use for
+# either (its "file dialog" is a URL and its window is a <canvas>).
+# docs/WEB_VIEWER.md records this split.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+eframe.workspace = true
+egui.workspace = true
+wgpu.workspace = true
+anyhow.workspace = true
 env_logger.workspace = true
 rfd.workspace = true

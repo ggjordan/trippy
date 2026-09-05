@@ -157,44 +157,89 @@ impl Bundle {
     /// no views, or disagrees with the point set about `C`.
     pub fn load(dir: &Path) -> Result<Self, String> {
         let manifest_path = dir.join(MANIFEST_NAME);
-        let text = std::fs::read_to_string(&manifest_path)
-            .map_err(|e| format!("{}: {e}", manifest_path.display()))?;
-        let manifest: Manifest = serde_json::from_str(&text)
-            .map_err(|e| format!("{}: {e}", manifest_path.display()))?;
+        let origin = manifest_path.display().to_string();
+        let text = std::fs::read_to_string(&manifest_path).map_err(|e| format!("{origin}: {e}"))?;
+        // Read the manifest first so only the two files it actually names are
+        // touched -- the bundle directory is not assumed to hold anything else.
+        let manifest = Self::parse_manifest(&text, &origin)?;
+        let points_bytes = std::fs::read(dir.join(&manifest.points))
+            .map_err(|e| format!("{}: {e}", dir.join(&manifest.points).display()))?;
+        let weight_bytes = std::fs::read(dir.join(&manifest.weights))
+            .map_err(|e| format!("{}: {e}", dir.join(&manifest.weights).display()))?;
+        Self::from_parts(dir.to_path_buf(), manifest, &points_bytes, &weight_bytes, &origin)
+    }
 
+    /// Parse and validate `bundle.json`, without touching the files it names.
+    ///
+    /// Split out so the web viewer can read the manifest, learn the two file
+    /// names, and only then spend 80 MB of `fetch` on them.
+    ///
+    /// # Arguments
+    /// - `text`: the manifest's JSON.
+    /// - `origin`: what to name in error messages (a path or a URL).
+    ///
+    /// # Errors
+    /// Returns `Err` if the JSON does not parse, the format is not
+    /// [`BUNDLE_FORMAT`], or there are no views.
+    pub fn parse_manifest(text: &str, origin: &str) -> Result<Manifest, String> {
+        let manifest: Manifest =
+            serde_json::from_str(text).map_err(|e| format!("{origin}: {e}"))?;
         if manifest.format != BUNDLE_FORMAT {
             return Err(format!(
-                "{}: format is {:?}, this build only reads {BUNDLE_FORMAT:?}",
-                manifest_path.display(),
+                "{origin}: format is {:?}, this build only reads {BUNDLE_FORMAT:?}",
                 manifest.format
             ));
         }
         if manifest.views.is_empty() {
-            return Err(format!("{}: no views", manifest_path.display()));
+            return Err(format!("{origin}: no views"));
         }
+        Ok(manifest)
+    }
 
-        let points = PointSet::from_npz(&dir.join(&manifest.points))?;
+    /// Assemble a bundle from bytes that are already in memory.
+    ///
+    /// This is the **web** entry point: the browser has no filesystem, so
+    /// `trips-web` fetches `points.npz` and `weights.safetensors` over
+    /// loopback and calls this. Every cross-check [`Self::load`] performs is
+    /// performed here — the two paths differ only in where the bytes came
+    /// from, which is what makes the browser's frame comparable with the
+    /// native screenshot.
+    ///
+    /// # Arguments
+    /// - `dir`: what to report as the bundle's location (a URL, on the web).
+    /// - `manifest`: from [`Self::parse_manifest`].
+    /// - `points_bytes`: the whole `points.npz`.
+    /// - `weight_bytes`: the whole `weights.safetensors`.
+    /// - `origin`: what to name in error messages.
+    ///
+    /// # Errors
+    /// Returns `Err` if either file fails to parse or disagrees with the
+    /// manifest about `C`.
+    pub fn from_parts(
+        dir: PathBuf,
+        manifest: Manifest,
+        points_bytes: &[u8],
+        weight_bytes: &[u8],
+        origin: &str,
+    ) -> Result<Self, String> {
+        let points = PointSet::from_npz_bytes(points_bytes, &manifest.points)?;
         if points.num_channels != manifest.num_channels {
             return Err(format!(
-                "{}: manifest says C = {}, {} has C = {}",
-                manifest_path.display(),
-                manifest.num_channels,
-                manifest.points,
-                points.num_channels
+                "{origin}: manifest says C = {}, {} has C = {}",
+                manifest.num_channels, manifest.points, points.num_channels
             ));
         }
         if !manifest.background.is_empty() && manifest.background.len() != points.num_channels {
             return Err(format!(
-                "{}: background has {} values, expected {}",
-                manifest_path.display(),
+                "{origin}: background has {} values, expected {}",
                 manifest.background.len(),
                 points.num_channels
             ));
         }
-        let weights = Weights::from_file(&dir.join(&manifest.weights))?;
+        let weights = Weights::from_bytes(weight_bytes)?;
 
         Ok(Self {
-            dir: dir.to_path_buf(),
+            dir,
             manifest,
             points,
             weights,

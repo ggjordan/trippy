@@ -1,0 +1,70 @@
+# trips-web — the TRIPS viewer as a wasm32 module driving WebGPU in a browser.
+#
+# The SAME pipeline as the native `trips-viewer` binary: it depends on that
+# package's library target (`trips_viewer`) for bundle loading, the fly camera
+# and the per-frame `brush-pyramid` -> `brush-unet` render, and on
+# `trips-viewer`'s `shaders/blit.wgsl` (re-exported as `trips_viewer::BLIT_WGSL`)
+# for the last step. What is *not* shared is the window toolkit: there is no
+# eframe/egui/winit here at all, only wgpu on a `<canvas>`, which is why the
+# wasm graph stays small enough to build (see docs/WEB_VIEWER.md).
+#
+# WebGPU only. No WebGL fallback is compiled in: `brush-pyramid`'s kernels are
+# compute shaders, which WebGL2 cannot run, so a WebGL path would be a blank
+# canvas pretending to be a viewer.
+[package]
+name = "trips-web"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish = false
+
+# `cdylib` is what wasm-pack links; `rlib` keeps `cargo check` on the host
+# useful (the crate is `cfg`-gated to wasm, so on the host it is empty).
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+trips-viewer = { path = "../trips-viewer" }
+brush-pyramid = { path = "../brush-pyramid", features = ["gpu"] }
+brush-unet = { path = "../brush-unet", features = ["gpu"] }
+
+burn-wgpu.workspace = true
+wgpu.workspace = true
+serde_json.workspace = true
+bytemuck.workspace = true
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+wasm-bindgen.workspace = true
+# Required by `wasm-bindgen`'s own codegen for exported `async fn`s -- it is
+# part of the wasm-bindgen toolchain, not a separate runtime dependency.
+wasm-bindgen-futures.workspace = true
+js-sys.workspace = true
+console_error_panic_hook.workspace = true
+web-sys = { workspace = true, features = [
+    "Window",
+    "Document",
+    "HtmlCanvasElement",
+    "Request",
+    "Response",
+    "console",
+] }
+# The `wasm_js` backend has to be selected explicitly by the crate at the root
+# of the wasm build; `getrandom` itself arrives transitively (ahash ->
+# burn-core). Both major versions are in the graph, hence both lines. This is
+# exactly what `apps/brush-app/Cargo.toml` does for its own wasm build.
+getrandom = { version = "0.4", features = ["wasm_js"] }
+getrandom_03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
+
+[package.metadata.wasm-pack.profile.release]
+# Same wasm-opt flags the Brush fork's web build uses; the two extra `--enable`
+# flags are needed because CubeCL's generated code uses bulk memory ops and
+# non-trapping float-to-int conversions.
+wasm-opt = [
+    "-Oz",
+    "--converge",
+    "--enable-bulk-memory",
+    "--enable-nontrapping-float-to-int",
+]
+
+[package.metadata.cargo-shear]
+ignored = ["getrandom", "getrandom_03", "wasm-bindgen-futures"]

@@ -5,7 +5,9 @@ Invariants under test: the script is valid bash; `--check` verifies the
     toolchain (npm, wasm-pack, wasm32-unknown-unknown) and exits 0 without
     building anything; each missing-prerequisite guard clause exits non-zero
     with an actionable message instead of silently doing the wrong thing
-    (AGENTS.md: "faking unsupported APIs" is forbidden).
+    (AGENTS.md: "faking unsupported APIs" is forbidden). Both build targets are
+    covered: the default (stock Brush demo, wasm-pack + vite) and `--trips`
+    (trippy's own trips-web viewer, wasm-pack --target web, no bundler).
 Related docs: docs/WEB_VIEWER.md "Build"; rust/README.md "web" section;
     scripts/web_build.sh itself; scripts/deliver.sh (the intended next step
     after a build, not exercised here -- it has its own review-required
@@ -91,6 +93,111 @@ def test_rejects_unknown_argument() -> None:
     )
     assert result.returncode != 0
     assert "unknown argument" in result.stderr
+
+
+# --- `--trips`: trippy's own web viewer ------------------------------------
+
+
+def _toolchain_or_skip() -> None:
+    if shutil.which("npm") is None or shutil.which("wasm-pack") is None:
+        pytest.skip("npm/wasm-pack not installed on this machine")
+
+
+def _fake_bundle(tmp_path: Path) -> Path:
+    """A directory that satisfies the --trips bundle guard clause.
+
+    Synthetic, not a real scene: the guard only reads bundle.json, and a test
+    must never depend on an exported bundle being present (AGENTS.md's
+    "synthetic fixtures only").
+    """
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    (bundle / "bundle.json").write_text(
+        '{"format": "trippy-bundle-1", "points": "points.npz", '
+        '"weights": "weights.safetensors", "num_channels": 4, '
+        '"params": {}, "views": []}'
+    )
+    return bundle
+
+
+def test_trips_check_mode_prints_the_trips_plan(tmp_path: Path) -> None:
+    _toolchain_or_skip()
+    bundle = _fake_bundle(tmp_path)
+    result = subprocess.run(
+        ["bash", str(SCRIPT), "--check", "--trips", "--bundle", str(bundle)],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "toolchain OK" in result.stdout
+    # The trips target is bundler-free on purpose: --target web, no vite.
+    assert "--target web" in result.stdout
+    assert "wasm-pack build rust/crates/trips-web" in result.stdout
+    assert "web/index.html" in result.stdout
+    assert str(bundle) in result.stdout
+    # It must NOT run the stock Brush demo's npm/vite steps.
+    assert "npm ci" not in result.stdout
+    assert "vite build" not in result.stdout
+
+
+def test_trips_out_flag_overrides_the_output_directory(tmp_path: Path) -> None:
+    _toolchain_or_skip()
+    bundle = _fake_bundle(tmp_path)
+    out = tmp_path / "elsewhere"
+    result = subprocess.run(
+        [
+            "bash", str(SCRIPT), "--check", "--trips",
+            "--bundle", str(bundle), "--out", str(out),
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert str(out) in result.stdout
+
+
+def test_trips_missing_bundle_directory_exits_nonzero(tmp_path: Path) -> None:
+    _toolchain_or_skip()
+    result = subprocess.run(
+        ["bash", str(SCRIPT), "--check", "--trips", "--bundle", str(tmp_path / "nope")],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 2
+    assert "bundle directory not found" in result.stderr
+
+
+def test_trips_directory_without_a_manifest_exits_nonzero(tmp_path: Path) -> None:
+    _toolchain_or_skip()
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    result = subprocess.run(
+        ["bash", str(SCRIPT), "--check", "--trips", "--bundle", str(empty)],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 2
+    assert "no bundle.json" in result.stderr
+
+
+def test_flag_needing_a_value_says_so() -> None:
+    result = subprocess.run(
+        ["bash", str(SCRIPT), "--trips", "--bundle"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "--bundle needs a directory" in result.stderr
 
 
 def test_missing_npm_exits_nonzero_with_message(tmp_path: Path) -> None:
