@@ -22,6 +22,12 @@ Related docs: docs/SPEC.md "Technical design", AGENTS.md forbidden
     list (no direct GPU/MPS work outside scripts/gpu_submit.sh -- `smoke
     --device mps` is only ever invoked by the GPU-queue job itself);
     docs/SPEC.md D4 (point sources); docs/EXPERIMENTS.md "Training runs".
+
+`candidate-report` runs the full per-checkpoint evaluation pipeline docs/
+SPEC.md D10 requires (export PLY -> Splats' shade/extent audits ->
+dolly video -> off-path honesty sheet -> report.json + README.md); see
+docs/EXPERIMENTS.md "Candidate report". It never opens an image itself
+(AGENTS.md privacy rule) -- only metrics and file paths are printed/written.
 """
 
 from __future__ import annotations
@@ -39,10 +45,15 @@ import torch
 from trippy import __version__
 from trippy.config import load_settings, pick_device
 from trippy.constants import (
+    CANDIDATE_REPORT_DOLLY_DIRNAME,
+    CANDIDATE_REPORT_JSON_FILENAME,
+    CANDIDATE_REPORT_OFFPATH_DIRNAME,
+    CANDIDATE_REPORT_README_FILENAME,
     DEFAULT_DENSITY_COLMAP_SPARSE_DIR,
     DEFAULT_DENSITY_GAUSSIAN_PLY,
     DEFAULT_MIN_OPACITY,
     DEPTH_POINTS_MISSING_DEPTH_EXIT_CODE,
+    DOLLY_DEFAULT_POSE_NAME,
     GIT_DESCRIBE_MATCH_PATTERN,
     MONODEPTH_DEFAULT_CONF0,
     MONODEPTH_DEFAULT_STRIDE,
@@ -51,16 +62,22 @@ from trippy.constants import (
     PARITY_DEFAULT_NUM_LAYERS,
     RASTER_NUM_LAYERS,
     RENDER_CACHE_SUBDIR,
+    SHADE_FRAMES_KK,
     SMOKE_MPS_TEST_TENSOR_LEN,
+    TRAIN_EXPORT_FILENAME,
 )
+from trippy.eval.audits import audit_report
 from trippy.points import depth_io
 from trippy.points.colmap_sparse import ColmapSparseSource
 from trippy.points.gaussian_ply import GaussianPlySource
 from trippy.points.monodepth import MonoDepthSource
 from trippy.points.source import PointSource
 from trippy.render import pyramid_render
+from trippy.render.candidate import render_candidate
+from trippy.render.dolly import shade_dolly_poses
+from trippy.render.offpath import offpath_poses
 from trippy.train.config import TrainConfig
-from trippy.train.eval import evaluate_checkpoint
+from trippy.train.eval import build_trainer_from_checkpoint, evaluate_checkpoint
 from trippy.train.trainer import Trainer
 
 _METAL_ADD_ONE_SRC = """
@@ -312,6 +329,135 @@ def _cmd_parity(args: argparse.Namespace) -> int:
     return 0
 
 
+def _candidate_report_readme(report: dict) -> str:
+    """Human-readable summary of a `candidate-report` run: numbers + artifact paths only.
+
+    Never embeds or describes pixel content -- AGENTS.md's privacy rule
+    means this function (and whoever wrote it) never opens the images it
+    references; it only prints metrics and paths so Jordan can open them
+    himself.
+    """
+    dolly = report["dolly"]
+    offpath = report["offpath"]
+    shade = report["audits"]["shade_audit"]
+    extent = report["audits"]["extent_gate"]
+
+    lines = [
+        "# trippy candidate report",
+        "",
+        f"- Checkpoint: `{report['checkpoint']}`",
+        f"- Device: {report['device']}",
+        f"- Scene: `{report['scene_root']}`",
+        f"- Export PLY: `{report['export_ply']}`",
+        "",
+        "## Dolly (shade camera path)",
+        f"- Frames: {dolly['n_frames']}",
+        f"- Mean coverage (full frame, T_final-derived): {dolly['mean_coverage_full']:.4f}",
+    ]
+    if "videos" in dolly:
+        lines.append(f"- Video (network output): `{dolly['videos']['net']}`")
+        lines.append(f"- Video (raw level-0): `{dolly['videos']['raw']}`")
+    if "honesty_sheet" in dolly:
+        lines.append(f"- Honesty sheet: `{dolly['honesty_sheet']}`")
+
+    lines += [
+        "",
+        "## Off-path honesty poses",
+        f"- Frames: {offpath['n_frames']}",
+        f"- Mean coverage (full frame, T_final-derived): {offpath['mean_coverage_full']:.4f}",
+    ]
+    if "honesty_sheet" in offpath:
+        lines.append(f"- Honesty sheet: `{offpath['honesty_sheet']}`")
+
+    lines += ["", "## Audits (Splats' own tools, run read-only via subprocess)"]
+    if "error" in shade:
+        lines.append(f"- Shade audit: FAILED -- {shade['error']}")
+    else:
+        for res in shade.get("results", []):
+            lines.append(
+                f"- Shade audit `{res.get('path')}`: mass_in_region={res.get('mass_in_region'):.1f} "
+                f"(n_in_region={res.get('n_in_region')})"
+            )
+    if "error" in extent:
+        lines.append(f"- Extent gate: FAILED -- {extent['error']}")
+    else:
+        for rec in extent.get("plys", []):
+            lines.append(
+                f"- Extent gate `{rec.get('ply_path')}`: radius p99={rec.get('radius_p99')} "
+                f"max={rec.get('radius_max')} scene_diagonal={rec.get('scene_diagonal')}"
+            )
+
+    lines += [
+        "",
+        (
+            "Jordan's viewer verdict is final (docs/EXPERIMENTS.md \"Jordan's viewer verdict is "
+            "final\") -- these numbers rank candidates; they do not replace opening the dolly "
+            "video and honesty sheet."
+        ),
+        "",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def _cmd_candidate_report(args: argparse.Namespace) -> int:
+    device = pick_device(args.device)
+    out_dir = Path(args.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    trainer = build_trainer_from_checkpoint(args.checkpoint, device=str(device))
+    export_path = trainer.export_ply(out_dir / TRAIN_EXPORT_FILENAME)
+    scene_root = Path(trainer.cfg.scene_root)
+    width = trainer.cfg.width
+    del trainer  # render_candidate below rebuilds its own Trainer from the checkpoint.
+
+    offpath_names = (
+        [n.strip() for n in args.offpath.split(",") if n.strip()] if args.offpath else list(SHADE_FRAMES_KK)
+    )
+    dolly_poses = shade_dolly_poses(scene_root, pose_name=args.dolly_pose, width=width)
+    offpath_pose_list = offpath_poses(scene_root, offpath_names, width=width)
+
+    dolly_metrics = render_candidate(
+        args.checkpoint,
+        dolly_poses,
+        out_dir / CANDIDATE_REPORT_DOLLY_DIRNAME,
+        device=str(device),
+        write_video_files=True,
+    )
+    offpath_metrics = render_candidate(
+        args.checkpoint,
+        offpath_pose_list,
+        out_dir / CANDIDATE_REPORT_OFFPATH_DIRNAME,
+        device=str(device),
+        write_video_files=False,
+    )
+
+    audits = audit_report([str(export_path)], scene_root / "sparse_txt", frames=None)
+
+    report = {
+        "checkpoint": str(args.checkpoint),
+        "device": str(device),
+        "scene_root": str(scene_root),
+        "export_ply": str(export_path),
+        "dolly": dolly_metrics,
+        "offpath": offpath_metrics,
+        "audits": audits,
+    }
+    (out_dir / CANDIDATE_REPORT_JSON_FILENAME).write_text(json.dumps(report, indent=2) + "\n")
+    (out_dir / CANDIDATE_REPORT_README_FILENAME).write_text(_candidate_report_readme(report))
+
+    print(
+        "JSON:"
+        + json.dumps(
+            {
+                "out": str(out_dir),
+                "n_dolly_frames": dolly_metrics["n_frames"],
+                "n_offpath_frames": offpath_metrics["n_frames"],
+            }
+        )
+    )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="trippy")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -413,6 +559,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="directory of the authors' own renders (default: <checkpoint>/<epoch>/test)",
     )
     parity.set_defaults(func=_cmd_parity)
+
+    candidate_report = sub.add_parser(
+        "candidate-report",
+        help="export a checkpoint's PLY, run Splats' shade/extent audits, render the dolly + honesty artifacts",
+    )
+    candidate_report.add_argument("--checkpoint", required=True, help="checkpoint .pt path")
+    candidate_report.add_argument("--out", required=True, help="output directory")
+    candidate_report.add_argument(
+        "--dolly-pose", default=DOLLY_DEFAULT_POSE_NAME, help="frozen-orientation pose for the shade dolly"
+    )
+    candidate_report.add_argument(
+        "--offpath",
+        default=None,
+        help="comma-separated registered image names for off-path honesty poses (default: SHADE_FRAMES_KK)",
+    )
+    candidate_report.add_argument("--device", choices=["cpu", "mps"], default=None, help="override the checkpoint's device")
+    candidate_report.set_defaults(func=_cmd_candidate_report)
 
     return parser
 

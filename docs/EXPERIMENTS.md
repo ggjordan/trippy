@@ -379,5 +379,72 @@ plus a line when a `--max-minutes` budget cuts a run short.
 (`trippy.train.eval.evaluate_checkpoint`) re-evaluates a checkpoint without re-training, rebuilding the
 exact dataset/point-source/split the checkpoint was trained with from its own saved config. Omitting
 `--images` evaluates the checkpoint's own held-out split. `trippy.train.eval.render_offpath` renders
-honesty triplets (no ground truth) at arbitrary poses from a JSON file -- the stable API the dolly-camera-
-path generator (see "Dolly camera paths" above) will plug into once it exists.
+honesty triplets (no ground truth) at arbitrary poses from a JSON file; the dolly/off-path camera-path
+generators below use the richer `trippy.render.candidate.render_candidate` pipeline instead (per-frame
+raw/net/coverage/honesty PNGs, videos, a summary honesty sheet, and `metrics.json`), not this JSON-file API.
+
+## Candidate report
+
+`trippy candidate-report --checkpoint <ckpt.pt> --out <dir> [--dolly-pose IMG_3830.jpg] [--offpath
+IMG_3828.jpg,...] [--device cpu|mps]` runs the full per-checkpoint evaluation pipeline docs/SPEC.md D10
+requires -- export PLY, both Splats audits, the shade dolly video, and the off-path honesty sheet -- for
+one checkpoint, in one command. It never opens an image (AGENTS.md privacy rule): every number below comes
+from a metrics dict or a subprocess's own stdout/JSON, never from reading a rendered PNG.
+
+**Shade dolly camera path** (`trippy.render.dolly.shade_dolly_poses`): the same construction as
+`~/Splats/tools/depthprior_shade_dolly.py` -- `pose_name`'s own COLMAP orientation is frozen, and the
+camera centre slides along that pose's forward ray from `t_range[0]` to `t_range[1]` times the scene's
+local depth at that point (median distance to sparse points in front of the camera, 5th-95th percentile
+trimmed). Reimplemented in numpy against `trippy.scene.colmap_io` / `trippy.geom.xform_a`, not imported
+from `~/Splats`.
+
+**Off-path honesty poses** (`trippy.render.offpath.offpath_poses`): the same construction as
+`~/Splats/research/visual/render_offpath.py` -- for each requested image, a `lateral` pose (step sideways,
+perpendicular to both the forward direction and the scene's up vector) and an `oblique` pose (rise above
+the capture height and look down at the scene centroid), neither ever photographed. The scene's up vector
+is the mean of every registered image's own world-frame up axis.
+
+**Renderer** (`trippy.render.candidate.render_candidate`): loads the checkpoint via
+`trippy.train.eval.build_trainer_from_checkpoint`, renders every pose through the pyramid + U-Net + tone
+mapper (using that pose's own image's trained exposure/white-balance when its name matches a registered
+image, else the mean across every trained frame), and writes, per pose, `raw_level0.png` (level-0
+composite, no U-Net), `net.png` (network output), `coverage.png` (a from-scratch `1 - T_final` heatmap,
+no photo pixels), and `honesty.png` (raw | net | coverage, with pixels below `coverage_threshold`
+outlined in white on the *network* panel -- so a reviewer sees exactly which part of the pretty render is
+inferred). When the poses form one camera path (the dolly case), also assembles `dolly.mp4` (network) and
+`dolly_raw.mp4` (raw); either way writes a `honesty_sheet.png` contact sheet (up to
+`CANDIDATE_HONESTY_MAX_SHEET_FRAMES` poses) and a `metrics.json` (per-frame mean coverage, full frame and
+centre crop).
+
+**Audit wrappers** (`trippy.eval.audits`): `run_shade_audit` and `run_extent_gate` run Splats' own
+`depthprior_shade_audit.py` and `extent_gate.py`, unmodified, via subprocess through Splats' `ml-sharp`
+venv interpreter, and parse their output into plain dicts -- the shade audit via its own `--json-out` flag
+(a stable structured artifact), the extent gate via a regex parse of its stdout table (that script has no
+JSON output). `audit_report` runs both and catches failures independently, so a missing Splats installation
+or an audit that can't run against a particular scene never stops `candidate-report` from finishing; it
+records `{"error": "..."}` for whichever audit failed instead.
+
+`candidate-report` writes, under `--out`:
+
+```
+<out>/
+├── export.ply                 (trainer.export_ply())
+├── dolly/                     (render_candidate output for the shade dolly path)
+│   ├── frames/<pose>/{raw_level0,net,coverage,honesty}.png
+│   ├── dolly.mp4, dolly_raw.mp4, honesty_sheet.png, metrics.json
+├── offpath/                   (render_candidate output for the off-path honesty poses,
+│                                no video -- poses may not share one image size)
+│   ├── frames/<pose>/{raw_level0,net,coverage,honesty}.png
+│   └── honesty_sheet.png, metrics.json
+├── report.json                (checkpoint, device, scene_root, export_ply, dolly, offpath, audits)
+└── README.md                  (human summary: numbers + artifact paths only, no pixel content)
+```
+
+Tested on CPU with a synthetic scene and a randomly initialised (untrained) checkpoint
+(`tests/test_render_dolly.py`, `tests/test_render_offpath.py`, `tests/test_eval_audits.py`,
+`tests/test_cli_candidate_report.py`); the shade audit needs a real COLMAP text scene with observed
+points to report anything but an error (the minimal synthetic scene used elsewhere in this repo's tests
+has neither), so `tests/test_eval_audits.py`'s real-audit test runs against the (read-only) Karekare
+`sparse_txt` geometry with a synthetic PLY placed inside its bounding box, skipping cleanly when
+`~/Splats`/the ml-sharp venv aren't present. The Orchestrator runs `candidate-report` against real trained
+checkpoints (GPU-trained, via `scripts/gpu_submit.sh`) once one exists.

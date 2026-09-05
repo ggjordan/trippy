@@ -736,3 +736,103 @@ PARITY_DEFAULT_INDICES = (8, 120, 144)
 # every frame checked). Any PSNR against those files must exclude it, or the
 # authors' own render scores 15 dB against its own ground truth.
 PARITY_EVAL_BORDER_PX = 16
+
+# --- render/dolly.py : shade dolly camera path ---
+# Same construction as ~/Splats/tools/depthprior_shade_dolly.py: pose_name's
+# own COLMAP orientation is frozen and the camera centre slides along that
+# pose's forward ray. Defaults below cite the exact source lines.
+
+# depthprior_shade_dolly.py:33 `--pose-name` default -- IMG_3830.jpg is the
+# centre of the karekare shade region (docs/EXPERIMENTS.md "Dolly camera
+# paths", SHADE_FRAMES_KK above).
+DOLLY_DEFAULT_POSE_NAME = "IMG_3830.jpg"
+
+# depthprior_shade_dolly.py:38-39 `--t-start`/`--t-end` defaults: walk from
+# before the shade frame's own position (-0.35x local depth) to well past
+# it (+1.20x).
+DOLLY_DEFAULT_T_START = -0.35
+DOLLY_DEFAULT_T_END = 1.20
+
+# Not a Splats default (that script's `--frames` defaults to 9, sized for a
+# contact-sheet grid); trippy's dolly is a video, so it defaults to enough
+# frames for a smooth ~2s clip at VIDEO_DEFAULT_FPS.
+DOLLY_DEFAULT_N_FRAMES = 48
+
+# render_offpath.py:137 `--width` default (both the dolly and off-path
+# generators share this).
+DOLLY_DEFAULT_WIDTH = 640
+
+# depthprior_shade_dolly.py:59 `infront.sum() > 50` -- below this count the
+# local-depth estimate falls back to using every sparse point (not just
+# ones in front of the camera).
+DOLLY_DEPTH_INFRONT_MIN_COUNT = 50
+
+# depthprior_shade_dolly.py:60 `np.percentile(dsel, [5, 95])` -- trims
+# outlier near/far points before taking the median.
+DOLLY_DEPTH_PERCENTILE_LOW = 5.0
+DOLLY_DEPTH_PERCENTILE_HIGH = 95.0
+
+# depthprior_shade_dolly.py:62 `else 3.0` -- fallback local depth (world
+# units) when a scene has no usable sparse points at all (e.g. an empty
+# points3D.txt in a minimal synthetic test scene).
+DOLLY_FALLBACK_DEPTH = 3.0
+
+# --- render/offpath.py : off-path honesty poses ---
+# Same construction as ~/Splats/research/visual/render_offpath.py.
+
+# render_offpath.py:139 `--lateral-factor` default.
+OFFPATH_DEFAULT_LATERAL_FRAC = 0.5
+
+# render_offpath.py:140 `--elevate-factor` default.
+OFFPATH_DEFAULT_ELEVATE_FRAC = 0.7
+
+# render_offpath.py:237 `- fwd0 * depth * 0.35` -- the oblique pose also
+# pulls back along the (negative) forward direction, not just up.
+OFFPATH_OBLIQUE_BACK_FRAC = 0.35
+
+# render_offpath.py:137 `--width` default (shared with the dolly generator).
+OFFPATH_DEFAULT_WIDTH = 640
+
+# --- render/candidate.py : per-checkpoint render artifacts ---
+
+CANDIDATE_FRAMES_DIRNAME = "frames"
+CANDIDATE_RAW_FILENAME = "raw_level0.png"
+CANDIDATE_NET_FILENAME = "net.png"
+CANDIDATE_COVERAGE_FILENAME = "coverage.png"
+CANDIDATE_HONESTY_FRAME_FILENAME = "honesty.png"
+CANDIDATE_NET_VIDEO_FILENAME = "dolly.mp4"
+CANDIDATE_RAW_VIDEO_FILENAME = "dolly_raw.mp4"
+CANDIDATE_HONESTY_SHEET_FILENAME = "honesty_sheet.png"
+CANDIDATE_METRICS_FILENAME = "metrics.json"
+
+# docs/EXPERIMENTS.md "Mandatory honesty sheet": pixels with coverage <0.3
+# are called out as likely-hallucinated; candidate.py outlines them in
+# white on the network-output panel (rather than only the coverage panel)
+# so a viewer sees exactly which part of the pretty render is inferred.
+CANDIDATE_LOW_COVERAGE_THRESHOLD = 0.3
+CANDIDATE_OUTLINE_COLOR = (255, 255, 255)
+
+# Matches TRAIN_EVAL_MAX_SHEET_IMAGES's row cap, applied here to the
+# honesty_sheet.png contact sheet (3 columns -- raw/net/coverage -- per
+# frame instead of that constant's 4).
+CANDIDATE_HONESTY_MAX_SHEET_FRAMES = 6
+
+# --- eval/audits.py : Splats' shade audit + extent gate, via subprocess ---
+# Both tools live in ~/Splats (read-only) and are run with Splats' own
+# ml-sharp venv interpreter, never trippy's own venv (they import Splats-
+# local helper modules trippy does not have, e.g. ply_extract.py).
+
+AUDIT_VENV_PYTHON_REL = "tools/ml-sharp/.venv/bin/python"  # relative to SPLATS_ROOT
+AUDIT_SHADE_SCRIPT_REL = "tools/depthprior_shade_audit.py"  # relative to SPLATS_ROOT
+AUDIT_EXTENT_SCRIPT_REL = "tools/tmp/extent-audit/extent_gate.py"  # relative to SPLATS_ROOT
+
+# Generous: depthprior_shade_audit.py reads a full points3D.txt plus one or
+# more (potentially multi-GB) PLYs.
+AUDIT_SUBPROCESS_TIMEOUT_S = 600.0
+
+# --- cli.py : `trippy candidate-report` ---
+
+CANDIDATE_REPORT_DOLLY_DIRNAME = "dolly"
+CANDIDATE_REPORT_OFFPATH_DIRNAME = "offpath"
+CANDIDATE_REPORT_JSON_FILENAME = "report.json"
+CANDIDATE_REPORT_README_FILENAME = "README.md"
