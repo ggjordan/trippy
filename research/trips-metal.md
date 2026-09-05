@@ -234,3 +234,4 @@ sheets carry GT | authors' render | ours | abs-diff | raw level-0 honesty panel)
 =======
 - 2026-09-05T13:29:37Z submitted job trippy-train-smoke-1 prio 16: bash -c PYTHONPATH=. /Users/nzbirdranch/trippy/.venv/bin/python -m trippy.cli train --config experiments/EXP-0003-kk-trips-train/config_smoke.yaml --device mps --max-minutes 25
 >>>>>>> Stashed changes
+- 2026-09-05T13:34:01Z delivered EXP-0002-horse-parity: Authors' public TRIPS horse checkpoint rendered through trippy (Metal rasteriser + U-Net) vs ground truth: 22.27 dB, authors' own render 22.34 dB. Public Tanks&Temples data, not family photos. (/Users/nzbirdranch/trippy/output/EXP-0002-horse-parity/summary_sheet.png)
