@@ -1,0 +1,68 @@
+# EXP-0009: hybrid design A -- the Gaussian splat render fed to the U-Net TOGETHER with the
+# TRIPS point pyramid, trained end to end on kk-coherent.
+#
+# Everything outside the `hybrid:` block is EXP-0003's config_full2_trips.yaml verbatim
+# (same scene, same point source, same size_mode, same mode/layers/epochs/train_factor), so
+# the two runs differ in exactly one thing: whether the network also sees the Gaussians.
+# That is what makes "hybrid vs plain TRIPS" a fair comparison. See README.md for the two
+# baselines this run has to beat.
+#
+# Run via: scripts/queue_training.sh experiments/EXP-0009-hybrid-a/config.yaml --max-minutes 330
+# (never invoked directly -- AGENTS.md: all MPS work goes through the queue).
+
+scene_root: /Users/nzbirdranch/Splats/scenes/karekare/kk-coherent
+# ABSOLUTE on purpose: the job runs from a git worktree, so a relative run_dir would
+# write into the worktree's own output/ (which is where EXP-0005's renders were lost) --
+# and scripts/deliver.sh refuses any artifact that is not under $TRIPPY_OUTPUT.
+run_dir: /Users/nzbirdranch/trippy/output/runs/EXP-0009-hybrid-a/hybrid-a-all-levels
+
+width: 1008
+crop: 384
+mode: trips
+layers: 5
+epochs: 300
+# 1.0 x 186 train images = 186 crops per epoch (EXP-0003 full2's setting).
+train_factor: 1.0
+
+point_source:
+  type: gaussian
+  path: /Users/nzbirdranch/Splats/output/Training-Data/karekare/kk-coherent/kkc_15000.ply
+  min_opacity: 0.05
+  # knn: mean 4-NN distance (TRIPS's own init). Gaussian scales project sub-pixel at 1008
+  # wide, leaving t_final ~0.93 (the U-Net invents 90% of every frame). Measured in EXP-0003.
+  size_mode: knn
+
+hybrid:
+  enabled: true
+  # 219 rgb/depth/alpha triples rendered from kkc_15000.ply at this scene's own undistorted
+  # 1008-wide grid (EXP-0005's renderer, re-run as trippy-hybrid-a-render-{1,2}).
+  renders_dir: /Users/nzbirdranch/trippy/output/hybrid-c/renders/w1008
+  channels: [rgb, alpha, depth]
+  # all_levels: TRIPS's CombineBridge re-concatenates each level's RAW input twice per level,
+  # so a level-0-only signal never reaches the coarse blocks that decide large-scale structure.
+  mode: all_levels
+  # Ablation 1: a fifth of the crops see zeros in the Gaussian channels, so the point branch
+  # has to stay a working renderer on its own rather than becoming a thin residual.
+  dropout_gaussian_p: 0.2
+  # Ablation 2: rgb * alpha, so an uncovered pixel reads as "nothing here", not as gsrender's
+  # background colour.
+  mask_by_alpha: true
+  # null = measure the scene's median camera-to-Gaussian depth at startup and record it in
+  # the checkpoint (so eval/report normalise identically).
+  depth_scale: null
+  # Rendered live (MPS, inside the queue job) for the candidate report's dolly and off-path
+  # poses, which no precomputed render exists for.
+  ply_path: /Users/nzbirdranch/Splats/output/Training-Data/karekare/kk-coherent/kkc_15000.ply
+
+# Every kk-coherent eval must report a shade-region number (docs/SPEC.md "Context";
+# SHADE_FRAMES_KK).
+forced_heldout:
+  - IMG_3828.jpg
+  - IMG_3829.jpg
+  - IMG_3830.jpg
+  - IMG_3831.jpg
+  - IMG_3832.jpg
+  - IMG_3833.jpg
+
+device: mps
+seed: 0

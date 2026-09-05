@@ -693,6 +693,82 @@ HYBRID_C_DEPTH_NORM_SCALE = 20.0
 # trainer for image->image").
 HYBRID_C_EVAL_MAX_SHEET_IMAGES = 6
 
+# --- hybrid/ : Design A (this repo's "hybrid A") -- the Gaussian splat render fed to the
+# TRIPS U-Net ALONGSIDE the TRIPS point pyramid, trained end to end (docs/EXPERIMENTS.md
+# "Hybrid design A"; trippy.hybrid.gaussian_input, trippy.hybrid.gsrender_live). Design C
+# above replaces the point pyramid with the render; design A concatenates the two, so the
+# network can keep the Gaussians where they are good and fall back on TRIPS points where
+# they fail. ---
+
+# Canonical channel-group order of the Gaussian block appended to every U-Net input level.
+# Fixed (not the order the config happens to list) so a checkpoint's channel layout is a
+# function of the *set* of groups only -- reordering `hybrid.channels:` in a YAML file can
+# never silently invalidate a trained checkpoint.
+HYBRID_A_CHANNEL_ORDER = ("rgb", "alpha", "depth")
+
+# Width in channels of each group in HYBRID_A_CHANNEL_ORDER.
+HYBRID_A_CHANNEL_WIDTHS = {"rgb": 3, "alpha": 1, "depth": 1}
+
+# The two ways the Gaussian block reaches the U-Net (TrainConfig.hybrid.mode):
+#   "all_levels"     -- the block is area-averaged down to every pyramid level's own (h, w)
+#                       and concatenated there. The default, because TRIPS's CombineBridge
+#                       re-concatenates the *raw* input of every level twice per level
+#                       (trippy.net.unet module docstring), so a level-0-only signal is
+#                       structurally unavailable to the coarse blocks that decide large-scale
+#                       structure -- exactly the decision "trust the Gaussians here" needs.
+#   "concat_level0"  -- only level 0 carries the real block; coarser levels get zeros in
+#                       those channels (the U-Net requires every level to have the same
+#                       channel count, trippy.net.unet.forward's own validation).
+HYBRID_A_MODES = ("all_levels", "concat_level0")
+
+# TrainConfig.hybrid.dropout_gaussian_p default: fraction of training crops whose Gaussian
+# channels are zeroed wholesale (the TRIPS channels are untouched). A regulariser, not an
+# augmentation: at p = 0 the network is free to become a thin residual on top of the Gaussian
+# render everywhere, which is precisely the failure design C already measured (EXP-0005:
+# +0.45 dB non-shade, -1.96 dB shade). 0.2 keeps a fifth of the steps TRIPS-only so the point
+# branch stays a working renderer on its own.
+HYBRID_A_DEFAULT_DROPOUT_P = 0.2
+
+# TrainConfig.hybrid.mask_by_alpha default: multiply the Gaussian rgb by its own alpha before
+# concatenation, so an uncovered pixel (alpha ~ 0) presents as black-with-zero-alpha rather
+# than as gsrender's composited-against-background colour, which carries no scene information
+# but does look like content to a conv net.
+HYBRID_A_DEFAULT_MASK_BY_ALPHA = True
+
+# Alpha above which a render pixel counts as "covered" when measuring the scene's median
+# camera-to-Gaussian depth (the depth-channel normaliser, see HYBRID_A_DEPTH_SCALE_FRAMES).
+# gsrender writes depth 0 where nothing was hit, so an unmasked median would mostly measure
+# holes.
+HYBRID_A_DEPTH_SCALE_ALPHA_MIN = 0.5
+
+# How many rendered frames the median camera-to-Gaussian depth is estimated from when
+# `hybrid.depth_scale` is not given explicitly. Evenly spaced over the scene's frame list; a
+# median over 12 full 1008-wide depth maps is ~9 M samples, far more than needed for a scale.
+HYBRID_A_DEPTH_SCALE_FRAMES = 12
+
+# Fallback depth normaliser when no rendered frame has any covered pixel at all (an empty or
+# entirely-missed Gaussian cloud). Reuses design C's coarse constant rather than inventing a
+# second magic number; only ever reached on a degenerate scene.
+HYBRID_A_DEPTH_SCALE_FALLBACK = HYBRID_C_DEPTH_NORM_SCALE
+
+# Frames held in trippy.hybrid.gaussian_input.RenderCache's LRU. A 1008x756 five-channel
+# float32 frame is ~15 MB, so 16 frames is ~240 MB of host RAM -- enough that a training
+# epoch over a shuffled 186-image split still re-reads from disk (the point: bounded memory),
+# but enough to make an eval pass over the held-out split effectively free.
+HYBRID_A_RENDER_CACHE_FRAMES = 16
+
+# EXP-0005's measured held-out PSNR for the RAW Gaussian render (kkc_15000.ply) against the
+# photo, on kk-coherent's modulo-8 held-out split: the "plain Gaussians" baseline any hybrid
+# must beat. `all` = 33 frames, `shade` = the 6 SHADE_FRAMES_KK frames.
+# Source: experiments/EXP-0005-hybrid-c/README.md "Verdict" table.
+HYBRID_A_BASELINE_GAUSSIAN_PSNR_ALL = 15.53
+HYBRID_A_BASELINE_GAUSSIAN_PSNR_SHADE = 14.94
+
+# EXP-0003 full1-broadcast's held-out PSNR (40 epochs, still rising when it stopped): the
+# "plain TRIPS" baseline. Recorded here so the hybrid is judged against both plain Gaussians
+# and plain TRIPS, not just against itself. Source: STATE.md / experiments/EXP-0003-*/README.md.
+HYBRID_A_BASELINE_TRIPS_PSNR_ALL = 14.42
+
 # --- train/checkpoint_io.py, trainer.py : on-disk run layout ---
 # docs/EXPERIMENTS.md "Run location": output/runs/<exp>/<run>/{...}.
 TRAIN_CHECKPOINT_DIRNAME = "checkpoints"

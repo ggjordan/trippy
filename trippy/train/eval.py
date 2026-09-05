@@ -1,7 +1,11 @@
 """Standalone evaluation from a checkpoint: held-out metrics + off-path honesty renders.
 
 Module: trippy.train.eval
-Invariants: `evaluate_checkpoint` rebuilds a full `Trainer` from the
+Invariants: a hybrid (design A) checkpoint gets a lazy live-gsrender
+    `gaussian_provider` installed by `build_trainer_from_checkpoint`, so
+    off-path/dolly poses -- which have no precomputed Gaussian render -- still
+    reach the network with their Gaussian channels filled in.
+    `evaluate_checkpoint` rebuilds a full `Trainer` from the
     checkpoint's own saved `cfg` (so the dataset/point-source/split are
     reconstructed identically to how the checkpoint was trained) and then
     loads the trained state into it -- it never re-runs training. This
@@ -19,6 +23,7 @@ from pathlib import Path
 
 import torch
 
+from trippy.hybrid.gsrender_live import gaussian_provider_for
 from trippy.render.sheets import colorize, save_png, side_by_side
 from trippy.train import checkpoint_io
 from trippy.train.config import TrainConfig
@@ -45,6 +50,13 @@ def build_trainer_from_checkpoint(checkpoint_path: str | Path, device: str | Non
         cfg.device = device
     trainer = Trainer(cfg)
     trainer.load_state(payload)
+    if trainer.hybrid is not None:
+        # Design A: poses with no precomputed render (dolly/off-path) need the PLY
+        # rendered live. The renderer is lazy -- nothing is loaded, and MPS is never
+        # touched, unless such a pose is actually rendered (a held-out eval never is).
+        trainer.gaussian_provider = gaussian_provider_for(
+            cfg.hybrid, trainer.hybrid, device=str(trainer.device)
+        )
     return trainer
 
 

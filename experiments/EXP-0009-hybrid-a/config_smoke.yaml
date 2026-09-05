@@ -1,0 +1,54 @@
+# EXP-0009 smoke: prove the whole MPS path (hybrid trainer + candidate report's LIVE
+# gsrender at dolly/off-path poses) end to end before the 300-epoch run is queued.
+#
+# Differences from config.yaml, all of them "make it finish in minutes":
+#   width 504 (the w1008 renders are area-averaged down to this grid by
+#     trippy.hybrid.gaussian_input.resample_to -- same camera, proportional K),
+#   max_points 200k, crop 256, 2 epochs, dropout 0 (2 epochs is too few for the ablation to
+#     mean anything, and a dropped crop would just add noise to the smoke's PSNR).
+#
+# Run via: scripts/gpu_submit.sh --prio 16 --wait hybrid-a-smoke -- \
+#   trippy train --config experiments/EXP-0009-hybrid-a/config_smoke.yaml --report --max-minutes 40
+
+scene_root: /Users/nzbirdranch/Splats/scenes/karekare/kk-coherent
+# ABSOLUTE on purpose: the job runs from a git worktree, so a relative run_dir would
+# write into the worktree's own output/ (which is where EXP-0005's renders were lost) --
+# and scripts/deliver.sh refuses any artifact that is not under $TRIPPY_OUTPUT.
+run_dir: /Users/nzbirdranch/trippy/output/runs/EXP-0009-hybrid-a/hybrid-a-smoke
+
+width: 504
+crop: 256
+mode: trips
+layers: 5
+epochs: 2
+train_factor: 0.125
+
+point_source:
+  type: gaussian
+  path: /Users/nzbirdranch/Splats/output/Training-Data/karekare/kk-coherent/kkc_15000.ply
+  min_opacity: 0.05
+  size_mode: knn
+  max_points: 200000
+
+hybrid:
+  enabled: true
+  renders_dir: /Users/nzbirdranch/trippy/output/hybrid-c/renders/w1008
+  channels: [rgb, alpha, depth]
+  mode: all_levels
+  dropout_gaussian_p: 0.0
+  mask_by_alpha: true
+  depth_scale: null
+  ply_path: /Users/nzbirdranch/Splats/output/Training-Data/karekare/kk-coherent/kkc_15000.ply
+
+forced_heldout:
+  - IMG_3828.jpg
+  - IMG_3829.jpg
+  - IMG_3830.jpg
+  - IMG_3831.jpg
+  - IMG_3832.jpg
+  - IMG_3833.jpg
+
+eval_every: 1
+checkpoint_every: 1
+device: mps
+seed: 0

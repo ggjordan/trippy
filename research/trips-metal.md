@@ -1271,3 +1271,82 @@ question the delivery asks is whether the drag now turns the scene and whether o
 committed); launchers at `$TRIPPY_OUTPUT/deliver/trips-horse/` and
 `$TRIPPY_OUTPUT/deliver/trips-kk-full1/`.
 - 2026-09-05T20:20:14Z submitted job trippy-viewer-camera-check3 prio 12: bash /Users/nzbirdranch/trippy/.worktrees/viewer-input/scripts/viewer_camera_check.sh /Users/nzbirdranch/trippy/output/brush/horse_bundle /Users/nzbirdranch/trippy/output/brush/viewer/camera-check-rebased
+- 2026-09-05T19:27:57Z submitted job trippy-hybrid-a-render-1 prio 17: bash -c cd /Users/nzbirdranch/trippy/.worktrees/hybrid-a && PYTHONPATH=. /Users/nzbirdranch/Splats/tools/ml-sharp/.venv/bin/python -m trippy.hybrid.render_splat_views --scene /Users/nzbirdranch/Splats/scenes/karekare/kk-coherent --ply /Users/nzbirdranch/Splats/output/Training-Data/karekare/kk-coherent/kkc_15000.ply --out /Users/nzbirdranch/trippy/output/hybrid-c/renders/w1008 --width 1008 --device mps --start-index 0 --end-index 110
+- 2026-09-05T19:28:05Z submitted job trippy-hybrid-a-render-2 prio 17: bash -c cd /Users/nzbirdranch/trippy/.worktrees/hybrid-a && PYTHONPATH=. /Users/nzbirdranch/Splats/tools/ml-sharp/.venv/bin/python -m trippy.hybrid.render_splat_views --scene /Users/nzbirdranch/Splats/scenes/karekare/kk-coherent --ply /Users/nzbirdranch/Splats/output/Training-Data/karekare/kk-coherent/kkc_15000.ply --out /Users/nzbirdranch/trippy/output/hybrid-c/renders/w1008 --width 1008 --device mps --start-index 110 --end-index 219
+
+## 2026-09-06 — EXP-0009: hybrid design A (Splats **combined with** TRIPS), built
+
+**Question.** Jordan (2026-09-06, STATE.md review queue): "his main interest is Splats
+combined with TRIPS (hybrid)". Design C threw the point cloud away; design A1 would throw the
+Gaussian render away. Design A keeps both: the Gaussian splat render (rgb + alpha +
+normalised depth) is concatenated onto **every level** of the TRIPS point pyramid before the
+U-Net, and points/sizes/features/poses/tone-mapper/network train end to end against the
+photos. Can a network that sees both beat each alone — especially in the shade?
+
+**Built.** `hybrid:` is now an option on the existing point-based trainer, not a second
+trainer: `trippy/hybrid/config_a.py` (`HybridConfig`, nested in `TrainConfig`),
+`trippy/hybrid/gaussian_input.py` (load / crop / pool / concat), `trippy/hybrid/
+gsrender_live.py` (live gsrender for unphotographed poses, PLY cached once per process).
+`enabled: false` is the default and a hard no-op. Load-bearing decisions:
+
+- Only the network widens: `TrainConfig.net_input_channels = feature_channels + G` (4 + 5 = 9
+  with the shipped defaults); points, background and the rasteriser stay at 4, so `layers[0]`
+  is still the pure TRIPS composite every honesty artifact is defined against.
+- The render is cropped by handing `trippy.scene.dataset.crop` the *same* `(size, zoom,
+  center)` and the same `K` as the photo crop, so the K-adjust is identical by construction.
+  Proven in `tests/test_hybrid_a_crop.py` against the photo path itself and against an
+  independent hand-written gather, over 5 crop cases including one that overshoots the frame.
+- Depth is normalised by the scene's measured median camera-to-Gaussian depth (median over
+  `alpha >= 0.5` pixels of 12 frames), written back into the config so the checkpoint records
+  the exact normaliser.
+- Missing Gaussian information is always an all-zero block, never a substitution. In
+  particular a dolly/off-path pose does **not** borrow its anchor image's precomputed render:
+  those cameras are displaced from the photographed one, so the block is rendered live or it
+  is zeros. (Caught during self-review; the first draft did substitute by name.)
+- Ablations in config: `dropout_gaussian_p` (default 0.2) and `mask_by_alpha` (default true).
+
+**Renders had to be re-created.** EXP-0005's 219 rgb/depth/alpha triples were written inside
+the since-removed `.worktrees/hybrid-c/output/` and went with the worktree. Re-rendered by
+`trippy-hybrid-a-render-1` (frames 0-110) and `trippy-hybrid-a-render-2` (110-219), prio 17,
+into the absolute path `/Users/nzbirdranch/trippy/output/hybrid-c/renders/w1008`.
+
+**Baselines to beat** (recorded as `HYBRID_A_BASELINE_*` in `trippy/constants.py`): plain
+Gaussians 15.53 dB all / 14.94 dB shade (EXP-0005); plain TRIPS 14.42 dB (EXP-0003
+full1-broadcast, 40 ep — the fair comparison is EXP-0003 `full2-trips` at 300 epochs, still
+queued); design C 15.54 / 12.97 dB.
+
+**Jobs.**
+
+| Job | prio | rc | numbers |
+|---|---|---|---|
+| `trippy-hybrid-a-render-1` | 17 | 0 | 110/110 frames, 1329.7 s |
+| `trippy-hybrid-a-render-2` | 17 | 0 | 109/109 frames, 1452.5 s |
+| `trippy-hybrid-a-smoke` | 16 | 0 | 18.5 min incl. report; 2 epochs / 48 crops at width 504, 200k points; held-out (n=33) PSNR 7.40 -> **8.88 dB**, SSIM 0.098 -> 0.162, LPIPS 0.860; measured depth_scale 3.898; renders found for 219/219 images; 48 dolly + 12 off-path frames rendered through **live gsrender on MPS**; all 3 deliveries succeeded, no `REPORT_FAILED.txt` |
+| `trippy-hybrid-a-all-levels` | 70 | queued | 300 epochs, train_factor 1.0, width 1008, `--max-minutes 330`, self-reporting |
+
+219/219 kk-coherent registered views re-rendered against `kkc_15000.ply` at `max_hw=400`,
+width 1008, 985 MB under `$TRIPPY_OUTPUT/hybrid-c/renders/w1008`.
+
+**CPU dry-runs against the real scene** (numbers only, no imagery opened), 6-8 images and 2k
+points, both shipped configs: 9 U-Net input channels; measured `depth_scale` 5.09 world units
+at width 504 and 5.27 at width 1008 (median camera-to-Gaussian depth); the w1008 render set
+resamples correctly onto the 378x504 grid; normalised depth lands in [0.20, 10.8] and alpha in
+[0.004, 1.0]; train step and full-frame eval both run, including the odd-size pyramid chain
+756 -> 378 -> 189 -> 95 -> 48.
+
+**Smoke read.** 8.88 dB after 48 crops on a 200k-point subset at half width is a *sanity*
+number, not a result -- it says the plumbing works and the loss is falling, nothing more.
+What it does prove is the part that could not be tested on the CPU: the 9-channel U-Net trains
+on MPS under `PYTORCH_ENABLE_MPS_FALLBACK=0`, and the candidate report renders the 1.7 GB
+Gaussian PLY *live* at 60 unphotographed dolly/off-path poses. `--report` is caught by
+`_run_train_report_safely`, so rc=0 alone would not have proven that -- the absence of
+`REPORT_FAILED.txt` plus 48+12 rendered frames and 3 successful deliveries does. Dolly mean
+coverage 0.031 (stop index 13 of 48) is the 200k-point subset showing through, not a hybrid
+effect.
+
+**Verdict.** Pending on `trippy-hybrid-a-all-levels`. It self-reports and delivers.
+- 2026-09-05T20:34:35Z submitted job trippy-hybrid-a-smoke prio 16: trippy train --config experiments/EXP-0009-hybrid-a/config_smoke.yaml --report --max-minutes 40
+- 2026-09-05T20:53:39Z delivered hybrid-a-smoke-dolly: trippy train report hybrid-a-smoke: epoch 1, held-out PSNR 8.88 dB, shade dark-mass 20.5% vs baseline 19.9% (/Users/nzbirdranch/trippy/output/runs/EXP-0009-hybrid-a/hybrid-a-smoke/report/dolly/dolly.mp4)
+- 2026-09-05T20:53:39Z delivered hybrid-a-smoke-honesty: trippy train report hybrid-a-smoke: epoch 1, held-out PSNR 8.88 dB, shade dark-mass 20.5% vs baseline 19.9% (/Users/nzbirdranch/trippy/output/runs/EXP-0009-hybrid-a/hybrid-a-smoke/report/dolly/honesty_sheet.png)
+- 2026-09-05T20:53:39Z delivered hybrid-a-smoke-export: trippy train report hybrid-a-smoke: epoch 1, held-out PSNR 8.88 dB, shade dark-mass 20.5% vs baseline 19.9% (/Users/nzbirdranch/trippy/output/runs/EXP-0009-hybrid-a/hybrid-a-smoke/export.ply)
+- 2026-09-05T20:55:16Z submitted job trippy-hybrid-a-all-levels prio 70: trippy train --config experiments/EXP-0009-hybrid-a/config.yaml --report --max-minutes 330

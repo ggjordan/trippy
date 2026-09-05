@@ -38,7 +38,7 @@ Related docs: docs/EXPERIMENTS.md "Mandatory honesty sheet", "Dolly camera
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 import numpy as np
@@ -71,12 +71,19 @@ from trippy.train.trainer import Trainer
 
 
 def _render_layers(
-    trainer: Trainer, K: torch.Tensor, R: torch.Tensor, t: torch.Tensor, image_hw: tuple[int, int]
+    trainer: Trainer,
+    K: torch.Tensor,
+    R: torch.Tensor,
+    t: torch.Tensor,
+    image_hw: tuple[int, int],
+    image_name: str | None = None,
 ) -> tuple[torch.Tensor, list[torch.Tensor], dict]:
     """Pyramid render + U-Net, before tone-mapping (see module docstring).
 
     Mirrors `Trainer._render` (trippy/train/trainer.py) exactly, built only
-    from `Trainer`'s public attributes.
+    from `Trainer`'s public attributes -- including hybrid design A's
+    `gaussian_for_pose`/`hybrid.attach` pair, which is skipped entirely on a
+    non-hybrid checkpoint (`trainer.hybrid is None`).
     """
     layers, aux = render_pyramid(
         trainer.point_params.xyz,
@@ -92,6 +99,9 @@ def _render_layers(
         bg=trainer.background,
     )
     inputs = [layer.unsqueeze(0) for layer in layers]
+    if trainer.hybrid is not None:
+        gaussian = trainer.gaussian_for_pose(image_name, K, R, t, image_hw)
+        inputs = trainer.hybrid.attach(inputs, gaussian)
     net_out = trainer.net(inputs)
     return net_out, layers, aux
 
@@ -170,6 +180,7 @@ def render_candidate(
     max_sheet_frames: int = CANDIDATE_HONESTY_MAX_SHEET_FRAMES,
     stop_at_low_coverage: bool = False,
     dolly_stop_threshold: float = DOLLY_COVERAGE_STOP_THRESHOLD,
+    gaussian_provider: Callable[..., torch.Tensor | None] | None = None,
 ) -> dict:
     """Render `poses` through a checkpoint and write every honesty artifact.
 
@@ -203,6 +214,17 @@ def render_candidate(
             coverage summary is affected. False for off-path honesty poses
             (not a single ordered path, so "stop" is meaningless there).
         dolly_stop_threshold: forwarded to `dolly_stop_index`.
+        gaussian_provider: hybrid design A only -- a
+            `(name, K, R, t, image_hw) -> (G, H, W) tensor | None` callback
+            supplying the Gaussian block for **every** pose here. None keeps
+            the lazy live-gsrender provider
+            `trippy.train.eval.build_trainer_from_checkpoint` already
+            installed; tests pass a fake so no PLY or MPS is ever touched.
+            No pose here is a photographed one (dolly/off-path cameras are
+            displaced from their anchor image), so a precomputed render is
+            never a valid substitute -- see
+            `trippy.hybrid.gsrender_live.gaussian_provider_for`. Ignored
+            entirely on a non-hybrid checkpoint.
 
     Returns:
         The metrics dict also written to `<out_dir>/metrics.json`:
@@ -217,6 +239,8 @@ def render_candidate(
     trainer = build_trainer_from_checkpoint(checkpoint_path, device=device)
     trainer.net.eval()
     trainer.camera.eval()
+    if gaussian_provider is not None:
+        trainer.gaussian_provider = gaussian_provider
 
     out_dir = Path(out_dir)
     frames_dir = out_dir / CANDIDATE_FRAMES_DIRNAME
@@ -235,7 +259,7 @@ def render_candidate(
             t = torch.tensor(np.asarray(pose.t, dtype=np.float32), device=trainer.device)
             image_hw = (int(pose.image_hw[0]), int(pose.image_hw[1]))
 
-            net_out, layers, aux = _render_layers(trainer, K, R, t, image_hw)
+            net_out, layers, aux = _render_layers(trainer, K, R, t, image_hw, pose.image_name)
             pred = _tone_map_for_pose(trainer, net_out, pose.image_name)
 
             raw01 = layers[0][:3].clamp(0.0, 1.0).permute(1, 2, 0).cpu().numpy()

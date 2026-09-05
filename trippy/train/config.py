@@ -70,6 +70,7 @@ from trippy.constants import (
     TRAIN_LR_DECAY_PATIENCE,
     TRAIN_VGG_START_FRAC,
 )
+from trippy.hybrid.config_a import HybridConfig
 
 
 def steps_per_epoch(train_factor: float, n_train: int) -> int:
@@ -219,6 +220,10 @@ class TrainConfig:
     eval_lpips: bool = True  # see trainer.py docstring: gated so CPU tests don't require a
     # network-reachable LPIPS/VGG backbone unless explicitly asked for.
 
+    # --- hybrid: the Gaussian splat render as extra U-Net input channels (design A) ---
+    # `enabled: false` (the default) is a hard no-op -- see trippy.hybrid.config_a.
+    hybrid: HybridConfig = field(default_factory=HybridConfig)
+
     # --- misc ---
     seed: int = TRAIN_DEFAULT_SEED
     device: str = "cpu"
@@ -227,6 +232,8 @@ class TrainConfig:
     def __post_init__(self) -> None:
         if isinstance(self.point_source, dict):
             self.point_source = PointSourceConfig(**self.point_source)
+        if isinstance(self.hybrid, dict):
+            self.hybrid = HybridConfig(**self.hybrid)
         if self.crop <= 0:
             raise ValueError(f"crop must be positive, got {self.crop}")
         if self.width <= 0:
@@ -245,6 +252,19 @@ class TrainConfig:
             raise ValueError(
                 f"pyramid_halving must be one of {RASTER_PYRAMID_HALVINGS}, got {self.pyramid_halving!r}"
             )
+
+    @property
+    def net_input_channels(self) -> int:
+        """Channels per U-Net input level: TRIPS features, plus the Gaussian block if hybrid.
+
+        `trippy.net.unet.MultiScaleUnet2dDecOnlySmallFixed` requires every
+        pyramid level to carry exactly `NetworkConfig.num_input_channels`
+        channels (its `forward` validates this), so the Gaussian block widens
+        *all* levels even in `concat_level0` mode -- the coarse levels simply
+        carry zeros there. With `hybrid.enabled` false this is exactly
+        `feature_channels`, i.e. the pre-design-A value.
+        """
+        return self.feature_channels + (self.hybrid.num_channels if self.hybrid.enabled else 0)
 
     @property
     def lock_cameras_epochs(self) -> int:
