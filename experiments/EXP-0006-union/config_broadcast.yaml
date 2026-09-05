@@ -1,0 +1,42 @@
+# EXP-0006: full kk-coherent training run, point source 3 (Union(Gaussian, MonoDepth)).
+# See docs/EXPERIMENTS.md "Training runs" for the config file format (only fields that
+# differ from TrainConfig's scaled-for-trippy defaults need to be listed here) and
+# experiments/EXP-0006-union/README.md for the question/gate this run answers and the
+# density numbers for the point set this config loads.
+#
+# Run via: trippy train --config experiments/EXP-0006-union/config_broadcast.yaml
+# (through scripts/gpu_submit.sh --train, never invoked directly -- see AGENTS.md).
+#
+# point_source.type is "npz", not "union": the union (Gaussian, size_mode=knn, 5.74M pts,
+# concatenated with the full-219-image MonoDepth set, ~4M pts, then voxel-deduped) was
+# built once offline via `trippy points-build` (CPU-heavy kNN over 5.74M points) and saved
+# to output/points/kk-coherent-union-full.npz -- loading that npz at train start is a
+# fraction of a second instead of re-running the kNN every time this config is used.
+
+scene_root: /Users/nzbirdranch/Splats/scenes/karekare/kk-coherent
+run_dir: output/runs/EXP-0006-union/broadcast
+
+width: 1008
+crop: 384
+mode: broadcast
+layers: 5
+epochs: 300
+# 1.0 x 186 train images = 186 crops per epoch, matching EXP-0003's full2 configs.
+train_factor: 1.0
+
+point_source:
+  type: npz
+  path: /Users/nzbirdranch/trippy/output/points/kk-coherent-union-full.npz
+
+# Every kk-coherent eval must report a shade-region number (docs/SPEC.md "Context";
+# docs/EXPERIMENTS.md's dolly-camera note anchors on IMG_3830.jpg).
+forced_heldout:
+  - IMG_3828.jpg
+  - IMG_3829.jpg
+  - IMG_3830.jpg
+  - IMG_3831.jpg
+  - IMG_3832.jpg
+  - IMG_3833.jpg
+
+device: mps
+seed: 0

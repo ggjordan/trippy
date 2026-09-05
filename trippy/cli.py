@@ -37,6 +37,13 @@ comparison table appended to the run's README.md, and delivery via
 runs". Reporting failures are caught here and written to
 `<run_dir>/REPORT_FAILED.txt`; they never fail an otherwise-successful
 training run (`trippy train`'s exit code reflects `fit()` only).
+`points-build` builds any `trippy.train.config.PointSourceConfig`-described
+source (gaussian/colmap/union/npz, the same schema as a TrainConfig YAML's
+`point_source:` block, taken as the document root here) and writes it to
+`.npz` + a summary JSON, exactly like `density`/`depth-points --out` do for
+their own single source -- the generic entry point for building a
+"union" of a Gaussian PLY and a MonoDepth `.npz` with a voxel dedupe
+(EXP-0006). CPU-only; never touches MPS.
 """
 
 from __future__ import annotations
@@ -51,6 +58,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 import torch
+import yaml
 
 from trippy import __version__
 from trippy.config import load_settings, pick_device
@@ -93,7 +101,7 @@ from trippy.render import pyramid_render
 from trippy.render.candidate import render_candidate
 from trippy.render.dolly import shade_dolly_poses
 from trippy.render.offpath import offpath_poses
-from trippy.train.config import TrainConfig
+from trippy.train.config import PointSourceConfig, TrainConfig
 from trippy.train.eval import build_trainer_from_checkpoint, evaluate_checkpoint
 from trippy.train.trainer import Trainer
 
@@ -361,6 +369,43 @@ def _cmd_depth_points(args: argparse.Namespace) -> int:
         summary_path = out_path.with_suffix(".summary.json")
         summary_path.write_text(json.dumps({"summary": summary, "describe": describe}, indent=2))
         print(f"wrote {out_path} and {summary_path}")
+
+def _cmd_points_build(args: argparse.Namespace) -> int:
+    """Build any `PointSourceConfig`-describable source and dump it to .npz + summary JSON.
+
+    `--config` is a YAML file holding exactly the fields `PointSourceConfig`
+    accepts (the same schema as a `TrainConfig` YAML's `point_source:` block,
+    but as the document root) -- so a "union" type's nested `sources:` list
+    works unchanged, including a "npz" leaf that loads a `PointSet` another
+    tool (or this same command, run earlier) already wrote to disk. This is
+    how EXP-0006's Union(Gaussian, MonoDepth) point set is built: one
+    "gaussian" leaf, one "npz" leaf pointing at the MonoDepth `.npz`, under a
+    "union" parent with a `voxel` dedupe.
+    """
+    data = yaml.safe_load(Path(args.config).read_text())
+    source_config = PointSourceConfig(**(data or {}))
+    source = source_config.to_source()
+
+    point_set = source.build()
+    summary = point_set.summary()
+    describe = source.describe()
+
+    print(f"source: {describe}")
+    print(f"count: {summary['count']}")
+    print(f"bbox_min: {summary['bbox_min']}")
+    print(f"bbox_max: {summary['bbox_max']}")
+    print(f"median_nn_distance: {summary['median_nn_distance']}")
+    print(f"provenance_histogram: {summary['provenance_histogram']}")
+    print(f"JSON:{json.dumps({'summary': summary, 'describe': describe})}")
+
+    out_path = Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    point_set.save_npz(out_path)
+    summary_path = out_path.with_suffix(".summary.json")
+    summary_path.write_text(json.dumps({"summary": summary, "describe": describe}, indent=2))
+    print(f"wrote {out_path} and {summary_path}")
+    return 0
+
 
 def _cmd_parity(args: argparse.Namespace) -> int:
     """Render published TRIPS checkpoint views through trippy and score them."""
@@ -639,6 +684,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="prepare inputs + print the gpu_submit.sh DepthPro command instead of building the PointSet",
     )
     depth_points.set_defaults(func=_cmd_depth_points)
+
+    points_build = sub.add_parser(
+        "points-build",
+        help="build any PointSourceConfig-described source (gaussian/colmap/union/npz) to .npz + summary JSON",
+    )
+    points_build.add_argument("--config", required=True, help="YAML file with PointSourceConfig fields at the root")
+    points_build.add_argument("--out", required=True, help="output .npz path (summary JSON written alongside it)")
+    points_build.set_defaults(func=_cmd_points_build)
+
     parity = sub.add_parser(
         "parity",
         help="render published TRIPS checkpoint views through trippy and score them vs the photos",

@@ -106,7 +106,7 @@ Output: radius p99, p99.9, max. These should not exceed the extent of the origin
 - `GaussianPlySource`: trained 3DGS Gaussian centres from a binary PLY. `min_opacity` filters by `sigmoid(opacity)`; `size_mode="scale"` uses the trained `exp(log_scale)` extent, `size_mode="knn"` ignores it and uses local point spacing instead. Reads the ~7M-row author PLYs in ~1-2 s (structured-dtype `np.fromfile`, no plyfile, no per-row loop).
 - `ColmapSparseSource`: the sparse triangulated points from `points3D.txt`, fixed `conf0=0.5`, size from kNN spacing.
 - `UnionSource`: concatenates any sources; with `voxel` set, dedupes colliding points keeping the highest-`conf0` survivor per cell.
-- `MonoDepthSource` / `LidarSource`: not implemented yet (v0.2.0 and "later" respectively); constructors document planned inputs.
+- `MonoDepthSource`: implemented (v0.2.0); see "Monocular depth points" below. `LidarSource`: not implemented yet ("later"); constructor documents planned inputs.
 
 Inspect any source without training via the CLI:
 
@@ -322,6 +322,33 @@ DepthPro's `valid_fraction=1.0` and stride-6 density (a point lands near
 almost every pixel by construction) rather than confirming the depth
 values themselves are *correct* there; that needs the shade audit /
 Jordan's viewer verdict once this source feeds a training run.
+
+### Full-scene MonoDepth build and the Union point source (EXP-0006)
+
+The 12-image sample above was extended to **all 219 registered kk-coherent images**
+(same `width=1008`, `stride=6`, `voxel=0.03`, `conf0=0.35`, `scale_mode="median_ratio"`):
+DepthPro job `depthpro-kk-coherent` (prio 11), rc=0, 219/219 images, `valid_fraction=1.0`
+throughout, 293.6 s total (~1.34 s/image). The resulting `MonoDepthSource` PointSet is
+**3,786,345** points (from 5,063,856 raw, 25.2% collapsed by its own internal voxel
+dedupe -- a much higher collapse rate than the 12-image sample's 7.6%, expected since a
+dense sequential walk has far more frame-to-frame overlap than 12 frames spread across
+the whole scene), median nn-distance 0.2806. See `experiments/EXP-0006-union/README.md`
+for the full per-image scale/MAD table and shade-frame coverage numbers.
+
+`trippy.points.union.UnionSource` (point source 3, docs/SPEC.md D4) is reached from a
+config file the same way any other source is -- `trippy.train.config.PointSourceConfig`
+already implements `type: "union"` (nested `sources:` list + a `voxel`) and `type:
+"npz"` (loads a `PointSet` written by `PointSet.save_npz` verbatim, e.g. a MonoDepth set
+built once via `depth-points --out` and reused across multiple later builds/trainings
+without recomputation). `trippy points-build --config <cfg.yaml> --out <path.npz>` is
+the generic CLI entry point that builds *any* `PointSourceConfig`-described source
+(gaussian/colmap/union/npz) and writes it to `.npz` + a summary JSON, exactly like
+`density`/`depth-points --out` already do for their own single source -- this is how
+EXP-0006's `Union(Gaussian, MonoDepth-219)` point set was built offline once (CPU-heavy:
+`size_mode="knn"` on the full 5.74M-row Gaussian PLY runs a k-d-tree query per point, so
+this ran via `scripts/cpu_heavy.sh`) and then loaded into training configs with
+`point_source: {type: npz, path: <the union .npz>}` -- a sub-second load instead of
+re-running the kNN + voxel dedupe at the start of every training job.
 
 `trippy.render.sheets` (`contact_sheet`, `side_by_side`, `colorize`,
 `save_png`) and `trippy.render.video` (`write_video`, `frames_from_dir`)
