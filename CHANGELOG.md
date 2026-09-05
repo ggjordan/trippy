@@ -3,6 +3,8 @@ All notable changes to trippy. Format: Keep a Changelog. Versions: semver tags `
 
 ## [Unreleased]
 
+## [v0.1.0] - 2026-09-06
+
 ## [0.1.0] - 2026-09-06
 ### Added
 - Repo governance (AGENTS.md, scripts, hooks, GPU-queue and delivery wrappers), public MIT repo.
