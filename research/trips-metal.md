@@ -630,3 +630,4 @@ checks) — 25 of them fail with either bug reintroduced. `tests/test_raster_nan
 each diffed against the float64 CPU reference at 1e-3 relative). Full CPU suite 530 passed.
 
 **Job**: `trippy-raster-nan-gpu-1` (prio 12) — 51 passed in 1.60s, **rc 0**.
+- 2026-09-05T16:26:13Z submitted job trippy-brush-pyramid-gpu-5 prio 12: bash -c cd /Users/nzbirdranch/trippy/rust && cargo test -p brush-pyramid --features gpu --offline --test parity_gpu -- --nocapture --test-threads=1
