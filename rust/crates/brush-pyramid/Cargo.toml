@@ -21,6 +21,11 @@ flate2 = { version = "1.1", default-features = false, features = ["rust_backend"
 burn = { workspace = true, features = ["wgpu"], optional = true }
 burn-cubecl = { workspace = true, optional = true }
 burn-wgpu = { workspace = true, optional = true }
+# The CubeTensor -> `burn::Tensor<D>` bridge (src/gpu/burn_bridge.rs) has to
+# register a fusion `Operation`, which lives in these two burn crates rather
+# than behind a `burn::` re-export. Same specs as the submodule's.
+burn-fusion = { workspace = true, optional = true }
+burn-ir = { workspace = true, optional = true }
 brush-cube = { path = "../../brush-trips/crates/brush-cube", optional = true }
 brush-sort = { path = "../../brush-trips/crates/brush-sort", optional = true }
 brush-prefix-sum = { path = "../../brush-trips/crates/brush-prefix-sum", optional = true }
@@ -33,6 +38,8 @@ gpu = [
     "dep:burn",
     "dep:burn-cubecl",
     "dep:burn-wgpu",
+    "dep:burn-fusion",
+    "dep:burn-ir",
     "dep:brush-cube",
     "dep:brush-sort",
     "dep:brush-prefix-sum",

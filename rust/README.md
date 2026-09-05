@@ -182,6 +182,133 @@ All three patches' CLI options showed up in the built binary, confirming the
 merge (see the patch table above) is not just syntactically clean but produces the
 combined feature set.
 
+## `brush-unet`: the U-Net + tone mapper, and the weight schema
+
+`brush-unet` is the second half of the forward pass: it takes the `L` feature
+images `brush-pyramid` composites and produces the displayed RGB frame.
+
+```
+crates/brush-unet/
+├── src/config.rs     UnetConfig / CameraConfig + the safetensors key schema.
+│                     NO dependencies -> compiled and tested on every push.
+├── src/weights.rs    the safetensors reader (host-side `Vec<f32>` only).
+├── src/net.rs        GatedBlock / UpBlock / Unet, Burn      | `gpu` feature
+├── src/camera.rs     NeuralCamera (exposure/WB/vignette/LUT)| `gpu` feature
+├── examples/render_frame_full.rs   points+camera+weights -> PNG, with timings
+└── tests/{schema_cpu,parity_gpu}.rs
+```
+
+### CubeTensor -> `burn::Tensor<4>` (the bridge that was missing)
+
+`brush_pyramid::gpu::PyramidRender` composites into one flat
+`CubeTensor<WgpuRuntime>` of shape `(P, C)` — pixel-major, channel-last,
+layer-major over the pyramid. Burn's `Conv2d` wants a `Tensor<4>` in NCHW.
+In the Burn revision this workspace pins (`b6e27bdc`), `Tensor<const D>` is
+backend-erased over the **fusion** backend, and a fusion tensor is a handle in
+a lazily recorded op stream, not a buffer — so there is no
+`Tensor::from_primitive(CubeTensor)`. The supported way in is a custom
+operation with **zero inputs** whose single output the op binds to an
+already-computed concrete tensor:
+
+- `brush-pyramid/src/gpu/burn_bridge.rs` — ~90 lines: a `BindOp` implementing
+  `burn_fusion::stream::Operation`, registered with
+  `client.register(StreamId::current(), OperationIr::Custom(desc), op)`. This is
+  the one-output, no-input case of the seven-output `BindOp` in the fork's
+  `brush-render/src/burn_glue.rs`. Zero-copy: no readback, one stream
+  registration.
+- `PyramidRender::layer_tensor(l)` then slices layer `l`'s rows out of the
+  `(P, C)` tensor, reshapes to `[1, h_l, w_l, C]` and permutes to
+  `[1, C, h_l, w_l]` — all on device.
+
+This needed two extra dependencies, `burn-fusion` and `burn-ir`, whose specs
+are copied verbatim from the submodule's `[workspace.dependencies]` for the
+same reason every other burn spec is (see above).
+
+### Weight schema (`trippy.net.export_safetensors`, format `trippy-unet-1`)
+
+`tools/export_unet_safetensors.py` writes one `.safetensors` file holding the
+U-Net and the tone mapper. Every tensor is **float32, C-contiguous**, written
+in the order below so the data segment is contiguous. `brush_unet::weights`
+is the 1:1 reader and refuses a file that deviates.
+
+`__metadata__` (all values are strings):
+
+| key | meaning |
+|---|---|
+| `format` | `trippy-unet-1` |
+| `num_layers` `filters` `in_channels` `out_channels` | `L`, `F`, `C`, `O` |
+| `activation` `norm` `upsample_mode` `last_act` | must be `elu` / `id` / `bilinear` / `id`; anything else is rejected rather than silently approximated |
+| `has_camera` | `1` when the tone mapper is included |
+| `num_frames` `response_params` | `M`, `P` |
+| `image_height` `image_width` | the resolution the vignette's aspect correction was fitted at |
+| `enable_exposure` `enable_white_balance` `enable_vignette` `enable_response` | `0`/`1` |
+
+Tensors:
+
+| key | shape | source (PyTorch) |
+|---|---|---|
+| `unet.start.feature.{weight,bias}` | `(F-2C, C, 3, 3)`, `(F-2C,)` | `start.conv.feature_conv` |
+| `unet.start.gate.{weight,bias}` | same | `start.conv.gate_conv` |
+| `unet.up.{k}.feature.{weight,bias}` | `(out_k, F, 3, 3)`, `(out_k,)` | `up[k].conv.feature_conv` |
+| `unet.up.{k}.gate.{weight,bias}` | same | `up[k].conv.gate_conv` |
+| `unet.final.{weight,bias}` | `(O, F, 1, 1)`, `(O,)` | `final[0]` |
+| `camera.exposure` | `(M,)` | `exposures_values`, squeezed |
+| `camera.white_balance` | `(M, 3)` | `white_balance_values`, squeezed |
+| `camera.vignette_params` | `(3,)` | `vignette_net.vignette_params` |
+| `camera.vignette_center` | `(2,)` | `vignette_net.vignette_center`, squeezed |
+| `camera.response` | `(O, P)` | `camera_response.response`, squeezed |
+
+with `out_k = F - C` for the last block (`k == L-2`) and `F - 2C` otherwise —
+TRIPS's "-2C" trick (Networks.h:1033-1034), which is what makes the final
+bridge concat land on exactly `F` channels.
+
+**`up.{k}` is indexed in application order, not by pyramid level.** `k = 0` is
+the block that consumes `inputs[L-2]` (the coarsest input the start block did
+not take) and `k = L-2` is the `last = true` block that consumes `inputs[0]`.
+`UnetConfig::up_level(k) == L - 2 - k`. This matches the Python `up`
+ModuleList index; getting it backwards produces a network that runs, has the
+right parameter count, and renders nonsense.
+
+### Building and testing `brush-unet`
+
+Default (no Burn — `scripts/build.sh` / `scripts/test.sh`, seconds):
+
+```bash
+cd rust && cargo test -p brush-unet          # config + schema_cpu
+```
+
+GPU parity (build through the CPU-heavy queue, run through the GPU queue):
+
+```bash
+bash scripts/cpu_heavy.sh brush-unet-build -- bash -c \
+  'cd rust && cargo test -p brush-unet --features gpu --release --no-run'
+
+bash scripts/gpu_submit.sh --prio 12 --wait brush-unet-gpu-1 -- bash -c \
+  'cd rust && cargo test -p brush-unet --features gpu --release --offline \
+   --test parity_gpu -- --nocapture --test-threads=1'
+```
+
+The three fixture tests are self-contained (committed random weights,
+`tests/fixtures/synthetic/unet_fixture_small/`, ~290 KiB). The fourth,
+`horse_frame_matches_the_python_parity_engine`, **skips** unless the public
+Zenodo horse exports exist under `$TRIPPY_OUTPUT/brush/horse/`; generate them
+with
+
+```bash
+PYTHONPATH=. TRIPS_DEVICE=cpu python tools/export_unet_safetensors.py horse-e2e --index 8
+```
+
+Render a whole frame and print per-stage timings:
+
+```bash
+cargo run --release --example render_frame_full --features gpu -- \
+  --points  $TRIPPY_OUTPUT/brush/horse/view_00008_points.npz \
+  --camera  $TRIPPY_OUTPUT/brush/horse/view_00008_camera.json \
+  --params  $TRIPPY_OUTPUT/brush/horse/view_00008_params.json \
+  --weights $TRIPPY_OUTPUT/brush/horse/horse_unet.safetensors \
+  --out /tmp/frame.png --iters 10
+```
+
 ## Parity testing
 
 The Rust forward pass is checked against trippy's Python forward on identical
@@ -211,6 +338,32 @@ dependency.
 
 Float images and `t_final` are compared with a 1e-4 absolute tolerance; `n_used` and
 the fragment counts are integers and must match **exactly**.
+
+`brush-unet` is checked the same way, with `tools/export_unet_safetensors.py fixture`
+in the role of `dump_raster_fixture.py`. It writes
+`tests/fixtures/synthetic/unet_fixture_small/` (~290 KiB, pinned seed, random
+weights, `num_layers=5`, `C=4`, `F=32`, a 32x24 pyramid):
+
+```
+weights.safetensors   the U-Net + tone mapper, schema `trippy-unet-1`
+io.safetensors        input.0 .. input.4, unet_out, rgb_out, camera_probe,
+                      camera_probe_out         (PyTorch's own answers)
+meta.json             seed, shapes, parameter_count, output magnitudes
+```
+
+- `crates/brush-unet/tests/schema_cpu.rs` — the key schema, the metadata, and that a
+  truncated or unsupported file is an *error*, not a panic. Part of `scripts/test.sh`.
+- `crates/brush-unet/tests/parity_gpu.rs` — Burn vs PyTorch at 1e-4 on the fixture
+  (U-Net alone, camera alone, and the two chained), plus the horse end-to-end.
+- `tests/test_net_export_safetensors.py` — the container round-trips, the header is
+  8-byte aligned with a contiguous data segment (the Rust reader validates both), the
+  key schema covers every parameter exactly once, and regenerating from the pinned
+  seed reproduces the committed bytes.
+
+The 32x24 base is not arbitrary: with `ceil` halving it gives level shapes
+`(24,32) (12,16) (6,8) (3,4) (2,2)`, so the coarsest upsample produces a 4x4 that
+must be centre-cropped down to the 3x4 raw input — i.e. the fixture exercises the
+odd-size `CombineBridge` branch that TRIPS's own code cannot handle.
 
 ## What `brush-pyramid` implements
 
@@ -279,9 +432,11 @@ The Brush fork retains Apache-2.0 license (inherited from the upstream Brush pro
   patches reapplied, and the fork builds `brush-app` in release mode.
   `brush-pyramid` now holds the **real forward pass** — the CPU reference, the six
   CubeCL kernels, the npz/camera loaders, the `render_frame` example and both parity
-  tests. **Not yet done**: the backward pass (`blend_bwd`), the U-Net Burn graph +
-  safetensors loader in `brush-unet`, wrapping the output as `burn::Tensor<4>` (see
-  `docs/LIMITATIONS.md`), and the viewer hook-in at
+  tests. `brush-unet` now holds the **Burn U-Net + tone mapper**, the safetensors
+  loader, the `CubeTensor -> Tensor<4>` bridge, and the `render_frame_full` example,
+  so `points -> pyramid -> U-Net -> tone map -> PNG` runs entirely on wgpu and
+  matches trippy's Python parity engine on the public horse scene at 115 dB.
+  **Not yet done**: the backward pass (`blend_bwd`) and the viewer hook-in at
   `apps/brush-app/src/ui/splat_backbuffer.rs`.
 - **v0.5.0, in progress**: web-viewer *toolchain* proven end to end with the
   stock Brush renderer (build script, `.command` launcher, WebGPU render of a

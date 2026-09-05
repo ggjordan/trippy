@@ -815,3 +815,137 @@ before `TRIPPY_OUTPUT` was pinned to the main checkout), the main checkout's
 - 2026-09-05T17:29:17Z submitted job trippy-union-broadcast prio 70: trippy train --config experiments/EXP-0006-union/config_broadcast.yaml --report --max-minutes 330
 - 2026-09-05T17:29:17Z submitted job trippy-union-trips prio 70: trippy train --config experiments/EXP-0006-union/config_trips.yaml --report --max-minutes 330
 - 2026-09-05T17:31:52Z submitted job trippy-full-trips prio 70: trippy train --config experiments/EXP-0007-hunua-clip4982/config.yaml --report --max-minutes 240
+- 2026-09-05T16:46:54Z submitted job trippy-brush-unet-gpu-1 prio 12: bash -c cd /Users/nzbirdranch/trippy/.worktrees/brush-unet/rust && cargo test -p brush-unet --features gpu --release --offline --test parity_gpu -- --nocapture --test-threads=1
+- 2026-09-05T16:49:30Z submitted job trippy-brush-unet-gpu-2 prio 12: bash -c set -e; export TRIPPY_OUTPUT=/Users/nzbirdranch/trippy/output; cd /Users/nzbirdranch/trippy/.worktrees/brush-unet/rust && cargo test -p brush-unet --features gpu --release --offline --test parity_gpu -- --nocapture --test-threads=1 && cargo run --release --example render_frame_full --features gpu --offline -- --points /Users/nzbirdranch/trippy/output/brush/horse/view_00008_points.npz --camera /Users/nzbirdranch/trippy/output/brush/horse/view_00008_camera.json --params /Users/nzbirdranch/trippy/output/brush/horse/view_00008_params.json --weights /Users/nzbirdranch/trippy/output/brush/horse/horse_unet.safetensors --out /Users/nzbirdranch/trippy/output/brush/horse/frame_00008.png --iters 10
+- 2026-09-05T16:51:49Z submitted job trippy-brush-unet-gpu-3 prio 12: bash -c set -e; export TRIPPY_OUTPUT=/Users/nzbirdranch/trippy/output; cd /Users/nzbirdranch/trippy/.worktrees/brush-unet/rust && cargo run --release --example render_frame_full --features gpu --offline -- --points /Users/nzbirdranch/trippy/output/brush/horse/view_00008_points.npz --camera /Users/nzbirdranch/trippy/output/brush/horse/view_00008_camera.json --params /Users/nzbirdranch/trippy/output/brush/horse/view_00008_params.json --weights /Users/nzbirdranch/trippy/output/brush/horse/horse_unet.safetensors --out /Users/nzbirdranch/trippy/output/brush/horse/frame_00008.png --iters 10
+- 2026-09-05T16:56:45Z submitted job trippy-brush-unet-gpu-4 prio 12: bash -c set -e; cd /Users/nzbirdranch/trippy/.worktrees/brush-unet/rust && cargo test -p brush-pyramid --features gpu --release --offline --test parity_gpu -- --nocapture --test-threads=1
+
+## 2026-09-06 — v0.4.0: the U-Net + tone mapper on wgpu, and the first honest Mac frame time
+
+**Question.** Can TRIPS's decoder-only gated U-Net (`MultiScaleUnet2dDecOnlySmallFixed`)
+and its `NeuralCamera` tone mapper run as Burn modules on wgpu, reproduce trippy's
+PyTorch forward, and — chained behind `brush-pyramid` — reproduce the whole parity
+render of the public Zenodo horse scene? And what does a 1920x1080 frame actually
+cost on this Mac?
+
+**Branch:** `feat/brush-unet`. **Jobs:** `trippy-brush-unet-gpu-1` (fixtures, rc 0),
+`-gpu-2` (fixtures + horse end-to-end + timing, rc 0), `-gpu-3` (timing with a
+stronger barrier), `-gpu-4` (`brush-pyramid` regression). All prio 12.
+
+### The bridge: `CubeTensor` -> `burn::Tensor<4>`
+
+This was the open item from the pyramid port (`docs/LIMITATIONS.md`). Confirmed on
+the pinned revision (`burn b6e27bdc`): there is **no** `Tensor::from_primitive` for a
+raw `CubeTensor`, and no readback-free alternative. `Tensor<const D>` is backend-erased
+over the *fusion* backend, where a tensor is a handle plus a position in a lazily
+recorded operation stream — not a buffer. The supported way in is a custom operation
+with **zero inputs** whose one output the op binds to an already-computed concrete
+tensor (`HandleContainer::register_float_tensor`), i.e. the one-output case of the
+seven-output `BindOp` in the fork's `brush-render/src/burn_glue.rs`.
+
+`brush-pyramid/src/gpu/burn_bridge.rs` is that, ~90 lines, generic over float/int.
+`PyramidRender::layer_tensor(l)` then does the whole layout change on device: slice
+layer `l`'s rows out of the flat `(P, C)` buffer, reshape to `[1, h_l, w_l, C]`,
+permute to NCHW. Zero-copy; the only host work is one stream registration. It needed
+two extra dependencies, `burn-fusion` and `burn-ir` (neither is re-exported through
+`burn::`), copied verbatim from the submodule's specs — `rust/Cargo.lock` grew by
+exactly 10 lines and pinned nothing new.
+
+### Parity, small fixture (random weights, `num_layers=5`, C=4, F=32, 32x24)
+
+`tools/export_unet_safetensors.py fixture` writes ~290 KiB into
+`tests/fixtures/synthetic/unet_fixture_small/`. Tolerance 1e-4:
+
+| check | max abs diff | mean abs diff | PSNR |
+|---|---:|---:|---:|
+| U-Net alone | 6.557e-7 | 1.057e-7 | 137.34 dB |
+| camera on an independent probe spanning [-1.61, 2.25] | 1.788e-7 | 1.710e-8 | — |
+| camera on PyTorch's own U-Net output | 1.192e-7 | 9.048e-9 | — |
+| U-Net + camera chained | 1.594e-6 | 5.357e-8 | 137.28 dB |
+
+So 60x to 150x headroom on the stated tolerance. The 32x24 base is chosen so that `ceil`
+halving gives `(24,32) (12,16) (6,8) (3,4) (2,2)` — the coarsest upsample produces a
+4x4 that must be centre-cropped to the 3x4 raw input, i.e. the fixture exercises the
+odd-size `CombineBridge` branch TRIPS's own code cannot handle.
+
+Two details that had to be right and were checked rather than assumed:
+
+- **Burn's bilinear `interpolate` with `align_corners = false` is PyTorch's.** cubek
+  builds the transform as `src = (dst + 0.5) * in/out - 0.5` and clamps both taps'
+  indices into range; PyTorch clamps the *coordinate* to >= 0 first. The two agree
+  because clamping either the coordinate or both tap indices gives the same value at
+  a boundary.
+- **The response LUT does not need `grid_sample`.** With `align_corners = true` and
+  `padding_mode = border`, PyTorch clips the sample coordinate before reading the two
+  taps, which makes the whole thing `clamp(x, 0, 1)` then a plain lerp between control
+  points `floor(s)` and `min(floor(s)+1, P-1)`. Implemented as one gather from a flat
+  `[1, O*P]` LUT. The fixture's `camera_probe` deliberately runs below 0 and above 1
+  so this equivalence is under test, not assumed.
+
+### Parity, end to end on the public horse scene (1920x1080, 2,218,471 points, L=8)
+
+`tools/export_unet_safetensors.py horse-e2e --index 8` writes the checkpoint's own
+point set in the pre-distorted camera frame `_render_trips_native` feeds
+`render_pyramid`, the camera JSON, the render parameters, the real weights
+(101,291 parameters, 34/34 tensors from `render_net.pth`) and the parity engine's own
+`unet_out` / `rgb` for view 8 (`00009.jpg`, the frame EXP-0002 measured). Rust then
+runs `brush-pyramid` -> `brush-unet` -> tone map and compares:
+
+| stage | max abs diff | mean abs diff | PSNR (Rust vs Python) |
+|---|---:|---:|---:|
+| U-Net output (pre tone map) | 5.869e-4 | 7.667e-7 | 114.49 dB |
+| final display RGB | 4.691e-4 | 7.094e-7 | **115.05 dB** |
+
+Bar was mean abs < 1e-3 and PSNR > 40 dB; the result clears both by three orders of
+magnitude. 10,351,708 fragments in the pyramid. Note the horse checkpoint learned a
+real response LUT but left the vignette at exactly zero, every white-balance gain at
+1.0 and frame 8's exposure at 0.0 EV — exposure, WB and the vignette polynomial are
+only covered by the synthetic fixture, which sets all three to non-trivial values.
+
+- 2026-09-05T17:18:37Z submitted job trippy-brush-unet-gpu-5 prio 12: bash -c set -e; export TRIPPY_OUTPUT=/Users/nzbirdranch/trippy/output; cd /Users/nzbirdranch/trippy/.worktrees/brush-unet/rust && cargo run --release --example render_frame_full --features gpu --offline -- --points /Users/nzbirdranch/trippy/output/brush/horse/view_00008_points.npz --camera /Users/nzbirdranch/trippy/output/brush/horse/view_00008_camera.json --params /Users/nzbirdranch/trippy/output/brush/horse/view_00008_params.json --weights /Users/nzbirdranch/trippy/output/brush/horse/horse_unet.safetensors --out /Users/nzbirdranch/trippy/output/brush/horse/frame_00008.png --iters 10
+### The first honest Mac frame time for stage 3 (M3 Ultra, 60 GPU cores, wgpu/Metal)
+
+`render_frame_full` renders the same view end to end and times it (job `-gpu-3`,
+release build, 10 iterations after a warm-up, median):
+
+```
+2,218,471 points, 1920x1080, C=4, L=8
+warm-up (shader compilation included): pyramid 531.6 ms, unet 71.6 ms, camera 4.1 ms
+whole frame, single barrier at the end: 193.1 ms  ->  5.2 fps
+```
+
+**5.2 fps at 1080p on an M3 Ultra.** The pyramid rasteriser is essentially the whole
+of it: rendering the pyramid *alone* measured ~205 ms in the same run, i.e. within
+the run-to-run spread of the 193.1 ms whole frame, so whatever the U-Net and tone map
+actually cost (>= ~4 ms from the FLOP floor below) they are a few percent of the
+frame. That is the number to plan against, and it says clearly where the next
+optimisation goes: **the sort, not the network** — two 32-bit radix passes over
+10.35 M fragments. For reference, `brush-render`'s gaussian path sorts per tile
+rather than globally, which is the obvious first thing to try.
+
+**A measurement trap worth recording.** The first attempt put a barrier *between*
+stages inside one timed run — first a one-element readback of each stage's output,
+then a full `sum()` readback. Both reported a U-Net cost of 1.3-2.3 ms. That is
+impossible: the network is ~82 GFLOP at 1920x1080 (the last up-block alone is
+2 x 28 x 32 x 9 x 2.07 M MACs) and this GPU peaks near 21.5 TFLOPS, so ~4 ms is a
+hard floor even at 100% efficiency. The work was still landing outside the window
+being measured — the staged split was measuring the barrier, not the stage. The
+example now times three *cumulative prefixes* (pyramid; pyramid+U-Net; whole frame),
+each from scratch with a single barrier at its own end and interleaved round-robin
+so clock ramp cannot bias one against another, and reports the differences. Recorded
+in `docs/LIMITATIONS.md` because "read one element back to force the GPU" is a
+natural thing to write and is wrong here.
+
+### Verdict and artefacts
+
+**PASS.** `points -> pyramid -> U-Net -> tone map -> PNG` now runs end to end on
+wgpu and reproduces trippy's Python parity engine at 115 dB on the public horse
+scene. `docs/LIMITATIONS.md`'s "no `burn::Tensor<4>`" entry is closed. What is still
+missing for v0.4.0: the backward pass (`blend_bwd`) and the viewer hook-in at
+`apps/brush-app/src/ui/splat_backbuffer.rs`.
+
+**Artefacts:** `output/logs/brush-unet-*.log`;
+`$SPLATS_ROOT/tools/gpu_queue/logs/trippy-brush-unet-gpu-{1..5}.log`; fixture at
+`tests/fixtures/synthetic/unet_fixture_small/` (296 KiB, committed); real-weight
+exports at `output/brush/` (not committed: 411 KiB of weights, an 80 MB point set
+and a 50 MB expected frame). `scripts/test.sh` stays green at 43.6 s.

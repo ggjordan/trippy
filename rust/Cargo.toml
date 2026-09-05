@@ -51,10 +51,13 @@ burn = { git = "https://github.com/tracel-ai/burn", branch = "main", default-fea
     'extension',
 ] }
 burn-cubecl = { git = "https://github.com/tracel-ai/burn", branch = "main" }
+burn-ir = { git = "https://github.com/tracel-ai/burn", branch = "main" }
 burn-wgpu = { git = "https://github.com/tracel-ai/burn", branch = "main", features = [
     "exclusive-memory-only",
 ] }
+burn-fusion = { git = "https://github.com/tracel-ai/burn", branch = "main" }
 bytemuck = "1.20"
+safetensors = "0.7"
 glam = { version = "0.30", features = ["serde"] }
 serde = { version = "1.0.215", default-features = false, features = [
     "derive",
