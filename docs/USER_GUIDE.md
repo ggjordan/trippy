@@ -88,6 +88,35 @@ rust/target/release/trips-viewer <bundle folder>
 
 or with no argument at all, and it opens a folder picker.
 
+## How to open the TRIPS viewer in a web browser (Mac, v0.5.0)
+
+The same scene, the same renderer, in a browser tab instead of an app window.
+**Double-click** `OPEN_TRIPS_WEB_<name>.command`. A tiny web server starts on
+your own machine (127.0.0.1 — nothing leaves this Mac) and the page opens.
+
+**Use Chrome.** Safari will open the page and draw something, but the picture is
+wrong — one of the renderer's shaders will not compile in Safari, and what you
+get is stripe noise rather than the scene. The page prints the error on screen
+in red and says the image is not trustworthy, so you will know; but the answer
+is to use Chrome.
+
+The controls are the native viewer's — `W A S D` to move, `Q`/`E` down and up,
+drag to look, scroll for speed, `V` to cycle views, `-`/`=` for render scale,
+`R` to jump back to the scene's own camera. The frame rate is in the top-left.
+
+**What you will and will not see.** The browser build renders the **rasteriser**:
+`raw level-0` (the photographed-ish evidence) and `coverage` (bright where the
+rasteriser drew, dark where the network would have invented the pixels). The
+**network view is not available in the browser** — a bug in a library trippy
+depends on makes it impossible to get the network's frame onto the screen there,
+and the page says so on-screen instead of pretending. For the finished,
+network-decoded image, use the native Mac viewer
+(`OPEN_TRIPS_MAC_<name>.command`); it is also about fourteen times faster.
+
+Expect about 3 frames per second on the horse scene (2.9 fps measured, while a
+training was running on the same GPU). That is slow, and honest: the browser
+re-uploads the whole two-million-point cloud on every frame.
+
 ## How to make a scene openable in the native viewer (`export-bundle`)
 
 `trippy export-bundle` packages a trained scene into one folder the native (Rust) viewer can open:

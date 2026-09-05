@@ -1,17 +1,332 @@
-# Web viewer (v0.5.0 groundwork)
+# Web viewer
 
-Status as of 2026-09-06: the **toolchain is proven end to end** on this Mac — the
-stock Brush fork's web app builds from the `rust/brush-trips` submodule to a wasm
-bundle, serves from a `.command`-launched local web server on 127.0.0.1, and loads
-a real (synthetic) `.ply` splat in a browser with WebGPU active. Dropping trippy's
-own TRIPS render output into this pipeline instead of the stock Brush renderer is a
-**separate, later task** (see "Next: wiring TRIPS in" below); nothing here changes
-`brush-pyramid`/`brush-unet` or `splat_backbuffer.rs`.
+Two things live in this document:
 
-This is groundwork for `docs/SPEC.md`'s v0.5.0 row: *"Web viewer via
-`apps/brush-app/web` (wasm-pack + vite), `OPEN_TRIPS_WEB.command` on 127.0.0.1"*.
+1. **The TRIPS web viewer (v0.5.0)** — `rust/crates/trips-web` + `web/`: trippy's
+   *own* forward pass (`brush-pyramid`'s CubeCL rasteriser, `brush-unet`'s Burn
+   decoder — the same crates the native `trips-viewer` binary runs) compiled to
+   `wasm32-unknown-unknown` and driving WebGPU on a `<canvas>`. This is the part
+   that matters; it is first, below.
+2. **The v0.5.0 groundwork (2026-09-06, earlier the same day)** — proving the
+   toolchain with the *stock* Brush web app. Kept because its build notes
+   (`npm ci` vs `npm install`, the base-path trap) still apply, and because its
+   Quest research is still the only Quest assessment that exists.
+
+---
+
+# 1. The TRIPS web viewer (`trips-web`)
+
+## What it is
+
+```
+web/index.html + web/trips.js           <- no framework, no bundler
+        │  <script type="module">
+        ▼
+pkg/trips_web.js  (wasm-pack --target web)
+        │
+        ▼
+rust/crates/trips-web  (cdylib)
+        ├── gpu.rs    wgpu Instance -> Adapter -> Device on the canvas surface,
+        │             then burn_wgpu::init_device on THAT device
+        ├── blit.rs   trips_viewer::BLIT_WGSL, as a plain wgpu render pipeline
+        └── lib.rs    wasm-bindgen entry points; thread_local viewer state
+                │
+                ▼
+rust/crates/trips-viewer  (LIBRARY target, new in v0.5.0)
+        bundle.rs · camera.rs · renderer.rs   <- shared with the native binary
+                │
+                ▼
+brush-pyramid (gpu) · brush-unet (gpu) · brush-cube/-sort/-prefix-sum
+```
+
+`trips-viewer` was split into a library plus a binary so the browser runs the
+**same** bundle loader, the **same** fly camera and the **same** per-frame
+pipeline as the Mac app. There is no second implementation of anything, and
+`shaders/blit.wgsl` is one `&'static str` shared by both front ends
+(`trips_viewer::BLIT_WGSL`), so a frame cannot be laid out two different ways.
+
+What is deliberately *not* shared: the window toolkit. `eframe`/`egui`/`rfd`
+moved to `[target.'cfg(not(target_family = "wasm"))'.dependencies]` of
+`trips-viewer`; the web front end is `wgpu` on a canvas plus ~380 lines of
+plain JavaScript. New runtime dependencies are exactly `wasm-bindgen`,
+`wasm-bindgen-futures`, `web-sys`, `js-sys`, `console_error_panic_hook` and
+`getrandom`'s `wasm_js` backend (the last is a feature selection for a crate
+already in the graph via `ahash` -> `burn-core`, done in the root crate of the
+wasm build exactly as `apps/brush-app/Cargo.toml` does it).
+
+**WebGPU only, no WebGL fallback.** Every stage of `brush_pyramid::gpu` is a
+compute shader and WebGL2 has none, so a WebGL path could not render the scene
+— only an empty canvas that looked like a viewer.
 
 ## Build
+
+```bash
+# Same one-time setup as the groundwork build below (wasm-pack, wasm32 target).
+bash scripts/web_build.sh --check --trips        # verify the toolchain, build nothing
+bash scripts/cpu_heavy.sh trips-web -- bash -c \
+  'TRIPPY_OUTPUT=$PWD/output bash scripts/web_build.sh --trips'
+```
+
+`scripts/web_build.sh --trips`:
+
+1. Guards: submodule present (`brush-cube`/`-sort`/`-prefix-sum` are path deps),
+   `npm`, `wasm-pack`, the `wasm32-unknown-unknown` target, and that
+   `--bundle` names a directory containing `bundle.json`.
+2. `wasm-pack build rust/crates/trips-web --release --target web --out-dir
+   $TRIPPY_OUTPUT/web/trips-dist/pkg`. **`--target web`, not `bundler`** — that
+   emits a plain ES module, so `index.html` can load it with
+   `<script type="module">` and there is no vite, no `npm install`, and nothing
+   to bundle. (The stock-Brush build below still needs vite; this one does not.)
+3. Copies `web/index.html` and `web/trips.js` next to `pkg/`.
+4. Copies the bundle's three files (`bundle.json`, and whatever the manifest
+   names for `points`/`weights`) into `dist/bundle/`. Default bundle:
+   `$TRIPPY_OUTPUT/brush/horse_bundle` — the **public** horse scene.
+
+Output: `$TRIPPY_OUTPUT/web/trips-dist/`, ~100 MB, of which 80 MB is
+`points.npz` and 24 MB is `trips_web_bg.wasm`.
+
+### Build timings on this Mac (M3 Ultra, warm cargo registry, shared target dir)
+
+| step | time |
+|---|---|
+| `cargo build --release` for `wasm32-unknown-unknown` (brush-pyramid, brush-unet, trips-viewer, trips-web + Burn/CubeCL/wgpu) — **cold** | 1 m 30 s |
+| the same, incremental after a one-crate edit | 9–23 s |
+| `wasm-bindgen` + `wasm-opt -Oz --converge` (68 MB → **24.4 MB** `trips_web_bg.wasm`) | ~40 s |
+| **total `--trips --release`, cold** | **2 m 14 s wall** (20 m 16 s user) |
+| `--profiling` variant (wasm-opt `-O`, keeps more names; 27 MB) | 23–31 s |
+
+## Running it
+
+`scripts/deliver.sh output/web/trips-dist <name> "<why>"` writes
+`OPEN_TRIPS_WEB_<NAME>.command`: `python3 -m http.server` bound to
+**127.0.0.1 only**, then `open`s the page. Nothing leaves the machine; the
+80 MB point set is fetched over loopback, which costs nothing worth measuring.
+
+Controls are the native viewer's (`docs/USER_GUIDE.md`). Query parameters:
+
+| parameter | default | meaning |
+|---|---|---|
+| `?bundle=<url>` | `./bundle` | bundle directory URL |
+| `?scale=<f>` | `0.75` | render scale — the shipped default, same as `scripts/open_mac_viewer.sh` |
+| `?half=0\|1` | `1` | f16 decoder — the shipped default, same as the native launcher |
+| `?mode=` | `network` | `network` / `raw` / `coverage`, the same three honesty views |
+| `?view=<n>` | bundle's | dataset view index |
+| `?screenshot=1` | off | run the verification sequence (below) and stop |
+| `?trace=1` | off | POST a stage-by-stage progress trace |
+
+## Verifying it without looking at it
+
+Safari has no headless mode on this Mac and `safaridriver --enable` needs an
+interactive sudo, so the page reports on itself. `?screenshot=1`:
+
+1. sizes the canvas to exactly **1440x810** and renders at scale 1.0 — which
+   reproduces the identical camera to `trips-viewer --screenshot --half-net
+   --scale 0.75` on a 1920x1080 view (`render_camera` scales `fx` by
+   `width / reference.width`, which is what `--scale` does natively) and makes
+   the blit a 1:1 copy rather than an upsample;
+2. renders 3 warm-up frames, then measures fps over a fixed 5 s window;
+3. posts the canvas via `canvas.toBlob()` **and** a second PNG produced by
+   `screenshot_png()` — a GPU readback encoded by the very same
+   `png::feature_to_rgb8` the native `--screenshot` uses, as a capture that
+   cannot come back blank;
+4. posts a JSON beacon: adapter, granted WebGPU features, scene, point count,
+   render size, mode, whether f16 is really in use, fps, frame count.
+
+The receiving end is a throwaway harness under `$TRIPPY_OUTPUT/web/`
+(`beacon_server.py`, `verify.sh`, `psnr.py` — not in the repo): a static file
+server that also accepts `POST /__trips_beacon` and `POST /__trips_shot`, and
+logs every `GET /__trips_stage?s=...` line, which is what turns a browser tab
+into a readable trace. The delivered `.command` launcher uses a plain
+`http.server`, which answers 501 to those POSTs; the page catches that and
+carries on.
+
+## Blockers hit, and what each one turned out to be
+
+All four were found in this session, in this order. None of them is in TRIPS
+code; three are in the pinned dependency stack and one is a real browser gap.
+
+### 1. `std::time::Instant` and `block_on` panic on wasm32 (ours, fixed)
+
+`Instant::now()` panics with "time not implemented on this platform" on
+`wasm32-unknown-unknown`, and `brush_pyramid::gpu::block_on` parks the only
+thread the page has. Fixed at the definition sites: `block_on` is now
+`#[cfg(not(target_family = "wasm"))]` so misuse cannot compile, and
+`render_inner`'s clock is constructed only when per-stage timings were asked
+for (`timed.then(Instant::now)`). `trips_viewer::renderer` got a `SubmitClock`
+that reports 0 on the web, where the frame interval comes from
+`requestAnimationFrame` anyway.
+
+### 2. wgpu panics on every **clean** error-scope pop (fatal; JS shim)
+
+```
+panicked at wgpu/src/backend/webgpu.rs:85:13: Unexpected error
+```
+
+`future_pop_error_scope` reads `GPUDevice.popErrorScope()` into a
+`js_sys::JsOption<GpuError>`, whose `into_option()` returns `None` **only for
+`undefined`**. The WebGPU specification says a clean pop resolves with
+**`null`**, and Chrome and Safari both do. So `null` is taken for an error,
+handed to `Error::from_js`, matches neither `GPUValidationError` nor
+`GPUOutOfMemoryError`, and reaches `panic!("Unexpected error")`.
+`JsNullable<T>` — the null-aware sibling in the same wasm-bindgen module — is
+what that code wants. CubeCL wraps every kernel launch and pipeline creation in
+an error scope (`cubecl-wgpu` `backend/base.rs:138`, `compute/stream.rs:401`),
+so the **first** TRIPS frame kills the page, in every browser, every time.
+
+Cannot be fixed in trippy's Rust (it is inside the pinned
+`ArthurBrussee/wgpu#js-interop-30`, reached through wasm-bindgen 0.2.127's
+newer js-sys API). `web/trips.js`'s `installWebGpuWorkaround()` rejects the pop
+instead: wgpu maps a rejected promise to "no error" and never calls `from_js`.
+Every error is still logged to the console and to the trace first, so nothing
+is hidden — the cost is that wgpu itself stops seeing validation errors, which
+for a viewer means a bad frame shows as bad pixels rather than as an exception.
+Delete the shim when the fork carries the `JsOption` -> `JsNullable` fix.
+
+### 3. CubeCL emits subgroup builtins without `enable subgroups;` (JS shim)
+
+```
+Error while parsing WGSL: :81:11 error: cannot call built-in function
+'subgroupAdd' without extension 'subgroups'
+  let v75 = subgroupAdd(v74);
+  - While calling [Device "trips-web"].CreateShaderModule(["sort_reduce_kernel"])
+```
+
+`brush-sort`'s radix passes call CubeCL's `plane_sum` / `plane_inclusive_sum`
+**unconditionally** in their `#[cube]` source (`crates/brush-sort/src/kernels.rs`),
+and CubeCL's WGSL backend translates those to `subgroupAdd` /
+`subgroupInclusiveAdd` — but never emits the `enable subgroups;` directive WGSL
+requires before either can be called. Its MSL and SPIR-V backends need no such
+directive, which is how this survived on the fork's Metal-first path. All four
+of `sort_reduce_kernel`, `sort_scan_kernel`, `sort_scan_add_kernel` and
+`sort_scatter_kernel` fail to compile, their pipelines come out invalid, and no
+frame is ever produced.
+
+**Masking `Features::SUBGROUP` off the device does not help** — measured, not
+assumed: with `subgroups` absent from the granted feature list, CubeCL emitted
+the same calls and Chrome reported the same four errors. There is no
+non-subgroup lowering to fall back to.
+
+What does work is supplying the missing line: `installWebGpuWorkaround()`
+prepends `enable subgroups;` to any shader source that calls a subgroup builtin
+and does not already declare it — 4 shaders per session, reported in the beacon
+as `subgroupShaderPatches`. Chrome then compiles all four and renders. The mask
+was reverted so `crate::gpu` keeps requesting `Features::SUBGROUP`, which is
+what makes the directive legal there.
+
+Safari is a separate case: it does **not** advertise `subgroups` at all, yet
+accepts the directive and the builtins once they are declared. It gets further
+than it did without the shim, and then fails elsewhere — see the matrix.
+
+### 4. `read_sync` cannot work on wasm — the U-Net view is still blocked
+
+```
+panicked at cubecl-environment/src/future/reader.rs:9:22:
+Failed to read tensor data synchronously. This can happen on platforms that
+don't support blocking futures like WASM.
+```
+
+Getting the U-Net's `burn::Tensor<4>` into a buffer the blit can bind means
+reading it, and **both** available routes end at CubeCL's `read_sync`, which on
+`wasm32-unknown-unknown` is `embassy_futures::poll_once` and fails unless the
+future is already complete:
+
+- `burn_bridge::resolve_to_cube_float` — the native zero-copy path — goes
+  through burn-fusion's `FusionClient::resolve_tensor_float` ->
+  `submit_blocking`;
+- `Tensor::into_data_async` — tried as a readback-and-re-upload replacement —
+  goes through burn-dispatch, whose `float_into_data`
+  (`burn-dispatch/src/ops/tensor.rs:54`) calls `read_sync` *inside* the async
+  function. Awaiting it does not help.
+
+It is an unrecoverable wasm trap, not an error return, so it cannot be caught.
+There is no async resolve in burn-fusion and no async `into_data` in
+burn-dispatch; nothing in trippy's code can route around it.
+
+The rasteriser's own views never go near it — `RawLevel0` and `Coverage` bind
+`PyramidRender`'s `CubeTensor`s directly — which is why they render.
+`trips-web` therefore substitutes `raw level-0` for `network`, says so on
+screen and in its status JSON (`networkBlocked: true`), and keeps
+`?force-network=1` so the trap stays reproducible. The `cfg`-split
+`resolve_network_output` in `trips_viewer::renderer` (readback + re-upload
+through the new `brush_pyramid::gpu::upload_f32`) is the shape of the fix and
+is kept for the day the upstream read becomes async.
+
+### Browser support matrix (this Mac, 2026-09-06, release build, view 8, 1440x810)
+
+| | Chrome 152.0.7977.83 | Safari 26.6.2 |
+|---|---|---|
+| installed | this session, `brew install --cask google-chrome` (dev tooling; nothing was sent anywhere) | system |
+| `navigator.gpu`, adapter | yes (unnamed, `BrowserWebGpu`) | yes (`apple`) |
+| 80 MB bundle fetch + inflate + wasm init + Burn on the shared device | yes | yes |
+| `shader-f16` granted | yes | yes |
+| `subgroups` granted | **yes** | **no** (not in `GPUAdapter.features`) |
+| shaders needing the injected `enable subgroups;` | 4 | 4 |
+| frames produced | yes | yes |
+| fps over a 5 s window (`raw level-0`) | **2.90** (15 frames / 5.18 s) | **3.25** (17 frames / 5.24 s) |
+| `canvas.toBlob()` PNG | 2,003,242 bytes | 1,068,451 bytes |
+| **is the picture right?** | **YES — the horse** | **NO — garbage** |
+
+**Chrome renders the scene correctly.** The 1440x810 `canvas.toBlob()` capture
+is the public TRIPS horse statue, its plinth and the house behind it, from
+dataset view 8, in `raw level-0` — pre-network feature channels clamped to
+`[0, 1]` for display, which is why it is speckled and heavily saturated (28 %
+of bytes are exactly 0, 23 % exactly 255). That is what this view is supposed
+to look like; `docs/USER_GUIDE.md` calls it "sparse and speckled is normal,
+this is the evidence".
+
+**Safari draws a wrong image.** It produces frames at a plausible rate and a
+plausible file size, and the picture is horizontal stripe noise. One CubeCL
+compute shader fails to compile —
+
+```
+GPUValidationError: 1 error generated while compiling the shader:
+1:0: Expected 'f16'
+... createComputePipeline failed
+```
+
+— and because blocker 2's shim removes wgpu's fatal error path, the missing
+stage silently produces nothing and the pipeline draws garbage. **Do not use
+Safari for this viewer.** Two things follow:
+
+1. `web/trips.js` now collects every WebGPU error and prints it **on screen in
+   red**, with "THIS IMAGE IS NOT TRUSTWORTHY", and includes them in the
+   beacon. Neutralising a fatal error handler is only defensible if the errors
+   stay visible; an honesty-first viewer that shows an invented picture without
+   saying so would be worse than one that crashes.
+2. The earlier reading of Safari in this session — "hard wall, cannot compile
+   the sort kernels" — was from *before* the `enable subgroups;` shim existed.
+   With the directive Safari accepts the subgroup builtins even though it does
+   not advertise the feature. It then fails elsewhere, on f16. Both statements
+   were true when measured; this table is the final one.
+
+### Not measured
+
+- **No PSNR against `output/brush/viewer/halfnet_s75.png`.** That reference is
+  the *network* frame, and the browser cannot produce a network frame
+  (blocker 4). Comparing it with a `raw level-0` capture is meaningless — the
+  two hold different quantities, and measured they correlate at r = -0.05.
+  A like-for-like check would need a native `trips-viewer --screenshot --mode
+  raw` reference, which is GPU work and a Splats training held the queue.
+  The pixel evidence that does exist is the capture itself, checked directly
+  (the horse scene is the public Zenodo one, which `AGENTS.md` permits
+  viewing).
+- **fps was measured with a Splats training running on the same GPU**
+  (`60-hunua-clip5250-train`), so both numbers are lower bounds. The 5 s window
+  is deliberate: AGENTS.md's GPU rule caps an unqueued browser check at ~10 s.
+- **Interactive fps at window size** — every number here is the fixed 1440x810
+  screenshot canvas.
+
+---
+
+# 2. Groundwork: the stock Brush web app
+
+Status as of 2026-09-06 (earlier the same day): the toolchain was proven end to
+end with the **stock** Brush fork's web app before any TRIPS code was compiled
+for wasm. Everything in this half is still accurate for that build target
+(`scripts/web_build.sh` with no `--trips`), and its `npm ci` and base-path notes
+are the reason that build works at all.
+
+## Build (stock Brush app)
 
 `scripts/web_build.sh` wraps the fork's own build (`rust/brush-trips/apps/brush-app/web/package.json`):
 
@@ -188,6 +503,50 @@ this non-interactive session. `docs/SPEC.md`'s v0.5.0 fps acceptance
 (`≥15 fps 1080p in Chrome`) is **not evaluated at all** here: Chrome is not
 installed on this machine, so neither functional nor fps verification in
 Chrome specifically was possible this session (see "Open questions").
+
+## Quest, honestly (updated 2026-09-06 after the TRIPS viewer ran)
+
+Nothing was measured on a Quest — none is here. What changed today is that the
+*desktop* result now bounds the Quest question much harder than the paper
+argument below did, and in the wrong direction.
+
+The web viewer renders trippy's real rasteriser in a browser at **2.9 fps at
+1440x810**, on an M3 Ultra, with the **U-Net not running at all**. The network
+is ~89 % of a native frame (`docs/LIMITATIONS.md`), so a complete browser frame
+on this machine would be some way under 1 fps before any Quest is involved. A
+Quest's mobile GPU is one to two orders of magnitude slower than this desktop.
+Interactive TRIPS in Quest Browser is therefore not a "measure it and see"
+question any more; it is arithmetic, and the answer is no.
+
+Three separate walls stand between here and a Quest, and each is enough on its
+own:
+
+1. **The U-Net cannot run in a browser at all** on this dependency stack
+   (CubeCL's `read_sync`, blocker 4). Until that is fixed upstream there is no
+   finished frame to be slow *at*.
+2. **Two dependency bugs already need JavaScript shims** to get any frame out of
+   a desktop browser (blockers 2 and 3), and one of the two browsers here still
+   draws a wrong image. Quest Browser is a third WebGPU implementation with its
+   own gaps; on today's evidence the base rate for "this stack works
+   unmodified in a new browser" is poor.
+3. **Meta's own release notes still scope Quest's WebGPU to WebXR sessions**
+   (146.0, 149.1, 150.1 — all "experimental", all tied to depth projection /
+   space-warp / foveation). `trips-web` is a flat 2D canvas app that never opens
+   an XR session, which is exactly the case those notes do not document. That
+   research is unchanged and is kept below.
+
+So: **do not promise interactive Quest performance, and do not spend a session
+on Quest hardware yet.** The honest sequencing is (a) get the U-Net running in
+a desktop browser, (b) cache the per-frame point upload so a desktop browser
+frame is tens of milliseconds rather than hundreds, (c) *then* ask what a Quest
+does with it. Until (a) and (b) land, the shipped Quest answer stays the
+fallback that already exists and does not depend on WebGPU at all: distilled
+Gaussians via `~/Splats/tools/publish/publish_splat.sh`, or `tools/flythrough.py`
+MP4s.
+
+The on-device checklist below is still the right checklist for the day (c)
+arrives, and the "does it even get a WebGPU device on a flat page" question is
+still the first thing to answer.
 
 ## Quest assessment (paper only — nothing measured on-device)
 

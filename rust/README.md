@@ -309,6 +309,30 @@ cargo run --release --example render_frame_full --features gpu -- \
   --out /tmp/frame.png --iters 10
 ```
 
+## `trips-web`: the same renderer, in a browser
+
+`rust/crates/trips-web` is a `cdylib` that compiles `trips-viewer`'s library half
+for `wasm32-unknown-unknown` and drives WebGPU on a `<canvas>`. No eframe, no
+egui, no bundler: `wasm-pack build --target web` emits a plain ES module and
+`web/index.html` loads it with `<script type="module">`.
+
+```
+crates/trips-web/
+├── src/gpu.rs   wgpu Instance -> Adapter -> Device on the canvas surface, then
+│                burn_wgpu::init_device on THAT device (the native trick, minus eframe)
+├── src/blit.rs  trips_viewer::BLIT_WGSL as a plain wgpu render pipeline
+└── src/lib.rs   wasm-bindgen entry points over a thread_local viewer
+```
+
+Build: `scripts/web_build.sh --trips` (2 m 14 s cold on this Mac; 24.4 MB wasm).
+Serve: `scripts/deliver.sh output/web/trips-dist <name> "<why>"`.
+
+**Read `docs/WEB_VIEWER.md` before touching it.** Four blockers had to be found
+and named to get a frame out of a browser at all, two of them are worked around
+by shims in `web/trips.js`, and one of them — the U-Net view — is still
+unsolved: CubeCL's `read_sync` cannot block on wasm32, so the rasteriser's views
+render and the network's does not. `docs/LIMITATIONS.md` has the short version.
+
 ## `trips-viewer`: the native Mac viewer
 
 `rust/crates/trips-viewer` is the third crate in the thin workspace and the thing
@@ -317,14 +341,24 @@ own size, with the real forward pass in the middle.
 
 ```
 crates/trips-viewer/
-├── src/main.rs        argv, the eframe launch, and the headless --screenshot/--bench paths
+├── src/lib.rs         LIBRARY: the platform-neutral half, shared with trips-web
 ├── src/bundle.rs      the `trippy-bundle-1` reader (bundle.json + points.npz + weights)
 ├── src/camera.rs      the fly camera; how a drag becomes (R, t)
 ├── src/renderer.rs    one frame: pyramid -> U-Net -> tone map, or a diagnostic buffer
+├── src/shaders/blit.wgsl   re-exported as `trips_viewer::BLIT_WGSL`
+├── src/main.rs        BINARY: argv, the eframe launch, --screenshot/--bench
 ├── src/app.rs         the egui shell: input, the ms/fps readout, the lever checkboxes
-├── src/blit.rs        the egui paint callback that binds a Burn buffer, no copy
-└── src/shaders/blit.wgsl
+└── src/blit.rs        the egui paint callback that binds a Burn buffer, no copy
 ```
+
+Since v0.5.0 this package has **both** a library and a binary target. `lib.rs`
+holds everything that does not know what a window is — the bundle loader, the
+camera and the per-frame pipeline — so `crates/trips-web` compiles the identical
+code for `wasm32-unknown-unknown` instead of re-implementing it. `eframe`, `egui`,
+`wgpu` and `rfd` moved to a `[target.'cfg(not(target_family = "wasm"))'.dependencies]`
+block, which is what keeps them out of the wasm graph. Nothing in `lib.rs` may
+reference them, call `std::time::Instant::now()` (it panics on wasm32) or
+`brush_pyramid::gpu::block_on` (which is now `cfg`-ed out for wasm entirely).
 
 **It is a separate binary, not a panel inside `apps/brush-app`.** That was the open
 question ADR-0005 left; `docs/decisions/ADR-0006-viewer-integration.md` decides it and

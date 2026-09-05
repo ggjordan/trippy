@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TRIPS — web viewer</title>
+<!--
+  index.html — the desktop web TRIPS viewer's shell.
+
+  Module: web/ (the whole front end; no framework, no bundler)
+  Purpose: give `trips-web`'s wasm module a <canvas>, drive its frame loop from
+      requestAnimationFrame, show the fps/mode readout, and (in ?screenshot=1
+      mode) post a status beacon and a PNG to a local endpoint so a headless
+      agent can verify the page without ever looking at it.
+  Invariants:
+      - Loaded as an ES module straight from a static file server. wasm-pack is
+        run with `--target web`, which emits a plain ES module -- so there is no
+        vite, no npm install, and nothing to bundle. `scripts/web_build.sh
+        --trips` copies these two files next to `pkg/` and the bundle assets.
+      - Everything is same-origin on 127.0.0.1. The only network calls are
+        `fetch`es of files this same server is serving, plus the two beacon
+        POSTs, which also go to this origin. Nothing leaves the machine.
+      - WebGPU only. If `navigator.gpu` is missing the page says so plainly
+        rather than falling back to a WebGL path that could not run the
+        rasteriser's compute shaders anyway.
+  Related docs: docs/WEB_VIEWER.md; docs/USER_GUIDE.md;
+      rust/crates/trips-web/src/lib.rs.
+-->
+<style>
+  html, body {
+    margin: 0; padding: 0; height: 100%; overflow: hidden;
+    background: #101014; color: #e8e8ee;
+    font: 13px/1.45 -apple-system, BlinkMacSystemFont, "SF Mono", Menlo, monospace;
+  }
+  #canvas { display: block; width: 100vw; height: 100vh; }
+  #hud {
+    position: fixed; top: 10px; left: 10px; z-index: 2;
+    background: rgba(16, 16, 20, 0.78); border: 1px solid #33333f; border-radius: 6px;
+    padding: 8px 11px; max-width: 46ch; pointer-events: none; white-space: pre-wrap;
+  }
+  #hud b { color: #9fd8ff; font-weight: 600; }
+  #keys { color: #8a8a99; margin-top: 6px; font-size: 12px; }
+  #error {
+    position: fixed; inset: 0; z-index: 3; display: none;
+    padding: 8vh 8vw; background: #101014; color: #ff9d9d; white-space: pre-wrap;
+    overflow: auto;
+  }
+</style>
+</head>
+<body>
+<canvas id="canvas"></canvas>
+<div id="hud">starting…</div>
+<pre id="error"></pre>
+<script type="module" src="./trips.js"></script>
+</body>
+</html>

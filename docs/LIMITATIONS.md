@@ -497,6 +497,91 @@ rather than the only defence.
   another, and reports the differences. The whole-frame number is measured directly
   and is the one to quote; the per-stage split inherits the noise of two
   measurements and each prefix charges its own barrier's readback.
+## Web viewer (v0.5.0, `rust/crates/trips-web` + `web/`)
+
+The whole diagnosis, with the exact error strings, is in `docs/WEB_VIEWER.md`.
+This is the short list of what the browser build cannot do.
+
+### The U-Net view does not run in a browser at all
+
+`raw level-0` and `coverage` render; **`network` does not**. Both ways of getting
+the U-Net's `burn::Tensor<4>` into a buffer the blit can bind —
+`burn_bridge::resolve_to_cube_float` (burn-fusion `submit_blocking`) and
+`Tensor::into_data_async` (burn-dispatch, whose `float_into_data` calls
+`read_sync` *inside* the async function) — end at CubeCL's `read_sync`, which on
+`wasm32-unknown-unknown` is `embassy_futures::poll_once` and fails unless the
+future is already complete. It is an unrecoverable wasm trap, not an error
+return. The rasteriser's own views bind `PyramidRender`'s `CubeTensor`s
+directly and never go near it, which is why they work.
+
+`trips-web` therefore substitutes `raw level-0` for `network` and **says so** on
+screen and in its status JSON (`networkBlocked: true`); `?force-network=1`
+reproduces the trap for whoever revisits this. The fix is upstream: an async
+resolve in burn-fusion, or an async `into_data` in burn-dispatch. Nothing in
+trippy's code can route around it.
+
+**Consequence for the acceptance check:** there is no browser-side PNG of the
+*network* frame, so there is no PSNR against
+`output/brush/viewer/halfnet_s75.png`. The pixel evidence that does exist is a
+2 MB `canvas.toBlob()` capture of the rasteriser's level-0 view at 1440x810.
+
+### Two shims in `web/trips.js` compensate for dependency bugs
+
+Neither is a preference; without them the page dies on its first frame in every
+browser.
+
+1. **`popErrorScope` is neutralised.** wgpu's WebGPU backend reads a clean pop
+   (`null` per spec) into a `js_sys::JsOption`, which only treats `undefined`
+   as "none", so it panics `"Unexpected error"` on *every* clean pop — and
+   CubeCL wraps every kernel launch in an error scope. Errors are still logged
+   to the console and the trace; what is lost is wgpu's own view of validation
+   errors, so a bad frame shows as bad pixels rather than as an exception.
+2. **`enable subgroups;` is prepended to shaders that need it.** CubeCL's WGSL
+   backend emits `subgroupAdd`/`subgroupInclusiveAdd` for `brush-sort`'s radix
+   passes without the directive WGSL requires. Masking `Features::SUBGROUP` off
+   does *not* avoid it — measured; there is no non-subgroup lowering.
+
+### Safari draws a WRONG image — use Chrome
+
+Safari 26.6.2 gets all the way to producing frames (3.25 fps, a
+plausible-looking 1 MB PNG) and **the picture is horizontal stripe noise, not
+the horse**. One CubeCL compute shader fails to compile there —
+`GPUValidationError: 1 error generated while compiling the shader: 1:0:
+Expected 'f16'`, then `createComputePipeline failed` — and because the shim
+above removes wgpu's fatal error path, the missing stage silently contributes
+nothing and the rest of the pipeline draws garbage.
+
+Chrome 152 renders the same scene correctly (verified against the pixels; the
+horse is the public Zenodo scene).
+
+This is why `web/trips.js` prints every WebGPU error **on screen in red** with
+"THIS IMAGE IS NOT TRUSTWORTHY" and puts them in the beacon. Neutralising a
+fatal error handler is only defensible if the errors stay visible: a viewer
+built around telling photographed pixels from invented ones must not quietly
+show an invented picture.
+
+Note the contrast with the v0.5.0 groundwork, where Safari ran the *stock*
+Brush splat viewer fine — Brush's Gaussian rasteriser and trippy's TRIPS
+rasteriser share no kernels.
+
+### The web frame pays for one copy the Mac app does not
+
+`trips_viewer::renderer::resolve_network_output` is `cfg`-split; the web branch
+reads the frame back and re-uploads it (`3 * H * W * 4` bytes each way, 14 MB at
+1440x810). Dead code today because the network view is blocked, but it is the
+shape of the fix if the upstream read is ever made async.
+
+### The browser is much slower than the Mac app, and the point upload is why
+
+Measured in Chrome 152 on this M3 Ultra, 1440x810, `raw level-0`, **while a
+Splats training was running on the same GPU**: **2.90 fps** over 15 frames in
+5.18 s (~345 ms/frame), against **46.6 fps** for the identical view natively. Most of
+that gap is not the GPU: `render_inner` re-uploads the whole point set every
+frame (~80 MB — see "The point set is re-uploaded every frame" above), and in a
+browser each upload crosses the wasm/JS boundary into a `GPUQueue.writeBuffer`
+instead of being a memcpy into unified memory. Caching the uploaded point
+buffers between frames is the obvious fix and would help the native viewer too.
+
 ## Distillation (design B)
 
 - **A distilled splat can only be as good as the checkpoint it was distilled from.**

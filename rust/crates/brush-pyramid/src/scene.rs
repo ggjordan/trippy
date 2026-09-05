@@ -23,7 +23,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::npz::{read_npz, NpyArray};
+use crate::npz::{read_npz, read_npz_bytes, NpyArray};
 
 /// A splattable point set, flattened for upload.
 #[derive(Debug, Clone, PartialEq)]
@@ -102,12 +102,36 @@ impl PointSet {
     /// Returns `Err` if the archive cannot be read, a required array is
     /// missing, or the shapes disagree.
     pub fn from_npz(path: &Path) -> Result<Self, String> {
-        let arrays = read_npz(path)?;
+        Self::from_arrays(read_npz(path)?, &path.display().to_string())
+    }
+
+    /// Load from the **bytes** of a numpy `.npz`.
+    ///
+    /// The web viewer has no filesystem: it `fetch`es `points.npz` over
+    /// loopback and hands the body straight here, so exactly the same parser,
+    /// key aliases and shape checks apply as on the native path. See
+    /// `docs/WEB_VIEWER.md`.
+    ///
+    /// # Arguments
+    /// - `bytes`: the whole archive.
+    /// - `origin`: what to name in error messages (a URL, usually).
+    ///
+    /// # Errors
+    /// As [`Self::from_npz`].
+    pub fn from_npz_bytes(bytes: &[u8], origin: &str) -> Result<Self, String> {
+        Self::from_arrays(read_npz_bytes(bytes)?, origin)
+    }
+
+    /// The shared body of [`Self::from_npz`] and [`Self::from_npz_bytes`].
+    fn from_arrays(
+        arrays: std::collections::HashMap<String, NpyArray>,
+        origin: &str,
+    ) -> Result<Self, String> {
         let pick = |names: &[&str]| -> Result<&NpyArray, String> {
             names
                 .iter()
                 .find_map(|n| arrays.get(*n))
-                .ok_or_else(|| format!("{}: none of {names:?} present", path.display()))
+                .ok_or_else(|| format!("{origin}: none of {names:?} present"))
         };
 
         let xyz_arr = pick(&["xyz"])?;

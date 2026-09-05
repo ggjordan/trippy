@@ -23,9 +23,13 @@
 
 mod app;
 mod blit;
-mod bundle;
-mod camera;
-mod renderer;
+
+// The platform-neutral half lives in this package's library target (`src/lib.rs`)
+// so `rust/crates/trips-web` can compile the identical bundle loader, camera and
+// render pipeline for wasm32. These imports are what keeps every `crate::bundle`
+// / `crate::camera` / `crate::renderer` path below (and in `app.rs`/`blit.rs`)
+// resolving unchanged.
+use trips_viewer::{bundle, camera, renderer};
 
 use std::path::PathBuf;
 
