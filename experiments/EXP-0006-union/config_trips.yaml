@@ -14,7 +14,7 @@
 # fraction of a second instead of re-running the kNN every time this config is used.
 
 scene_root: /Users/nzbirdranch/Splats/scenes/karekare/kk-coherent
-run_dir: output/runs/EXP-0006-union/trips
+run_dir: output/runs/EXP-0006-union/union-trips
 
 width: 1008
 crop: 384
