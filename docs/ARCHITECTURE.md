@@ -151,3 +151,43 @@ CPU pytest (before any GPU job):
 7. **U-Net shape**: odd-size crops, verify autograd.
 
 If any test fails, training is not submitted.
+
+## net/ -- U-Net, neural camera, losses (feat/net, 2026-09-05)
+
+`trippy/net/` ports TRIPS's default render/tone-mapping network, verified against
+`third_party/TRIPS/src/lib/models/{Networks,NeuralCamera}.{h,cpp}` and, for the one piece not vendored in
+this checkout (Saiga's gated conv block and SSIM), against the public Saiga source fetched over the
+network. See `docs/TRIPS_REFERENCE.md` Sec. 5-7, 9 and `docs/LIMITATIONS.md`'s "net/" section for full
+citations; this is a summary for the architecture overview.
+
+- **`trippy/net/gated.py`**: `GatedConvBlock` -- two independent 3x3 convs (`feature_transform` ->
+  activation, `mask_transform` -> sigmoid) multiplied together then normed; exact Saiga formula, not a
+  guess (see LIMITATIONS.md).
+- **`trippy/net/unet.py`**: `MultiScaleUnet2dDecOnlySmallFixed` -- a decoder-only U-Net that consumes a
+  finest-first image pyramid (`inputs[0]` = full resolution) with no encoder/downsample path at all (the
+  rasteriser itself produces every pyramid level directly). At the *shipped default* config
+  (`train_normalnet.ini`: `filters=32, num_input_channels=4, num_layers=5`), the exact, hand-verified
+  parameter count is **59,675** (corrects an earlier unverified "~130k" estimate in this file's memory
+  section below). The publicly released Tanks & Temples checkpoints were actually trained with
+  `num_layers=8` (101,291 params) -- see `docs/LIMITATIONS.md` for how that was discovered (a real
+  checkpoint's shapes matched trippy's from-scratch port tensor-for-tensor once `num_layers` was corrected).
+  Odd input resolutions are centre-cropped to a multiple of `2**(num_layers-1)`, a documented, safe
+  generalization of TRIPS's own `CombineBridge` (see LIMITATIONS.md).
+- **`trippy/net/camera_model.py`**: `NeuralCamera` -- per-image exposure (`x * 2**-ev`), per-image white
+  balance (green fixed to 1), a radial vignette (zero-init, so a no-op until trained), and a 25-point
+  learned response-curve LUT (init to a gamma-1/2.2 curve, applied via `grid_sample`). Rolling shutter is
+  not ported (off by default in TRIPS).
+- **`trippy/net/losses.py`**: `TripsLoss` combines L1 + SSIM (Saiga's real 5x5-window formula, fetched and
+  verified, not the generic 11x11 window) + a `lpips.LPIPS(net='vgg')` stand-in for TRIPS's un-portable
+  Caffe VGG19 perceptual loss + an optional `lpips.LPIPS(net='alex')` term (Saiga's own verified choice for
+  its separate, off-by-default `loss_lpips`), with a validity mask honoured by all four terms.
+- **`trippy/net/checkpoint.py`**: `try_load_trips_network` -- best-effort loader for TRIPS's
+  `render_net.pth` files. Tries `torch.jit.load` (which, in practice, does succeed at reading the named
+  tensors -- see `docs/TRIPS_REFERENCE.md` Sec. 9a for the correction to this doc's earlier assumption)
+  then `torch.load(weights_only=False)` as a fallback, and assigns into a target module by shape-matched
+  registration order.
+
+The memory-notes section above ("U-Net: ~130k params, 5 levels") predates this verification and is now
+known to undercount the "params" figure's precision (true default is 59,675, not "~130k"); the "5 levels"
+figure is correct for the shipped `train_normalnet.ini` default (though not for the released checkpoints,
+which use 8).

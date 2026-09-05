@@ -102,6 +102,79 @@ COLMAP_DEFAULT_CONF0 = 0.5
 
 DEFAULT_DENSITY_GAUSSIAN_PLY = "output/Training-Data/karekare/kk-coherent/kkc_15000.ply"
 DEFAULT_DENSITY_COLMAP_SPARSE_DIR = "scenes/karekare/kk-coherent/sparse_txt"
+
+# --- net/gated.py : Saiga::GatedBlockImpl ---
+# Source: https://github.com/darglein/saiga @ ee7a4e6b65832433e2ca521353b7b7431c8e17a0
+# src/saiga/vision/torch/PartialConvUnet2d.h:108-150 (fetched over the network per task
+# authorization -- External/saiga/ is an empty dir in the vendored TRIPS checkout).
+
+# GatedBlockImpl only supports kernel_size==3 (SAIGA_ASSERT(kernel_size == 3),
+# PartialConvUnet2d.h:116) -- MultiScaleUnet2dDecOnlySmallFixed never calls it with anything
+# else (Networks.h UnetBlockFromString(..., 3, 1, 1, ...) at every call site).
+GATED_CONV_KERNEL_SIZE = 3
+
+# --- net/unet.py : MultiScaleUnet2dDecOnlySmallFixed defaults ---
+# configs/train_normalnet.ini:202-219 (TRIPS @ a59a65b6d9a8b1c14c73bc004cc9a8956f054c24).
+NET_DEFAULT_NUM_INPUT_LAYERS = 5  # ini:202 num_input_layers
+NET_DEFAULT_NUM_INPUT_CHANNELS = 4  # ini:203 num_input_channels
+NET_DEFAULT_NUM_OUTPUT_CHANNELS = 3  # ini:204 num_output_channels
+NET_DEFAULT_NUM_LAYERS = 5  # ini:206 num_layers
+NET_DEFAULT_UPSAMPLE_MODE = "bilinear"  # ini:210 upsample_mode
+NET_DEFAULT_NORM = "id"  # ini:211-212 norm_layer_down / norm_layer_up (both "id")
+NET_DEFAULT_LAST_ACT = "id"  # ini:213 last_act
+NET_DEFAULT_ACTIVATION = "elu"  # ini:217 activation (every gated block's feature activation)
+# ini:219 `filters_network = 32 32 32 32 32 32 32 32` -- 8 entries (max num_layers the C++
+# struct supports); only indices 0..num_layers-1 are read when num_layers=5, and they are
+# all equal, so trippy's NetworkConfig simplifies this to one scalar `filters` field. TRIPS's
+# struct technically allows a per-level list; that generality is unused by any shipped .ini
+# and is out of scope here (documented, not guessed -- see docs/TRIPS_REFERENCE.md Sec. 5).
+NET_DEFAULT_FILTERS = 32
+
+# Upsample scale factor for every UpsampleDecOnlySmallBlockFixed / SmallDecStartBlock stage
+# (Networks.h:1009 `std::vector<double> scale = {2.0, 2.0}`).
+NET_UPSAMPLE_SCALE_FACTOR = 2.0
+
+# --- net/camera_model.py : NeuralCameraParams / CameraResponseNetImpl defaults ---
+# Sources: third_party/TRIPS/src/lib/data/Settings.h:110-141, configs/train_normalnet.ini:190-198.
+CAMERA_DEFAULT_ENABLE_EXPOSURE = True  # ini:191
+CAMERA_DEFAULT_ENABLE_WHITE_BALANCE = True  # ini:193 (Settings.h struct default is False; ini wins)
+CAMERA_DEFAULT_ENABLE_VIGNETTE = True  # ini:190 (module always present; params init to 0 => no-op at init)
+CAMERA_DEFAULT_ENABLE_RESPONSE = True  # ini:192
+CAMERA_DEFAULT_RESPONSE_PARAMS = 25  # ini:196, CameraResponseNetImpl LUT control-point count
+CAMERA_DEFAULT_RESPONSE_GAMMA = 1.0 / 2.2  # ini:197 (0.4545454681, a float32 round-trip of 1/2.2)
+CAMERA_DEFAULT_RESPONSE_LEAK_FACTOR = 0.01  # ini:198 (0.009999999776, float32 round-trip of 0.01)
+
+# CameraResponseNetImpl::ParamLoss's internal MSE weighting (NeuralCamera.cpp:154
+# `double smoothness_factor = 1e-5;`), squared into the loss via `factor = n*sqrt(1e-5)`
+# applied to both operands before torch::mse_loss(..., Reduction::Sum). This is a different
+# constant from the ini's `response_smoothness` (=1, an outer multiplier applied at the
+# Pipeline.cpp:804 call site, `params->optimizer_params.response_smoothness * camera->ParamLoss()`)
+# -- both are folded into NeuralCamera.regularizer() in trippy's port for a single call site.
+CAMERA_RESPONSE_SMOOTHNESS_INTERNAL_FACTOR = 1e-5
+CAMERA_RESPONSE_SMOOTHNESS_OUTER_WEIGHT = 1.0  # ini response_smoothness (OptimizerParams section)
+
+# CameraResponseNetImpl::forward's leaky-extrapolation epsilon (NeuralCamera.cpp:104
+# `leaky_value / (image.abs() + 1e-4).sqrt()`), guarding the 1/sqrt(|x|) singularity at x=0.
+CAMERA_RESPONSE_LEAK_SQRT_EPS = 1e-4
+
+# --- net/losses.py : Saiga::SSIMImpl defaults ---
+# Source: https://github.com/darglein/saiga @ 5fb87057f09f518b1ecf7de1a486420681455892
+# src/saiga/vision/torch/ImageSimilarity.h:73-126 (fetched over the network; confirmed as the
+# exact class TRIPS instantiates via `SSIM loss_ssim = SSIM();`, Pipeline.h:238, i.e. with the
+# class's own defaults radius=2, max_value=1 -- NOT the generic "11x11" Wang et al. window).
+SSIM_GAUSSIAN_RADIUS = 2  # window size = 2*radius + 1 = 5x5
+SSIM_GAUSSIAN_SIGMA = 1.5
+SSIM_MAX_VALUE = 1.0  # images are compared in [0, 1]; C1 = (0.01*max)^2, C2 = (0.03*max)^2
+SSIM_C1_COEFF = 0.01
+SSIM_C2_COEFF = 0.03
+
+# --- net/losses.py : TripsLoss default weights ---
+# configs/train_normalnet.ini:40-42,62-63 (`[TrainParams]`).
+LOSS_DEFAULT_WEIGHT_VGG = 1.0  # ini:40 loss_vgg
+LOSS_DEFAULT_WEIGHT_L1 = 1.0  # ini:41 loss_l1
+LOSS_DEFAULT_WEIGHT_MSE = 0.0  # ini:42 loss_mse (unused by trippy's TripsLoss; kept for parity)
+LOSS_DEFAULT_WEIGHT_SSIM = 1.0  # ini:62 loss_ssim
+LOSS_DEFAULT_WEIGHT_LPIPS = 0.0  # ini:63 loss_lpips (off by default; VGG carries perceptual loss)
 # --- scene/colmap_io.py binary format ---
 
 # COLMAP's fixed camera_model_id -> (model_name, num_params) table, as used

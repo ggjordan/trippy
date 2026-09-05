@@ -326,6 +326,56 @@ determines whether each block has 1 or 2 conv weight tensors of shape `[out,in,3
 porter must confirm against the real Saiga source or against a loaded checkpoint's `state_dict` keys/shapes
 before assuming this.
 
+### 5a. UPDATE (feat/net, 2026-09-05): gated-conv formula fetched and verified against a real checkpoint
+
+The above paragraph's "presumably" is resolved. `External/saiga/` is still an empty dir in this checkout,
+but Saiga is public MIT source, so it was fetched directly from GitHub (no private data involved):
+
+```
+Source:  https://github.com/darglein/saiga
+Commit:  ee7a4e6b65832433e2ca521353b7b7431c8e17a0  ("use namespace tinyeigen", 2026-03-20)
+File:    src/saiga/vision/torch/PartialConvUnet2d.h:108-152 (GatedBlockImpl)
+```
+
+Exact formula (`GatedBlockImpl::forward`, PartialConvUnet2d.h:139-145):
+```cpp
+auto x_t = feature_transform->forward(x);   // Conv2d(in,out,3,pad=1) -> Activation (elu by config)
+auto m_t = mask_transform->forward(x);      // Conv2d(in,out,3,pad=1) -> Sigmoid  (independent weights)
+auto res = norm.forward(x_t * m_t);         // norm = Identity when norm_str == "id"
+return {res, mask};                          // the incoming validity `mask` is passed through UNCHANGED
+```
+Both convs read the *same* input `x` (not each other's output, not `mask`); they have independent
+weights but identical (in_channels, out_channels, kernel=3, stride=1, dilation=1, padding=1) — confirmed
+against `NormFromString`/`ActivationFromString` in `src/saiga/vision/torch/TorchHelper.h:194-246` (same
+commit; `"id"` -> `torch::nn::Identity()`, `"bn"` -> `BatchNorm2d(momentum=0.01)`, `"elu"` ->
+`torch::nn::ELU()`). So each `GatedConvBlock(in, out)` costs exactly `2 * (9*in*out + out)` parameters
+under `norm="id"` — the guess in the paragraph above was right, and is now source-verified, not assumed.
+
+**Real-checkpoint verification** (trippy's `feat/net` port, `tests/test_net_unet.py` +
+`third_party/zenodo/tt_checkpoints/checkpoint_horse/ep0600/render_net.pth`, extracted from the public
+Zenodo record 10687419 checkpoint archive): loading that file via `torch.jit.load` (see correction to
+Sec. 9 below) yields exactly 34 named tensors whose names (`start.conv.feature_transform.0.weight`,
+`up7.convolution.mask_transform.0.bias`, `final.0.weight`, ...) and shapes match trippy's from-scratch
+Python port **tensor-for-tensor, in registration order**, once `num_layers` is set to match that
+checkpoint's own `params.ini` (see next paragraph) — the strongest possible confirmation of this section's
+architecture table and the gated-conv formula above, independent of reading Networks.h a second time.
+
+**IMPORTANT discrepancy discovered from the real checkpoint's `params.ini`**: the public Zenodo Tanks &
+Temples checkpoints (all 8 scenes: family, francis, horse, lighthouse, m60, panther, playground, train)
+were trained with `num_input_layers = 8` and `num_layers = 8`, **not** the `num_layers=5` shipped in this
+checkout's `configs/train_normalnet.ini`. Every other relevant field matches exactly
+(`num_input_channels=4, num_output_channels=3, filters_network=32 32 32 32 32 32 32 32, upsample_mode=
+bilinear, norm_layer_up=id, last_act=id, conv_block_up=gated, activation=elu`) — only the pyramid depth
+differs. `filters_network` already has 8 entries in the shipped ini (this section's opening paragraph
+notes "only indices 0..4 used since num_layers=5"); with `num_layers=8`, all 8 entries are used, all still
+equal to 32, so the "-2C"/"-C" channel-bookkeeping formula in this section's table is unchanged, just
+applied 3 more times (up7..up2 non-last, up1 last). Total parameter count at `num_layers=8`:
+`1776 (start) + 6*13872 (up7..up2) + 16184 (up1, last) + 99 (final) = 101291`. **A porter targeting
+bit-exact compatibility with the released Tanks & Temples checkpoints must use `num_layers=8`, not the
+`train_normalnet.ini` default of 5** — trippy's `NetworkConfig` defaults to 5 per this task's brief
+(matching `train_normalnet.ini`, the config named in the task) but takes `num_layers` as a parameter for
+exactly this reason. See `docs/LIMITATIONS.md` for the load attempt report.
+
 ## 6. Neural camera / tone mapping (`src/lib/models/NeuralCamera.{h,cpp}`)
 
 Order of operations in `NeuralCameraImpl::forward` (`NeuralCamera.cpp:258-390`), applied to an already-3
@@ -469,6 +519,41 @@ self-describing graph to trace):
 
 `params->optimizer_params.network_checkpoint_directory` allows loading only the render network from a
 different location than the rest of the scene state (`Pipeline.cpp:74-80`).
+
+### 9a. UPDATE (feat/net, 2026-09-05): `torch.jit.load` DOES read `render_net.pth` from Python
+
+Correcting this section's earlier claim ("these are libtorch module-state archives, not
+`torch.jit.ScriptModule`s... there is no self-describing graph to trace") and the same claim repeated in
+Sec. 11: it is **half right**. Tested directly against a real file,
+`third_party/zenodo/tt_checkpoints/checkpoint_horse/ep0600/render_net.pth` (extracted selectively from the
+public Zenodo record 10687419 checkpoint archive, whole-zip `unzip -t` verified error-free at 2.65 GB
+first, see `docs/LIMITATIONS.md`):
+
+```python
+>>> import torch
+>>> m = torch.jit.load("render_net.pth", map_location="cpu")   # succeeds, no error
+>>> len(m.state_dict())
+34
+```
+
+`torch::save(*network, path)` on a plain (non-scripted) `torch::nn::Module` writes a
+`torch::serialize::OutputArchive` zip container that Python's `torch.jit.load` can open and expose via
+`.state_dict()` — it returns something usable for *reading the named tensors*, with names that exactly
+match the C++ module's `register_module`/`register_parameter` hierarchy (e.g.
+`start.conv.feature_transform.0.weight`, `up7.convolution.mask_transform.0.bias`, `final.0.weight`). What
+remains true from the original claim: this is **not** a traced/scripted computation graph — the loaded
+object cannot run `forward()` correctly as TRIPS's C++ network would (no graph, no `forward` method beyond
+whatever `torch.jit.load`'s generic wrapper provides), so it is only useful as a **named-tensor bag** for
+transplanting weights into an independently-built module (exactly what
+`trippy.net.checkpoint.try_load_trips_network` does), not as a runnable model. `torch.load(path,
+weights_only=False)` was not needed for this file in practice — `torch.jit.load` succeeded first — but the
+loader still tries it as a fallback per the task brief, in case a different TRIPS build/version produces a
+file `torch.jit.load` can't parse.
+
+Verification result (see `docs/LIMITATIONS.md` for the full report): with `num_layers=8` (matching that
+checkpoint's own `params.ini`, see Sec. 5a above), all 34 tensors from `render_net.pth` shape-match
+trippy's `MultiScaleUnet2dDecOnlySmallFixed(NetworkConfig(num_layers=8))` **exactly**, in registration
+order — the network architecture (Sec. 5) is now checkpoint-verified, not just source-read.
 
 ## 10. Contradictions with `docs/ARCHITECTURE.md` / `docs/GEOMETRY.md`
 
