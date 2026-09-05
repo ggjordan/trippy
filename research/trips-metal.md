@@ -190,6 +190,7 @@ the SO(3) generator, magnitude 1). A pose delta initialised at exactly zero woul
 translation but never rotation. Pinned by
 `tests/test_raster_bwd_ref.py::test_pose_delta_rotation_gradient_vanishes_at_zero`; the fix belongs in
 `xform_b.se3_exp` (and needs the xform_a/xform_b agreement test re-run), not in the rasteriser.
+<<<<<<< Updated upstream
 - 2026-09-05T13:24:52Z submitted job trippy-adop-parity-1 prio 13: bash -c cd /Users/nzbirdranch/trippy/.worktrees/adop-parity && PYTHONPATH=. /Users/nzbirdranch/trippy/.venv/bin/python -m trippy.cli parity --scene /Users/nzbirdranch/trippy/third_party/zenodo/scenes/tnt_scenes/tt_horse --checkpoint /Users/nzbirdranch/trippy/third_party/zenodo/tt_checkpoints/checkpoint_horse --epoch ep0600 --indices 8,120,144 --render-scale 1 --modes trips,broadcast,trilinear --device mps --out /Users/nzbirdranch/trippy/output/EXP-0002-horse-parity
 - 2026-09-05T13:26:40Z delivered EXP-0002-horse-parity: Authors' TRIPS horse checkpoint rendered through trippy's Metal rasteriser + U-Net vs ground truth (PSNR in the sheet). This is the public Tanks&Temples scene, not family data. (/Users/nzbirdranch/trippy/.worktrees/adop-parity/output/EXP-0002-horse-parity/summary_sheet.png)
 
@@ -230,3 +231,6 @@ Per frame (trips): 25.099 / 21.979 / 19.716 dB against the authors' 25.186 / 22.
 
 **Artifact**: `output/EXP-0002-horse-parity/` (summary sheet delivered to Jordan-Review; per-frame contact
 sheets carry GT | authors' render | ours | abs-diff | raw level-0 honesty panel).
+=======
+- 2026-09-05T13:29:37Z submitted job trippy-train-smoke-1 prio 16: bash -c PYTHONPATH=. /Users/nzbirdranch/trippy/.venv/bin/python -m trippy.cli train --config experiments/EXP-0003-kk-trips-train/config_smoke.yaml --device mps --max-minutes 25
+>>>>>>> Stashed changes
