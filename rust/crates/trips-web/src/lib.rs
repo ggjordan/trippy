@@ -57,6 +57,11 @@ const SCALE_STEPS: [f32; 4] = [0.5, 0.75, 0.9, 1.0];
 /// `--half-net --scale 0.75`. See `docs/LIMITATIONS.md` for what it costs.
 const DEFAULT_SCALE: f32 = 0.75;
 
+/// The web viewer's default sort mode: the **exact** two-pass sort, as native.
+///
+/// See [`Options::packed_sort`] for the measured alternative and what it costs.
+const DEFAULT_PACKED_SORT: bool = false;
+
 thread_local! {
     /// The page's one viewer. See the module invariants for why it is not a
     /// `#[wasm_bindgen]` struct.
@@ -129,6 +134,25 @@ fn js(e: String) -> JsValue {
 struct Options {
     scale: f32,
     half_net: bool,
+    /// One packed 32-bit radix sort instead of two exact passes.
+    ///
+    /// **Off by default, the same as the native viewer.** It exists here
+    /// because it was the obvious lever while the browser frame was 100 %
+    /// per-kernel-launch host cost: cutting 14 radix passes to 8 removed 31
+    /// of the 85 launches and was worth 1.45x. Once `build.rs` stopped
+    /// `wasm-ld` re-running every static constructor on every call
+    /// (`docs/WEB_VIEWER.md`), launches stopped being the frame, and the
+    /// lever went back to being what it is natively: a small speed-up for a
+    /// real loss of fidelity. Measured in Chrome at 1440x810, view 8:
+    ///
+    /// | sort | `raw level-0` | `network` | PSNR vs the native reference |
+    /// |---|---|---|---|
+    /// | exact (default) | 79.1 fps | 17.4 fps | **104.5 dB** |
+    /// | packed | 114.6 fps | 19.4 fps | 36.9 dB |
+    ///
+    /// 11 % more frames for 68 dB is not a trade this viewer makes for you.
+    /// `?packed=1` and the `P` key are there so it stays checkable.
+    packed_sort: bool,
     mode: ViewMode,
     /// A **dataset** view index (`views[i].index`), not a position.
     view: Option<usize>,
@@ -139,6 +163,7 @@ impl Default for Options {
         Self {
             scale: DEFAULT_SCALE,
             half_net: true,
+            packed_sort: DEFAULT_PACKED_SORT,
             mode: ViewMode::Network,
             view: None,
         }
@@ -163,6 +188,9 @@ impl Options {
         }
         if let Some(half) = value.get("halfNet").and_then(serde_json::Value::as_bool) {
             out.half_net = half;
+        }
+        if let Some(packed) = value.get("packedSort").and_then(serde_json::Value::as_bool) {
+            out.packed_sort = packed;
         }
         if let Some(view) = value.get("view").and_then(serde_json::Value::as_u64) {
             out.view = Some(view as usize);
@@ -243,8 +271,8 @@ pub fn install_panic_hook() {
 ///   are the render size; CSS size is irrelevant.
 /// - `bundle_url`: a directory URL holding `bundle.json` (trailing slash
 ///   optional). The two files the manifest names are fetched from beside it.
-/// - `options_json`: `{"scale":0.75,"halfNet":true,"mode":"network",
-///   "view":8}`; every key optional.
+/// - `options_json`: `{"scale":0.75,"halfNet":true,"packedSort":false,
+///   "mode":"network","view":8}`; every key optional.
 ///
 /// # Errors
 /// Returns a JS exception carrying the exact failure — no WebGPU adapter, a
@@ -319,6 +347,7 @@ pub async fn start(
     let settings = Settings {
         render_scale: options.scale,
         half_net: options.half_net,
+        packed_sort: options.packed_sort,
         ..Settings::default()
     };
     // An adapter without SHADER_F16 cannot run the f16 decoder at all; say so
@@ -439,13 +468,14 @@ pub async fn frame() -> Result<String, JsValue> {
         v.gpu.queue.present(texture);
         v.frames += 1;
         Ok(format!(
-            r#"{{"frames":{},"width":{},"height":{},"fragments":{},"mode":"{}","halfNet":{}}}"#,
+            r#"{{"frames":{},"width":{},"height":{},"fragments":{},"mode":"{}","halfNet":{},"packedSort":{}}}"#,
             v.frames,
             rendered.stats.width,
             rendered.stats.height,
             rendered.stats.fragment_slots,
             rendered.mode.label(),
-            v.settings.half_net
+            v.settings.half_net,
+            v.settings.packed_sort
         ))
     })
     .map_err(js)
@@ -577,6 +607,20 @@ pub fn set_half_net(on: bool) -> Result<bool, JsValue> {
     .map_err(js)
 }
 
+/// Turn the packed 32-bit sort key on or off. Returns the new state.
+///
+/// Off by default, as natively; see [`Options::packed_sort`]. Exposed as a
+/// live toggle so the approximation can be checked against the exact sort in
+/// the same session rather than taken on trust.
+#[wasm_bindgen]
+pub fn set_packed_sort(on: bool) -> Result<bool, JsValue> {
+    with_state(|v| {
+        v.settings.packed_sort = on;
+        Ok(v.settings.packed_sort)
+    })
+    .map_err(js)
+}
+
 /// Tell the viewer the canvas' backing store changed size.
 #[wasm_bindgen]
 pub fn resize(width: u32, height: u32) -> Result<(), JsValue> {
@@ -602,7 +646,7 @@ fn viewer_status(v: &Viewer) -> String {
         Some(reason) => serde_json::Value::String(reason.clone()).to_string(),
     };
     format!(
-        r#"{{"scene":{},"points":{},"adapter":{{"name":{},"vendor":{},"backend":"{:?}","device_type":"{:?}"}},"canvas":[{},{}],"render":[{},{}],"scale":{},"halfNet":{},"shaderF16":{},"subgroups":{},"halfNetFallback":{},"mode":"{}","view":{},"pinned":{},"frames":{}}}"#,
+        r#"{{"scene":{},"points":{},"adapter":{{"name":{},"vendor":{},"backend":"{:?}","device_type":"{:?}"}},"canvas":[{},{}],"render":[{},{}],"scale":{},"halfNet":{},"packedSort":{},"shaderF16":{},"subgroups":{},"halfNetFallback":{},"mode":"{}","view":{},"pinned":{},"frames":{}}}"#,
         serde_json::Value::String(v.scene_name.clone()),
         v.num_points,
         serde_json::Value::String(info.name.clone()),
@@ -615,6 +659,7 @@ fn viewer_status(v: &Viewer) -> String {
         height,
         v.settings.render_scale,
         v.settings.half_net,
+        v.settings.packed_sort,
         v.gpu.has_f16,
         v.gpu.has_subgroups,
         fallback,

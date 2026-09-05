@@ -318,13 +318,15 @@ egui, no bundler: `wasm-pack build --target web` emits a plain ES module and
 
 ```
 crates/trips-web/
+├── build.rs     --export=__wasm_call_ctors, and it is worth 15x -- read it
 ├── src/gpu.rs   wgpu Instance -> Adapter -> Device on the canvas surface, then
 │                burn_wgpu::init_device on THAT device (the native trick, minus eframe)
 ├── src/blit.rs  trips_viewer::BLIT_WGSL as a plain wgpu render pipeline
 └── src/lib.rs   wasm-bindgen entry points over a thread_local viewer
 ```
 
-Build: `scripts/web_build.sh --trips` (2 m 14 s cold on this Mac; 24.4 MB wasm).
+Build: `scripts/web_build.sh --trips` (2 m 14 s cold on this Mac; ~1 min for a
+one-crate change; 26.9 MB wasm).
 Serve: `scripts/deliver.sh output/web/trips-dist <name> "<why>"`.
 
 **Read `docs/WEB_VIEWER.md` before touching it.** Four blockers had to be found
@@ -338,6 +340,23 @@ sets `AutotuneLevel::Full`, at which `burn-cubecl` registers no bounds generator
 at all; `trips_web::gpu::Gpu::create` calls it before the first CubeCL device
 exists. The price is ~20 s of autotune on the first frame of each convolution
 shape. `docs/LIMITATIONS.md` has the short version.
+
+**Blocker 5 is the one to know about if you change the build.** The browser was
+27x slower than the Mac app for a reason that has nothing to do with the
+renderer: `wasm-ld` wraps every export of a wasm module it does not treat as a
+reactor in a `<name>.command_export` shim that re-runs the whole `.init_array`
+on entry. That is normally free — Rust has no static constructors — but
+`cubecl-ir` pulls in `pliron`, whose `inventory` registrations make one
+`__wasm_call_ctors` run cost ~110 us, and `wasm-bindgen` resolves
+`__externref_table_alloc` **by export name**, so every `JsValue` `wgpu` built
+for a bind group paid it: ~2,500 constructor runs a frame, 275 ms of a 297 ms
+frame. `build.rs` emits `cargo::rustc-link-arg=--export=__wasm_call_ctors` for
+wasm targets, which suppresses the wrappers, and `web/trips.js` runs the
+constructors once itself and refuses to start if the export is missing.
+`raw level-0` 3.32 -> 75.9 fps, `network` 1.09 -> 17.7 fps, readback PSNR
+62.04 -> 104.54 dB. Two tests in `tests/test_web_build_script.py` guard both
+halves. Do **not** replace `build.rs` with a `RUSTFLAGS` setting: that would
+rebuild all ~500 dependency crates and would not live in the source tree.
 
 ## `trips-viewer`: the native Mac viewer
 

@@ -1,8 +1,9 @@
 # STATE — externalized progress (update at end of every session)
 
-Last updated: 2026-09-05 (session 1, Orchestrator: Claude Fable 5.1)
+Last updated: 2026-09-06 (web-perf session, Orchestrator: Claude Fable 5.1)
 
 ## Done
+- **feat/web-perf (2026-09-06): the browser viewer was 27x slower because of the LINKER, not the renderer.** `wasm-ld` wrapped every export in a `.command_export` shim that re-runs the whole `.init_array`; `cubecl-ir` -> `pliron` makes one such run cost ~110 us, and `wasm-bindgen` resolves `__externref_table_alloc` by export name, so every `JsValue` `wgpu` built for a bind group paid it -- ~2,500 constructor runs a frame, 275 ms of a 297 ms frame. `trips-web/build.rs` now links with `--export=__wasm_call_ctors`; `web/trips.js` runs them once and refuses without the export. **Chrome 1440x810: `raw level-0` 3.32 -> 75.9 fps, `network` 1.09 -> 17.7 fps, readback PSNR 62.04 -> 104.54 dB.** Safari re-diagnosed: "Expected 'f16'" was never about f16 -- Safari 26.6.2 has no WebGPU subgroups in any form, so `brush-sort`'s four radix kernels cannot compile; the page now refuses with the exact kernels and builtins, checked on `adapter.features`, not the user agent. Launcher `trips-web-viewer-horse` re-delivered.
 - Spec + plan grilled and approved 2026-09-05.
 - Phase 1 skeleton reviewed and pushed as `build-0001` (public repo github.com/ggjordan/trippy, 27 CPU tests green).
 - feat/points merged (build-0004): PointSet, GaussianPlySource (5.74M pts on kk-coherent, median nn 0.080), density CLI; 50 tests green.
