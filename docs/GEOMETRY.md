@@ -14,7 +14,7 @@ where `x_w` is a 3D point in world, `x_c` is the same point in camera coordinate
 
 ### Quaternions
 
-All quaternions in this project use **wxyz** order: `q = [w, x, y, z]` where `w` is the scalar part.
+All quaternions in this project use **wxyz** order: `q = [w, x, y, z]` where `w` is the scalar part. Note that ADOP's own `poses.txt` stores **xyzw** (`SceneData.cpp:463-469`), so any ADOP scene reader/writer must swap on both sides.
 
 ### Camera coordinate system
 
@@ -40,26 +40,63 @@ where `(cx, cy)` is the principal point (usually near image centre) and `(fx, fy
 
 ### Image pyramid
 
-A pyramid has `L` levels (typically 5). At level `l`, the resolution is:
+A pyramid has `L` levels (default 5, `trippy.constants.RASTER_NUM_LAYERS`). At level `l`, the resolution is:
 
 ```
 H_l = ceil(H_0 / 2^l)
 W_l = ceil(W_0 / 2^l)
 ```
 
-where `H_0`, `W_0` are the base (level 0) resolution.
+where `H_0`, `W_0` are the base (level 0) resolution. **Deviation from TRIPS:** TRIPS halves with integer division (`h /= 2; w /= 2`, `PointRenderer.cu:378`) and therefore silently drops the last row/column of an odd-sized level. We use `ceil` so every layer-0 pixel has a covering pixel in every layer. The cost is that the coarsest layer covers up to `2^(L-1) - 1` columns/rows *beyond* the image; the visibility cull in `raster/emit.py` accounts for that explicitly.
 
-### Pyramid level selection
+### Layer coordinates: halving convention
 
-For a point projected to size `s` (in pixels, measured as the major axis of the bilinear footprint):
+A point's continuous layer-0 coordinate `uv` (corner origin, from `K`) maps to layer `l` as
 
-- **Lower level**: `l_lower = max(0, floor(log2(s)))`
-- **Upper level**: `l_upper = min(L-1, ceil(log2(s)))`
-- Both are clamped to `[0, L-1]`.
+```
+uv_l = uv / 2^l          # no offsets
+```
 
-Bilinear interpolation weights are computed between the two levels with a **linear layer factor**: if `log2(s) = 1.3`, we interpolate with weight 0.3 toward the upper level.
+This matches TRIPS exactly: the layer loop carries `ip *= 0.5f` per level with no additive term (`RenderForward.cu:1610`, and identically at `:348`, `:1556`, `:2001`). It is also the *only* correct halving in the corner-origin convention above — a 2× box downsample maps the continuous coordinate `x` to exactly `x/2`, because the corner at `x = 0` is shared by both grids. (Had we stored `uv` as pixel *indices*, i.e. centre origin, the map would be `(x + 0.5)/2 - 0.5`; we do not.)
 
-**Sub-pixel epsilon rule**: if the footprint size is < 0.25 pixels, clamp it to 0.25 to avoid numerical issues in bilinear weight computation.
+The 2×2 bilinear footprint is anchored on pixel **centres**, so the base pixel of the splat is
+
+```
+base = floor(uv_l - 0.5)
+frac = uv_l - 0.5 - base
+weights = [(1-fx)(1-fy), fx(1-fy), (1-fx)fy, fx·fy]   for pixels base + {(0,0),(1,0),(0,1),(1,1)}
+```
+
+TRIPS's `compute_blending_fac` (`PointBlending.h:216-240`) uses `floor(ip)` with no `-0.5`, i.e. it treats its `ip` as centre-origin. Our `-0.5` is the corner-origin equivalent of the same formula; the exact meaning of TRIPS's `ip` depends on Saiga's `normalizedToImage`, which is not vendored in `third_party/TRIPS` (`External/saiga/` is empty), so we follow this file's stated convention rather than guessing theirs.
+
+Out-of-bounds fragments are **dropped, never clamped** (bug class 3 below). A footprint straddling the image border contributes only its in-bounds corners.
+
+### Pyramid level selection and the layer factor
+
+Implemented in `trippy/raster/emit.py` (`layer_bounds`, `layer_factor`) and re-derived independently in `trippy/raster/ref_numpy.py`. It is an exact port of TRIPS's `compute_point_size_fac` (`third_party/TRIPS/src/lib/rendering/PointBlending.h:81-149`).
+
+For a point whose projected size is `s = fx · size_world / z` pixels at layer 0 (TRIPS uses `fx` only, `RenderForward.cu:1489`):
+
+```
+if s <= 1:  lower = upper = 0
+else:       lower = clamp(floor(log2 s), 0, L-1)
+            upper = clamp(ceil(log2 s),  0, L-1)
+
+layer_factor(s, layer):
+    if layer < lower:            -> 1.0     # inert; see note
+    if upper == 0:               -> (1 - 0.25) * exp(s - 1) + 0.25
+    if lower == upper:           -> 1.0
+    else:  f = (s - 2^lower) / (2^upper - 2^lower)
+           -> 1 - f  if layer == lower, else f
+```
+
+Three points this file previously got wrong (docs/TRIPS_REFERENCE.md §10.2):
+
+1. **There is no sub-pixel size clamp.** The old "clamp footprint size to 0.25" rule does not exist in TRIPS. The real rule is an exponential *floor on the blend factor*: a 0.01 px point still splats, with factor `0.75·exp(-0.99) + 0.25 ≈ 0.529`, never below 0.25 (`PointBlending.h:106`). The 0.25 was chosen so that 16 such fragments still leave `alpha_dest ≈ 0.99`.
+2. **The interpolation is linear in point-size units, not in the log2 fraction.** For `s = 2^1.3 = 2.46`: the old text implies weight 0.3 toward the upper layer; the code gives `(2.46 - 2)/(4 - 2) = 0.23`.
+3. **`layer < lower` returns `1.0` in the C++**, not 0 (`PointBlending.h:96-100`) — `docs/TRIPS_REFERENCE.md` §3 states 0. It is inert either way: TRIPS's point-size emission kernel `CollectTiled2Pointsize` writes only `layer_lower` and `layer_higher` (`RenderForward.cu:2296-2360`), and so does trippy's `"trilinear"` mode, so neither ever asks for a layer below `lower`. We match the source, not the doc.
+
+In `mode="broadcast"` (TRIPS's shipped default, see docs/ARCHITECTURE.md) none of this runs: every point goes into every layer with factor 1.
 
 ## Undistortion and image cache
 
@@ -132,6 +169,6 @@ When converting from COLMAP (world-to-camera), use: `R_cw = R^T`, `t_cw = -R^T @
 
 1. **Rotation composition**: multiplying quaternions in the wrong order or using conjugate instead of transpose when converting between active/passive rotations.
 2. **Depth sign**: forgetting that world-to-camera `z > 0` means "in front" but then treating negative depth as valid, or flipping the camera look direction.
-3. **Padded pixels unprojected as scene**: rasterisation pads images to pyramid-level resolutions. Fragments from padded regions must be dropped before unprojection; otherwise, padded pixels project as valid scene points, corrupting gradients.
+3. **Padded pixels unprojected as scene**: rasterisation pads images to pyramid-level resolutions. Fragments from padded regions must be dropped before unprojection; otherwise, padded pixels project as valid scene points, corrupting gradients. Enforced by `tests/test_raster_bounds.py`: the emitter drops, and never clamps, any footprint corner outside its own layer, and the pre-emission visibility cull is proven conservative (a point 3 px off the left edge is culled from layer 0 but still drawn at layer 3).
 
 Each has been caught early by comparing `xform_a` (numpy) and `xform_b` (torch) on small CPU-only tests before GPU work. Make both implementations fail the same way before fixing.

@@ -29,3 +29,4 @@ Decisions D1–D12 locked. Repository skeleton created: AGENTS.md, CLAUDE.md, RE
 **Artifact**: this commit; `git ls-files` confirms no images/plys/checkpoints.
 - 2026-09-05T10:49:54Z submitted job trippy-smoke prio 15: trippy smoke --device mps
 - 2026-09-05T11:11:03Z smoke job trippy-smoke rc=0: torch 2.14.0 on MPS inside the Splats GPU queue, inline Metal kernel ran (add_one -> 1.0 x8). Queue round-trip proven. Log: output/logs/trippy-smoke.log
+- 2026-09-05T11:24:04Z submitted job trippy-raster-gpu-tests prio 12: bash -c cd /Users/nzbirdranch/trippy/.worktrees/raster && PYTHONPATH=. /Users/nzbirdranch/trippy/.venv/bin/python -m pytest -q -m gpu -s tests/test_raster_metal.py

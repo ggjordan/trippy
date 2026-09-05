@@ -45,3 +45,6 @@ markers = [
 [tool.ruff]
 line-length = 110
 target-version = "py313"
+
+[tool.setuptools.package-data]
+trippy = ["raster/metal_src/*.metal"]
