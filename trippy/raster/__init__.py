@@ -63,6 +63,7 @@ from trippy.raster.emit import (
     layer_factor,
     layer_grid,
     project_points,
+    safe_depth,
 )
 from trippy.raster.pyramid import render_pyramid
 from trippy.raster.ref_numpy import render_pyramid_numpy
@@ -88,6 +89,7 @@ __all__ = [
     "render_pyramid",
     "render_pyramid_numpy",
     "render_pyramid_ref",
+    "safe_depth",
     "segment_offsets",
     "sort_fragments",
     "split_layers",

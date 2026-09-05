@@ -174,6 +174,44 @@ all switches. `tests/test_raster_bwd_scenes.py` is therefore a hand-built
 fixture that sits ≥ 0.05 away from every one of those switches (≈ 5·10⁴
 gradcheck steps), not a random scene.
 
+### The two guards that keep the backward finite
+
+The backward has exactly two places where a *degenerate* input — not a wrong
+one — used to produce NaN. Both are now guarded, and both guards are
+forward-neutral: they change no pixel of any render.
+
+**1. Never divide by the raw camera-space z** (`trippy.raster.emit.safe_depth`).
+`project_points` divides twice by depth: `uv = fx·x/z + cx` and
+`size_px = fx·size/z`. torch differentiates `n / z` w.r.t. the denominator as
+`-grad · (n / z / z)` and evaluates that product for **every** row of the batch,
+including rows whose upstream gradient is exactly zero because the point was
+culled. A point whose camera-space z is exactly `0.0` therefore contributes
+`-0 · inf = NaN` to its own `xyz` gradient and, through `world_to_cam`, to the
+frame's pose delta — from a point that draws nothing. `z == 0` is ordinary in
+float32 (it is the third component of `xyz @ R.T + t`; any point on a camera's
+principal plane rounds to it), and it cost a real training run one point and one
+pose (docs/LIMITATIONS.md). Both divisions now use
+`safe_depth(z, znear) = where(z > znear, z, znear)`, which is bit-identical for
+every point `cull_points` keeps (`z > znear`) and finite for every point it
+drops. `where` and not `clamp`, because `clamp` propagates NaN: that is how a
+NaN `xyz` used to poison `raw_size` on the following step.
+
+**2. The alpha clamp must be resolvable in the compute dtype**
+(`trippy.raster.ref_torch.composite_sorted`). The vectorised torch compositor
+takes `log1p(-alpha)` and rebases per segment, so `alpha == 1` gives
+`-inf - (-inf) = NaN`. The clamp is `1 - max(RASTER_ALPHA_MAX_EPS,
+finfo(dtype).eps)`: the constant 1e-12 alone rounds back to 1.0 in float32 and
+guarded nothing there. The **Metal path has never needed this**: `blend_fwd`
+loops `T *= (1 - a)` sequentially and `blend_bwd`'s suffix recurrences are
+division free (above), so `alpha == 1` is an ordinary value on the GPU. The
+guard exists only to give the torch twin the kernel's semantics.
+
+`tests/test_raster_nan_ref.py` pins both on CPU in float32 and float64 (zero
+depth, depths at/inside/behind the near plane, a fragment on an exact pixel
+boundary, `size_px` an exact power of two, `size_px` 0, alpha 0 and 1);
+`tests/test_raster_nan_metal.py` pins the same set on MPS and diffs it against
+the float64 reference.
+
 ## Fragment emission: three layer-selection modes and two conventions
 
 `render_pyramid(..., mode=..., pixel_center=..., pyramid_halving=...)` decides how a point is spread over the pyramid. All three modes are ports of real TRIPS code paths (`trippy.constants.RASTER_MODES`); the full derivation, with the exact `compute_point_size_fac` formula and its `path:line` citations, is in **docs/GEOMETRY.md** "Pyramid level selection and the layer factor".

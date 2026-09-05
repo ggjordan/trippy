@@ -216,13 +216,17 @@ layer 0 (4 pixels out of 2 073 600), mean ~1e-07 per level, zero pixels over 1e-
   `render_pyramid` call with `cx, cy + 0.5`, so its layer 0 is aligned and its coarser layers are up to
   half a layer-pixel off. Both exist to reproduce *wrong* readings of the reference doc, so neither is a
   parity claim. Mode `trips` has two engines that must agree (below).
-- **`alpha == 1.0` exactly makes the float32 CPU reference compositor produce NaN.**
-  `trippy.raster.ref_torch.composite_sorted` clamps alpha to `1 - RASTER_ALPHA_MAX_EPS` with
-  `RASTER_ALPHA_MAX_EPS = 1e-12`, which is a no-op in float32 (`1 - 1e-12 == 1.0f`), so `log1p(-1) = -inf`
-  and the per-segment rebase `exclusive - exclusive[start]` becomes `-inf - -inf`. Unreachable in a real
-  render (confidence is a sigmoid output, strictly < 1) and unreachable on the Metal path (which loops
-  sequentially), but it bit `tests/test_parity_render.py` when a test used `conf = 1.0`. Not fixed here:
-  `trippy/raster/ref_torch.py` is outside this task's file list.
+- **`alpha == 1.0` exactly used to make the float32 CPU reference compositor produce NaN. Fixed
+  (fix/raster-nan, 2026-09-06).** `trippy.raster.ref_torch.composite_sorted` clamped alpha to
+  `1 - RASTER_ALPHA_MAX_EPS` with `RASTER_ALPHA_MAX_EPS = 1e-12`, which is a no-op in float32
+  (`1 - 1e-12 == 1.0f`), so `log1p(-1) = -inf` and the per-segment rebase `exclusive - exclusive[start]`
+  became `-inf - -inf`. It bit `tests/test_parity_render.py` when a test used `conf = 1.0`. The clamp is
+  now `max(RASTER_ALPHA_MAX_EPS, finfo(dtype).eps)`, i.e. unchanged in float64 and `1 - 2**-23` in
+  float32. The Metal path never needed a guard (`blend_fwd` loops `T *= 1 - a`, `blend_bwd` uses
+  division-free suffix recurrences), so this only brings the torch twin up to the kernel's semantics.
+  `alpha == 1.0` is reachable from a real render, not just from a test: it needs a fragment on an exact
+  pixel boundary (bilinear weight 1), `conf == 1`, and `size_px` an exact power of two (layer factor 1) --
+  see `tests/test_raster_nan_ref.py::test_alpha_exactly_one_is_reachable_from_a_real_render`.
 - **Masks are untested.** `tt_horse`'s `masks.txt` is 151 blank lines and its `params.ini` has
   `use_image_masks = false`, so the mask path in `trippy.scene.adop_io` (which parses the file and exposes
   `AdopView.mask_path`) has never been exercised against a scene that actually has masks.
@@ -275,23 +279,53 @@ zoom and crop sampling); the U-Net's and NeuralCamera's weight init went through
 generator, so two runs of one config started from different networks (observed: 6.7 dB vs 8.4 dB held-out
 at init on the same config). `Trainer.__init__` now calls `torch.manual_seed(cfg.seed)`.
 
-### Not fixed: a NaN gradient out of the rasteriser backward (contained, not cured)
+### Fixed (fix/raster-nan, 2026-09-06): the NaN gradient out of the rasteriser backward
 
-Reproduced on CPU with the fixed trainer on kk-coherent (`config_smoke.yaml`, `train_factor = 1.0`,
-6 epochs): somewhere in epoch 4 a *single* point's `xyz` (3 entries) and `raw_size` (1 entry) become NaN,
-along with the pose delta of the 1-2 frames that point was last rendered in. The image loss stays finite
--- a NaN position fails every bounds comparison, so the point is culled from every subsequent render --
-but `_extent_penalty` reduces over *all* points, so the reported total loss is NaN from then on while the
-held-out PSNR keeps improving (13.39 -> 13.47 dB across the NaN). The root cause is a NaN gradient
-produced inside `trippy.raster`'s backward for a degenerate fragment; that package is outside this task's
-file list, so it is reported rather than fixed. Related and already known:
-`trippy.raster.ref_torch.composite_sorted` produces NaN for `alpha == 1.0` exactly (see the EXP-0002
-section above), and `xform_b.se3_exp` has a zero -- not NaN -- rotation gradient at `phi == 0`.
+**Symptom.** Reproduced on CPU on kk-coherent (`config_smoke.yaml`, `mode = trilinear`,
+`max_points = 200000`, `train_factor = 1.0`, 6 epochs, `Trainer._sanitise_gradients` disabled): a
+*single* point's `xyz` (3 entries) and `raw_size` (1 entry) become NaN, along with the pose delta of the
+frame that point was last rendered in. The image loss stays finite -- a NaN position fails every bounds
+comparison, so the point is culled from every subsequent render -- but `_extent_penalty` reduces over
+*all* points, so the reported total loss is NaN from then on while the held-out PSNR keeps improving
+(13.39 -> 13.47 dB across the NaN).
 
-Containment: `Trainer._sanitise_gradients` zeroes non-finite gradient entries before `optimizer.step()`
-and records the count as `nonfinite_grads` in `metrics.jsonl`, so one degenerate fragment can no longer
-write NaN into a checkpoint, and the event is visible instead of silent. `trippy-train-smoke-3` recorded
-`nonfinite_grads = 0` for all 48 steps.
+**Root cause: `project_points` divided by the raw camera-space z.** The reproducing input is a point
+whose camera-space z is **exactly 0.0** -- point 964 of 200000, world
+`(-1.3989772, 0.60192317, 5.9451413)`, camera-space `(-1.2281361, 3.7178385, 0.0)`, in `IMG_3811.jpg`.
+That is not a measure-zero curiosity in float32: z is the third component of `xyz @ R.T + t`, so any
+point that drifts onto a camera's principal plane rounds to exactly 0.0, and there are 200k points x 186
+views x 6 epochs of chances.
+
+The point is *culled* (`cull_points` requires `depth > znear`), so its incoming `uv` gradient is exactly
+zero -- but torch differentiates `n / z` w.r.t. the denominator as `-grad * (n / z / z)` and evaluates
+that product for **every** row, culled ones included. At `z == 0` that is `-0 * inf = NaN`; the
+numerator's own derivative `grad / z` is `0 / 0`, also NaN. (Even a non-zero z is unsafe once
+`n / z / z` overflows float32, i.e. below `|z| ~ 1e-19`.) The NaN lands on that point's `xyz` gradient
+and, through `world_to_cam`'s matmul, on all six components of that frame's pose delta. Adam turns a
+NaN gradient into a permanently NaN parameter. On the *next* step the now-NaN `xyz` gave a NaN `depth`,
+`torch.clamp(nan, min=znear)` kept it NaN, and `size_px = fx * size / nan` handed `raw_size` a NaN
+gradient too -- which is why `raw_size` always went NaN exactly one step after `xyz` did.
+
+**Fix.** `trippy.raster.emit.safe_depth(depth, znear) = where(depth > znear, depth, znear)` is now the
+divisor of *both* projection divisions (`fx * x / z` and `fx * size / z`). It is bit-identical for every
+point that survives the near-plane cull, so the forward is unchanged; `where` rather than `clamp` so a
+NaN depth is replaced instead of propagated. Verified as an A/B on the failing run: with and without the
+patch the trainer is bit-identical for 693 steps (loss equal to the last float32 bit), at which point
+the unpatched run emits `{xyz: 3, pose: 6}` NaN gradients and its loss is NaN from the next step onward,
+while the patched run completes 5 epochs / 930 steps with **zero** non-finite gradients in any parameter
+(points, sizes, confidences, features, background, poses, U-Net, exposure, response) and no NaN loss.
+
+**The Metal path needed no change.** Everything before compositing is the same vectorised torch code on
+both devices (`build_sorted_fragments`), so `safe_depth` fixes MPS too; and `blend_bwd.metal` is
+division free by construction (suffix recurrences `U`/`Q`, never TRIPS's `colour_behind / (1 - alpha)`),
+so it never had the alpha-side hazard either. `tests/test_raster_nan_metal.py` pins all of it on MPS
+(51 tests, GPU job `trippy-raster-nan-gpu-1`, rc 0).
+
+Related and still true: `xform_b.se3_exp` has a zero -- not NaN -- rotation gradient at `phi == 0`.
+
+**Containment stays.** `Trainer._sanitise_gradients` still zeroes non-finite gradient entries before
+`optimizer.step()` and records the count as `nonfinite_grads` in `metrics.jsonl`. It is now a backstop
+rather than the only defence.
 
 ### Known gaps in the trainer (not bugs, but they bound what a smoke run can show)
 

@@ -576,3 +576,57 @@ would have done a full `--release` build of the Burn/CubeCL/wgpu tree *inside* t
 GPU lock, which is CPU work that has no business holding a shared GPU queue slot.
 Rebuilt in debug through `scripts/cpu_heavy.sh` and resubmitted instead.)
 - 2026-09-05T16:11:11Z submitted job trippy-brush-pyramid-gpu-4 prio 12: bash -c set -e; cd /Users/nzbirdranch/trippy/.worktrees/brush-pyramid/rust && cargo test -p brush-pyramid --features gpu --offline --test parity_gpu -- --nocapture --test-threads=1 && cargo run --example render_frame --features gpu --offline -- --points ../tests/fixtures/synthetic/raster_fixture_trips_half/points.npz --camera ../tests/fixtures/synthetic/raster_fixture_trips_half/camera.json --mode trips --layers 3 --background 0.1,0.2,0.3,0.4 --out /Users/nzbirdranch/trippy/.worktrees/brush-pyramid/output/render_frame_gpu.png
+- 2026-09-05T15:38:47Z submitted job trippy-raster-nan-gpu-1 prio 12: bash -c cd /Users/nzbirdranch/trippy/.worktrees/raster-nan && PYTHONPATH=. TRIPPY_OUTPUT=/Users/nzbirdranch/trippy/output /Users/nzbirdranch/trippy/.venv/bin/python -m pytest -q -m gpu tests/test_raster_nan_metal.py
+
+## 2026-09-06 — fix/raster-nan: the NaN gradient out of the rasteriser backward, found and fixed
+
+**Question**: where does the NaN gradient reported in `docs/LIMITATIONS.md` ("Not fixed: a NaN gradient
+out of the rasteriser backward") actually come from, and can the reference *and* the Metal path be made
+finite on every degenerate fragment?
+
+**Repro** (CPU, no GPU): `experiments/EXP-0003-kk-trips-train/config_smoke.yaml`, `device=cpu`,
+`mode=trilinear`, `max_points=200000`, `train_factor=1.0`, 6 epochs, `Trainer._sanitise_gradients`
+replaced by a finiteness probe that runs after `backward()` and before `optimizer.step()`.
+(`output/diag/find_nan3.py` and `cpu_short_train.py`, which produced the original report, both survive.)
+
+**Root cause**: `trippy.raster.emit.project_points` divided by the raw camera-space z. The failing input
+is a point at camera-space z **exactly 0.0** — point 964/200000, world `(-1.3989772, 0.60192317,
+5.9451413)`, camera-space `(-1.2281361, 3.7178385, 0.0)`, frame `IMG_3811.jpg`. The point is culled
+(`cull_points` needs `depth > znear`), so its incoming `uv` gradient is exactly zero — but torch
+differentiates `n / z` w.r.t. the denominator as `-grad * (n/z/z)` and evaluates it for every row,
+culled ones included: `-0 * inf = NaN`. The NaN goes into that point's `xyz` gradient and, via
+`world_to_cam`, into all six components of that frame's pose delta; Adam converts it to a NaN parameter.
+On the *next* step the NaN `xyz` gave a NaN depth, `clamp(nan, min=znear)` kept it NaN, and
+`size_px = fx*size/nan` handed `raw_size` a NaN gradient — which is exactly the reported
+"`xyz` (3) + `raw_size` (1) + one pose delta" signature, one step apart. `z == 0` is not exotic in
+float32: z is the third component of `xyz @ R.T + t`, so any point on a camera's principal plane rounds
+to it.
+
+**Fix**: `trippy.raster.emit.safe_depth(depth, znear) = where(depth > znear, depth, znear)` is now the
+divisor of both projection divisions. Bit-identical for every point that survives the cull, so the
+forward is untouched; `where` not `clamp` so a NaN depth is replaced rather than propagated. Second,
+smaller fix: `ref_torch.composite_sorted`'s alpha clamp now uses
+`max(RASTER_ALPHA_MAX_EPS, finfo(dtype).eps)` — the 1e-12 constant rounds back to 1.0 in float32, so
+`alpha == 1` gave `log1p(-1) = -inf` and then `-inf - -inf = NaN` (docs/LIMITATIONS.md EXP-0002 entry).
+
+**Numbers (controlled A/B on the failing run, only the patch differs)**: bit-identical losses for the
+first 693 steps (3 epochs + 135 steps). At step 693 the unpatched run emits `{xyz: 3, pose: 6}` non-finite
+gradient entries; at step 694 `{xyz: 3, raw_size: 1, pose: 6}` and the loss is NaN from there on. The
+patched run completes 5 epochs / 930 steps with **zero** non-finite gradients across every parameter
+(points, sizes, confidences, features, background, poses, U-Net, exposure, response) and no NaN loss;
+the full 6-epoch run is clean too. The synthetic-scene trainer repro (`tests/test_train_helpers.py`
+scene, `train_factor=1.0`, 6 epochs, sanitiser disabled) is likewise clean.
+
+**Metal**: no kernel change needed. Emission/projection is the same torch code on both devices, so
+`safe_depth` covers MPS; `blend_bwd.metal` is division free by construction (suffix recurrences `U`/`Q`,
+never TRIPS's `colour_behind / (1 - alpha)`), so it never had the alpha hazard the torch twin did.
+
+**Verdict**: fixed, not contained. `Trainer._sanitise_gradients` stays as a backstop.
+
+**Tests**: `tests/test_raster_nan_ref.py` (117 CPU cases: zero depth, depths at/inside/behind the near
+plane, depths that overflow `n/z/z` in float32, fragment on an exact pixel boundary, `size_px` an exact
+power of two / 1 / 0, alpha exactly 0 and 1, plus the reduced single-fragment case and forward-neutrality
+checks) — 25 of them fail with either bug reintroduced. `tests/test_raster_nan_metal.py` (51 GPU cases,
+each diffed against the float64 CPU reference at 1e-3 relative). Full CPU suite 530 passed.
+
+**Job**: `trippy-raster-nan-gpu-1` (prio 12) — 51 passed in 1.60s, **rc 0**.

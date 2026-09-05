@@ -26,6 +26,13 @@ Invariants:
       factor 1). See trippy.constants.RASTER_MODES and emit_fragments.
     - Out-of-bounds fragments are DROPPED, never clamped (docs/GEOMETRY.md
       historical bug class 3: clamped/padded pixels unproject as scene).
+    - Nothing in this module ever divides by the raw camera-space z. Both
+      `fx * x / z` and `fx * size / z` divide by `safe_depth(z, znear)`
+      instead, which is bit-identical for every point that survives the
+      near-plane cull and finite for every point that does not -- because
+      torch's division backward evaluates `-grad * (n / z / z)` on *all*
+      rows, culled ones included, and turns a `z == 0` row into NaN even
+      though its upstream gradient is exactly zero. See safe_depth.
     - `alpha` stays connected to autograd; the integer key parts do not.
     - An optional (6,) `pose_delta` refines `(R, t)` *left-multiplicatively*
       (`se3_exp(delta) @ [R | t]`, trippy.geom.xform_b.compose's convention)
@@ -258,6 +265,51 @@ def apply_pose_delta(R: Tensor, t: Tensor, delta: Tensor) -> tuple[Tensor, Tenso
     return refined[:3, :3], refined[:3, 3]
 
 
+def safe_depth(depth: Tensor, znear: float = RASTER_ZNEAR) -> Tensor:
+    """`depth` with every non-renderable value replaced by `znear`.
+
+    This is the divisor of *both* projection divisions -- `fx * x / z` in
+    `project_points` and `fx * size / z` for `size_px`. It exists for the
+    backward pass, not the forward one.
+
+    The forward result is unchanged for every point that can produce a
+    fragment. `cull_points` keeps a point only when `depth > znear`, and for
+    those `safe_depth(depth) == depth` bit-for-bit; the substituted value is
+    only ever seen by points that are dropped before emission.
+
+    The backward is where the raw `z` is unusable. torch differentiates
+    `n / z` w.r.t. the denominator as `-grad * (n / z / z)`, and it evaluates
+    that product for *every* row, including rows whose upstream gradient is
+    exactly zero because the point was culled. At `z == 0` that is
+    `-0 * inf = NaN`; the numerator's own derivative `grad / z` is `0 / 0`,
+    also NaN. `z == 0` is not a measure-zero curiosity in float32: `z` is the
+    third component of `xyz @ R.T + t`, so any point sitting on a camera's
+    principal plane rounds to exactly 0.0. One such point in one training
+    view is enough -- the NaN lands on that point's `xyz` gradient and, via
+    `world_to_cam`, on all six components of that frame's pose delta, and Adam
+    turns a NaN gradient into a permanently NaN parameter (observed on
+    kk-coherent: 200k points, epoch 4, one point, docs/LIMITATIONS.md).
+    Floors below `znear` are dangerous for the same reason even when non-zero:
+    `n / z / z` overflows float32 once `|z|` drops under ~1e-19.
+
+    `torch.where` rather than `torch.clamp`: `clamp` propagates NaN (a NaN
+    depth stays NaN and poisons the numerator's `grad / z` in turn, which is
+    how `raw_size` went NaN one step after `xyz` did), whereas `NaN > znear`
+    is False, so `where` substitutes the finite `znear` and the lane's
+    gradient is a clean zero.
+
+    Args:
+        depth: (N,) float, camera-space z in world units (any sign).
+        znear: float > 0, the same near plane `cull_points` culls on.
+
+    Returns:
+        (N,) float, `depth` where `depth > znear` and `znear` everywhere else.
+        Same dtype/device as `depth`, and differentiable (zero gradient on
+        the substituted lanes).
+    """
+    return torch.where(depth > znear, depth, torch.full_like(depth, znear))
+
+
 def project_points(
     xyz: Tensor,
     size: Tensor,
@@ -278,18 +330,23 @@ def project_points(
         K: (3, 3) float, layer-0 pinhole intrinsics in pixels.
         R: (3, 3) float, world->camera rotation.
         t: (3,) float, world->camera translation, world units.
-        znear: float, depths at or below this are treated as behind the
-            camera (see trippy.constants.RASTER_ZNEAR).
+        znear: float > 0, depths at or below this are treated as behind the
+            camera (see trippy.constants.RASTER_ZNEAR). Both divisions here
+            use `safe_depth(depth, znear)` as their divisor, so `znear` is
+            also what keeps the *backward* finite -- see safe_depth.
         pose_delta: optional (6,) float SE(3) twist applied to `(R, t)` via
             `apply_pose_delta` before projecting. Carries gradient, so this
             is how camera-pose refinement is trained. None = no refinement.
 
     Returns:
         uv: (N, 2) float, continuous layer-0 pixel coordinates (corner
-            origin; pixel i spans [i, i+1)).
-        depth: (N,) float, camera-space z in world units (may be <= znear;
-            callers cull on it).
-        size_px: (N,) float, `fx * size / max(z, znear)`, the projected point
+            origin; pixel i spans [i, i+1)). Computed as
+            `fx * x / safe_depth(z) + cx`, hence exact for every point
+            `cull_points` keeps (`z > znear`) and meaningless -- but always
+            finite -- for the ones it drops.
+        depth: (N,) float, the *true* camera-space z in world units, never
+            floored (may be <= znear or negative; callers cull on it).
+        size_px: (N,) float, `fx * size / safe_depth(z)`, the projected point
             diameter in layer-0 pixels. TRIPS uses fx only, not fy
             (RenderForward.cu:1489).
     """
@@ -300,8 +357,16 @@ def project_points(
     cx = K[0, 2]
     cy = K[1, 2]
     xyz_c = world_to_cam(R, t, xyz)
-    uv, depth = project_pinhole(xyz_c, fx, fy, cx, cy)
-    depth_safe = torch.clamp(depth, min=znear)
+    depth = xyz_c[:, 2]
+    # Both divisions below run through `safe_depth`, never through the raw z:
+    # a point with z == 0 (or |z| small enough that fx * x / z / z overflows)
+    # makes torch's division backward emit NaN *even when its incoming
+    # gradient is exactly zero*, and every such point is culled anyway. See
+    # safe_depth for the full argument; this is the fix for docs/LIMITATIONS.md
+    # "NaN gradient out of the rasteriser backward".
+    depth_safe = safe_depth(depth, znear)
+    xyz_c_safe = torch.cat([xyz_c[:, :2], depth_safe.reshape(-1, 1)], dim=1)
+    uv, _ = project_pinhole(xyz_c_safe, fx, fy, cx, cy)
     size_px = fx * size / depth_safe
     return uv, depth, size_px
 

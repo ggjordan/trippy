@@ -87,8 +87,17 @@ def composite_sorted(
 
     if layer_pixel.numel() > 0:
         # log(1 - alpha) is clamped away from log(0); alpha == 1 would make the
-        # rest of the segment invisible anyway.
-        alpha_c = torch.clamp(alpha, max=1.0 - RASTER_ALPHA_MAX_EPS)
+        # rest of the segment invisible anyway. The epsilon has to be one the
+        # *compute dtype* can resolve: `1 - RASTER_ALPHA_MAX_EPS` (1e-12)
+        # rounds straight back to 1.0f in float32, which left this reference
+        # producing `log1p(-1) = -inf` and then `-inf - -inf = NaN` in the
+        # per-segment rebase below (docs/LIMITATIONS.md). float64 keeps the
+        # tighter 1e-12; float32 falls back to its own eps, 2**-23, whose
+        # predecessor of 1.0 is exactly representable. The Metal forward loops
+        # sequentially (`T *= 1 - a`) and needs no such guard, so this only
+        # brings the torch twin up to the kernel's semantics.
+        alpha_max_eps = max(RASTER_ALPHA_MAX_EPS, float(torch.finfo(alpha.dtype).eps))
+        alpha_c = torch.clamp(alpha, max=1.0 - alpha_max_eps)
         log1m = torch.log1p(-alpha_c)
         # Exclusive prefix sum over the flat list, then rebased per segment.
         # The running sum spans every fragment in the image, so it is taken in
