@@ -404,3 +404,5 @@ worktree needs that variable set explicitly (worktrees carry no `.env`).
 metrics.jsonl, eval_ep0000/, eval_ep0001/ incl. the honesty sheets, checkpoints/, export.ply);
 diagnostics under `output/diag/`.
 - 2026-09-05T15:02:32Z submitted job trippy-train-smoke-4 prio 16: bash -c cd /Users/nzbirdranch/trippy/.worktrees/train-debug && PYTHONPATH=. /Users/nzbirdranch/trippy/.venv/bin/python -m trippy.cli train --config experiments/EXP-0003-kk-trips-train/config_smoke.yaml --run-dir /Users/nzbirdranch/trippy/output/runs/EXP-0003-kk-trips-train/EXP-0003-kk-trips-train_smoke4 --device mps --max-minutes 25
+- 2026-09-05T15:09:55Z submitted job trippy-train-full1 prio 70: bash -c PYTHONPATH=. /Users/nzbirdranch/trippy/.venv/bin/python -m trippy.cli train --config experiments/EXP-0003-kk-trips-train/config.yaml --device mps --max-minutes 360
+- 2026-09-05T15:09:55Z submitted job trippy-train-full1-broadcast prio 70: bash -c PYTHONPATH=. /Users/nzbirdranch/trippy/.venv/bin/python -m trippy.cli train --config experiments/EXP-0003-kk-trips-train/config_broadcast.yaml --device mps --max-minutes 360
