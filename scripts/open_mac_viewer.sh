@@ -18,7 +18,10 @@ cd "$(dirname "$0")/.."
 # removed. `--git-common-dir` is the shared `.git` for both.
 REPO_ROOT=$(cd "$(git rev-parse --path-format=absolute --git-common-dir)/.." && pwd)
 
+# Exported env wins over .env (tests and worktrees set TRIPPY_OUTPUT explicitly).
+_pre_env_out=${TRIPPY_OUTPUT:-}; _pre_env_splats=${SPLATS_ROOT:-}
 if [ -f .env ]; then . ./.env; fi
+TRIPPY_OUTPUT=${_pre_env_out:-${TRIPPY_OUTPUT:-}}; SPLATS_ROOT=${_pre_env_splats:-${SPLATS_ROOT:-}}
 TRIPPY_OUTPUT=${TRIPPY_OUTPUT:-$PWD/output}
 
 # The viewer's default speed setting, chosen from the measured table in

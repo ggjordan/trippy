@@ -349,8 +349,10 @@ def build_mac_viewer_launcher(bundle_dir: Path, name: str) -> dict:
                 "(scripts/cpu_heavy.sh recommended) before a launcher can be generated"
             ),
         }
+    settings = load_settings()
     result = subprocess.run(
         ["bash", str(_OPEN_MAC_VIEWER_SCRIPT), str(bundle_dir), name],
+        env={**os.environ, "TRIPPY_OUTPUT": str(settings.trippy_output)},
         capture_output=True,
         text=True,
         timeout=DELIVER_SUBPROCESS_TIMEOUT_S,
@@ -362,7 +364,6 @@ def build_mac_viewer_launcher(bundle_dir: Path, name: str) -> dict:
             "status": "failed",
             "note": f"scripts/open_mac_viewer.sh exited {result.returncode}: {result.stderr.strip()}",
         }
-    settings = load_settings()
     command_path = settings.trippy_output / "deliver" / name / f"OPEN_TRIPS_MAC_{name}.command"
     return {"command_path": str(command_path), "status": "ok"}
 

@@ -12,7 +12,10 @@
 set -eu
 cd "$(dirname "$0")/.."
 
+# Exported env wins over .env (tests and worktrees set TRIPPY_OUTPUT explicitly).
+_pre_env_out=${TRIPPY_OUTPUT:-}; _pre_env_splats=${SPLATS_ROOT:-}
 if [ -f .env ]; then . ./.env; fi
+TRIPPY_OUTPUT=${_pre_env_out:-${TRIPPY_OUTPUT:-}}; SPLATS_ROOT=${_pre_env_splats:-${SPLATS_ROOT:-}}
 SPLATS_ROOT=${SPLATS_ROOT:-/Users/nzbirdranch/Splats}
 TRIPPY_OUTPUT=${TRIPPY_OUTPUT:-$PWD/output}
 
