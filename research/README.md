@@ -1,0 +1,20 @@
+# Research index
+
+This is the experiment and milestone tracking index for the trippy project. Each row corresponds to one experiment or major milestone. Update this table as experiments run and gates are evaluated.
+
+| Experiment | Stage | Status | Verdict | Artifact |
+|---|---|---|---|---|
+| EXP-0001-forward-pyramid | v0.1.0 | planned | — | contact sheet: photo / ref / Metal / 5 pyramid levels |
+
+## Parked ideas (never culled for effort)
+
+Ideas that are out of scope for the current milestones but valuable for future work. These are not forgotten; they remain in the backlog unless explicitly closed with a note.
+
+- **A2: EWA footprints per level**: Extend trilinear splatting with elliptical weighted average (EWA) footprints. Improves sharpness on high-curvature surfaces.
+- **Low-coverage point spawning**: Detect regions with <0.3 coverage (inferred vs. photographed) and spawn new points from monocular depth to fill holes. Reduces U-Net hallucination.
+- **Distortion refinement**: COLMAP distortion parameters are applied once during dataset loading. Refining them during training (joint pose + distortion optimization) could improve geometry.
+- **Training the U-Net inside Brush (Burn backward)**: v0.4.0 ports the U-Net to Burn (inference only). A future milestone could add full backward passes to Burn, enabling training directly in the Brush viewer app (called "Burn backward" in the backlog).
+
+## Running log
+
+See `trips-metal.md` for the chronological experiment log (appended as you work, never rewritten).

@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trippy"
+dynamic = ["version"]
+description = "TRIPS (Trilinear Point Splatting) ported to PyTorch/MPS for Apple Silicon."
+readme = "README.md"
+requires-python = ">=3.13,<3.14"
+license = { text = "MIT" }
+dependencies = [
+    "torch>=2.13",
+    "torchvision",
+    "numpy",
+    "pillow",
+    "scipy",
+    "plyfile",
+    "lpips",
+    "pyyaml",
+    "tqdm",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff"]
+
+[dependency-groups]
+dev = ["pytest", "ruff"]
+
+[project.scripts]
+trippy = "trippy.cli:main"
+
+[tool.setuptools.dynamic]
+version = { file = "VERSION" }
+
+[tool.setuptools.packages.find]
+include = ["trippy*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "gpu: needs MPS, only inside a GPU-queue job",
+]
+
+[tool.ruff]
+line-length = 110
+target-version = "py313"

@@ -1,0 +1,54 @@
+#!/bin/bash
+# pre-commit hook: public-repo guard. trippy is a PUBLIC MIT-licensed repo from day one — Jordan's
+# scenes, renders, and checkpoints must never land in git history, and large binaries bloat a
+# public clone forever. Blocks staged images/video/point-clouds/checkpoints, anything under
+# output/ or third_party/, and any file over 5 MB. Synthetic test fixtures are exempt.
+# Usage: .githooks/pre-commit                        (invoked by git; checks the staged diff)
+#        FILE_GUARD_LIST="$files" .githooks/pre-commit  (reused by .githooks/pre-push to check an
+#                                                         arbitrary newline-separated list of paths)
+# Invariants: read-only (never modifies the index or working tree); exits 1 on the first violation.
+set -eu
+
+BLOCKED_EXTS="png jpg jpeg heic gif webp mp4 mov avi ply sog pt pth ckpt safetensors npy npz bin"
+MAX_BYTES=$((5 * 1024 * 1024))
+
+if [ -n "${FILE_GUARD_LIST:-}" ]; then
+  files="$FILE_GUARD_LIST"
+else
+  files=$(git diff --cached --name-only --diff-filter=AM)
+fi
+
+while IFS= read -r f; do
+  [ -n "$f" ] || continue
+
+  case "$f" in
+    tests/fixtures/synthetic/*)
+      : # exempt: synthetic fixtures only
+      ;;
+    output/*|third_party/*)
+      echo "✗ blocked: $f" >&2
+      echo "  trippy is a PUBLIC repo; output/ and third_party/ are never committed." >&2
+      exit 1
+      ;;
+    *)
+      ext=$(printf '%s' "$f" | awk -F. '{if (NF>1) print tolower($NF); else print ""}')
+      for b in $BLOCKED_EXTS; do
+        if [ "$ext" = "$b" ]; then
+          echo "✗ blocked: $f" >&2
+          echo "  trippy is a PUBLIC repo; Jordan's scenes/renders/checkpoints must never be" >&2
+          echo "  committed (only tests/fixtures/synthetic/ may carry .$b files)." >&2
+          exit 1
+        fi
+      done
+      ;;
+  esac
+
+  size=$(git cat-file -s ":$f" 2>/dev/null || echo 0)
+  if [ "$size" -gt "$MAX_BYTES" ]; then
+    echo "✗ blocked: $f is $size bytes (>5 MB)" >&2
+    echo "  trippy is a PUBLIC repo; large binaries are never committed to it." >&2
+    exit 1
+  fi
+done <<EOF
+$files
+EOF

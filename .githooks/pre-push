@@ -1,0 +1,34 @@
+#!/bin/sh
+# pre-push hook: (1) every outgoing commit needs a Reviewed-by trailer (wip/* exempt, same as
+# Revisit); (2) the public-repo file guard (.githooks/pre-commit's checks, reused via
+# FILE_GUARD_LIST) runs over the full push range — not just the last commit — so nothing forbidden
+# can ever reach the remote; (3) scripts/test.sh must pass. Escape hatch for (3) only:
+# TRIPPY_SKIP_TESTS=1. Use scripts/push.sh, which also tags build-NNNN.
+set -e
+root=$(git rev-parse --show-toplevel)
+z40=0000000000000000000000000000000000000000
+empty_tree=$(git hash-object -t tree --stdin < /dev/null)
+while read local_ref local_sha remote_ref remote_sha; do
+  [ "$local_sha" = "$z40" ] && continue          # deleting a ref
+  case "$local_ref" in refs/heads/wip/*|refs/tags/*) continue ;; esac
+  if [ "$remote_sha" = "$z40" ]; then range="$local_sha --not --remotes"; base="$empty_tree"; else range="$remote_sha..$local_sha"; base="$remote_sha"; fi
+  bad=$(git rev-list $range 2>/dev/null | while read c; do
+          git log -1 --format=%B "$c" | grep -qiE '^Reviewed-by: .+' || echo "$c"; done)
+  if [ -n "$bad" ]; then
+    echo "✗ Push rejected: commits without Reviewed-by trailer on $local_ref:" >&2
+    for c in $bad; do git log -1 --format='   %h %s' "$c" >&2; done
+    exit 1
+  fi
+  guard_files=$(git diff --name-only "$base" "$local_sha" 2>/dev/null || true)
+  if [ -n "$guard_files" ]; then
+    if ! FILE_GUARD_LIST="$guard_files" "$root/.githooks/pre-commit"; then
+      echo "✗ Push rejected: forbidden files in $local_ref (see above)." >&2
+      exit 1
+    fi
+  fi
+done
+if [ "${TRIPPY_SKIP_TESTS:-0}" != "1" ]; then
+  echo "▶ pre-push: test check"
+  "$root/scripts/test.sh" >/dev/null || { echo "✗ Tests failed; push rejected (see scripts/test.sh output)" >&2; exit 1; }
+  echo "✓ tests OK"
+fi

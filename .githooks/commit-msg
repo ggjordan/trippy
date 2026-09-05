@@ -1,0 +1,15 @@
+#!/bin/sh
+# commit-msg hook: enforce the review gate (AGENTS.md).
+# Usage: invoked automatically by git on `git commit` (core.hooksPath=.githooks).
+# Invariants: every commit must carry a "Reviewed-by:" trailer, except on wip/* branches;
+#             subagents never commit — the Orchestrator adds the trailer after acting as Reviewer.
+branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+case "$branch" in wip/*) exit 0 ;; esac
+if ! grep -qiE '^Reviewed-by: .+' "$1"; then
+  echo "" >&2
+  echo "✗ Commit rejected: missing 'Reviewed-by: <role>/<model>/<effort>' trailer." >&2
+  echo "  Review the diff as Reviewer first (scripts/review.sh), then commit with the trailer." >&2
+  echo "  Example:  git commit -m 'Add pose logger' -m 'Reviewed-by: Reviewer/claude-opus-5/high'" >&2
+  echo "  Spikes may be saved on a wip/* branch without a trailer." >&2
+  exit 1
+fi

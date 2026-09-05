@@ -1,0 +1,46 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.uv-cache/
+
+# Rust
+rust/**/target/
+
+# Build outputs
+build/
+output/
+
+# Third-party / upstream code
+third_party/
+
+# Models and large files
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.ply
+*.sog
+*.npy
+*.npz
+
+# Images and video (except test fixtures)
+*.png
+*.jpg
+*.jpeg
+*.heic
+*.gif
+*.mp4
+*.mov
+!tests/fixtures/synthetic/**/*.png
+!tests/fixtures/synthetic/**/*.jpg
+
+# Environment
+.env
+
+# OS
+.DS_Store
