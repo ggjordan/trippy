@@ -6,6 +6,7 @@ Last updated: 2026-09-05 (session 1, Orchestrator: Claude Fable 5.1)
 - Spec + plan grilled and approved 2026-09-05.
 - Phase 1 skeleton reviewed and pushed as `build-0001` (public repo github.com/ggjordan/trippy, 27 CPU tests green).
 - feat/points merged (build-0004): PointSet, GaussianPlySource (5.74M pts on kk-coherent, median nn 0.080), density CLI; 50 tests green.
+- Merged brush-unet (build-0032): Rust pyramid + U-Net + camera on wgpu match the PyTorch path at 115 dB on the horse scene; whole frame 193 ms at 1080p (5 fps, sort-dominated) -> perf work in feat/mac-viewer.
 - Merged: self-reporting trainings (build-0028), union point set (EXP-0006: monodepth 3.79M, union 5.89M), web toolchain. Baseline shade audit on kkc_15000: dark(lum<0.25) 19.9% of region mass.
 - EXP-0003 full1-broadcast (40 ep, 11 min): held-out 14.42 dB / SSIM 0.39 / LPIPS 0.51, still rising -> long runs queued. Hybrid C (EXP-0005) negative for shade (-1.96 dB). brush-pyramid CubeCL port merged (GPU parity 2e-6). Raster NaN guard merged.
 - Trainer fixed (smoke 12.26 dB), native trips mode merged, candidate-report merged. Finding: with Gaussian-scale sizes the U-Net invents ~90% of every frame (t_final 0.93); full runs use kNN sizes.
@@ -17,7 +18,7 @@ Last updated: 2026-09-05 (session 1, Orchestrator: Claude Fable 5.1)
 
 ## In flight
 - GPU queue (prio 70, self-reporting, in order): full2-broadcast, full2-trips (EXP-0003, 300 ep), union-broadcast, union-trips (EXP-0006), full-trips (EXP-0007 Hunua clip4982). Each delivers dolly/honesty/ply + audit table to Jordan-Review on completion.
-- feat/brush-unet (large/high): Burn U-Net + camera, safetensors export, end-to-end horse parity on wgpu + first Mac ms numbers (GPU jobs 1-4 rc 0; gpu-5 queued).
+- feat/mac-viewer (large/high): TRIPS in the Brush app (pyramid -> U-Net -> screen), perf levers to reach >= 20 fps at 1080p, OPEN_TRIPS_MAC launcher, export-bundle CLI.
 - feat/distill (mid/high): design B fallback -- distil a TRIPS checkpoint into plain Gaussians with the Brush fork for Quest/publish.
 
 ## Next (in order)
