@@ -2,6 +2,8 @@
 All notable changes to trippy. Format: Keep a Changelog. Versions: semver tags `vX.Y.Z`. Every push also gets a `build-NNNN` tag.
 
 ## [Unreleased]
+
+## [v0.3.0] - 2026-09-06
 ### Milestone note
 - v0.3.0 = the web viewer milestone (plan's v0.5.0), released before the Karekare shade verdict because it landed first; the verdict will be recorded in the release where it lands.
 ### Added
