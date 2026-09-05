@@ -25,6 +25,7 @@
 //! Related docs: `docs/ARCHITECTURE.md`; `rust/README.md`;
 //!     `docs/decisions/ADR-0005-brush-fork-layout.md`.
 
+pub mod burn_bridge;
 pub mod kernels;
 
 use brush_cube::{
@@ -153,6 +154,38 @@ impl PyramidRender {
     #[must_use]
     pub fn feature_buffer(&self) -> &CubeTensor<WgpuRuntime> {
         &self.out
+    }
+
+    /// Pyramid layer `l` as a `burn::Tensor<4>` in NCHW, `[1, C, h_l, w_l]`.
+    ///
+    /// This is the U-Net's input. The composited buffer is one flat
+    /// `(P, C)` allocation, pixel-major and channel-last; this slices layer
+    /// `l`'s rows out of it, reshapes to `[1, h_l, w_l, C]` and permutes to
+    /// NCHW. Everything happens **on the device** — the only host work is the
+    /// one fusion `Operation` registration in
+    /// [`burn_bridge::float_tensor`].
+    ///
+    /// # Arguments
+    /// - `layer`: pyramid level, 0 = finest.
+    ///
+    /// # Panics
+    /// Panics if `layer >= grid().num_layers()`.
+    #[must_use]
+    pub fn layer_tensor(&self, layer: usize) -> burn::tensor::Tensor<4> {
+        let (rows, h_l, w_l) = self.layer_span(layer);
+        let flat: burn::tensor::Tensor<2> = burn_bridge::float_tensor(self.out.clone());
+        flat.slice([rows])
+            .reshape([1, h_l, w_l, self.channels])
+            .permute([0, 3, 1, 2])
+    }
+
+    /// Every pyramid layer as a `Tensor<4>`, finest first — exactly the list
+    /// `brush_unet`'s decoder consumes.
+    #[must_use]
+    pub fn layer_tensors(&self) -> Vec<burn::tensor::Tensor<4>> {
+        (0..self.grid.num_layers())
+            .map(|layer| self.layer_tensor(layer))
+            .collect()
     }
 
     /// Remaining transmittance per layer-pixel, `(P,)` f32. 1.0 means nothing

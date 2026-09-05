@@ -1,0 +1,36 @@
+{
+  "seed": 20260906,
+  "num_layers": 5,
+  "filters": 32,
+  "in_channels": 4,
+  "out_channels": 3,
+  "num_frames": 3,
+  "frame_index": 1,
+  "height": 24,
+  "width": 32,
+  "layer_shapes": [
+    [
+      24,
+      32
+    ],
+    [
+      12,
+      16
+    ],
+    [
+      6,
+      8
+    ],
+    [
+      3,
+      4
+    ],
+    [
+      2,
+      2
+    ]
+  ],
+  "parameter_count": 59675,
+  "unet_out_absmax": 0.9422221779823303,
+  "rgb_out_absmax": 0.7994307279586792
+}

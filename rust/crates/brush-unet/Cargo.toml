@@ -3,7 +3,33 @@ name = "brush-unet"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "TRIPS U-Net decoder inference (skeleton). Real Burn conv2d graph + safetensors loader land here at v0.4.0 (see docs/SPEC.md)."
+description = "TRIPS decoder-only gated U-Net + NeuralCamera tone mapper, as Burn modules on wgpu."
 publish = false
 
 [dependencies]
+# Always on, and deliberately light: `config` and `weights` are what
+# `scripts/build.sh` / `scripts/test.sh` compile on every push, so the schema
+# stays checked without pulling Burn/CubeCL/wgpu. `safetensors` is pure Rust
+# (serde + serde_json + hashbrown) and is already in the workspace lock via
+# burn-store.
+safetensors = { workspace = true }
+
+# --- `gpu` feature only -------------------------------------------------------
+burn = { workspace = true, features = ["wgpu"], optional = true }
+burn-wgpu = { workspace = true, optional = true }
+brush-pyramid = { path = "../brush-pyramid", optional = true }
+
+# The `render_frame_full` example parses a small per-view JSON.
+[dev-dependencies]
+# The horse end-to-end test reads the per-view render parameters the
+# exporter writes next to the point set.
+serde = { workspace = true, features = ["std"] }
+serde_json.workspace = true
+
+[features]
+default = []
+# The Burn graph (`net`, `camera`), the pyramid bridge and the GPU parity
+# tests. Off by default so the default build stays seconds long.
+gpu = ["dep:burn", "dep:burn-wgpu", "dep:brush-pyramid", "brush-pyramid/gpu"]
+# Compile the pyramid kernels to MSL rather than WGSL. macOS only.
+metal = ["gpu", "brush-pyramid/metal"]

@@ -421,6 +421,8 @@ dependencies = [
  "brush-sort",
  "burn",
  "burn-cubecl",
+ "burn-fusion",
+ "burn-ir",
  "burn-wgpu",
  "flate2",
  "serde",
@@ -442,6 +444,14 @@ dependencies = [
 [[package]]
 name = "brush-unet"
 version = "0.1.0"
+dependencies = [
+ "brush-pyramid",
+ "burn",
+ "burn-wgpu",
+ "safetensors 0.7.0",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "built"

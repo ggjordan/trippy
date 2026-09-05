@@ -11,3 +11,15 @@
 # tests/test_dump_raster_fixture.py keeps the whole tree under 1 MB.
 !*.npz
 !*.npy
+
+# Same exception for the U-Net/tone-mapper parity fixture
+# (tests/fixtures/synthetic/unet_fixture_small/, written by
+# `tools/export_unet_safetensors.py fixture`): ~290 KiB of random weights and
+# a 32x24 pyramid, no scene or checkpoint data anywhere near it. The repo-root
+# .gitignore excludes *.safetensors as "models and large files"; these are
+# neither, and rust/crates/brush-unet's parity test reads them from the
+# working tree.
+#
+# tests/test_net_export_safetensors.py keeps this fixture under 400 KiB and
+# tests/test_dump_raster_fixture.py keeps the whole tree under 1 MB.
+!*.safetensors

@@ -301,11 +301,17 @@ rust/
 │   │   ├── src/cpu.rs               CPU reference forward (the twin)
 │   │   ├── src/gpu/kernels.rs       six #[cube(launch)] kernels    | `gpu` feature
 │   │   ├── src/gpu/mod.rs           Burn/wgpu host pipeline        | `gpu` feature
+│   │   ├── src/gpu/burn_bridge.rs   CubeTensor -> burn::Tensor<D> | `gpu` feature
 │   │   ├── src/png.rs               tiny PNG writer for the example
 │   │   ├── examples/render_frame.rs points + camera JSON -> PNG
 │   │   └── tests/parity_{cpu,gpu}.rs
-│   └── brush-unet/src/lib.rs       UnetConfig placeholder (5 levels, 32 filters);
-│                                    no Burn conv2d graph or weight loading yet
+│   └── brush-unet/                  the U-Net decoder + tone mapper, ported
+│       ├── src/config.rs            UnetConfig/CameraConfig + safetensors key schema
+│       ├── src/weights.rs           safetensors reader (host-side, no Burn)
+│       ├── src/net.rs               GatedBlock/UpBlock/Unet (Burn)  | `gpu` feature
+│       ├── src/camera.rs            NeuralCamera tone mapper (Burn) | `gpu` feature
+│       ├── examples/render_frame_full.rs  whole frame -> PNG + per-stage ms
+│       └── tests/{schema_cpu,parity_gpu}.rs
 └── brush-trips/                    git submodule -> github.com/ggjordan/brush,
                                      branch trippy-fork (upstream 8b7f5c6c + Splats'
                                      robust/appearance/surface patches, merged)
@@ -335,6 +341,25 @@ points + camera
    -> add background       out += t_final * bg
    -> L feature images, finest first, plus t_final and n_used
 ```
+
+and then, in `brush-unet`, still on the device:
+
+```
+L x CubeTensor (P, C)   the flat composited buffer
+   -> burn_bridge       one zero-input fusion `Operation` binds the buffer into
+                        the fusion stream; slice + reshape + permute give
+                        `Tensor<4>` [1, C, h_l, w_l] per layer  (zero-copy)
+   -> Unet              start gated block on the coarsest level, then L-1
+                        upsample blocks (bilinear x2, CombineBridge centre-crop,
+                        gated conv), then a 1x1 conv to RGB
+   -> NeuralCamera      x * 2**-ev  ->  wb * x  ->  vignette(uv) * x  ->  LUT(x)
+   -> [1, 3, H, W] display RGB
+```
+
+The bridge is the piece `docs/LIMITATIONS.md` used to list as missing: in the pinned
+Burn revision `Tensor<D>` is backend-erased over the *fusion* backend, so a raw
+`CubeTensor` cannot simply be wrapped — it has to be bound as the output of a
+registered custom operation. `rust/README.md` has the details.
 
 Two decisions are worth carrying forward:
 

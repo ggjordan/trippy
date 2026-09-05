@@ -1,72 +1,78 @@
-//! brush-unet: TRIPS U-Net decoder inference (skeleton).
+//! `brush-unet`: TRIPS's decoder-only gated U-Net and tone mapper, in Burn.
 //!
-//! Module: brush_unet
-//! Purpose: v0.4.0 placeholder for the Rust/Burn port of the TRIPS U-Net
-//!     decoder (5 levels, 32 base filters, ~130k params; see
-//!     docs/UPSTREAM.md). This crate currently exposes only the
-//!     architecture's shape as a config struct so downstream crates
-//!     (`apps/brush-app`) and CI have something concrete to build against.
-//!     The real Burn conv2d graph and the safetensors weight loader (mirrors
-//!     `crates/lpips-convert` in the Brush fork) are future work tracked in
-//!     docs/SPEC.md's v0.4.0 row.
-//! Invariants:
-//!     - `UnetConfig::default()` must describe the same architecture as the
-//!       trained PyTorch checkpoints this crate will eventually load
-//!       (5 levels, 32 filters) so parity tests have a fixed target.
-//! Related docs: docs/UPSTREAM.md ("TRIPS: original paper and code");
-//!     docs/SPEC.md v0.4.0 row; docs/decisions/ADR-0005-brush-fork-layout.md.
+//! Module: `brush_unet`
+//! Purpose: the second half of the v0.4.0 forward pass. `brush-pyramid`
+//!     rasterises a point set into `L` alpha-composited feature images;
+//!     this crate fuses them into RGB (`net::Unet`) and applies the
+//!     per-image tone mapper (`camera::NeuralCamera`), both on wgpu through
+//!     Burn. Weights come from `trippy.net.export_safetensors`, so the Mac
+//!     and web viewers load exactly what the Python trainer produced.
+//!
+//! # Layout
+//!
+//! - [`config`] — architecture description + the safetensors key schema.
+//!   **No dependencies**, so `scripts/build.sh` / `scripts/test.sh` compile
+//!   and test it on every push.
+//! - [`weights`] — the safetensors reader. Host-side only (`Vec<f32>`), so
+//!   the schema is testable without a GPU.
+//! - `net` — the Burn graph (`GatedBlock`, `UpBlock`, `Unet`).
+//!   **Behind the `gpu` feature.**
+//! - `camera` — the Burn tone mapper. Behind the `gpu` feature.
+//!
+//! # The forward pass
+//!
+//! ```text
+//! points + camera --brush-pyramid--> L x Tensor<4> [1,C,h,w]  (finest first)
+//!                 --Unet::forward--> Tensor<4> [1,3,H,W]      (linear-ish)
+//!    --NeuralCamera::forward(frame)--> Tensor<4> [1,3,H,W]    (display RGB)
+//! ```
+//!
+//! # Parity
+//!
+//! `tests/parity_gpu.rs` (feature `gpu`) checks three things against PyTorch:
+//! a random-weight 5-layer U-Net on a 32x24 pyramid, the tone mapper on the
+//! same fixture, and — when the exports exist under `$TRIPPY_OUTPUT/brush` —
+//! the whole pipeline on the public Zenodo horse scene at 1920x1080 against
+//! `trippy.render.parity`'s own frame.
+//!
+//! Related docs: `rust/README.md` ("brush-unet weight schema"),
+//! `docs/TRIPS_REFERENCE.md` Sec. 5/5a and 6/6a, `docs/ARCHITECTURE.md`,
+//! `docs/LIMITATIONS.md`.
 
-/// Shape of the U-Net decoder. Placeholder: no weights, no forward pass yet.
+#![forbid(unsafe_code)]
+
+pub mod config;
+pub mod weights;
+
+#[cfg(feature = "gpu")]
+pub mod camera;
+#[cfg(feature = "gpu")]
+pub mod net;
+
+pub use config::{CameraConfig, UnetConfig};
+pub use weights::{HostTensor, Weights};
+
+#[cfg(feature = "gpu")]
+pub use camera::NeuralCamera;
+#[cfg(feature = "gpu")]
+pub use net::{combine_bridge, GatedBlock, UpBlock, Unet};
+
+/// Repository root, derived from this crate's manifest directory.
 ///
-/// Mirrors the TRIPS reference architecture (arXiv 2401.06003): an input
-/// packing colour + coverage/confidence channels, an RGB output, `levels`
-/// encoder/decoder stages, and `base_filters` channels at the finest level.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct UnetConfig {
-    /// Input channel count (TRIPS: RGB + per-pixel coverage/confidence).
-    pub in_channels: u32,
-    /// Output channel count (RGB).
-    pub out_channels: u32,
-    /// Channel count at the finest encoder/decoder level; doubles per level
-    /// going down, per the standard U-Net convention.
-    pub base_filters: u32,
-    /// Number of encoder/decoder levels.
-    pub levels: u32,
+/// `CARGO_MANIFEST_DIR` is `<repo>/rust/crates/brush-unet`, so the root is
+/// three levels up. Used by the tests and the example's default paths, the
+/// same way `brush_pyramid::fixture::repo_root` is.
+#[must_use]
+pub fn repo_root() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(3)
+        .expect("crate is nested at <repo>/rust/crates/brush-unet")
+        .to_path_buf()
 }
 
-impl Default for UnetConfig {
-    /// The TRIPS paper's reference configuration: 5 levels, 32 base filters,
-    /// ~130k parameters total (docs/UPSTREAM.md).
-    fn default() -> Self {
-        Self {
-            in_channels: 4,
-            out_channels: 3,
-            base_filters: 32,
-            levels: 5,
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn default_config_matches_trips_reference_architecture() {
-        let cfg = UnetConfig::default();
-        assert_eq!(cfg.levels, 5, "TRIPS U-Net has 5 encoder/decoder levels");
-        assert_eq!(cfg.base_filters, 32, "TRIPS U-Net has 32 base filters");
-        assert_eq!(cfg.out_channels, 3, "decoder output is RGB");
-    }
-
-    #[test]
-    fn config_is_plain_data() {
-        // Placeholder skeleton: no weights, no forward pass. This test only
-        // pins that the config type is cheap, comparable data so it can be
-        // threaded through the app without ceremony once the real network
-        // lands.
-        let a = UnetConfig::default();
-        let b = a;
-        assert_eq!(a, b);
-    }
+/// Directory holding the committed random-weight parity fixture.
+#[must_use]
+pub fn fixture_dir() -> std::path::PathBuf {
+    repo_root().join("tests/fixtures/synthetic/unet_fixture_small")
 }
