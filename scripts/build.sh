@@ -28,8 +28,12 @@ echo "▶ import trippy"
 "$PY" -c "import trippy"
 
 if [ -f rust/Cargo.toml ]; then
-  echo "▶ cargo check (rust/)"
-  ( cd rust && cargo check --workspace )
+  # rust/Cargo.toml is trippy's OWN thin workspace (brush-pyramid, brush-unet
+  # only) -- NOT the rust/brush-trips submodule's workspace, which vendors the
+  # whole Brush fork and would blow the <30s budget. See
+  # docs/decisions/ADR-0005-brush-fork-layout.md.
+  echo "▶ cargo check (rust/: brush-pyramid, brush-unet)"
+  ( cd rust && cargo check -p brush-pyramid -p brush-unet )
 fi
 
 echo "✓ build OK"

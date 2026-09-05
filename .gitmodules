@@ -1,0 +1,4 @@
+[submodule "rust/brush-trips"]
+	path = rust/brush-trips
+	url = https://github.com/ggjordan/brush.git
+	branch = trippy-fork

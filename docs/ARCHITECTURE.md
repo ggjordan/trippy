@@ -232,6 +232,34 @@ rust/brush-trips/
 
 The viewer loads a trained `.ply` and runs the full forward pass (emit → sort → blend_fwd → U-Net) every frame without leaving the browser or the native app.
 
+### Actual state as of v0.4.0 setup (see ADR-0005, `rust/README.md`)
+
+The diagram above is the eventual, fully-wired layout. What actually exists today:
+
+```
+rust/
+├── Cargo.toml                      trippy's own thin workspace (version 0.1.0)
+├── crates/
+│   ├── brush-pyramid/src/lib.rs    layer_bounds + layer_factor port (with unit
+│   │                                tests against the same hand values as
+│   │                                tests/test_raster_layer_factor.py); no
+│   │                                emit_fragments/sort/CubeCL kernels yet
+│   └── brush-unet/src/lib.rs       UnetConfig placeholder (5 levels, 32 filters);
+│                                    no Burn conv2d graph or weight loading yet
+└── brush-trips/                    git submodule -> github.com/ggjordan/brush,
+                                     branch trippy-fork (upstream 8b7f5c6c + Splats'
+                                     robust/appearance/surface patches, merged);
+                                     builds apps/brush-app in release mode
+```
+
+`brush-pyramid`/`brush-unet` are intentionally **not** nested under
+`rust/brush-trips/crates/` yet — they live in trippy's own workspace so
+`scripts/build.sh`/`scripts/test.sh` stay fast on every push (see ADR-0005). Moving
+them into the submodule's workspace (or path-dependency-wiring them from
+`apps/brush-app`) is part of the still-open v0.4.0 work: `emit_fragments`, the two
+radix argsorts, `prefix_sum`, `blend_fwd`/`blend_bwd` CubeCL kernels, the real U-Net
+Burn graph + safetensors loader, and the `splat_backbuffer.rs` viewer hook-in.
+
 ## Validation strategy
 
 CPU pytest (before any GPU job):

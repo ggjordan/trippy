@@ -1,0 +1,9 @@
+[package]
+name = "brush-unet"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "TRIPS U-Net decoder inference (skeleton). Real Burn conv2d graph + safetensors loader land here at v0.4.0 (see docs/SPEC.md)."
+publish = false
+
+[dependencies]

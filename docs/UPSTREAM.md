@@ -36,13 +36,32 @@ bash tools/fetch_upstream.sh --download tt_scenes.zip
 ## Brush fork
 
 - **Original repository**: https://github.com/ArthurBrussee/brush (Apache-2.0 licence)
-- **Local fork**: `~/Splats/tools/brush-final` (patches in `~/Splats/tools/patches/`)
-- **Commit**: (to be recorded in `rust/README.md` and `docs/UPSTREAM.md` when integrated)
+- **Public fork**: https://github.com/ggjordan/brush (Apache-2.0 licence, forked via `gh repo fork`)
+- **In trippy**: `rust/brush-trips`, a git submodule pointing at the public fork's
+  `trippy-fork` branch (see `.gitmodules` and ADR-0005).
+- **Upstream base commit**: `8b7f5c6c0638892204b540d9aced219f62fc2192` (2026-08-17) —
+  the same commit Splats' working fork (`~/Splats/tools/brush-final`, patches in
+  `~/Splats/tools/patches/`) started from. This was also `origin/main`'s HEAD on
+  `ArthurBrussee/brush` at the time the fork was created (2026-09-06), so the fork's
+  `main` and `upstream-base` branches match it too.
+- **trippy's pinned commit**: the `trippy-fork` branch tip on `ggjordan/brush` —
+  `8b7f5c6c06...` plus three merge commits, one per applied Splats patch. See
+  `rust/README.md` for the exact SHA and per-patch notes (applied/skipped, and any
+  hand-resolved merge conflicts between patches touching the same files).
 
-The fork extends Brush with:
-- `crates/brush-pyramid`: trilinear splatting and pyramid rasterisation (CubeCL)
-- `crates/brush-unet`: U-Net inference via Burn (conv2d + safetensors loading)
-- `apps/brush-app/src/ui/splat_backbuffer.rs`: viewer integration
+The Brush fork extends upstream with:
+- Splats' `brush-robust` patch: robust photometric loss (transient-distractor rejection).
+- Splats' `brush-appearance` patch: per-image appearance embedding (NeRF-W / WildGaussians style).
+- Splats' `brush-surface` patch: surface-lid penalty + depth-distortion (2DGS-style) regularisation.
+
+Not yet added (v0.4.0 work, tracked in `docs/SPEC.md`):
+- `crates/brush-pyramid`: trilinear splatting and pyramid rasterisation (CubeCL). A
+  placeholder skeleton with only `layer_bounds`/`layer_factor` exists today, but in
+  trippy's own thin `rust/Cargo.toml` workspace, not yet inside `rust/brush-trips/crates/`
+  (see ADR-0005 for why the two are kept apart until the real integration).
+- `crates/brush-unet`: U-Net inference via Burn (conv2d + safetensors loading). Same
+  placeholder-only status as above.
+- `apps/brush-app/src/ui/splat_backbuffer.rs`: viewer integration.
 
 The fork retains Apache-2.0 licence. When distributing the Brush fork as part of trippy (v0.4.0 onward), include `NOTICE` files attributing ArthurBrussee's original work.
 
