@@ -342,13 +342,15 @@ def crop(
     x0 = center_x - half
     y0 = center_y - half
 
+    # Index math in float64 on the CPU (MPS has no float64); only the int64 gather indices move to
+    # the image's device.
     device = rgb.device
-    out_idx = torch.arange(size, dtype=torch.float64, device=device)
+    out_idx = torch.arange(size, dtype=torch.float64)
     src_x = x0 + (out_idx + 0.5) / size * window  # (size,) continuous source pixel coords
     src_y = y0 + (out_idx + 0.5) / size * window
 
-    src_col = torch.floor(src_x).to(torch.int64)  # nearest source pixel (spans [i, i+1))
-    src_row = torch.floor(src_y).to(torch.int64)
+    src_col = torch.floor(src_x).to(torch.int64).to(device)  # nearest source pixel (spans [i, i+1))
+    src_row = torch.floor(src_y).to(torch.int64).to(device)
 
     valid_col = (src_col >= 0) & (src_col < width_src)
     valid_row = (src_row >= 0) & (src_row < height_src)
