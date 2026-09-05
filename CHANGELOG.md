@@ -2,6 +2,16 @@
 All notable changes to trippy. Format: Keep a Changelog. Versions: semver tags `vX.Y.Z`. Every push also gets a `build-NNNN` tag.
 
 ## [Unreleased]
+
+## [0.2.0] - 2026-09-06
+Milestone numbering note: the plan tied v0.2.0 to the Karekare shade verdict and v0.4.0 to the Mac viewer. The viewer landed first (the long Karekare trainings are still queued behind Splats' jobs), so this release carries the viewer and the complete trainer; the shade verdict will be recorded in the release where it lands.
+### Added
+- Native Mac TRIPS viewer `trips-viewer` (pyramid -> U-Net -> camera -> screen) on wgpu: horse scene at 1920x1080 exact 204 ms; f16 U-Net + 0.75 render scale 45 ms = 22 fps; screenshot parity 82.7 dB vs the reference path. Launcher delivered (ADR-0006).
+- Rust pipeline: brush-pyramid (CubeCL, parity 2e-6 vs Python) + brush-unet (Burn, 115 dB end-to-end parity), safetensors export, `trippy export-bundle`.
+- Differentiable MPS rasteriser (blend_bwd), trainer with self-reporting runs, candidate report (dolly, honesty sheet, audits), design-B distillation pipeline, union point sources, web toolchain (`scripts/web_build.sh`).
+### Findings
+- Design C (U-Net refinement of Gaussian renders) does not fix the shade: shade PSNR -1.96 dB.
+- First TRIPS training from Gaussian centres (40 ep): 14.4 dB held-out; the point cloud carries more dark mass in the shade volume (36%) than the Gaussian baseline (20%). Long runs queued.
 ### Added
 - **Native Mac TRIPS viewer** (`rust/crates/trips-viewer`, ADR-0006): opens a trippy asset bundle from argv or a folder picker and renders it live -- pyramid rasteriser -> U-Net -> tone mapper -> screen -- at the window's size, with WASD/mouse flight, a `V` toggle between network / raw level-0 / coverage views, an on-screen ms+fps readout, and headless `--screenshot` / `--bench` / `--profile` paths for verification. A separate binary from Brush's own `brush`, which is untouched.
 - `trippy export-bundle --checkpoint ... --out <dir>`: writes a `trippy-bundle-1` directory (`bundle.json` + `points.npz` + `weights.safetensors`) from either a published TRIPS checkpoint or a trippy-native one, so any scene opens in the viewer with no Rust change.

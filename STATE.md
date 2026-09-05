@@ -6,6 +6,7 @@ Last updated: 2026-09-05 (session 1, Orchestrator: Claude Fable 5.1)
 - Spec + plan grilled and approved 2026-09-05.
 - Phase 1 skeleton reviewed and pushed as `build-0001` (public repo github.com/ggjordan/trippy, 27 CPU tests green).
 - feat/points merged (build-0004): PointSet, GaussianPlySource (5.74M pts on kk-coherent, median nn 0.080), density CLI; 50 tests green.
+- v0.2.0 RELEASED: native Mac viewer at 22 fps (horse scene), 82.7 dB screenshot parity; launcher `trips-mac-viewer-horse.command` in Jordan-Review. Finding: the U-Net is 89% of frame time, the rasteriser 11%.
 - Merged brush-unet (build-0032): Rust pyramid + U-Net + camera on wgpu match the PyTorch path at 115 dB on the horse scene; whole frame 193 ms at 1080p (5 fps, sort-dominated) -> perf work in feat/mac-viewer.
 - Merged: self-reporting trainings (build-0028), union point set (EXP-0006: monodepth 3.79M, union 5.89M), web toolchain. Baseline shade audit on kkc_15000: dark(lum<0.25) 19.9% of region mass.
 - EXP-0003 full1-broadcast (40 ep, 11 min): held-out 14.42 dB / SSIM 0.39 / LPIPS 0.51, still rising -> long runs queued. Hybrid C (EXP-0005) negative for shade (-1.96 dB). brush-pyramid CubeCL port merged (GPU parity 2e-6). Raster NaN guard merged.
@@ -18,7 +19,7 @@ Last updated: 2026-09-05 (session 1, Orchestrator: Claude Fable 5.1)
 
 ## In flight
 - GPU queue (prio 70, self-reporting, in order): full2-broadcast, full2-trips (EXP-0003, 300 ep), union-broadcast, union-trips (EXP-0006), full-trips (EXP-0007 Hunua clip4982). Each delivers dolly/honesty/ply + audit table to Jordan-Review on completion.
-- feat/mac-viewer (large/high): TRIPS in the Brush app (pyramid -> U-Net -> screen), perf levers to reach >= 20 fps at 1080p, OPEN_TRIPS_MAC launcher, export-bundle CLI.
+- feat/web-trips (large/high): TRIPS pipeline in the browser (wasm32 + WebGPU), OPEN_TRIPS_WEB launcher, fps in Safari/Chrome.
 - feat/distill (mid/high): design B fallback -- distil a TRIPS checkpoint into plain Gaussians with the Brush fork for Quest/publish.
 
 ## Next (in order)
@@ -32,5 +33,6 @@ Last updated: 2026-09-05 (session 1, Orchestrator: Claude Fable 5.1)
 - None.
 
 ## Open questions for Jordan (review queue; nothing blocks on these)
+- REVIEW: open `trips-mac-viewer-horse.command` (4-other) to step into the public horse scene rendered live by TRIPS on this Mac; V toggles network/raw/coverage.
 - REVIEW: first TRIPS candidate in Jordan-Review (EXP-0003-full1-broadcast-dolly.mp4, -honesty.png, -points.ply). Numbers say: 14.4 dB, and the point cloud has MORE dark mass in the shade volume than the Gaussian baseline (36% vs 20% of region mass at lum<0.25); the network output may still look better, which is exactly the hallucination question. Your viewer verdict decides whether this direction is worth the long runs already queued.
 - PRIVACY INCIDENT (2026-09-05 ~23:40): the render-kk subagent opened `output/runs/EXP-0001/.../sheet.png` (a CPU dry-run contact sheet whose first panel is a kk-coherent photo) with its Read tool to sanity-check layout. Image pixels went to the model API. My task brief caused it ("look at the coverage image with the Read tool"). Fixed: AGENTS.md now forbids viewing any scene-derived imagery; all running agents were told. Nothing else left the machine. Please decide whether you want any further action.
