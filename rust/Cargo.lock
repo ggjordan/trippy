@@ -540,7 +540,7 @@ dependencies = [
 
 [[package]]
 name = "brush-pyramid"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "brush-cube",
  "brush-prefix-sum",
@@ -569,7 +569,7 @@ dependencies = [
 
 [[package]]
 name = "brush-unet"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "brush-pyramid",
  "burn",
@@ -6667,7 +6667,7 @@ dependencies = [
 
 [[package]]
 name = "trips-viewer"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "brush-pyramid",

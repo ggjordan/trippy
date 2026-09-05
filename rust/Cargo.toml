@@ -36,7 +36,7 @@ exclude = ["brush-trips"]
 
 [workspace.package]
 edition = "2021"
-version = "0.1.0"
+version = "0.2.0"
 license = "MIT"
 
 # Every spec below must match `rust/brush-trips/Cargo.toml`'s byte for byte: two
