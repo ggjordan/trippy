@@ -6,6 +6,7 @@ Last updated: 2026-09-05 (session 1, Orchestrator: Claude Fable 5.1)
 - Spec + plan grilled and approved 2026-09-05.
 - Phase 1 skeleton reviewed and pushed as `build-0001` (public repo github.com/ggjordan/trippy, 27 CPU tests green).
 - feat/points merged (build-0004): PointSet, GaussianPlySource (5.74M pts on kk-coherent, median nn 0.080), density CLI; 50 tests green.
+- v0.3.0 RELEASED (web viewer milestone): full pipeline incl. U-Net in Chrome (62 dB vs native, ~1 fps; 27x gap under investigation in feat/web-perf); Mac viewer 29.5 fps after the point-upload cache. EXP-0008 distillation proven end to end on the weak checkpoint (distilled ply in 2-open-in-brush; dark mass 37% vs 36% TRIPS export vs 20% Gaussians; pipeline proof only).
 - Viewer v2 merged (PR #22): drag/orbit/pan/scroll, scene-scaled speed, R/N/P/F keys; launchers `trips-mac-viewer-horse-v2.command` and `trips-mac-viewer-karekare-full1.command` in Jordan-Review.
 - v0.5.0 (merged, PR #25): the full TRIPS pipeline incl. the U-Net renders in Chrome via WebGPU (62 dB vs native; ~1.1 fps network / 3.3 fps raw at 1440x810 measured while a Splats training held the GPU; ~20 s first-frame autotune). Safari still draws wrong output and is blocked by the page. Mac viewer after the point-upload cache: shipped preset 29.5 fps, raw 102 fps at 1080p. Chrome was installed as dev tooling. Launcher `trips-web-viewer-horse` delivered. Quest: not interactive by any measure; distilled Gaussians / videos remain the Quest path.
 - v0.2.0 RELEASED: native Mac viewer at 22 fps (horse scene), 82.7 dB screenshot parity; launcher `trips-mac-viewer-horse.command` in Jordan-Review. Finding: the U-Net is 89% of frame time, the rasteriser 11%.
@@ -20,10 +21,9 @@ Last updated: 2026-09-05 (session 1, Orchestrator: Claude Fable 5.1)
 - Jordan set the goal (2026-09-05 ~22:50): finish all stages autonomously; anything needing Jordan goes in the review queue below.
 
 ## In flight
-- GPU queue (prio 70, self-reporting, in order): full2-broadcast, full2-trips (EXP-0003, 300 ep), union-broadcast, union-trips (EXP-0006), full-trips (EXP-0007 Hunua clip4982). Each delivers dolly/honesty/ply + audit table to Jordan-Review on completion.
-- feat/report-bundle (mid): self-reporting runs also export a viewer bundle + deliver a Mac launcher (Jordan prefers free navigation over dolly videos).
-- feat/hybrid-a (large/high): Gaussian render + TRIPS pyramid fused in the U-Net (EXP-0009); re-rendering the 219 Gaussian views, then smoke + 300-epoch run.
-- feat/distill (mid/high): design B fallback -- distil a TRIPS checkpoint into plain Gaussians with the Brush fork for Quest/publish.
+- GPU queue (prio 70, self-reporting, in order): distill done; full-trips (EXP-0007 Hunua), full2-broadcast, full2-trips (EXP-0003), union-broadcast, union-trips (EXP-0006), hybrid-a-all-levels (EXP-0009). Each delivers a viewer launcher + dolly/honesty/ply + audit table on completion. Splats' prio-60 trainings keep arriving ahead of them (Jordan: no queue jump).
+- feat/web-perf (large/high): where the browser's 27x gap goes; Safari `Expected 'f16'` shader.
+- feat/leaderboard (mid): cross-run comparison table from report.json files, delivered as one sheet.
 
 ## Next (in order)
 1. Merge scene-io + points; launch feat/raster (large/high: numpy reference + Metal blend_fwd + pyramid forward) and feat/net (mid/high: U-Net + tone mapper ports) once TRIPS_REFERENCE.md lands.
