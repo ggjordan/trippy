@@ -162,3 +162,82 @@ SHADE_FRAMES_KK = [
     "IMG_3832.jpg",
     "IMG_3833.jpg",
 ]
+
+# --- train/export.py : 3DGS PLY export (docs/GEOMETRY.md "3DGS PLY export
+# mapping"; must invert exactly against trippy.points.gaussian_ply's read
+# side, which uses SH_C0 above and its own sigmoid/exp) ---
+
+# Clamp bound for conf0 before taking logit() to produce the exported
+# `opacity` field: conf0 is only guaranteed to lie in the open interval
+# (0, 1) (see PointSet docstring), but a value within float32 epsilon of
+# 0 or 1 makes logit() +/-inf. Clamping to [eps, 1-eps] keeps opacity
+# finite; DEFAULT_MIN_OPACITY's read-side filter (0.05) is far above this
+# eps, so no point that survives that filter is ever affected.
+EXPORT_OPACITY_CLAMP_EPS = 1e-4
+
+# TRIPS has no learned rotation (points are isotropic splats); exported
+# 3DGS `rot_0..3` (wxyz, per docs/GEOMETRY.md "Quaternions") is always the
+# identity rotation.
+EXPORT_IDENTITY_ROT = (1.0, 0.0, 0.0, 0.0)
+
+# sh_degree flag values accepted by write_gaussian_ply(): 0 (default, no
+# f_rest_* properties written -- TRIPS colour is DC-only) or 3 (writes
+# zero-filled f_rest_0..44 so strict 3DGS viewers expecting a full SH
+# basis don't choke on a missing property).
+SH_DEGREE_ZERO = 0
+SH_DEGREE_THREE = 3
+
+# Number of "rest" (non-DC) SH coefficients for degree-3, 3-channel colour:
+# 3 channels * ((3 + 1)**2 - 1) = 3 * 15 = 45, i.e. f_rest_0..44.
+SH_DEGREE_THREE_NUM_REST_COEFFS = 45
+
+# --- render/sheets.py : contact_sheet() / colorize() ---
+
+# contact_sheet() defaults: each thumbnail is resized to fit within a
+# cell_max x cell_max box; pad is the gutter (pixels) around every cell
+# and between the sheet border and its content; bg fills the space a
+# non-square thumbnail doesn't cover plus the inter-cell gutters.
+CONTACT_SHEET_CELL_MAX = 512
+CONTACT_SHEET_PAD = 8
+CONTACT_SHEET_BG = (20, 20, 20)
+
+# Vertical band (pixels) reserved under each thumbnail for its PIL
+# default-font label. PIL's built-in bitmap font is ~11px tall; this
+# leaves comfortable clearance without measuring text per-call.
+CONTACT_SHEET_LABEL_BAND_PX = 18
+
+# colorize()'s 5-stop RGB ramp (0, uint8), sampled at t = 0, 0.25, 0.5,
+# 0.75, 1.0 -- a hand-picked approximation of matplotlib's viridis
+# colormap (dark purple -> blue -> teal -> green -> yellow), used so
+# depth/coverage panels get a perceptually-monotonic colour map without
+# adding a matplotlib dependency (AGENTS.md: no new dependencies).
+COLORMAP_VIRIDIS_STOPS = (
+    (68, 1, 84),
+    (59, 82, 139),
+    (33, 145, 140),
+    (94, 201, 98),
+    (253, 231, 37),
+)
+
+# --- render/video.py : write_video() ---
+
+# Default output frame rate (frames/sec) when the caller doesn't specify
+# one; matches the dolly render cadence in docs/EXPERIMENTS.md ("Dolly
+# camera paths", typically 24 fps, but 30 is the more common default for
+# quick-look contact videos of arbitrary frame sequences).
+VIDEO_DEFAULT_FPS = 30
+
+# ffmpeg raw-frame input pixel format: frames are always 8-bit RGB,
+# channel-interleaved, matching the uint8 HxWx3 arrays this module
+# accepts everywhere else.
+FFMPEG_RAW_PIX_FMT = "rgb24"
+
+# ffmpeg encoded-output pixel format (yuv420p): the most broadly
+# compatible H.264 output format for playback outside ffmpeg itself.
+FFMPEG_OUTPUT_PIX_FMT = "yuv420p"
+
+# Hardware H.264 encoder used when available (Apple Silicon VideoToolbox
+# is a free win on this machine per Splats' PROJECT.md notes) and its
+# software fallback.
+FFMPEG_VIDEOTOOLBOX_ENCODER = "h264_videotoolbox"
+FFMPEG_LIBX264_ENCODER = "libx264"

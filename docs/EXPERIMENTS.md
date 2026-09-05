@@ -166,3 +166,62 @@ Artifact: output/runs/EXP-0001-forward-pyramid_1/
 ```
 
 This log serves as the experiment audit trail.
+
+## Exporting TRIPS point sets as PLY
+
+`trippy.train.export` (`write_gaussian_ply` / `export_pointset_ply`) writes
+any `PointSet` (or raw `xyz`/`rgb`/`conf`/`size` arrays) as a
+3DGS-compatible binary PLY, so Splats' existing audit tools (extent gate,
+`ply_extract.py`, `depthprior_shade_audit.py`) and the Brush viewer can
+open a TRIPS point set unchanged -- exactly the mapping documented in
+`docs/GEOMETRY.md` "3DGS PLY export mapping":
+
+```
+f_dc_{0,1,2}  = (rgb - 0.5) / SH_C0
+opacity       = logit(clamp(conf, 1e-4, 1 - 1e-4))
+scale_{0,1,2} = log(size)                    (isotropic)
+rot_{0,1,2,3} = (1, 0, 0, 0)                 (wxyz identity; TRIPS has no rotation)
+nx, ny, nz    = 0
+```
+
+The writer is the exact mathematical inverse of `GaussianPlySource`'s read
+side (`trippy/points/gaussian_ply.py`): a 200-point synthetic round trip
+(`write_gaussian_ply` -> `GaussianPlySource`) reproduces `xyz`/`rgb0`/
+`conf0`/`size0` to within float32 precision, and the point count matches
+exactly (`tests/test_export_ply.py`). Higher-order SH is zero (`sh_degree`
+defaults to 0, no `f_rest_*` properties); passing `sh_degree=3` also
+writes 45 zero-filled `f_rest_0..44` properties for viewers that expect a
+full SH basis. A per-point `provenance` array, if supplied, is written
+alongside the `.ply` as a `<path>.provenance.npy` sidecar
+(`write_provenance_sidecar`) for post hoc per-source diagnostics -- not
+read by any 3DGS tool.
+
+Verified against Splats' own (unmodified) `extent_gate.py` on a synthetic
+200-point PLY:
+
+```
+$ ~/Splats/tools/ml-sharp/.venv/bin/python \
+    ~/Splats/tools/tmp/extent-audit/extent_gate.py synthetic.ply
+
+synthetic.ply  (200 gaussians)
+  median centre           [ 0.1767 -0.3056  0.2197]
+  radius p50/p99/p99.9/max  4.85 / 7.30 / 7.70 / 7.77
+  scene diagonal (min/max box)  17.11
+  non-finite means         0
+  non-finite scales        0
+```
+exit code 0 -- the gate accepts the synthetic PLY with no changes to
+Splats' code. `tests/test_export_ply.py::test_splats_extent_gate_accepts_synthetic_ply`
+runs this same check via subprocess and skips cleanly on a machine
+without the Splats `ml-sharp` venv.
+
+`trippy.render.sheets` (`contact_sheet`, `side_by_side`, `colorize`,
+`save_png`) and `trippy.render.video` (`write_video`, `frames_from_dir`)
+give every export an inspectable artifact: a labelled contact sheet
+(PIL only, no matplotlib) and an ffmpeg-piped MP4 (`h264_videotoolbox`
+hardware encoder when ffmpeg reports it available, `libx264` otherwise;
+raises a clear `RuntimeError` if ffmpeg isn't on `PATH` rather than
+failing silently). `colorize` maps depth/coverage scalars to RGB with a
+hand-picked 5-stop viridis-like ramp implemented in numpy, so
+`docs/SPEC.md`'s honesty sheet (raw composite | network output |
+coverage/provenance map) needs no new plotting dependency.
