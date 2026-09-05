@@ -42,7 +42,7 @@ from trippy.constants import (
 )
 from trippy.raster.blend_autograd import blend_fragments
 from trippy.raster.emit import build_sorted_fragments, layer_grid
-from trippy.raster.ref_torch import render_pyramid_ref, split_layers
+from trippy.raster.ref_torch import fragments_per_layer, render_pyramid_ref, split_layers
 
 
 def render_pyramid(
@@ -66,6 +66,8 @@ def render_pyramid(
     compute_dtype: torch.dtype | None = None,
     pose_delta: Tensor | None = None,
     differentiable: bool | None = None,
+    pixel_center: str = "half",
+    pyramid_halving: str = "ceil",
 ) -> tuple[list[Tensor], dict]:
     """Render one image as an L-layer alpha-composited pyramid.
 
@@ -81,10 +83,15 @@ def render_pyramid(
         t: (3,) float, world->camera translation, world units.
         image_hw: (H, W) layer-0 image size in pixels.
         num_layers: L, pyramid layers (layer l is ceil(H / 2**l) tall).
-        mode: "trilinear" -- each point writes into the (at most two) layers
-            its projected size straddles, weighted by TRIPS's layer factor;
-            or "broadcast" -- every point writes into every layer with factor
-            1, TRIPS's shipped default (docs/TRIPS_REFERENCE.md section 10.1).
+        mode: one of trippy.raster.emit.EMIT_MODES.
+            "trips" -- each point writes into layers `0 .. layer_higher`,
+            weighted by TRIPS's `compute_point_size_fac`; the rule the
+            published checkpoints render with (docs/TRIPS_REFERENCE.md
+            Sec. 3a) and trippy's training default.
+            "trilinear" -- only the (at most two) layers the projected size
+            straddles, weighted by the same factor.
+            "broadcast" -- every point into every layer with factor 1,
+            `use_layer_point_size = false` (docs/TRIPS_REFERENCE.md 10.1).
         bg: (C,) float background feature, composited as `t_final * bg`.
             None means a black/zero background.
         max_frags: fragments composited per layer-pixel (TRIPS: 16).
@@ -106,6 +113,12 @@ def render_pyramid(
             torch.no_grad() (the pre-blend_bwd behaviour, cheapest); True
             forces the autograd path. CPU always uses the differentiable
             reference, so this flag only affects the MPS path.
+        pixel_center: "half" (the centre of pixel i is at i + 0.5,
+            docs/GEOMETRY.md -- trippy's own convention and the default) or
+            "integer" (the centre of pixel i is at i, TRIPS's `ip`). Only a
+            TRIPS-checkpoint parity render needs "integer".
+        pyramid_halving: "ceil" (default, and what TRIPS does for every
+            published checkpoint) or "floor".
 
     Returns:
         layers: list of L tensors; layer l is (C, h_l, w_l), channel-first.
@@ -142,6 +155,8 @@ def render_pyramid(
             segment_method=segment_method,
             compute_dtype=compute_dtype,
             pose_delta=pose_delta,
+            pixel_center=pixel_center,
+            pyramid_halving=pyramid_halving,
         )
     if device.type != "mps":
         raise ValueError(f"render_pyramid supports device 'cpu' and 'mps', got {device.type!r}")
@@ -163,6 +178,8 @@ def render_pyramid(
         "sort_method": sort_method,
         "segment_method": segment_method,
         "pose_delta": pose_delta,
+        "pixel_center": pixel_center,
+        "pyramid_halving": pyramid_halving,
     }
     if differentiable:
         return _render_pyramid_mps(xyz, size, feat, conf, K, R, t, image_hw, **kwargs)
@@ -190,6 +207,8 @@ def _render_pyramid_mps(
     sort_method: str,
     segment_method: str,
     pose_delta: Tensor | None,
+    pixel_center: str,
+    pyramid_halving: str,
 ) -> tuple[list[Tensor], dict]:
     """MPS path: torch emission/sort + the Metal blend_fwd/blend_bwd pair.
 
@@ -202,7 +221,7 @@ def _render_pyramid_mps(
     storage without checking dtype or strides.
     """
     height, width = int(image_hw[0]), int(image_hw[1])
-    grid = layer_grid(height, width, num_layers)
+    grid = layer_grid(height, width, num_layers, pyramid_halving=pyramid_halving)
     frags = build_sorted_fragments(
         xyz.to(torch.float32),
         size.to(torch.float32),
@@ -217,6 +236,7 @@ def _render_pyramid_mps(
         sort_method=sort_method,
         segment_method=segment_method,
         pose_delta=None if pose_delta is None else pose_delta.to(torch.float32),
+        pixel_center=pixel_center,
     )
     out, t_final, n_used, depth_sum = blend_fragments(
         frags,
@@ -229,4 +249,5 @@ def _render_pyramid_mps(
 
     layers, aux = split_layers(out, t_final, n_used, depth_sum, grid)
     aux["num_fragments"] = len(frags)
+    aux["fragments_per_layer"] = fragments_per_layer(frags.offsets, grid)
     return layers, aux

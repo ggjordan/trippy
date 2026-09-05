@@ -65,6 +65,7 @@ from trippy.constants import (
     RENDER_DEPTH_PERCENTILE_HIGH,
     RENDER_DEPTH_PERCENTILE_LOW,
     SCENE_CACHE_META_FILENAME,
+    TRAIN_DEFAULT_MODE,
 )
 from trippy.geom.xform_b import qvec2R
 from trippy.points.gaussian_ply import GaussianPlySource
@@ -357,7 +358,7 @@ def render_frames(
     width: int,
     out_dir: str | Path,
     device: torch.device,
-    mode: str = "trilinear",
+    mode: str = TRAIN_DEFAULT_MODE,
     num_layers: int = RASTER_NUM_LAYERS,
     min_opacity: float = DEFAULT_MIN_OPACITY,
     size_mode: str = "scale",
@@ -382,7 +383,9 @@ def render_frames(
         width: SceneDataset's undistortion width (layer-0 image width).
         out_dir: output directory (created if missing).
         device: torch.device("cpu") or torch.device("mps").
-        mode: "trilinear" or "broadcast" (trippy.raster.render_pyramid).
+        mode: one of trippy.constants.RASTER_MODES -- "trips" (TRIPS's own
+            layer rule, the default), "trilinear" or "broadcast". See
+            trippy.raster.emit.emit_fragments.
         num_layers: pyramid layer count.
         min_opacity, size_mode, max_points: forwarded to GaussianPlySource.
         cache_root: SceneDataset cache root; defaults to

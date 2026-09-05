@@ -23,7 +23,7 @@ The camera looks down the **+Z axis**. Positive X points right, positive Y point
 ### Image coordinates
 
 - **Image origin**: top-left corner is (0, 0).
-- **Pixel centre convention**: pixel at integer index `i` (row) and `j` (column) has its continuous-space centre at `(i + 0.5, j + 0.5)`. A pixel spans `[i, i+1) × [j, j+1)` in continuous coordinates.
+- **Pixel centre convention**: pixel at integer index `i` (row) and `j` (column) has its continuous-space centre at `(i + 0.5, j + 0.5)`. A pixel spans `[i, i+1) × [j, j+1)` in continuous coordinates. This is the project-wide convention: COLMAP's, `grid_sample(align_corners=False)`'s, and the one `trippy.scene.dataset`'s undistortion cache is built in. The rasteriser can be told to use TRIPS's convention instead for one render — see "Pixel-centre convention" below — but nothing else in trippy ever moves.
 - **Depth sign**: depth is positive in front of the camera (+Z direction). Any reprojection where depth is negative indicates the point is behind the camera and should be clipped.
 
 ### Camera intrinsics
@@ -38,65 +38,104 @@ K = [fx   0  cx]
 
 where `(cx, cy)` is the principal point (usually near image centre) and `(fx, fy)` are focal lengths in pixels. Projection: `u = K @ (x_c / z_c)` for a point `x_c = [x, y, z]^T` in camera coordinates.
 
-### Image pyramid
+### Image pyramid (`pyramid_halving`)
 
-A pyramid has `L` levels (default 5, `trippy.constants.RASTER_NUM_LAYERS`). At level `l`, the resolution is:
+A pyramid has `L` levels (default 5, `trippy.constants.RASTER_NUM_LAYERS`). At level `l` the resolution is set by the `pyramid_halving` option of `trippy.raster.emit.layer_grid`:
 
-```
-H_l = ceil(H_0 / 2^l)
-W_l = ceil(W_0 / 2^l)
-```
+| `pyramid_halving` | `H_l` | TRIPS branch |
+|---|---|---|
+| `"ceil"` (default) | `ceil(H_0 / 2^l)` | every `network_version` except the literal `"MultiScaleUnet2d"` — i.e. **every published checkpoint** (`PointRenderer.cu:385-391`) |
+| `"floor"` | `H_0 // 2^l` | the `"MultiScaleUnet2d"` branch; silently drops the last row/column of an odd-sized level |
 
-where `H_0`, `W_0` are the base (level 0) resolution. **Deviation from TRIPS:** TRIPS halves with integer division (`h /= 2; w /= 2`, `PointRenderer.cu:378`) and therefore silently drops the last row/column of an odd-sized level. We use `ceil` so every layer-0 pixel has a covering pixel in every layer. The cost is that the coarsest layer covers up to `2^(L-1) - 1` columns/rows *beyond* the image; the visibility cull in `raster/emit.py` accounts for that explicitly.
+This was previously documented here as a *deviation* from TRIPS. It is not: `network_version = MultiScaleUnet2dDecOnlySmallFixed` in every published `params.ini`, so TRIPS uses `ceil` too (`docs/TRIPS_REFERENCE.md` §3b). `ceil` is what keeps a 1080-row image's U-Net output at 1080 rows (1080 → 540 → 270 → 135 → 68 → 34 → 17 → 9) instead of 1024. `"floor"` exists so the other branch can be reproduced if a `MultiScaleUnet2d` checkpoint ever needs to be read; it raises rather than produce an empty layer.
+
+The cost of `ceil` is that the coarsest layer covers up to `2^(L-1) - 1` columns/rows *beyond* the image; the visibility cull in `raster/emit.py` accounts for that explicitly.
 
 ### Layer coordinates: halving convention
 
-A point's continuous layer-0 coordinate `uv` (corner origin, from `K`) maps to layer `l` as
+A point's continuous layer-0 coordinate `uv` (from `K`) maps to layer `l` as
 
 ```
-uv_l = uv / 2^l          # no offsets
+uv_l = uv / 2^l          # no additive term, in either pixel-centre convention
 ```
 
-This matches TRIPS exactly: the layer loop carries `ip *= 0.5f` per level with no additive term (`RenderForward.cu:1610`, and identically at `:348`, `:1556`, `:2001`). It is also the *only* correct halving in the corner-origin convention above — a 2× box downsample maps the continuous coordinate `x` to exactly `x/2`, because the corner at `x = 0` is shared by both grids. (Had we stored `uv` as pixel *indices*, i.e. centre origin, the map would be `(x + 0.5)/2 - 0.5`; we do not.)
+This matches TRIPS exactly: the layer loop carries `ip *= 0.5f` per level with no additive term (`RenderForward.cu:1610`, and identically at `:348`, `:1556`, `:2001`).
+
+### Pixel-centre convention (`pixel_center`)
 
 The 2×2 bilinear footprint is anchored on pixel **centres**, so the base pixel of the splat is
 
 ```
-base = floor(uv_l - 0.5)
-frac = uv_l - 0.5 - base
+base = floor(uv_l - c)
+frac = uv_l - c - base
 weights = [(1-fx)(1-fy), fx(1-fy), (1-fx)fy, fx·fy]   for pixels base + {(0,0),(1,0),(0,1),(1,1)}
 ```
 
-TRIPS's `compute_blending_fac` (`PointBlending.h:216-240`) uses `floor(ip)` with no `-0.5`, i.e. it treats its `ip` as centre-origin. Our `-0.5` is the corner-origin equivalent of the same formula; the exact meaning of TRIPS's `ip` depends on Saiga's `normalizedToImage`, which is not vendored in `third_party/TRIPS` (`External/saiga/` is empty), so we follow this file's stated convention rather than guessing theirs.
+`c` is the `pixel_center` option of `trippy.raster.emit.emit_fragments` (and of `render_pyramid` / `render_pyramid_ref` / `render_pyramid_numpy`), and it has exactly two values:
 
-Out-of-bounds fragments are **dropped, never clamped** (bug class 3 below). A footprint straddling the image border contributes only its in-bounds corners.
+| `pixel_center` | `c` | centre of pixel `i` sits at | who uses it |
+|---|---|---|---|
+| `"half"` (default) | 0.5 | `i + 0.5` | trippy: COLMAP intrinsics, the undistortion cache, `grid_sample(align_corners=False)`, every training run |
+| `"integer"` | 0.0 | `i` | TRIPS: `compute_blending_fac` splats at `floor(ip)` and `floor(ip)+1` with weights from `ip - floor(ip)` (`PointBlending.h:216-240`) |
+
+**The two conventions cannot be reconciled by a constant shift of `cx, cy`.** Rendering with `cx + 0.5` and `c = 0.5` gives `floor(uv/2^l + 0.5/2^l - 0.5)`, which equals TRIPS's `floor(ip/2^l)` only at `l = 0`; at layer `l` the residual offset is `2^(l-1)` layer-0 pixels. That is why `pixel_center` is a per-render option applied *after* the halving, rather than a doctored `K` — and why `trippy.render.parity` can now reproduce TRIPS's whole pyramid in a single multi-layer `render_pyramid` call instead of one `num_layers=1` call per level (this corrects `docs/TRIPS_REFERENCE.md` §6a's "a single multi-layer call cannot"). Pinned by `tests/test_raster_trips_mode.py` and `tests/test_parity_render.py::test_native_engine_uses_integer_pixel_centres_not_a_shifted_cx`.
+
+Note that no single coordinate is a pixel centre at two layers at once in the `"half"` convention (`uv = 2^l·(n + 0.5)` cannot hold for `l = 0` and `l = 1`), whereas an even integer `ip` is one at several consecutive layers in the `"integer"` convention. Hand-computed tests have to account for that.
+
+Out-of-bounds fragments are **dropped, never clamped** (bug class 3 below). In modes `"trilinear"` and `"broadcast"` a footprint straddling the image border contributes only its in-bounds corners. Mode `"trips"` uses TRIPS's own stricter gate instead — see below.
 
 ### Pyramid level selection and the layer factor
 
-Implemented in `trippy/raster/emit.py` (`layer_bounds`, `layer_factor`) and re-derived independently in `trippy/raster/ref_numpy.py`. It is an exact port of TRIPS's `compute_point_size_fac` (`third_party/TRIPS/src/lib/rendering/PointBlending.h:81-149`).
+`render_pyramid(..., mode=...)` chooses which pyramid layers a point is written into and with what weight. All three modes are ports of real TRIPS code paths; `trippy.constants.RASTER_MODES` is the list, `trippy/raster/emit.py` (`layer_bounds`, `layer_factor`, `emit_fragments`) is the implementation, and `trippy/raster/ref_numpy.py` re-derives all of it independently from the CUDA source.
 
 For a point whose projected size is `s = fx · size_world / z` pixels at layer 0 (TRIPS uses `fx` only, `RenderForward.cu:1489`):
 
 ```
-if s <= 1:  lower = upper = 0
+if s <= 1:  lower = upper = 0                      # `point_size_opt > 1` is strict
 else:       lower = clamp(floor(log2 s), 0, L-1)
-            upper = clamp(ceil(log2 s),  0, L-1)
-
-layer_factor(s, layer):
-    if layer < lower:            -> 1.0     # inert; see note
-    if upper == 0:               -> (1 - 0.25) * exp(s - 1) + 0.25
-    if lower == upper:           -> 1.0
-    else:  f = (s - 2^lower) / (2^upper - 2^lower)
-           -> 1 - f  if layer == lower, else f
+            upper = clamp(ceil(log2 s),  0, L-1)   # == TRIPS's `layer_higher`
 ```
 
-Three points this file previously got wrong (docs/TRIPS_REFERENCE.md §10.2):
+**The layer factor** — an exact port of `compute_point_size_fac`
+(`third_party/TRIPS/src/lib/rendering/PointBlending.h:81-149`):
+
+```
+layer_factor(s, layer, L):
+    if layer < lower:            -> 1.0                                    # PointBlending.h:92-96
+    if upper == 0:               -> (1 - 0.25) * exp(s - 1) + 0.25         # :101-110
+    if lower == upper:           -> 1.0                                    # :111-115
+    else:  f = (s - 2^lower) / (2^upper - 2^lower)                         # :116-130
+           -> 1 - f  if layer == lower, else f
+           -> 1.0    if lower == L - 1                                     # :138-143
+```
+
+**The three modes:**
+
+| `mode` | layers written | weight | fragments/point | TRIPS path |
+|---|---|---|---|---|
+| `"trips"` (default) | `0 … upper` inclusive | `layer_factor` — so **1.0** on every layer below `lower`, then the two interpolation weights | ≤ `4·L` | `CountAndCollectTiled` / `RenderFast16`, selected by `use_layer_point_size = !fix_point_size = true` (`Settings.cpp:39`) — **what every published checkpoint renders with** |
+| `"trilinear"` | `[lower, upper]` only | `layer_factor` | ≤ 8 | `CollectTiled2Pointsize` (`RenderForward.cu:2296-2360`), the `combine_lists = true` branch |
+| `"broadcast"` | every layer | 1 everywhere | `4·L` | `use_layer_point_size = false` |
+
+Worked example, `s = 5` px, `L = 8`: `lower = 2`, `upper = 3`, `f = (5-4)/(8-4) = 0.25`, so mode `"trips"` writes layers **0, 1, 2, 3 with factors 1, 1, 0.75, 0.25**; `"trilinear"` writes only layers 2 and 3 with 0.75 and 0.25; `"broadcast"` writes all 8 with 1. Measured on three held-out `tt_horse` frames from the authors' own checkpoint: `trips` **22.27 dB**, `trilinear` 21.47 dB, `broadcast` 15.14 dB (`experiments/EXP-0002-horse-parity/README.md`).
+
+**Mode `"trips"` also brings TRIPS's footprint gate**, which the other two modes do not have (`RenderForward.cu:340-352`):
+
+```
+for (layer = 0; layer <= upper; ++layer, ip *= 0.5f)
+    if (!valid_point(floor(ip), z, layer)) break;      # break, NOT continue
+    write all four corners
+```
+
+`valid_point` requires `0 <= floor(ip_l) < size_l - 1` on both axes, i.e. **all four** footprint corners in bounds — so a point whose splat hangs off the edge writes nothing at that layer, rather than losing one or two corners. And it is a `break`: failing at layer `l` suppresses every *coarser* layer too, even ones the point would have passed on its own. Layer 0's gate is TRIPS's pre-loop `valid_point(ip, z, 0, …)` (`:296`); no separate code is needed, because `floor(x) < w - 1` and `x < w - 1` are the same statement for integers. Pinned by `tests/test_raster_trips_mode.py`.
+
+Three points this file previously got wrong about the factor (docs/TRIPS_REFERENCE.md §10.2):
 
 1. **There is no sub-pixel size clamp.** The old "clamp footprint size to 0.25" rule does not exist in TRIPS. The real rule is an exponential *floor on the blend factor*: a 0.01 px point still splats, with factor `0.75·exp(-0.99) + 0.25 ≈ 0.529`, never below 0.25 (`PointBlending.h:106`). The 0.25 was chosen so that 16 such fragments still leave `alpha_dest ≈ 0.99`.
 2. **The interpolation is linear in point-size units, not in the log2 fraction.** For `s = 2^1.3 = 2.46`: the old text implies weight 0.3 toward the upper layer; the code gives `(2.46 - 2)/(4 - 2) = 0.23`.
-3. **`layer < lower` returns `1.0` in the C++**, not 0 (`PointBlending.h:96-100`) — `docs/TRIPS_REFERENCE.md` §3 states 0. It is inert either way: TRIPS's point-size emission kernel `CollectTiled2Pointsize` writes only `layer_lower` and `layer_higher` (`RenderForward.cu:2296-2360`), and so does trippy's `"trilinear"` mode, so neither ever asks for a layer below `lower`. We match the source, not the doc.
+3. **`layer < lower` returns `1.0` in the C++**, not 0 (`PointBlending.h:96-100`) — `docs/TRIPS_REFERENCE.md` §3 states 0. That branch was described here as "inert" because neither `"trilinear"` nor `CollectTiled2Pointsize` ever asks for a layer below `lower`. **In mode `"trips"` it is the opposite of inert**: it is the whole reason a big point paints every fine layer at full alpha, and it is worth 0.8 dB over the `"trilinear"` reading.
 
-In `mode="broadcast"` (TRIPS's shipped default, see docs/ARCHITECTURE.md) none of this runs: every point goes into every layer with factor 1.
+Gradients: only `"trips"` and `"trilinear"` make the per-point size parameter do anything. In `"broadcast"` the factor is identically 1, so `size` has no gradient at all and the render is not even connected to it in the autograd graph.
 
 ## Undistortion and image cache
 

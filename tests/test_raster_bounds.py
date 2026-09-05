@@ -59,7 +59,7 @@ def _emit(grid, xyz, size, conf, K, R, t, mode: str = "broadcast"):
     return uv, emit_fragments(uv, depth, size_px, conf, grid, mode=mode, valid=valid)
 
 
-@pytest.mark.parametrize("mode", ["trilinear", "broadcast"])
+@pytest.mark.parametrize("mode", ["trilinear", "broadcast", "trips"])
 def test_no_fragment_lands_outside_its_layer(mode: str) -> None:
     """Every emitted pixel index decodes to a valid (y, x) in its own layer."""
     scene = make_scene(seed=0)
@@ -173,3 +173,7 @@ def test_odd_sized_images_keep_their_last_row_and_column() -> None:
     assert grid.shapes == [(31, 33), (16, 17), (8, 9), (4, 5)]
     assert grid.total == sum(h * w for h, w in grid.shapes)
     assert grid.offsets == [0, 31 * 33, 31 * 33 + 16 * 17, 31 * 33 + 16 * 17 + 8 * 9]
+    # ... and TRIPS's other branch is available as an explicit opt-in.
+    assert layer_grid(31, 33, 4, pyramid_halving="floor").shapes == [
+        (31, 33), (15, 16), (7, 8), (3, 4)
+    ]

@@ -215,6 +215,56 @@ def test_parity_smoke_modes_differ(parity_report):
     assert arrays["trips"].shape == arrays["trilinear"].shape
 
 
+def test_parity_both_engines_score_the_same_and_agree_per_level(tmp_path):
+    """End to end: `--engine native` must reproduce `--engine perlayer`.
+
+    Same synthetic checkpoint, same views, mode "trips" only. The two engines
+    have to land on the same PSNR (the acceptance bar for the real tt_horse
+    run is 0.05 dB; on this tiny synthetic scene they agree far tighter) and
+    `--compare-engines` must record a per-level diff for every view.
+    """
+    scene_dir = tmp_path / "scene"
+    ckpt_dir = tmp_path / "checkpoint"
+    _write_scene(scene_dir)
+    _write_checkpoint(ckpt_dir)
+
+    def _run(engine: str, compare: bool):
+        return run_parity(
+            ParityConfig(
+                scene_dir=str(scene_dir),
+                checkpoint_dir=str(ckpt_dir),
+                out_dir=str(tmp_path / f"out_{engine}"),
+                device="cpu",
+                indices=(0, 2),
+                num_layers=NUM_LAYERS,
+                modes=("trips",),
+                engine=engine,
+                compare_engines=compare,
+            )
+        )
+
+    per = _run("perlayer", False)
+    native = _run("native", True)
+
+    assert {v["engine"] for v in per["views"]} == {"perlayer"}
+    assert {v["engine"] for v in native["views"]} == {"native"}
+    for a, b in zip(per["views"], native["views"], strict=True):
+        assert abs(a["vs_ground_truth"]["psnr_db"] - b["vs_ground_truth"]["psnr_db"]) < 0.05
+        assert a["num_fragments"] == b["num_fragments"]
+        assert a["points_active"] == b["points_active"]
+
+    assert per["engine_agreement"] is None
+    agreement = native["engine_agreement"]
+    assert agreement is not None and len(agreement) == 2
+    for entry in agreement:
+        assert entry["num_fragments"]["native"] == entry["num_fragments"]["perlayer"]
+        assert entry["points_active"]["native"] == entry["points_active"]["perlayer"]
+        assert len(entry["levels"]) == NUM_LAYERS
+        for row in entry["levels"]:
+            assert row["max_rel_diff"] < 1e-5, row
+    assert "Engine agreement" in (tmp_path / "out_native" / "README.md").read_text()
+
+
 def test_parity_rejects_a_request_with_no_views(tmp_path):
     scene_dir = tmp_path / "scene"
     ckpt_dir = tmp_path / "checkpoint"

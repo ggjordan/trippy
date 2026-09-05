@@ -21,10 +21,12 @@ Units / frames: `xyz` COLMAP world frame, world units; `size` world units;
     `K` layer-0 pixels; depth is camera-space z, positive in front of the
     camera; `uv` is corner-origin continuous pixel coordinates (the centre of
     pixel i is at i + 0.5, docs/GEOMETRY.md).
-Related docs: docs/TRIPS_REFERENCE.md sections 3 and 10;
+Related docs: docs/TRIPS_REFERENCE.md sections 3, 3a and 10;
     third_party/TRIPS/src/lib/rendering/PointBlending.h:81-149 and
-    RenderForward.cu:1610 (per-layer halving), 2296-2360 (which two layers
-    the point-size path writes) and 3529-3559 (the blend recurrence).
+    RenderForward.cu:1610 (per-layer halving), 334-352 (mode "trips":
+    layers 0..layer_higher, the all-four-corners gate and its `break`),
+    2296-2360 (mode "trilinear": which two layers the CollectTiled2Pointsize
+    path writes) and 3529-3559 (the blend recurrence).
 """
 
 from __future__ import annotations
@@ -92,9 +94,47 @@ def layer_factor_scalar(size_px: float, layer: int, num_layers: int) -> float:
     return factor
 
 
-def layer_shapes(height: int, width: int, num_layers: int) -> list[tuple[int, int]]:
-    """Pyramid layer sizes: layer l is (ceil(H / 2**l), ceil(W / 2**l))."""
-    return [(-(-height // (1 << layer)), -(-width // (1 << layer))) for layer in range(num_layers)]
+def layer_higher_scalar(size_px: float, num_layers: int) -> int:
+    """TRIPS's `layer_higher`: the coarsest layer mode "trips" writes into.
+
+    Re-derived here from `RenderForward.cu:334-338`
+    (`CountAndCollectTiled`), not imported from trippy.raster.emit:
+
+        int layer_higher = 0;
+        if (point_size_opt > 1) layer_higher = min(int(ceil(log2f(point_size_opt))), num_layers - 1);
+
+    Args:
+        size_px: projected point size in layer-0 pixels.
+        num_layers: L.
+
+    Returns:
+        An int in [0, L - 1]; 0 for any sub-pixel point.
+    """
+    if size_px <= 1.0:
+        return 0
+    # `math.ceil` already returns an int, so the C++ `int(...)` cast is implicit.
+    return min(math.ceil(math.log2(size_px)), num_layers - 1)
+
+
+def layer_shapes(height: int, width: int, num_layers: int, pyramid_halving: str = "ceil") -> list[tuple[int, int]]:
+    """Pyramid layer sizes for layer l.
+
+    Args:
+        height, width: layer-0 size in pixels.
+        num_layers: L.
+        pyramid_halving: "ceil" -> (ceil(H / 2**l), ceil(W / 2**l)), what
+            TRIPS does for every published checkpoint
+            (PointRenderer.cu:385-391); "floor" -> (H // 2**l, W // 2**l),
+            its `MultiScaleUnet2d` branch.
+
+    Returns:
+        List of L (h_l, w_l) pairs.
+    """
+    if pyramid_halving == "ceil":
+        return [(-(-height // (1 << layer)), -(-width // (1 << layer))) for layer in range(num_layers)]
+    if pyramid_halving == "floor":
+        return [(height // (1 << layer), width // (1 << layer)) for layer in range(num_layers)]
+    raise ValueError(f"pyramid_halving must be 'ceil' or 'floor', got {pyramid_halving!r}")
 
 
 def render_pyramid_numpy(
@@ -113,6 +153,8 @@ def render_pyramid_numpy(
     t_cutoff: float = RASTER_T_CUTOFF,
     alpha_min: float = RASTER_ALPHA_MIN,
     znear: float = RASTER_ZNEAR,
+    pixel_center: str = "half",
+    pyramid_halving: str = "ceil",
 ) -> tuple[list[np.ndarray], dict]:
     """Render an L-layer pyramid the slow, obvious way.
 
@@ -125,24 +167,34 @@ def render_pyramid_numpy(
         R: (3, 3) float world->camera rotation; t: (3,) translation.
         image_hw: (H, W) layer-0 image size in pixels.
         num_layers: L.
-        mode: "trilinear" (layers [lower, upper], weighted) or "broadcast"
-            (all layers, factor 1).
+        mode: "trips" (layers 0..layer_higher, weighted, with TRIPS's
+            all-four-corners footprint gate and its `break`), "trilinear"
+            (layers [lower, upper], weighted) or "broadcast" (all layers,
+            factor 1). See trippy.raster.emit.emit_fragments.
         bg: (C,) float background, added as `t_final * bg`; None means zero.
         max_frags: per-pixel fragment cap.
         t_cutoff: transmittance stop threshold.
         alpha_min: emission-time alpha floor.
         znear: near-plane cull, world units.
+        pixel_center: "half" (pixel i centred at i + 0.5, trippy) or
+            "integer" (centred at i, TRIPS).
+        pyramid_halving: "ceil" or "floor" (see layer_shapes).
 
     Returns:
         layers: list of L float64 arrays, layer l is (C, h_l, w_l).
         aux: {"t_final": list of L (h_l, w_l), "n_used": list of L
             (h_l, w_l) int64, "depth_sum": list of L (h_l, w_l),
-            "num_fragments": int}.
+            "num_fragments": int, "fragments_per_layer": list of L int}.
     """
-    if mode not in ("trilinear", "broadcast"):
-        raise ValueError(f"mode must be 'trilinear' or 'broadcast', got {mode!r}")
+    if mode not in ("trilinear", "broadcast", "trips"):
+        raise ValueError(f"mode must be 'trips', 'trilinear' or 'broadcast', got {mode!r}")
+    if pixel_center not in ("half", "integer"):
+        raise ValueError(f"pixel_center must be 'half' or 'integer', got {pixel_center!r}")
+    # 0.5 puts the centre of pixel i at i + 0.5 (docs/GEOMETRY.md), 0.0 puts
+    # it at i (TRIPS's `ip`, PointBlending.h:216-240).
+    centre_shift = 0.5 if pixel_center == "half" else 0.0
     height, width = int(image_hw[0]), int(image_hw[1])
-    shapes = layer_shapes(height, width, num_layers)
+    shapes = layer_shapes(height, width, num_layers, pyramid_halving)
     num_channels = int(feat.shape[1])
 
     fx = float(K[0, 0])
@@ -165,19 +217,26 @@ def render_pyramid_numpy(
         size_px = fx * float(size[i]) / z
         if mode == "broadcast":
             selected = range(num_layers)
+        elif mode == "trips":
+            selected = range(layer_higher_scalar(size_px, num_layers) + 1)
         else:
             lower, upper = layer_bounds_scalar(size_px, num_layers)
             selected = range(lower, upper + 1)
         for layer in selected:
-            factor = 1.0 if mode == "broadcast" else layer_factor_scalar(size_px, layer, num_layers)
             h_l, w_l = shapes[layer]
             scale = 1.0 / float(1 << layer)
-            # Corner-origin coordinates halve exactly (RenderForward.cu:1610);
-            # the -0.5 re-anchors the 2x2 footprint on pixel centres.
-            u = float(uv[i, 0]) * scale - 0.5
-            v = float(uv[i, 1]) * scale - 0.5
+            # The layer coordinate halves exactly (RenderForward.cu:1610);
+            # `centre_shift` re-anchors the 2x2 footprint on pixel centres.
+            u = float(uv[i, 0]) * scale - centre_shift
+            v = float(uv[i, 1]) * scale - centre_shift
             base_x = math.floor(u)
             base_y = math.floor(v)
+            # `if (!valid_point(p_rd, z, layer, ...)) break;`
+            # (RenderForward.cu:344-345) -- all four corners must be in
+            # bounds, and failing here also skips every coarser layer.
+            if mode == "trips" and not (0 <= base_x < w_l - 1 and 0 <= base_y < h_l - 1):
+                break
+            factor = 1.0 if mode == "broadcast" else layer_factor_scalar(size_px, layer, num_layers)
             frac_x = u - base_x
             frac_y = v - base_y
             for corner_y in (0, 1):
@@ -198,7 +257,13 @@ def render_pyramid_numpy(
                     num_fragments += 1
 
     layers: list[np.ndarray] = []
-    aux: dict = {"t_final": [], "n_used": [], "depth_sum": [], "num_fragments": num_fragments}
+    aux: dict = {
+        "t_final": [],
+        "n_used": [],
+        "depth_sum": [],
+        "num_fragments": num_fragments,
+        "fragments_per_layer": [sum(len(v) for v in buckets[layer].values()) for layer in range(num_layers)],
+    }
     for layer in range(num_layers):
         h_l, w_l = shapes[layer]
         image = np.zeros((num_channels, h_l, w_l), dtype=np.float64)

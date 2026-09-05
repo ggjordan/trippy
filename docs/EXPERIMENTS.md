@@ -324,7 +324,7 @@ scene_root: /Users/nzbirdranch/Splats/scenes/karekare/kk-coherent
 run_dir: output/runs/EXP-0003-kk-trips-train/EXP-0003-kk-trips-train_1
 width: 1008
 crop: 384
-mode: trilinear
+mode: trips        # trips | trilinear | broadcast, docs/GEOMETRY.md; "trips" is the default
 layers: 5
 epochs: 150
 device: mps

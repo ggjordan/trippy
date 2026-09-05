@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pytest
 
+from trippy.constants import RASTER_MODES
 from trippy.train.config import PointSourceConfig, TrainConfig, steps_per_epoch
 
 
@@ -96,3 +97,32 @@ def test_steps_per_epoch_is_ceil_and_floored_at_one() -> None:
 def test_train_config_steps_per_epoch_method_matches_module_function() -> None:
     cfg = TrainConfig(train_factor=0.25)
     assert cfg.steps_per_epoch(10) == steps_per_epoch(0.25, 10)
+
+
+def test_default_render_mode_is_trips_with_trippys_own_pixel_convention() -> None:
+    """docs/TRIPS_REFERENCE.md Sec. 3a: "trips" is the published rule.
+
+    `pixel_center` deliberately stays on trippy's `i + 0.5` convention:
+    trippy undistorts its own scenes that way (docs/GEOMETRY.md), so
+    "integer" -- which exists to reproduce a TRIPS checkpoint bit-for-bit --
+    would render half a pixel off the ground truth it is trained against.
+    """
+    cfg = TrainConfig()
+    assert cfg.mode == "trips"
+    assert cfg.pixel_center == "half"
+    assert cfg.pyramid_halving == "ceil"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("mode", "nonsense"), ("pixel_center", "middle"), ("pyramid_halving", "round")],
+)
+def test_bad_render_conventions_fail_loudly(field: str, value: str) -> None:
+    """A config typo must raise, not silently render something else."""
+    with pytest.raises(ValueError, match=field):
+        TrainConfig(**{field: value})
+
+
+@pytest.mark.parametrize("mode", list(RASTER_MODES))
+def test_every_raster_mode_is_accepted(mode: str) -> None:
+    assert TrainConfig(mode=mode).mode == mode

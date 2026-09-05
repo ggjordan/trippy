@@ -25,7 +25,13 @@ NUM_LAYERS = 3
 TOL = 1e-6
 
 
-def _render_both(mode: str, seed: int = 0, num_points: int = 50, bg: bool = True):
+def _render_both(
+    mode: str,
+    seed: int = 0,
+    num_points: int = 50,
+    bg: bool = True,
+    pixel_center: str = "half",
+):
     scene = make_scene(num_points=num_points, height=32, width=32, num_channels=3, seed=seed)
     npy = as_numpy(scene)
     bg_t = scene["bg"] if bg else None
@@ -42,6 +48,7 @@ def _render_both(mode: str, seed: int = 0, num_points: int = 50, bg: bool = True
         num_layers=NUM_LAYERS,
         mode=mode,
         bg=bg_t,
+        pixel_center=pixel_center,
     )
     layers_n, aux_n = render_pyramid_numpy(
         npy["xyz"],
@@ -55,14 +62,16 @@ def _render_both(mode: str, seed: int = 0, num_points: int = 50, bg: bool = True
         num_layers=NUM_LAYERS,
         mode=mode,
         bg=bg_n,
+        pixel_center=pixel_center,
     )
     return layers_t, aux_t, layers_n, aux_n
 
 
-@pytest.mark.parametrize("mode", ["trilinear", "broadcast"])
-def test_numpy_and_torch_references_agree(mode: str) -> None:
+@pytest.mark.parametrize("pixel_center", ["half", "integer"])
+@pytest.mark.parametrize("mode", ["trilinear", "broadcast", "trips"])
+def test_numpy_and_torch_references_agree(mode: str, pixel_center: str) -> None:
     """Composited colour, transmittance, depth and fragment counts all match."""
-    layers_t, aux_t, layers_n, aux_n = _render_both(mode)
+    layers_t, aux_t, layers_n, aux_n = _render_both(mode, pixel_center=pixel_center)
     assert aux_t["num_fragments"] == aux_n["num_fragments"]
     for layer in range(NUM_LAYERS):
         diff = np.abs(layers_t[layer].detach().numpy() - layers_n[layer]).max()
@@ -72,7 +81,7 @@ def test_numpy_and_torch_references_agree(mode: str) -> None:
         assert np.array_equal(aux_t["n_used"][layer].numpy(), aux_n["n_used"][layer])
 
 
-@pytest.mark.parametrize("mode", ["trilinear", "broadcast"])
+@pytest.mark.parametrize("mode", ["trilinear", "broadcast", "trips"])
 def test_references_agree_without_background(mode: str) -> None:
     """bg=None must mean a plain zero background, not an implicit one."""
     layers_t, _, layers_n, _ = _render_both(mode, seed=5, bg=False)
@@ -90,10 +99,11 @@ def test_fragment_cap_is_reached_and_respected() -> None:
 
 
 def test_broadcast_writes_more_fragments_than_trilinear() -> None:
-    """Mode "broadcast" is TRIPS's shipped default: every point, every layer."""
+    """Fragment budgets: trilinear (<=2 layers) < trips (0..higher) < broadcast."""
     _, aux_tri, _, _ = _render_both("trilinear")
+    _, aux_trips, _, _ = _render_both("trips")
     _, aux_bro, _, _ = _render_both("broadcast")
-    assert aux_bro["num_fragments"] > aux_tri["num_fragments"]
+    assert aux_tri["num_fragments"] < aux_trips["num_fragments"] < aux_bro["num_fragments"]
 
 
 def test_render_pyramid_cpu_dispatches_to_reference() -> None:

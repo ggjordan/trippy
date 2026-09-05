@@ -236,6 +236,8 @@ class Trainer:
             num_layers=self.cfg.layers,
             mode=self.cfg.mode,
             bg=self.background,
+            pixel_center=self.cfg.pixel_center,
+            pyramid_halving=self.cfg.pyramid_halving,
         )
         inputs = [layer.unsqueeze(0) for layer in layers]
         net_out = self.net(inputs)

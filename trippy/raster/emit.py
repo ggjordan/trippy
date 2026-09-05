@@ -10,12 +10,20 @@ Purpose: turn a point cloud plus a camera into a flat, unsorted list of
 Invariants:
     - Coordinate frames: `xyz` is COLMAP world frame; `(R, t)` is
       world->camera (x_cam = R @ x_world + t); `uv` is continuous layer-0
-      pixel coordinates in the *corner-origin* convention of
-      docs/GEOMETRY.md (the centre of pixel index i sits at i + 0.5).
-    - Layer-l coordinates are `uv / 2**l` exactly, with no half-pixel
-      offsets: in corner-origin coordinates a 2x downsample is exactly a
-      halving. This mirrors TRIPS's `ip *= 0.5f` per layer
-      (third_party/TRIPS/src/lib/rendering/RenderForward.cu:1610).
+      pixel coordinates. Whether the centre of pixel i sits at `i + 0.5`
+      (docs/GEOMETRY.md, `pixel_center="half"`, the default) or at `i`
+      (TRIPS's `ip`, `pixel_center="integer"`) is a *rendering option*, not a
+      property of `uv`: it only changes where the 2x2 footprint is anchored.
+    - Layer-l coordinates are `uv / 2**l` exactly, with no additive term, in
+      both conventions. This mirrors TRIPS's `ip *= 0.5f` per layer
+      (third_party/TRIPS/src/lib/rendering/RenderForward.cu:1610). The
+      footprint anchor is `floor(uv/2**l - c)`, c = 0.5 or 0.0, so the two
+      conventions differ by half a *layer-l* pixel, i.e. by a
+      layer-dependent amount in layer-0 units -- see emit_fragments.
+    - Three layer-selection modes, all ports of real TRIPS code paths:
+      "trips" (layers 0..layer_higher, TRIPS's shipped-checkpoint rule),
+      "trilinear" (the two straddling layers) and "broadcast" (all layers,
+      factor 1). See trippy.constants.RASTER_MODES and emit_fragments.
     - Out-of-bounds fragments are DROPPED, never clamped (docs/GEOMETRY.md
       historical bug class 3: clamped/padded pixels unproject as scene).
     - `alpha` stays connected to autograd; the integer key parts do not.
@@ -39,14 +47,23 @@ from torch import Tensor
 from trippy.constants import (
     RASTER_ALPHA_MIN,
     RASTER_CULL_MARGIN_COARSE_PX,
+    RASTER_MODES,
     RASTER_NUM_LAYERS,
+    RASTER_PIXEL_CENTERS,
+    RASTER_PYRAMID_HALVINGS,
     RASTER_SMALL_POINT_CUTOFF,
     RASTER_ZNEAR,
 )
 from trippy.geom.xform_b import compose, project_pinhole, world_to_cam
 from trippy.raster.sort import segment_offsets, sort_fragments
 
-EMIT_MODES = ("trilinear", "broadcast")
+EMIT_MODES = RASTER_MODES
+PIXEL_CENTERS = RASTER_PIXEL_CENTERS
+PYRAMID_HALVINGS = RASTER_PYRAMID_HALVINGS
+
+# Continuous-coordinate offset subtracted before `floor` to find the 2x2
+# footprint's base pixel, per pixel-centre convention (RASTER_PIXEL_CENTERS).
+_CENTRE_SHIFT = {"half": 0.5, "integer": 0.0}
 
 # Offsets of the four bilinear footprint corners, in TRIPS's blend_vec order
 # (PointBlending.h:216-240): index = 2 * dy + dx.
@@ -72,30 +89,56 @@ class LayerGrid:
     total: int
 
 
-def layer_grid(height: int, width: int, num_layers: int = RASTER_NUM_LAYERS) -> LayerGrid:
+def layer_grid(
+    height: int,
+    width: int,
+    num_layers: int = RASTER_NUM_LAYERS,
+    pyramid_halving: str = "ceil",
+) -> LayerGrid:
     """Build the pyramid geometry for a layer-0 image of size (height, width).
 
     Args:
         height, width: layer-0 image size in pixels (ints, > 0).
         num_layers: L, number of pyramid layers (>= 1).
+        pyramid_halving: "ceil" (default) -- `h_l = ceil(H / 2**l)`; or
+            "floor" -- `h_l = H // 2**l` (see RASTER_PYRAMID_HALVINGS).
+            "ceil" is what TRIPS does for every `network_version` other than
+            the literal `"MultiScaleUnet2d"`, i.e. for every published
+            checkpoint (`PointRenderer.cu:385-391`, docs/TRIPS_REFERENCE.md
+            Sec. 3b); "floor" is TRIPS's other branch, which loses the last
+            row and column of an odd-sized layer.
 
     Returns:
-        LayerGrid with `ceil` halving per docs/GEOMETRY.md. NOTE this is a
-        deliberate deviation from TRIPS, which halves with integer division
-        (`h /= 2`, PointRenderer.cu:378) and therefore loses the last row and
-        column of odd-sized layers.
+        LayerGrid.
+
+    Raises:
+        ValueError: on a bad size, a bad `num_layers`, an unknown
+            `pyramid_halving`, or a pyramid so deep that "floor" halving
+            would produce an empty layer.
     """
     if height <= 0 or width <= 0:
         raise ValueError(f"image size must be positive, got {(height, width)}")
     if num_layers < 1:
         raise ValueError(f"num_layers must be >= 1, got {num_layers}")
+    if pyramid_halving not in PYRAMID_HALVINGS:
+        raise ValueError(f"pyramid_halving must be one of {PYRAMID_HALVINGS}, got {pyramid_halving!r}")
     shapes: list[tuple[int, int]] = []
     offsets: list[int] = []
     total = 0
     for layer in range(num_layers):
         step = 1 << layer
-        h_l = -(-height // step)
-        w_l = -(-width // step)
+        if pyramid_halving == "ceil":
+            h_l = -(-height // step)
+            w_l = -(-width // step)
+        else:
+            # Repeated `h /= 2` is exactly one `h // 2**l` (floor composes).
+            h_l = height // step
+            w_l = width // step
+        if h_l < 1 or w_l < 1:
+            raise ValueError(
+                f"pyramid_halving={pyramid_halving!r} gives an empty layer {layer} "
+                f"({h_l}x{w_l}) for a {height}x{width} image; reduce num_layers"
+            )
         shapes.append((h_l, w_l))
         offsets.append(total)
         total += h_l * w_l
@@ -323,7 +366,9 @@ class Fragments:
         depth: (F,) float, camera-space z of the source point, world units.
         point_id: (F,) int64, index into the input point arrays.
         alpha: (F,) float, `bilinear_weight * conf * layer_factor`, in
-            (0, 1). Connected to autograd.
+            [0, 1). Exactly 0 is reachable when `alpha_min=0` (TRIPS's own
+            setting: it writes all four corners even at weight 0).
+            Connected to autograd.
         grid: the LayerGrid the indices refer to.
     """
 
@@ -348,24 +393,64 @@ def emit_fragments(
     mode: str = "trilinear",
     valid: Tensor | None = None,
     alpha_min: float = RASTER_ALPHA_MIN,
+    pixel_center: str = "half",
 ) -> Fragments:
     """Emit bilinear fragments for every (point, layer) pair the point covers.
 
-    Layer selection:
-        - mode "trilinear": layers [lower, upper] from `layer_bounds`, each
-          weighted by `layer_factor` -- TRIPS's `use_layer_point_size=true`
-          path, whose emission kernel `CollectTiled2Pointsize` writes exactly
-          those two layers (RenderForward.cu:2296-2360). That path is
-          unreachable from any shipped TRIPS .ini (docs/TRIPS_REFERENCE.md
-          section 11). At most 2 layers x 4 corners = 8 fragments per point.
-        - mode "broadcast": every layer, factor 1 -- TRIPS's actual shipped
-          default (`use_layer_point_size=false`, docs/TRIPS_REFERENCE.md
-          section 10.1). Up to L x 4 = 20 fragments per point.
+    Layer selection (all three are real TRIPS code paths, see
+    docs/GEOMETRY.md "Pyramid level selection" and trippy.constants.RASTER_MODES):
 
-    Footprint: layer coordinate `uv_l = uv / 2**l`; the 2x2 footprint is
-    anchored at pixel *centres*, so the base pixel is
-    `floor(uv_l - 0.5)` and the fractional weights come from
-    `uv_l - 0.5 - base` (docs/GEOMETRY.md pixel-centre convention).
+    - mode "trips": layers `0 .. layer_higher` inclusive, each weighted by
+      `layer_factor`. This is what the published checkpoints render with:
+      `use_layer_point_size = !fix_point_size = true` (`Settings.cpp:39`)
+      selects `RenderFast16` / `CountAndCollectTiled`, whose emission loop is
+
+          layer_higher = (s > 1) ? min(ceil(log2 s), L-1) : 0   # :334-338
+          for (layer = 0; layer <= layer_higher; ++layer, ip *= 0.5f)
+              if (!valid_point(floor(ip), z, layer)) break;     # break, NOT continue
+              atomicAdd 4x into per_pixel_list_lengths[layer]   # :340-352
+
+      and whose per-fragment alpha is `bilinear * confidence *
+      compute_point_size_fac(s, layer, L)` (`RenderForward.cu:3511-3517`).
+      `compute_point_size_fac` returns exactly **1.0** for every
+      `layer < layer_lower` (`PointBlending.h:92-96`), so a 5-px point writes
+      layers 0..3 with factors 1, 1, 0.75, 0.25. Up to L x 4 fragments per
+      point. Two TRIPS-only rules come with this mode:
+        * the footprint gate is `valid_point`, which requires **all four**
+          corners in bounds (`0 <= floor(ip) < size - 1`), not the
+          per-corner drop the other modes use; and
+        * it is a `break`, so failing that gate at layer l also suppresses
+          every *coarser* layer, even ones the point would have passed.
+      Layer 0's gate is TRIPS's pre-loop `valid_point(ip, z, 0, ...)`
+      (`RenderForward.cu:296`) -- identical, because `floor(x) < w - 1` and
+      `x < w - 1` are the same statement for integers.
+    - mode "trilinear": layers [lower, upper] from `layer_bounds`, each
+      weighted by `layer_factor` -- TRIPS's `CollectTiled2Pointsize`
+      emission (RenderForward.cu:2296-2360), reachable only through the
+      `combine_lists = true` path. At most 2 layers x 4 corners = 8
+      fragments per point.
+    - mode "broadcast": every layer, factor 1 --
+      `use_layer_point_size = false` (docs/TRIPS_REFERENCE.md section 10.1).
+      Up to L x 4 fragments per point.
+
+    Footprint: layer coordinate `uv_l = uv / 2**l` (an exact halving in both
+    conventions, mirroring TRIPS's `ip *= 0.5f`), then
+
+        base = floor(uv_l - c),  frac = uv_l - c - base
+
+    with `c = 0.5` for `pixel_center="half"` (trippy's convention: the centre
+    of pixel i is at i + 0.5, docs/GEOMETRY.md) and `c = 0.0` for
+    `pixel_center="integer"` (TRIPS's `ip`, whose pixel centres are on
+    integers -- `compute_blending_fac` splats at `floor(ip)`,
+    `PointBlending.h:216-240`).
+
+    Why `c` is subtracted *after* the halving and not before: TRIPS halves
+    its own coordinate, `ip_l = ip / 2**l`, and anchors the footprint at
+    `floor(ip_l)`. In the "half" convention the same operation is
+    `floor(uv/2**l - 0.5)`. The two therefore differ by a *layer-dependent*
+    half pixel, `2**(l-1)` layer-0 pixels, which is why a TRIPS-parity render
+    needs `pixel_center="integer"` rather than a fixed `+0.5` on `cx, cy`
+    (docs/TRIPS_REFERENCE.md Sec. 6a).
 
     Args:
         uv: (N, 2) float, layer-0 continuous pixel coordinates.
@@ -374,18 +459,25 @@ def emit_fragments(
         conf: (N,) float in (0, 1), effective (post-sigmoid) confidence. The
             trainer owns the raw parameter.
         grid: LayerGrid describing the pyramid.
-        mode: "trilinear" or "broadcast".
+        mode: one of EMIT_MODES.
         valid: optional (N,) bool mask from cull_points; None means all.
-        alpha_min: fragments with alpha below this are dropped.
+        alpha_min: fragments with alpha below this are dropped. TRIPS uses no
+            such floor; pass 0.0 for an exact port (every in-bounds corner
+            then takes a slot in the 16-deep list, even at weight 0).
+        pixel_center: "half" or "integer" (see PIXEL_CENTERS).
 
     Returns:
-        Fragments (unsorted; ordering is by layer then by input point index).
+        Fragments (unsorted; ordering is by layer, then by input point index,
+        then by footprint corner).
     """
     if mode not in EMIT_MODES:
         raise ValueError(f"mode must be one of {EMIT_MODES}, got {mode!r}")
+    if pixel_center not in PIXEL_CENTERS:
+        raise ValueError(f"pixel_center must be one of {PIXEL_CENTERS}, got {pixel_center!r}")
     num_layers = len(grid.shapes)
     device = uv.device
     dtype = uv.dtype
+    centre_shift = _CENTRE_SHIFT[pixel_center]
     if valid is None:
         valid = torch.ones(uv.shape[0], dtype=torch.bool, device=device)
 
@@ -393,6 +485,9 @@ def emit_fragments(
     dy = torch.tensor(_CORNER_DY, dtype=torch.int64, device=device)
 
     lower, upper = layer_bounds(size_px, num_layers)
+    # TRIPS's `layer_higher` is `layer_bounds`' upper bound: both are
+    # `min(ceil(log2 s), L-1)` for s > 1 and 0 otherwise.
+    alive = valid
 
     out_lp: list[Tensor] = []
     out_layer: list[Tensor] = []
@@ -403,21 +498,47 @@ def emit_fragments(
 
     for layer in range(num_layers):
         h_l, w_l = grid.shapes[layer]
-        if mode == "broadcast":
+        scale = 1.0 / float(1 << layer)
+
+        if mode == "trips":
+            # The gate has to be evaluated for every surviving point, not just
+            # the selected ones, because it *propagates* to coarser layers.
+            centred_all = uv * scale - centre_shift
+            base_all = torch.floor(centred_all)
+            fits = (
+                (base_all[:, 0] >= 0.0)
+                & (base_all[:, 0] <= float(w_l - 2))
+                & (base_all[:, 1] >= 0.0)
+                & (base_all[:, 1] <= float(h_l - 2))
+            )
+            alive = alive & fits
+            selected = alive & (upper >= layer)
+        elif mode == "broadcast":
             selected = valid
-            factor_all = torch.ones_like(size_px)
-        else:
+        else:  # "trilinear"
             selected = valid & (lower <= layer) & (layer <= upper)
-            factor_all = layer_factor(size_px, layer, num_layers)
+
         idx = torch.nonzero(selected, as_tuple=False).reshape(-1)
         if idx.numel() == 0:
             continue
 
-        scale = 1.0 / float(1 << layer)
-        centred = uv.index_select(0, idx) * scale - 0.5
-        base = torch.floor(centred)
+        if mode == "trips":
+            centred = centred_all.index_select(0, idx)
+            base = base_all.index_select(0, idx)
+        else:
+            centred = uv.index_select(0, idx) * scale - centre_shift
+            base = torch.floor(centred)
         frac = centred - base
         base_i = base.to(torch.int64)
+
+        size_sel = size_px.index_select(0, idx)
+        # layer_factor is elementwise, so evaluating it on the selected rows
+        # only is numerically identical and avoids L passes over all N points.
+        factor = (
+            torch.ones_like(size_sel)
+            if mode == "broadcast"
+            else layer_factor(size_sel, layer, num_layers)
+        )
 
         wx = torch.cat([1.0 - frac[:, 0:1], frac[:, 0:1]], dim=1)
         wy = torch.cat([1.0 - frac[:, 1:2], frac[:, 1:2]], dim=1)
@@ -427,12 +548,10 @@ def emit_fragments(
         px = base_i[:, 0:1] + dx.reshape(1, 4)
         py = base_i[:, 1:2] + dy.reshape(1, 4)
 
-        alpha = (
-            beta
-            * conf.index_select(0, idx).reshape(-1, 1)
-            * factor_all.index_select(0, idx).reshape(-1, 1).to(dtype)
-        )
+        alpha = beta * conf.index_select(0, idx).reshape(-1, 1) * factor.reshape(-1, 1).to(dtype)
 
+        # A no-op in mode "trips" (its `fits` gate already guarantees all four
+        # corners are inside), the drop rule everywhere else.
         in_bounds = (px >= 0) & (px < w_l) & (py >= 0) & (py < h_l)
         keep = (in_bounds & (alpha >= alpha_min)).reshape(-1)
         if not bool(keep.any()):
@@ -510,6 +629,7 @@ def build_sorted_fragments(
     segment_method: str = "searchsorted",
     sort_stable: bool = True,
     pose_delta: Tensor | None = None,
+    pixel_center: str = "half",
 ) -> SortedFragments:
     """Project -> cull -> emit -> sort -> segment, the whole pre-compositing pipeline.
 
@@ -523,7 +643,7 @@ def build_sorted_fragments(
         K: (3, 3) float, layer-0 intrinsics in pixels.
         R: (3, 3) float, world->camera rotation. t: (3,) float, translation.
         grid: LayerGrid for the target image.
-        mode: "trilinear" or "broadcast" (see emit_fragments).
+        mode: one of EMIT_MODES (see emit_fragments).
         alpha_min: emission-time alpha floor.
         znear: near-plane cull, world units.
         sort_method: "composite" or "two_pass" (see trippy.raster.sort).
@@ -531,13 +651,24 @@ def build_sorted_fragments(
         sort_stable: stable sort flag passed to sort_fragments.
         pose_delta: optional (6,) SE(3) twist refining `(R, t)`; see
             apply_pose_delta. Differentiable.
+        pixel_center: "half" or "integer" (see emit_fragments).
 
     Returns:
         SortedFragments on the same device/dtype as the inputs.
     """
     uv, depth, size_px = project_points(xyz, size, K, R, t, znear=znear, pose_delta=pose_delta)
     valid = cull_points(uv, depth, size_px, grid, znear=znear)
-    frags = emit_fragments(uv, depth, size_px, conf, grid, mode=mode, valid=valid, alpha_min=alpha_min)
+    frags = emit_fragments(
+        uv,
+        depth,
+        size_px,
+        conf,
+        grid,
+        mode=mode,
+        valid=valid,
+        alpha_min=alpha_min,
+        pixel_center=pixel_center,
+    )
     perm = sort_fragments(frags.layer_pixel, frags.depth, method=sort_method, stable=sort_stable)
     layer_pixel = frags.layer_pixel.index_select(0, perm)
     offsets = segment_offsets(layer_pixel, grid.total, method=segment_method)

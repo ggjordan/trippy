@@ -83,7 +83,9 @@ def test_mps_torch_primitives() -> None:
         print(f"mps: {label} agrees with the default path")
 
 
-def _render_mps_and_reference(mode: str, seed: int, num_channels: int, num_layers: int):
+def _render_mps_and_reference(
+    mode: str, seed: int, num_channels: int, num_layers: int, pixel_center: str = "half"
+):
     scene = make_scene(
         num_points=50, height=32, width=32, num_channels=num_channels, seed=seed, dtype=torch.float64
     )
@@ -99,6 +101,7 @@ def _render_mps_and_reference(mode: str, seed: int, num_channels: int, num_layer
         num_layers=num_layers,
         mode=mode,
         bg=scene["bg"],
+        pixel_center=pixel_center,
     )
     mps_args = [
         scene[key].to(torch.float32).to("mps")
@@ -110,11 +113,12 @@ def _render_mps_and_reference(mode: str, seed: int, num_channels: int, num_layer
         num_layers=num_layers,
         mode=mode,
         bg=scene["bg"].to(torch.float32).to("mps"),
+        pixel_center=pixel_center,
     )
     return ref_layers, ref_aux, gpu_layers, gpu_aux
 
 
-@pytest.mark.parametrize("mode", ["trilinear", "broadcast"])
+@pytest.mark.parametrize("mode", ["trilinear", "broadcast", "trips"])
 @pytest.mark.parametrize("num_channels", [3, 4])
 def test_metal_matches_reference(mode: str, num_channels: int) -> None:
     """blend_fwd on MPS must match the float64 CPU reference within 1e-4."""
@@ -137,6 +141,30 @@ def test_metal_matches_reference(mode: str, num_channels: int) -> None:
         assert t_diff.item() < FP32_TOL
     print(f"[{mode} C={num_channels}] worst max abs diff over layers: {worst:.3e}")
     assert int(gpu_aux["n_used"][0].max().item()) <= RASTER_MAX_FRAGS
+
+
+@pytest.mark.parametrize("pixel_center", ["half", "integer"])
+def test_metal_matches_reference_trips_both_pixel_conventions(pixel_center: str) -> None:
+    """Mode "trips" on MPS, in both pixel-centre conventions.
+
+    `pixel_center="integer"` is the setting `trippy.render.parity`'s native
+    engine renders a TRIPS checkpoint with, so it has to be exercised on the
+    device that engine actually runs on.
+    """
+    ref_layers, ref_aux, gpu_layers, gpu_aux = _render_mps_and_reference(
+        "trips", seed=2, num_channels=4, num_layers=SMALL_LAYERS, pixel_center=pixel_center
+    )
+    print(
+        f"[trips {pixel_center}] fragments ref={ref_aux['num_fragments']} "
+        f"metal={gpu_aux['num_fragments']} "
+        f"per layer ref={ref_aux['fragments_per_layer'].tolist()} "
+        f"metal={gpu_aux['fragments_per_layer'].cpu().tolist()}"
+    )
+    assert abs(ref_aux["num_fragments"] - gpu_aux["num_fragments"]) <= 2
+    for layer in range(SMALL_LAYERS):
+        diff = (gpu_layers[layer].cpu().double() - ref_layers[layer]).abs().max().item()
+        print(f"[trips {pixel_center}] layer {layer}: max|out| {diff:.3e}")
+        assert diff < FP32_TOL
 
 
 def test_metal_sort_fallback_matches_composite() -> None:

@@ -42,13 +42,17 @@
 
 - **The background is always added as `T_final · bg`.** TRIPS only adds it when `alpha_dest >= ALPHA_DEST_CUTOFF` (`RenderForward.cu:3610`), i.e. it hard-zeroes a residual of up to 0.001. Ours is the continuous version — the difference is ≤0.001 × bg and it avoids a discontinuity in the loss.
 
-- **The out-of-bounds test is per fragment, not per point.** TRIPS rejects a point's *whole* 2×2 footprint at a layer if `floor(ip)` is out of range, and then abandons the remaining (coarser) layers entirely: the broadcast kernel `break`s out of the layer loop (`RenderForward.cu:1610-1620`) and the point-size kernel nests the `layer_higher` write inside the `layer_lower` bounds check (`RenderForward.cu:2296-2360`), so a point on the border loses its coarse-layer contribution too. We test each of the four corners independently and each layer independently, so a point straddling the border still contributes its in-bounds corners, and a point off the edge of layer 0 can still draw in a coarse layer. This is strictly more correct at borders; it also means our fragment counts near the frame edge do not match TRIPS's.
+- **The out-of-bounds test is per fragment in `trilinear`/`broadcast`, per point in `trips`.** TRIPS rejects a point's *whole* 2×2 footprint at a layer if `floor(ip)` is out of `[0, w_l-2] × [0, h_l-2]`, and then abandons the remaining (coarser) layers entirely (`RenderForward.cu:340-352`). `mode="trips"` implements exactly that rule, including the `break`. Modes `"trilinear"` and `"broadcast"` keep trippy's older per-corner rule instead, so a point straddling the border still contributes its in-bounds corners and a point off the edge of layer 0 can still draw in a coarse layer. That is strictly more correct at borders and it means those two modes' fragment counts near the frame edge do not match TRIPS's. Two rules now coexist on purpose; do not "unify" them.
 
-- **Pyramid layers use `ceil` halving, TRIPS uses integer division.** See docs/GEOMETRY.md. Odd-sized images differ in the last row/column of every layer.
+- **Pyramid halving is a `pyramid_halving` option, default `"ceil"`.** `"ceil"` is what TRIPS does for every published checkpoint (`network_version != "MultiScaleUnet2d"`, `PointRenderer.cu:385-391`); `"floor"` reproduces the other branch. This entry previously called `ceil` a deviation from TRIPS — it is not (docs/TRIPS_REFERENCE.md §3b). `layer_grid` raises rather than build an empty layer under `"floor"`.
 
-- **`use_layer_point_size` mode parity is untestable against a TRIPS checkpoint.** `mode="trilinear"` ports a code path that no shipped TRIPS `.ini` can enable (docs/TRIPS_REFERENCE.md §11), so it can never be validated against a released TRIPS checkpoint — only against our own references. `mode="broadcast"` is the mode a TRIPS checkpoint would have been trained in.
+- **The pixel-centre convention is a `pixel_center` option, default `"half"`.** TRIPS's `ip` puts pixel centres on integers; trippy puts them at `i + 0.5`, which is what its own COLMAP intrinsics and undistortion cache assume. Training therefore always runs on `"half"`; `"integer"` exists only for TRIPS-checkpoint parity. Rendering a trippy-trained model with `"integer"` (or a TRIPS checkpoint with `"half"`) shifts the image by half a layer-`l` pixel on layer `l`, which is a real, visible error at coarse layers — not a rounding detail.
 
-- **Fragment memory scales with the mode.** In `broadcast` mode a point emits up to `4 × L = 20` fragments, not 8. At 7.36M points and L=5 that is up to 147M fragments before the bounds cull, well past the 50M figure assumed above for int64 argsort; large scenes will need tiling or crop-based rendering (the trainer already renders 384–512 px crops).
+- **`use_layer_point_size` mode parity is testable, and `"trips"` is the mode that matters.** This entry previously said the point-size path could not be reached from any shipped `.ini`. It can: `use_layer_point_size = !fix_point_size` (`Settings.cpp:39`) and `fix_point_size = false` in every published `params.ini` (docs/TRIPS_REFERENCE.md §2b/3a). `mode="trips"` is that path and is validated against a real checkpoint. `mode="trilinear"` ports `CollectTiled2Pointsize`, reachable only with `combine_lists = true`, and has *not* been checked against a released checkpoint; `mode="broadcast"` corresponds to `fix_point_size = true`, which no released Tanks & Temples checkpoint uses.
+
+- **`mode="trips"` breaks crop/full-frame equivalence on the crop's rim** — and this is TRIPS's own behaviour, not a porting bug. TRIPS's `valid_point` gate is evaluated against *the image being rendered*, so a training crop's edge is a real image edge: a point one pixel outside the crop is dropped, where in the full frame it was interior and drew normally. The affected band is `2**l` layer-0 pixels wide at layer l (1 px at layer 0, 16 px at layer 4), so at the trainer's 384 px crop with L=5 the outer ~4% of the crop has thinner coarse-layer coverage than a full-frame render would give it. Modes `"trilinear"` and `"broadcast"` keep exact crop equivalence, because their per-corner rule only ever loses the corners that genuinely fall outside. Measured and pinned by `tests/test_train_crop_equivalence.py::test_crop_equals_cropped_full_render_trips_mode_in_the_interior`: exact one pixel in, ~0.45 feature units on the outermost ring. If this ever shows up as a visible crop-boundary artefact in training, the fix is to render a crop with a `2**(L-1)` px margin and discard it, not to weaken the gate.
+
+- **Fragment memory scales with the mode.** In `trips` and `broadcast` modes a point emits up to `4 × L = 20` fragments, not 8. At 7.36M points and L=5 that is up to 147M fragments before the bounds cull, well past the 50M figure assumed above for int64 argsort; large scenes will need tiling or crop-based rendering (the trainer already renders 384–512 px crops). `trips` is the trainer default, so this is now the *normal* case, not a corner: in practice most points are sub-pixel (`layer_higher = 0`) and only the near-field ones reach `4 · L`.
 
 - **Composite sort key caps the pyramid at 2^31 layer-pixels.** The key packs `layer_pixel << 32 | float32_bits(depth)` into an int64. Beyond ~2.1 G layer-pixels (far above any realistic frame) `sort_fragments` raises and the `two_pass` fallback must be used; it has no such limit.
 
@@ -70,7 +74,7 @@
 
 - **The per-point feature gradient reduction is a torch `index_add_`, not an atomic.** On MPS this is a separate kernel launch over F fragments after `blend_bwd`, and its summation order is torch's, not ours; results are deterministic in practice on this backend but the order is not contractually guaranteed by torch. TRIPS instead accumulates with `atomicAdd` per fragment, which is *less* deterministic.
 
-- **`mode="broadcast"` gives per-point sizes no gradient at all.** With `use_layer_point_size=false` the layer factor is 1 everywhere and each point is written to every layer, so `size` feeds nothing that affects the image and `size.grad` is `None`. This is not a bug in the backward; it is what TRIPS's shipped default does, and it is why every released TRIPS checkpoint's point sizes are untrained (docs/TRIPS_REFERENCE.md §10.1).
+- **`mode="broadcast"` gives per-point sizes no gradient at all** — which is why it is not the trainer default. With `use_layer_point_size=false` the layer factor is 1 everywhere and each point is written to every layer, so `size` feeds nothing that affects the image; the render is not even connected to `size` in the autograd graph. This is not a bug in the backward; it is what `fix_point_size = true` does. Modes `trips` and `trilinear` both give `size` a real gradient, on the two layers the projected footprint straddles.
 ## net/ (feat/net, 2026-09-05): U-Net, neural camera, losses port
 
 - **Gated conv block: VERIFIED, not a guess.** `External/saiga/` is empty in the vendored TRIPS
@@ -160,6 +164,34 @@ exactly**, in registration order. This was run manually against the extracted fi
 automated pytest test, since the checkpoint file lives outside the git-tracked worktree and cannot be
 required by CI); the exact commands are reproducible from `docs/TRIPS_REFERENCE.md` Sec. 9a.
 
+### `x.to("cpu", torch.float64)` on an MPS tensor returns garbage, silently
+
+MPS has no float64. `Tensor.to(device, dtype)` performs the dtype cast on the *source* device, so this
+one-liner casts float32 -> float64 on MPS: it does **not** raise, even with
+`PYTORCH_ENABLE_MPS_FALLBACK=0`, and it does not fall back — it returns reinterpreted bytes. Observed in
+job `trippy-trips-mode-gpu-1`: a 1920x1080 feature layer whose real range is about [-100, 100] came back
+with a maximum of 1.5e10, NaNs on three of eight levels, and float64 denormals (4.9e-324) on others. The
+render itself was correct; only the diagnostic that read it was wrong, which is the dangerous shape of
+this bug. **Always `.cpu()` first, then `.to(torch.float64)`.** `.to("cpu", torch.float32)` is safe and is
+what the rest of `trippy.render.parity` uses.
+
+### Native vs per-layer `trips` engine (feat/trips-mode)
+
+`trippy parity --engine native` renders the whole pyramid with a single
+`render_pyramid(mode="trips", pixel_center="integer", pyramid_halving="ceil")` call;
+`--engine perlayer` is the original loop of `num_layers=1` calls with `cx, cy + 0.5`. They select
+*identical* fragments (same `points_active` per layer, same total fragment count — a discrete quantity, so
+it matches exactly or not at all) but they are not bit-identical in float32: `perlayer` computes the layer
+coordinate as `fl(ip·2^-l + fl(cx·2^-l + 0.5)) - 0.5` and `native` as `fl(ip)·2^-l`. Adding and then
+subtracting 0.5 at a coordinate of order 10³ costs about one float32 ulp (~1.2e-4 px at layer 0), which
+propagates into the bilinear weights. `--compare-engines` measures it per level. `native` is the more
+accurate of the two and is the default; `perlayer` is kept as the independent check.
+
+Measured on tt_horse at 1920x1080 x 8 levels (job `trippy-trips-mode-gpu-2`, rc 0): identical fragment
+counts and identical per-layer active-point vectors; worst relative level-image disagreement 5.5e-05 on
+layer 0 (4 pixels out of 2 073 600), mean ~1e-07 per level, zero pixels over 1e-3 on levels 1-7; PSNR gap
+1.3e-08 dB. The layer-0 outliers are `floor()` flips at coordinates within one ulp of an integer.
+
 ## EXP-0002 (feat/adop-parity, 2026-09-06): reproducing the published TRIPS horse render
 
 `trippy parity` now renders the authors' `checkpoint_horse` @ `ep0600` end to end and lands within
@@ -171,19 +203,19 @@ required by CI); the exact commands are reproducible from `docs/TRIPS_REFERENCE.
   fragments, float32 accumulation order, and the `abs(ip - g) > 1` defensive guard
   (`RenderForward.cu:3507`, unreachable for an exact 2x2 footprint) all differ at the ULP level. Measured
   agreement against the authors' own render is 37.0 dB PSNR, not infinity.
-- **Border-pixel rule differs by one pixel.** TRIPS drops a point from layer `l` when
+- **Border-pixel rule: now implemented in the rasteriser itself.** TRIPS drops a point from layer `l` when
   `floor(ip_l)` is outside `[0, w_l-2] x [0, h_l-2]` and then `break`s out of all coarser layers.
-  `trippy.render.parity` reproduces both rules, but `trippy.raster.emit.emit_fragments` additionally drops
-  individual out-of-bounds *corners*, which TRIPS never reaches because its point-level test already
-  guarantees all four are inside. No observable difference; noted so a future refactor does not "fix" one
-  of the two.
+  `trippy.raster.emit.emit_fragments` implements both rules in `mode="trips"` (they used to live only in
+  `trippy.render.parity`'s per-layer loop). Its per-corner drop still runs afterwards but is a no-op there,
+  since the point-level test already guarantees all four corners are inside.
 - **`render_scale != 1` is untested for parity.** `size_px = fx * softplus(size) / z` scales with `fx`, so
   a downscaled render moves points into different pyramid layers than the checkpoint was trained for. A
   1/8-scale smoke render of frame 8 scores 10.4 dB. Parity numbers are only claimed at `render_scale = 1`.
-- **The `trilinear` ablation renders one multi-layer `render_pyramid` call**, so its coarse layers use
-  trippy's corner-origin halving rather than TRIPS's `ip *= 0.5f`. Layer 0 is aligned (the `cx, cy` +0.5
-  shift is applied); coarser layers are up to half a layer-pixel off. That is fine for an ablation column
-  and wrong for a parity claim, which is why the `trips` mode renders each layer separately.
+- **The `trilinear` and `broadcast` ablation columns are still rendered by the per-layer engine.**
+  `broadcast` reproduces TRIPS's per-layer gate exactly; `trilinear` renders one multi-layer
+  `render_pyramid` call with `cx, cy + 0.5`, so its layer 0 is aligned and its coarser layers are up to
+  half a layer-pixel off. Both exist to reproduce *wrong* readings of the reference doc, so neither is a
+  parity claim. Mode `trips` has two engines that must agree (below).
 - **`alpha == 1.0` exactly makes the float32 CPU reference compositor produce NaN.**
   `trippy.raster.ref_torch.composite_sorted` clamps alpha to `1 - RASTER_ALPHA_MAX_EPS` with
   `RASTER_ALPHA_MAX_EPS = 1e-12`, which is a no-op in float32 (`1 - 1e-12 == 1.0f`), so `log1p(-1) = -inf`

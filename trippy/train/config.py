@@ -33,6 +33,9 @@ from trippy.constants import (
     LOSS_DEFAULT_WEIGHT_LPIPS,
     LOSS_DEFAULT_WEIGHT_SSIM,
     LOSS_DEFAULT_WEIGHT_VGG,
+    RASTER_MODES,
+    RASTER_PIXEL_CENTERS,
+    RASTER_PYRAMID_HALVINGS,
     TRAIN_DEFAULT_BACKGROUND,
     TRAIN_DEFAULT_CHECKPOINT_EVERY,
     TRAIN_DEFAULT_CROP,
@@ -52,6 +55,8 @@ from trippy.constants import (
     TRAIN_DEFAULT_LR_SIZE,
     TRAIN_DEFAULT_LR_TEXTURE,
     TRAIN_DEFAULT_MODE,
+    TRAIN_DEFAULT_PIXEL_CENTER,
+    TRAIN_DEFAULT_PYRAMID_HALVING,
     TRAIN_DEFAULT_SEED,
     TRAIN_DEFAULT_TRAIN_FACTOR,
     TRAIN_DEFAULT_WIDTH,
@@ -191,7 +196,14 @@ class TrainConfig:
     extent_margin: float = TRAIN_EXTENT_MARGIN_FRAC
 
     # --- render (trippy.raster.pyramid.render_pyramid / trippy.net.unet.NetworkConfig) ---
+    # `mode` defaults to "trips", the layer rule the published TRIPS checkpoints render
+    # with. `pixel_center` stays on trippy's own "half" convention: trippy undistorts its
+    # scenes with pixel centres at i + 0.5 (docs/GEOMETRY.md), so "integer" -- which exists
+    # to reproduce a TRIPS checkpoint bit-for-bit -- would put the render half a pixel off
+    # its own ground truth. See docs/GEOMETRY.md "Pixel-centre convention".
     mode: str = TRAIN_DEFAULT_MODE
+    pixel_center: str = TRAIN_DEFAULT_PIXEL_CENTER
+    pyramid_halving: str = TRAIN_DEFAULT_PYRAMID_HALVING
     layers: int = TRAIN_DEFAULT_LAYERS
     feature_channels: int = TRAIN_DEFAULT_FEATURE_CHANNELS
     background: float = TRAIN_DEFAULT_BACKGROUND
@@ -223,6 +235,16 @@ class TrainConfig:
             raise ValueError(f"epochs must be positive, got {self.epochs}")
         if self.feature_channels < 3:
             raise ValueError(f"feature_channels must be >= 3 (rgb0 seeds channels 0:3), got {self.feature_channels}")
+        if self.mode not in RASTER_MODES:
+            raise ValueError(f"mode must be one of {RASTER_MODES}, got {self.mode!r}")
+        if self.pixel_center not in RASTER_PIXEL_CENTERS:
+            raise ValueError(
+                f"pixel_center must be one of {RASTER_PIXEL_CENTERS}, got {self.pixel_center!r}"
+            )
+        if self.pyramid_halving not in RASTER_PYRAMID_HALVINGS:
+            raise ValueError(
+                f"pyramid_halving must be one of {RASTER_PYRAMID_HALVINGS}, got {self.pyramid_halving!r}"
+            )
 
     @property
     def lock_cameras_epochs(self) -> int:

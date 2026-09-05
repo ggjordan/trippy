@@ -557,6 +557,14 @@ order — the network architecture (Sec. 5) is now checkpoint-verified, not just
 
 ## 10. Contradictions with `docs/ARCHITECTURE.md` / `docs/GEOMETRY.md`
 
+> **Read §2a/2b/3a/3b/6a first.** Everything in this section that turns on
+> "`use_layer_point_size` is unreachable from any `.ini`, therefore always false" is **wrong**: it is
+> derived from `fix_point_size`, which is `false` in every published checkpoint (§2b). The mode the
+> released checkpoints render with is neither of the two this section weighs up — it is
+> `0 .. layer_higher` with `compute_point_size_fac` weights (§3a), trippy's `mode="trips"` and its
+> default. This section is kept as written because the *formula* corrections in items 2 and 3 are correct
+> and still load-bearing.
+
 1. **Forward pass "emit ≤8 fragments per point, 2 pyramid levels × 2×2 bilinear weights" (ARCHITECTURE.md
    line ~30) does not match TRIPS's actual default.** TRIPS's default (`use_layer_point_size=false`, the
    only value reachable from any shipped `.ini` — see §2/§3) writes **every point into every one of the 5
@@ -760,10 +768,20 @@ crop then only ever trims the upsampled tensor by one row/column (136 -> 135), n
 `compute_blending_fac` (`PointBlending.h:216-240`) takes `subpixel_pos = ip - floor(ip)` and writes the
 2x2 footprint at `floor(ip)` and `floor(ip)+1`. So in TRIPS the *centre* of pixel `i` is at coordinate
 `i`, whereas `docs/GEOMETRY.md` puts it at `i + 0.5`. Feeding trippy's rasteriser the raw `K` therefore
-shifts the whole render by half a pixel per layer. `trippy.render.parity` corrects this by adding 0.5 to
+shifts the whole render by half a pixel per layer. `trippy.render.parity` originally corrected this by adding 0.5 to
 `cx, cy` **and** rendering each pyramid layer with its own `num_layers=1` call at
-`K_l = (fx, fy, cx, cy) / 2**l`, which reproduces TRIPS's `ip *= 0.5f` exactly (a single multi-layer call
-cannot: `uv/2**l - 0.5` and `ip/2**l` differ by a layer-dependent amount for any fixed `cx`).
+`K_l = (fx, fy, cx, cy) / 2**l`, which reproduces TRIPS's `ip *= 0.5f` exactly.
+
+**Correction (feat/trips-mode):** the parenthetical that used to follow — "a single multi-layer call
+cannot: `uv/2**l - 0.5` and `ip/2**l` differ by a layer-dependent amount for any fixed `cx`" — is true only
+of a *fixed pixel-centre convention*. The offset is layer-dependent precisely because it is applied before
+the halving; applied *after* it, it is a constant 0.5 or 0.0 per layer. `trippy.raster.emit.emit_fragments`
+therefore takes a `pixel_center` option (`"half"` -> `base = floor(uv_l - 0.5)`, `"integer"` ->
+`base = floor(uv_l)`) and one `render_pyramid(mode="trips", pixel_center="integer")` call now reproduces
+the whole pyramid. `trippy parity --engine native` is that path; `--engine perlayer` keeps the original
+loop as an independent check, and `--compare-engines` diffs them per level (they select identical
+fragments; the residual is ~1 float32 ulp of the layer coordinate, because `perlayer` adds and then
+subtracts 0.5 at a coordinate of order 10**3). See docs/GEOMETRY.md "Pixel-centre convention".
 
 ### 8a. `poses.txt` xyzw camera-to-world is confirmed against TRIPS's own buffer
 

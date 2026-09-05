@@ -7,6 +7,15 @@ Invariants under test: for the same points and pose, rendering a
     `crop()` call, to within 1e-5 (float64 compute) -- this is the "K-adjust"
     strategy `Trainer.train_step` uses so a training crop only ever
     rasterises the crop's own fragments, never the full frame's.
+
+    EXCEPTION, and it is TRIPS's own behaviour, not a bug: in `mode="trips"`
+    the equivalence holds only in the crop's *interior*. That mode carries
+    TRIPS's `valid_point` gate, which drops a point from layer l unless all
+    four footprint corners are inside layer l *of the image being rendered*
+    (`RenderForward.cu:340-352`). A crop is a smaller image, so its own edge
+    is a real edge: a point one pixel outside it is gone, where in the full
+    frame it was interior and drew normally. The affected band is
+    `2**l` layer-0 pixels wide at layer l. See docs/LIMITATIONS.md.
 """
 
 from __future__ import annotations
@@ -67,3 +76,25 @@ def test_crop_equals_cropped_full_render_off_center() -> None:
 def test_crop_equals_cropped_full_render_near_border_but_in_bounds() -> None:
     # crop_size=16 centred at (10, 10) spans [2, 18) x [2, 18) -- fully inside 48x36.
     _check_crop_matches("broadcast", center=(10.0, 10.0), crop_size=16)
+
+
+def test_crop_equals_cropped_full_render_trips_mode_in_the_interior() -> None:
+    """Mode "trips": exact inside, deliberately different on the crop's rim.
+
+    The rim difference is TRIPS's `valid_point` gate seeing the crop's edge
+    as an image edge (see the module docstring). Measured on this fixture it
+    is ~0.45 in feature units on the outermost ring and exactly zero one
+    pixel in -- i.e. it is a band, not a smeared error, which is what makes
+    it safe to train on (TRIPS itself trains on crops with this rule).
+    """
+    xyz, size, feat, conf, K, R, t, full_layers = _render_full("trips", 3)
+    item = {"rgb": full_layers[0].permute(1, 2, 0), "K": K}
+    cropped = dataset_crop(item, size=16, zoom=1.0, center=(20.0, 15.0))
+    cropped_from_full = cropped["rgb"].permute(2, 0, 1)
+    crop_layers, _aux = render_pyramid(
+        xyz, size, feat, conf, cropped["K"], R, t, (16, 16),
+        num_layers=3, mode="trips", compute_dtype=torch.float64,
+    )  # fmt: skip
+    diff = (cropped_from_full - crop_layers[0]).abs()
+    assert diff[:, 1:-1, 1:-1].max().item() < 1e-5, "the crop's interior must be exact"
+    assert diff.max().item() > 1e-3, "the rim must differ -- if not, the gate is missing"

@@ -11,12 +11,25 @@ Invariants:
       `detach()`ed and the modules run in `eval()`.
     - Pixel convention: TRIPS's `ip` puts pixel *centres* at integer
       coordinates (`PointBlending.h:216-240` takes the 2x2 footprint from
-      `floor(ip)`), trippy's rasteriser puts them at `i + 0.5`
-      (docs/GEOMETRY.md). Every K handed to `render_pyramid` therefore has
-      `cx, cy` shifted by `+PARITY_PIXEL_CENTRE_OFFSET`, and each pyramid
-      layer is rendered by its own `num_layers=1` call with
-      `K_l = (fx, fy, cx, cy) / 2**l` so that TRIPS's per-layer
-      `ip *= 0.5f` is reproduced exactly rather than approximated.
+      `floor(ip)`), trippy's rasteriser defaults to `i + 0.5`
+      (docs/GEOMETRY.md). Two engines reproduce TRIPS's convention, and they
+      must agree:
+        * `engine="perlayer"` (the original): each pyramid layer is rendered
+          by its own `num_layers=1` `render_pyramid` call with
+          `K_l = (fx, fy, cx, cy) / 2**l` and `cx, cy` shifted by
+          `+PARITY_PIXEL_CENTRE_OFFSET`, which turns TRIPS's `ip/2**l` into
+          trippy's `uv_l - 0.5`. Layer selection, the `layer_higher` cut and
+          the `valid_point` break are done here, in this module.
+        * `engine="native"` (the default): ONE `render_pyramid` call with
+          `mode="trips"`, `pixel_center="integer"`, `pyramid_halving="ceil"`
+          and `num_layers=L`. The layer rule and the break now live in
+          `trippy.raster.emit`, so the trainer renders exactly what the
+          parity harness measures.
+      The two differ only by float32 rounding: `perlayer` computes
+      `fl(fl(A*2**-l + fl(cx*2**-l + 0.5))) - 0.5` where `native` computes
+      `fl(A + cx) * 2**-l`, and adding then subtracting 0.5 at a coordinate
+      of order 10**3 costs about one float32 ulp (~1.2e-4 px at layer 0).
+      `--compare-engines` measures it.
     - Lens distortion is applied *before* `render_pyramid`, by replacing
       each point's camera-space position with
       `(xd * z, yd * z, z)` where `(xd, yd)` is its distorted normalised
@@ -49,8 +62,11 @@ point is written into layers `0 .. layer_higher` inclusive, where
 (RenderForward.cu:3511-3517). `compute_point_size_fac` returns **1.0** for
 every layer strictly below `layer_lower` (PointBlending.h:92-96), so this is
 neither trippy's `"broadcast"` (all layers, factor 1) nor its `"trilinear"`
-(only the two straddling layers). This module calls that third mode
-`"trips"`, and renders `"broadcast"` and `"trilinear"` as ablations.
+(only the two straddling layers). That third mode is
+`trippy.raster.emit`'s `"trips"`; this module renders `"broadcast"` and
+`"trilinear"` as ablations, always through the per-layer engine (they exist
+to reproduce the *wrong* readings of the reference doc, so there is nothing
+to gain from a second implementation of them).
 """
 
 from __future__ import annotations
@@ -92,6 +108,17 @@ from trippy.render.sheets import colorize, contact_sheet, save_png
 from trippy.scene.adop_io import AdopScene, AdopView, load_adop_scene, quat_xyzw_to_wxyz, qvec2R
 
 RENDER_MODES = ("trips", "broadcast", "trilinear")
+
+# Which implementation of mode "trips" to use; see the module docstring.
+# "native" is one multi-layer `render_pyramid(mode="trips")` call, "perlayer"
+# is this module's original loop of `num_layers=1` calls.
+PARITY_ENGINES = ("native", "perlayer")
+
+# Depth floor used only to keep `size_px = fx * size / z` finite. TRIPS divides
+# by the raw z and culls z <= 0 separately (RenderForward.cu:268 + the
+# `valid_point` gate); any point this clamp touches sits within a micron of the
+# optical centre and is culled by the layer-0 bounds test anyway.
+PARITY_MIN_DEPTH = 1e-6
 
 
 # --- geometry ------------------------------------------------------------
@@ -213,6 +240,7 @@ def render_trips_layers(
     mode: str = "trips",
     max_frags: int = RASTER_MAX_FRAGS,
     t_cutoff: float = RASTER_T_CUTOFF,
+    engine: str = "native",
 ) -> tuple[list[Tensor], dict]:
     """Rasterise one view into `num_layers` feature images.
 
@@ -226,6 +254,9 @@ def render_trips_layers(
             two straddling layers). See the module docstring.
         max_frags: per-pixel composite depth (TRIPS: 16).
         t_cutoff: transmittance floor (TRIPS ALPHA_DEST_CUTOFF = 0.001).
+        engine: `"native"` or `"perlayer"` (see PARITY_ENGINES). Only
+            consulted for `mode="trips"`; the two ablation modes have a
+            single implementation, the per-layer one.
 
     Returns:
         `(layers, aux)`: `layers[l]` is `(C, h_l, w_l)`; `aux` carries
@@ -234,6 +265,8 @@ def render_trips_layers(
     """
     if mode not in RENDER_MODES:
         raise ValueError(f"mode must be one of {RENDER_MODES}, got {mode!r}")
+    if engine not in PARITY_ENGINES:
+        raise ValueError(f"engine must be one of {PARITY_ENGINES}, got {engine!r}")
     device = points.xyz.device
     dtype = points.xyz.dtype
 
@@ -256,10 +289,12 @@ def render_trips_layers(
     alive = (z > 0) & (ip[:, 0] >= 0) & (ip[:, 0] < width - 1) & (ip[:, 1] >= 0) & (ip[:, 1] < height - 1)
 
     # point_size_opt = K.fx * crop_transform.fx * softplus(raw) / z, RenderForward.cu:268.
-    size_px = K[0, 0] * points.size / torch.clamp(z, min=1e-6)
+    size_px = K[0, 0] * points.size / torch.clamp(z, min=PARITY_MIN_DEPTH)
 
     if mode == "trilinear":
         return _render_trilinear(points, K, ndc, z, alive, shapes, max_frags, t_cutoff)
+    if mode == "trips" and engine == "native":
+        return _render_trips_native(points, K, ndc, z, shapes, max_frags, t_cutoff)
 
     # layer_higher, RenderForward.cu:334-338.
     log2_size = torch.log2(torch.clamp(size_px, min=torch.finfo(dtype).tiny))
@@ -319,6 +354,148 @@ def render_trips_layers(
         aux["n_used"].append(layer_aux["n_used"][0])
         aux["num_fragments"] += int(layer_aux["num_fragments"])
     return layers, aux
+
+
+def _render_trips_native(
+    points: ScenePoints,
+    K: Tensor,
+    ndc: Tensor,
+    z: Tensor,
+    shapes: list[tuple[int, int]],
+    max_frags: int,
+    t_cutoff: float,
+) -> tuple[list[Tensor], dict]:
+    """Mode "trips" as ONE `render_pyramid` call (the `native` engine).
+
+    Everything the per-layer engine does by hand -- `layer_higher`, the
+    `compute_point_size_fac` weight, the `valid_point` all-four-corners gate
+    and its `break` to coarser layers, TRIPS's `ip *= 0.5f` halving with
+    pixel centres on integers -- lives in `trippy.raster.emit` in mode
+    `"trips"` with `pixel_center="integer"`. This function's only remaining
+    jobs are (a) turning the pre-distorted normalised coordinates back into
+    synthetic camera-space points so the plain pinhole projection inside
+    `render_pyramid` lands on TRIPS's `ip`, and (b) passing TRIPS's own
+    thresholds (no alpha floor, near plane at PARITY_MIN_DEPTH).
+
+    `K` is handed over unshifted: `pixel_center="integer"` *is* the shift,
+    applied per layer where it belongs, so the
+    `cx + PARITY_PIXEL_CENTRE_OFFSET` trick the per-layer engine needs is
+    neither used nor correct here.
+
+    Args:
+        points: scene tensors; `points.size` must be the post-softplus world
+            radius, since `render_pyramid` recomputes
+            `size_px = fx * size / z` itself.
+        K: (3, 3) full-resolution intrinsics, TRIPS convention.
+        ndc: (N, 2) distorted normalised coordinates from `project_adop`.
+        z: (N,) camera-space depth, world units.
+        shapes: per-layer (h, w) from `trips_layer_shapes`.
+        max_frags, t_cutoff: as in `render_trips_layers`.
+
+    Returns:
+        `(layers, aux)` in the same shape as the per-layer engine, including
+        `points_active` (exact: mode "trips" writes all four corners or
+        none, so it is the per-layer fragment count divided by 4).
+    """
+    device = points.xyz.device
+    dtype = points.xyz.dtype
+    xyz_cam = torch.stack([ndc[:, 0] * z, ndc[:, 1] * z, z], dim=1)
+
+    layers, aux = render_pyramid(
+        xyz_cam,
+        points.size,
+        points.feat,
+        points.conf,
+        K,
+        torch.eye(3, dtype=dtype, device=device),
+        torch.zeros(3, dtype=dtype, device=device),
+        shapes[0],
+        num_layers=len(shapes),
+        mode="trips",
+        bg=points.bg,
+        max_frags=max_frags,
+        t_cutoff=t_cutoff,
+        # TRIPS applies no alpha floor: every in-bounds bilinear corner takes
+        # a slot in the 16-deep list even when its weight is 0.
+        alpha_min=0.0,
+        znear=PARITY_MIN_DEPTH,
+        pixel_center="integer",
+        pyramid_halving="ceil",
+    )
+    counts = [int(c) for c in aux["fragments_per_layer"].tolist()]
+    aux["points_active"] = [c // 4 for c in counts]
+    return layers, aux
+
+
+def engine_agreement(
+    points: ScenePoints,
+    view: AdopView,
+    num_layers: int = PARITY_DEFAULT_NUM_LAYERS,
+    max_frags: int = RASTER_MAX_FRAGS,
+    t_cutoff: float = RASTER_T_CUTOFF,
+) -> dict:
+    """Render one view with both `trips` engines and measure the difference.
+
+    This is the proof that the single multi-layer `mode="trips"` call
+    reproduces the per-layer harness that produced
+    `experiments/EXP-0002-horse-parity/README.md`'s numbers. It compares the
+    *rasteriser's* output (the U-Net's input), before any network runs, so
+    nothing downstream can hide a disagreement.
+
+    Args:
+        points, view, num_layers, max_frags, t_cutoff: as in
+            `render_trips_layers`.
+
+    Returns:
+        `{"levels": [...one row per pyramid layer...], "num_fragments":
+        {...}, "points_active": {...}}`. Each level row carries
+        `max_abs_diff`, `max_abs_value` (the per-layer feature magnitude the
+        absolute number should be read against), `max_rel_diff`,
+        `mean_abs_diff` and `pixels_over_1e_3` out of `num_pixels`.
+    """
+    per, aux_per = render_trips_layers(
+        points, view, num_layers=num_layers, mode="trips", max_frags=max_frags,
+        t_cutoff=t_cutoff, engine="perlayer",
+    )
+    nat, aux_nat = render_trips_layers(
+        points, view, num_layers=num_layers, mode="trips", max_frags=max_frags,
+        t_cutoff=t_cutoff, engine="native",
+    )
+    rows = []
+    for layer, (a, b) in enumerate(zip(per, nat, strict=True)):
+        # `.cpu()` FIRST, then the float64 cast. `x.to("cpu", torch.float64)`
+        # on an MPS tensor casts on the *source* device, and MPS has no
+        # float64 -- it does not raise, it returns reinterpreted garbage
+        # (observed: 1e10 magnitudes, NaNs and denormals in this very
+        # function, job trippy-trips-mode-gpu-1). See docs/LIMITATIONS.md.
+        a64 = a.detach().cpu().to(torch.float64)
+        b64 = b.detach().cpu().to(torch.float64)
+        diff = (a64 - b64).abs()
+        magnitude = max(float(a64.abs().max()), PARITY_MIN_DEPTH)
+        per_pixel = diff.amax(dim=0)
+        rows.append(
+            {
+                "layer": layer,
+                "shape": list(a.shape),
+                "max_abs_diff": float(diff.max()),
+                "max_abs_value": magnitude,
+                "max_rel_diff": float(diff.max()) / magnitude,
+                "mean_abs_diff": float(diff.mean()),
+                "pixels_over_1e_3": int((per_pixel > 1e-3).sum()),
+                "num_pixels": int(per_pixel.numel()),
+            }
+        )
+    return {
+        "levels": rows,
+        "num_fragments": {
+            "perlayer": int(aux_per["num_fragments"]),
+            "native": int(aux_nat["num_fragments"]),
+        },
+        "points_active": {
+            "perlayer": list(aux_per["points_active"]),
+            "native": list(aux_nat["points_active"]),
+        },
+    }
 
 
 def _render_one_layer(
@@ -541,6 +718,8 @@ class ParityConfig:
     modes: tuple[str, ...] = ("trips", "broadcast", "trilinear")
     max_points: int | None = None
     reference_dir: str | None = None
+    engine: str = "native"  # see PARITY_ENGINES; only affects mode "trips"
+    compare_engines: bool = False  # also render both engines and diff the levels
 
 
 def _scene_name_from_params(checkpoint_dir: Path, override: str | None) -> str:
@@ -659,6 +838,7 @@ class ViewResult:
     index: int
     image_name: str
     mode: str
+    engine: str
     seconds: float
     num_fragments: int
     points_active: list[int] = field(default_factory=list)
@@ -674,11 +854,14 @@ def render_view(
     camera: NeuralCamera,
     mode: str,
     num_layers: int,
+    engine: str = "native",
 ) -> tuple[Tensor, list[Tensor], dict]:
     """Rasterise + U-Net + NeuralCamera for one view. Returns `(rgb, layers, aux)`."""
     device = points.xyz.device
     with torch.no_grad():
-        layers, aux = render_trips_layers(points, view, num_layers=num_layers, mode=mode)
+        layers, aux = render_trips_layers(
+            points, view, num_layers=num_layers, mode=mode, engine=engine
+        )
         inputs = [layer.unsqueeze(0) for layer in layers]
         raw = net(inputs)
         frame_index = torch.tensor([view.index], dtype=torch.long, device=device)
@@ -697,6 +880,11 @@ def run_parity(config: ParityConfig) -> dict:
     Returns:
         The same dict that is written to `metrics.json`.
     """
+    if config.engine not in PARITY_ENGINES:
+        raise ValueError(f"engine must be one of {PARITY_ENGINES}, got {config.engine!r}")
+    for mode in config.modes:
+        if mode not in RENDER_MODES:
+            raise ValueError(f"mode must be one of {RENDER_MODES}, got {mode!r}")
     scene_dir = Path(config.scene_dir)
     checkpoint_dir = Path(config.checkpoint_dir)
     out_dir = Path(config.out_dir)
@@ -726,6 +914,7 @@ def run_parity(config: ParityConfig) -> dict:
     reference_dir = Path(config.reference_dir) if config.reference_dir else checkpoint_dir / config.epoch / "test"
 
     results: list[ViewResult] = []
+    engine_reports: list[dict] = []
     authors_baseline: dict[int, ViewMetrics] = {}
     sheet_rows: list[np.ndarray] = []
     sheet_labels: list[str] = []
@@ -749,8 +938,11 @@ def run_parity(config: ParityConfig) -> dict:
             labels.append(f"TRIPS authors' render, PSNR {authors_vs_gt.psnr_db:.2f} dB vs GT")
 
         for mode in config.modes:
+            engine = config.engine if mode == "trips" else "perlayer"
             started = time.time()
-            rgb, layers, aux = render_view(points, view, net, camera, mode, config.num_layers)
+            rgb, layers, aux = render_view(
+                points, view, net, camera, mode, config.num_layers, engine=engine
+            )
             elapsed = time.time() - started
             rgb_cpu = rgb.detach().to("cpu", torch.float32).clamp(0.0, 1.0)
 
@@ -758,6 +950,7 @@ def run_parity(config: ParityConfig) -> dict:
                 index=index,
                 image_name=view.image_name,
                 mode=mode,
+                engine=engine,
                 seconds=elapsed,
                 num_fragments=int(aux.get("num_fragments", 0)),
                 points_active=list(aux.get("points_active", [])),
@@ -789,13 +982,27 @@ def run_parity(config: ParityConfig) -> dict:
                 ]
             )
             print(
-                f"[parity] idx {index:>4} {mode:<10} {elapsed:6.1f}s  "
+                f"[parity] idx {index:>4} {mode:<10} [{engine:<8}] {elapsed:6.1f}s  "
                 f"PSNR(GT) {gt_psnr:6.2f} dB"
                 + (
                     f"  PSNR(authors) {result.vs_reference_masked.psnr_db:6.2f} dB"
                     if result.vs_reference_masked is not None
                     else ""
                 ),
+                flush=True,
+            )
+
+        if config.compare_engines:
+            agreement = engine_agreement(points, view, num_layers=config.num_layers)
+            agreement["index"] = index
+            agreement["image"] = view.image_name
+            engine_reports.append(agreement)
+            worst = max(row["max_rel_diff"] for row in agreement["levels"])
+            print(
+                f"[parity] idx {index:>4} engine agreement: "
+                f"max relative level diff {worst:.3e}, fragments "
+                f"{agreement['num_fragments']['perlayer']} (perlayer) vs "
+                f"{agreement['num_fragments']['native']} (native)",
                 flush=True,
             )
 
@@ -831,6 +1038,7 @@ def run_parity(config: ParityConfig) -> dict:
                 "index": r.index,
                 "image": r.image_name,
                 "mode": r.mode,
+                "engine": r.engine,
                 "seconds": round(r.seconds, 3),
                 "num_fragments": r.num_fragments,
                 "points_active": r.points_active,
@@ -854,6 +1062,7 @@ def run_parity(config: ParityConfig) -> dict:
             else None
         ),
         "eval_border_px": PARITY_EVAL_BORDER_PX,
+        "engine_agreement": engine_reports or None,
     }
     (out_dir / "metrics.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     (out_dir / "README.md").write_text(_readme(report), encoding="utf-8")
@@ -904,8 +1113,8 @@ def _readme(report: dict) -> str:
             "(TRIPS's `train_mask_border`, which it blacks out in its own saved test images)."
         ),
         "",
-        "| view | mode | PSNR vs GT | SSIM vs GT | LPIPS vs GT | authors' PSNR vs GT | PSNR vs authors | s |",
-        "|---|---|---|---|---|---|---|---|",
+        "| view | mode | engine | PSNR vs GT | SSIM vs GT | LPIPS vs GT | authors' PSNR vs GT | PSNR vs authors | s |",
+        "|---|---|---|---|---|---|---|---|---|",
     ]
     for view in report["views"]:
         gt = view["vs_ground_truth"] or {}
@@ -916,7 +1125,8 @@ def _readme(report: dict) -> str:
             return f"{d[key]:.4f}" if key in d else "-"
 
         lines.append(
-            f"| {view['image']} | {view['mode']} | {fmt(gt, 'psnr_db')} | {fmt(gt, 'ssim')} | "
+            f"| {view['image']} | {view['mode']} | {view.get('engine', '-')} | "
+            f"{fmt(gt, 'psnr_db')} | {fmt(gt, 'ssim')} | "
             f"{fmt(gt, 'lpips')} | {fmt(base, 'psnr_db')} | {fmt(ref, 'psnr_db')} | "
             f"{view['seconds']:.1f} |"
         )
@@ -944,8 +1154,39 @@ def _readme(report: dict) -> str:
         (
             "`trips` is the render path the published checkpoint actually used "
             "(`use_layer_point_size=true` via `fix_point_size=false`, see trippy/render/parity.py); "
-            "`broadcast` and `trilinear` are ablations."
+            "`broadcast` and `trilinear` are ablations, always rendered by the per-layer engine."
         ),
         "",
     ]
+    agreement = report.get("engine_agreement")
+    if agreement:
+        lines += [
+            "## Engine agreement (`native` vs `perlayer`, mode `trips`)",
+            "",
+            (
+                "Rasteriser output only -- the U-Net's input, before any network runs. "
+                "`native` is one `render_pyramid(mode=\"trips\", pixel_center=\"integer\")` call; "
+                "`perlayer` is a loop of `num_layers=1` calls with `cx, cy + 0.5`."
+            ),
+            "",
+            "| view | level | shape | max abs diff | level magnitude | max rel diff | mean abs diff | pixels > 1e-3 |",
+            "|---|---|---|---:|---:|---:|---:|---:|",
+        ]
+        for entry in agreement:
+            for row in entry["levels"]:
+                lines.append(
+                    f"| {entry['image']} | {row['layer']} | "
+                    f"{row['shape'][1]}x{row['shape'][2]} | {row['max_abs_diff']:.3e} | "
+                    f"{row['max_abs_value']:.3e} | {row['max_rel_diff']:.3e} | "
+                    f"{row['mean_abs_diff']:.3e} | {row['pixels_over_1e_3']} / {row['num_pixels']} |"
+                )
+        lines += [""]
+        for entry in agreement:
+            lines.append(
+                f"- {entry['image']}: fragments {entry['num_fragments']['perlayer']} (perlayer) vs "
+                f"{entry['num_fragments']['native']} (native); "
+                f"points per layer {entry['points_active']['perlayer']} vs "
+                f"{entry['points_active']['native']}."
+            )
+        lines += [""]
     return "\n".join(lines)

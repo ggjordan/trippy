@@ -42,11 +42,13 @@ KERNEL_FORMULA_TOL = 1e-11
 GRAD_INPUTS = ("xyz", "size", "conf", "feat", "pose_delta")
 
 
-def _render_flat(scene: dict, **overrides) -> torch.Tensor:
+def _render_flat(scene: dict, mode: str = "trilinear", pixel_center: str = "half", **overrides) -> torch.Tensor:
     """Render the fixture and flatten every layer into one vector.
 
     Args:
         scene: a make_smooth_scene() dict.
+        mode: layer-selection mode (trippy.raster.emit.EMIT_MODES).
+        pixel_center: "half" or "integer".
         overrides: tensors replacing the scene's own (the gradcheck inputs).
 
     Returns:
@@ -65,8 +67,10 @@ def _render_flat(scene: dict, **overrides) -> torch.Tensor:
         args["t"],
         args["image_hw"],
         num_layers=args["num_layers"],
+        mode=mode,
         bg=args["bg"],
         pose_delta=args["pose_delta"],
+        pixel_center=pixel_center,
     )
     return torch.cat([layer.reshape(-1) for layer in layers])
 
@@ -90,6 +94,58 @@ def test_gradcheck_reference_render(name: str) -> None:
     )
 
 
+@pytest.mark.parametrize("name", GRAD_INPUTS)
+@pytest.mark.parametrize("pixel_center", ["half", "integer"])
+def test_gradcheck_reference_render_trips_mode(name: str, pixel_center: str) -> None:
+    """Same gradcheck in mode "trips", in both pixel-centre conventions.
+
+    Mode "trips" changes *which* layers a point writes and therefore which
+    `layer_factor` branch its alpha goes through -- `size` now feeds the
+    factor on the two straddling layers and a hard 1.0 on every layer below
+    them (`PointBlending.h:92-96`), so a mistake in the new branch shows up
+    as a wrong d(render)/d(size) here, not just as a wrong picture. The
+    footprint gate and its `break` are piecewise constant, so they do not
+    affect the derivative anywhere the fixture sits (its margins are
+    >= 0.05, ~5e4 gradcheck steps).
+    """
+    scene = make_smooth_scene()
+    variable = scene[name].clone().requires_grad_(True)
+
+    def fn(value: torch.Tensor) -> torch.Tensor:
+        return _render_flat(scene, mode="trips", pixel_center=pixel_center, **{name: value})
+
+    assert torch.autograd.gradcheck(
+        fn,
+        (variable,),
+        eps=GRADCHECK_EPS,
+        atol=GRADCHECK_ATOL,
+        rtol=GRADCHECK_RTOL,
+        nondet_tol=0.0,
+    )
+
+
+def test_trips_mode_size_gradient_is_non_zero_and_finite() -> None:
+    """A passing gradcheck on an all-zero d/d size would prove nothing.
+
+    In mode "broadcast" the layer factor is identically 1, so `size` has no
+    gradient at all (docs/TRIPS_REFERENCE.md Sec. 10.1). Mode "trips" must
+    not degenerate to that: the two straddling layers carry a real
+    d(alpha)/d(size).
+    """
+    scene = make_smooth_scene()
+    size = scene["size"].clone().requires_grad_(True)
+    _render_flat(scene, mode="trips", size=size).sum().backward()
+    assert size.grad is not None
+    assert torch.isfinite(size.grad).all()
+    assert float(size.grad.abs().max()) > 0.0
+
+    broadcast_size = scene["size"].clone().requires_grad_(True)
+    broadcast_out = _render_flat(scene, mode="broadcast", size=broadcast_size)
+    # `size` reaches nothing differentiable in "broadcast" (it only feeds the
+    # boolean coarse cull), so the render is not even connected to the graph.
+    assert not broadcast_out.requires_grad
+
+
 def test_gradcheck_all_five_inputs_together() -> None:
     """The five gradients must also be right when perturbed jointly."""
     scene = make_smooth_scene()
@@ -97,6 +153,24 @@ def test_gradcheck_all_five_inputs_together() -> None:
 
     def fn(*values: torch.Tensor) -> torch.Tensor:
         return _render_flat(scene, **dict(zip(GRAD_INPUTS, values, strict=True)))
+
+    assert torch.autograd.gradcheck(
+        fn,
+        variables,
+        eps=GRADCHECK_EPS,
+        atol=GRADCHECK_ATOL,
+        rtol=GRADCHECK_RTOL,
+        nondet_tol=0.0,
+    )
+
+
+def test_gradcheck_all_five_inputs_together_trips_mode() -> None:
+    """The joint gradcheck, in the mode the trainer actually runs."""
+    scene = make_smooth_scene()
+    variables = tuple(scene[name].clone().requires_grad_(True) for name in GRAD_INPUTS)
+
+    def fn(*values: torch.Tensor) -> torch.Tensor:
+        return _render_flat(scene, mode="trips", **dict(zip(GRAD_INPUTS, values, strict=True)))
 
     assert torch.autograd.gradcheck(
         fn,

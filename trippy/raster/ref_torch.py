@@ -137,6 +137,8 @@ def render_pyramid_ref(
     segment_method: str = "searchsorted",
     compute_dtype: torch.dtype | None = torch.float64,
     pose_delta: Tensor | None = None,
+    pixel_center: str = "half",
+    pyramid_halving: str = "ceil",
 ) -> tuple[list[Tensor], dict]:
     """Render the whole pyramid in torch (the float64 CPU reference path).
 
@@ -149,8 +151,10 @@ def render_pyramid_ref(
         R: (3, 3) float world->camera rotation; t: (3,) translation.
         image_hw: (H, W) layer-0 image size in pixels.
         num_layers: L pyramid layers.
-        mode: "trilinear" (footprint-weighted, <= 2 layers) or "broadcast"
-            (every layer, factor 1 -- TRIPS's shipped default).
+        mode: one of trippy.raster.emit.EMIT_MODES -- "trips" (layers
+            0..layer_higher, the published checkpoints' rule), "trilinear"
+            (the two straddling layers) or "broadcast" (every layer,
+            factor 1).
         bg: (C,) float background feature, added as `t_final * bg`. None = 0.
         max_frags, t_cutoff, alpha_min, znear: see trippy.constants.
         sort_method, segment_method: see trippy.raster.sort.
@@ -159,16 +163,20 @@ def render_pyramid_ref(
         pose_delta: optional (6,) SE(3) twist refining `(R, t)`
             left-multiplicatively (trippy.raster.emit.apply_pose_delta).
             Differentiable, so `pose_delta.grad` is the camera-pose gradient.
+        pixel_center: "half" (trippy's convention) or "integer" (TRIPS's);
+            see trippy.raster.emit.emit_fragments.
+        pyramid_halving: "ceil" or "floor"; see
+            trippy.raster.emit.layer_grid.
 
     Returns:
         layers: list of L tensors, layer l is (C, h_l, w_l) with
-            h_l = ceil(H / 2**l).
+            h_l = ceil(H / 2**l) ("ceil" halving).
         aux: {"t_final": list of L (h_l, w_l), "n_used": list of L (h_l, w_l)
             int64, "depth_sum": list of L (h_l, w_l), "num_fragments": int,
-            "grid": LayerGrid}.
+            "fragments_per_layer": (L,) int64 tensor, "grid": LayerGrid}.
     """
     height, width = int(image_hw[0]), int(image_hw[1])
-    grid = layer_grid(height, width, num_layers)
+    grid = layer_grid(height, width, num_layers, pyramid_halving=pyramid_halving)
     dtype = feat.dtype if compute_dtype is None else compute_dtype
 
     xyz_d, size_d, feat_d, conf_d = (a.to(dtype) for a in (xyz, size, feat, conf))
@@ -189,6 +197,7 @@ def render_pyramid_ref(
         sort_method=sort_method,
         segment_method=segment_method,
         pose_delta=delta_d,
+        pixel_center=pixel_center,
     )
     out, t_final, n_used, depth_sum = composite_sorted(
         frags.layer_pixel,
@@ -205,7 +214,30 @@ def render_pyramid_ref(
 
     layers, aux = split_layers(out, t_final, n_used, depth_sum, grid)
     aux["num_fragments"] = len(frags)
+    aux["fragments_per_layer"] = fragments_per_layer(frags.offsets, grid)
     return layers, aux
+
+
+def fragments_per_layer(offsets: Tensor, grid: LayerGrid) -> Tensor:
+    """Fragment count per pyramid layer, read straight off the segment offsets.
+
+    `layer_pixel` is layer-major, so the fragments of layer l occupy the
+    contiguous slice `[offsets[grid.offsets[l]], offsets[grid.offsets[l+1]])`
+    of the sorted list. This is O(L) gathers -- no histogram over F, and no
+    device sync.
+
+    Args:
+        offsets: (P + 1,) int64 segment starts (SortedFragments.offsets).
+        grid: the LayerGrid those offsets describe.
+
+    Returns:
+        (L,) int64 tensor on `offsets`' device.
+    """
+    bounds = torch.tensor(
+        list(grid.offsets) + [grid.total], dtype=torch.int64, device=offsets.device
+    )
+    edges = offsets.index_select(0, bounds)
+    return edges[1:] - edges[:-1]
 
 
 def split_layers(
