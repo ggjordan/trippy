@@ -61,6 +61,51 @@ Bilinear interpolation weights are computed between the two levels with a **line
 
 **Sub-pixel epsilon rule**: if the footprint size is < 0.25 pixels, clamp it to 0.25 to avoid numerical issues in bilinear weight computation.
 
+## Undistortion and image cache
+
+`trippy.scene.dataset.SceneDataset` undistorts every COLMAP image exactly
+once per (scene, width) and caches the result to disk, so repeated
+training runs never re-pay the cost.
+
+- **Destination camera**: a pinhole camera (zero distortion) at the
+  requested width, keeping the source camera's aspect ratio. Destination
+  intrinsics are the source's `(fx, fy, cx, cy)` uniformly scaled by
+  `width_dst / width_src` -- no re-centring, no field-of-view change (this
+  is the simple "scaled pinhole" convention, not OpenCV's
+  `getOptimalNewCameraMatrix` free-scaling).
+- **Sampling direction**: inverse mapping, one sampling grid per (source
+  camera, destination width), built once in
+  `trippy.geom.camera.undistort_maps`. For every destination pixel, cast
+  the pinhole ray, apply the source camera's *forward* OpenCV
+  radial-tangential distortion (`OpenCVDistortion.distort`) to find where
+  that ray lands in the as-captured (distorted) source image, then sample
+  there with `torch.nn.functional.grid_sample(mode="bilinear",
+  padding_mode="zeros", align_corners=False)`.
+- **Pixel-centre convention carries through unchanged**: per "Image
+  coordinates" above, pixel (row i, col j) has its centre at
+  `(j + 0.5, i + 0.5)`. Combined with `align_corners=False`, `grid_sample`
+  maps grid value `g in [-1, 1]` to continuous pixel coordinate
+  `x = (g + 1) * size / 2`, i.e. `g = 2*x/size - 1` -- exactly this
+  pixel-centre convention, with no extra `+/-0.5` shift anywhere in
+  `undistort_maps`.
+- **Pinhole sources skip the distortion step**: when a source camera's
+  `(k1, k2, p1, p2)` are all zero (PINHOLE, SIMPLE_PINHOLE), the sampling
+  grid degenerates to a plain resize -- `undistort_maps` is still used
+  (one code path for all camera models), but the forward-distortion call
+  is skipped.
+- **Cache layout**: `<cache_root>/<scene_name>/w<width>/<image_name>.npy`
+  (uint8 RGB, `(H, W, 3)`) plus one `meta.json` per (scene, width) holding
+  each cached image's scaled intrinsics, pose, original size, and EXIF
+  exposure/ISO if present. A second `SceneDataset` construction over the
+  same `cache_root`/width recomputes each image's intrinsics from the live
+  COLMAP model and asserts they match `meta.json`'s stored values before
+  trusting the cached pixels -- a mismatch (e.g. the scene was re-run
+  through COLMAP) raises loudly instead of silently serving stale pixels.
+- **Crop padding (bug class 3, repeated here deliberately)**:
+  `trippy.scene.dataset.crop` never treats a crop's overshoot past the
+  source image edges as content -- `rgb == 0` and `mask == 0` there,
+  exactly, not a blurred or extrapolated value.
+
 ## 3DGS PLY export mapping
 
 When exporting a trained TRIPS model to 3DGS PLY format for use with `gsrender.py` and other tools:
