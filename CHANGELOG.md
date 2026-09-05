@@ -2,6 +2,8 @@
 All notable changes to trippy. Format: Keep a Changelog. Versions: semver tags `vX.Y.Z`. Every push also gets a `build-NNNN` tag.
 
 ## [Unreleased]
+### Milestone note
+- v0.4.0 = the browser viewer is interactive (plan's v0.5.0 acceptance: >= 15 fps at 1080p-class resolution in Chrome now passes: 18 fps network / 76 fps raw at 1440x810), plus the Mac viewer at 29.5 fps and the cross-run leaderboard. The Karekare shade verdict is still pending in the GPU queue.
 
 ## [v0.3.0] - 2026-09-06
 ### Milestone note
