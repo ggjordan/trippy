@@ -141,6 +141,11 @@ lives in a local tensor and is never written back into the module or the checkpo
 (`NeuralCamera.forward_with`). Adam is warm-started at `-log2(best_global_gain)` because it moves an
 exposure by only ~`lr` per step and a broken frame can start 5.87 EV away.
 
+Measured once, on EXP-0003 full2-broadcast (job `eval-calib-1`, rc 0): held-out shade
+**8.49 -> 15.32 dB** calibrated, all held-out 15.02 -> 17.66, other 16.47 -> 18.18; the closed-form
+global-gain number (nothing fitted) is 14.59 dB in the shade. The Gaussian baseline it is compared with
+is 14.94 dB. See `experiments/EXP-0003-kk-trips-train/README.md` for the per-frame table and the caveats.
+
 Rules for reporting it:
 
 - **Default off** (`eval_calibrate_camera: false`, the `--calibrate` side column below). Every

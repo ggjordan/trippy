@@ -201,6 +201,55 @@ before/after table here when it lands.
 
 <!-- eval-calib-1 results: filled in below when the job completes -->
 
+**Result: `trippy-eval-calib-1` (prio 15, rc 0, 2026-09-06 15:30, MPS).** Full held-out re-eval of
+`checkpoint_latest.pt` with `--calibrate`; artefacts in
+`output/runs/EXP-0003-kk-trips-train/full2-broadcast/eval_manual_20260906-153040/metrics.json` plus a
+`{"eval": true, ..., "calibrated": true}` row in that run's `metrics.jsonl`.
+
+| group | n | PSNR (as reported) | PSNR @ best global gain | PSNR calibrated |
+|---|---|---|---|---|
+| all held-out | 33 | 15.02 | 17.20 | **17.66** |
+| shade | 6 | 8.49 | 14.59 | **15.32** |
+| other | 27 | 16.47 | 17.78 | **18.18** |
+| the 6 broken-exposure frames | 6 | 6.55 | 13.49 | 16.00 |
+| the 27 EXIF-valid frames | 27 | 16.90 | 18.02 | 18.03 |
+| shade, EXIF valid | 2 | 12.37 | 16.03 | 15.30 |
+| shade, EXIF missing | 4 | 6.55 | 13.87 | 15.32 |
+
+Shade SSIM 0.302 -> 0.398, shade LPIPS 0.689 -> 0.502.
+
+**The shade verdict flips sign under calibration.** Calibrated shade PSNR **15.32 dB** is *above* the
+Gaussian baseline's 14.94 dB, and even the stricter structure-only number -- the best a single global
+brightness factor can do, no fitting of anything else -- is **14.59 dB**, level with it. The reported
+-6.45 dB shade deficit was, in the main, a photometric one.
+
+Per-frame calibration detail for the six shade frames (`calibration` key in `metrics.json`):
+
+| frame | EV before -> after | gain before -> after | L1 before -> after |
+|---|---|---|---|
+| IMG_3828 | -0.88 -> +0.37 | 1.85 -> 0.77 | 0.160 -> 0.123 |
+| IMG_3829 | -5.87 -> +0.37 | 58.50 -> 0.77 | 0.437 -> 0.117 |
+| IMG_3830 | -0.88 -> +0.44 | 1.85 -> 0.74 | 0.158 -> 0.118 |
+| IMG_3831 | -5.87 -> +0.44 | 58.50 -> 0.74 | 0.418 -> 0.124 |
+| IMG_3832 | -5.87 -> +0.65 | 58.50 -> 0.64 | 0.421 -> 0.128 |
+| IMG_3833 | -5.87 -> +0.49 | 58.50 -> 0.71 | 0.411 -> 0.112 |
+
+Two things to read out of that table. First, all six converge to essentially the same fitted exposure
+(gain 0.64-0.77) from starting points 6 EV apart -- the fit is finding a property of the *frames*, not
+of its own initialisation. Second, **even the two shade frames with valid EXIF were wrong**: their
+EXIF-derived 1.85x gain should have been ~0.74x, so the network's output is systematically ~35% too
+bright in the shade. The U-Net learned an output scale tuned to the exposure of the frames it trained
+on, and no held-out frame's exposure was ever adjusted to match it. That is not fixed by the
+missing-EXIF fix; it is the general "held-out exposure is never trained" limitation
+(docs/LIMITATIONS.md), for which TRIPS's `interpolate_eval_settings` is the not-yet-ported remedy.
+
+**What this does NOT say.** Calibration fits against the held-out photo, so 15.32 dB is not a pure
+novel-view number; 14.59 dB (closed-form gain) is the conservative one to quote. Neither number says
+the shade *looks* right -- the shade dark-mass fraction is still 36.9% against the baseline's 19.9%,
+and Jordan's viewer verdict is still the verdict (docs/EXPERIMENTS.md "Jordan's viewer verdict is
+final"). What they do say is that the headline "8.49 dB vs 14.94 dB" was measuring exposure, and
+should not be used as the stop-or-go signal in that form.
+
 ### Two hold-out protocols, and an unfair baseline
 
 `full2-broadcast` holds out **all six** consecutive shade frames, so the training set contains no

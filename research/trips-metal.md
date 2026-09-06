@@ -1724,3 +1724,24 @@ device-side count (indirect dispatch) so `render_inner` never stalls. That is a
 - 2026-09-06T02:58:12Z submitted job trippy-hybrid-a-all-levels-bc prio 70: trippy train --config experiments/EXP-0009-hybrid-a/config_bc.yaml --report --max-minutes 240
 - 2026-09-06T02:58:58Z Throughput decision: trips mode trains ~10x slower per step than broadcast on MPS (full2-trips: ~7 min/epoch vs 0.2 s/step broadcast). Dequeued the trips-mode variants of Hunua, full3-alt, hybrid-a and union; requeued them as broadcast (-bc run dirs) so results land tonight. full2-trips keeps running under its 330-min budget as the trips-mode data point. perf/trips-mode profiling launched.
 - 2026-09-06T03:29:44Z Stopped full2-trips at epoch ~22 (104 min, ~5 min/epoch): at that pace it would hold the GPU until ~19:15 for ~60 epochs while the Karekare viewer fix (Jordan is waiting), the trips-mode profiler and the broadcast runs queue behind it. Requeue after perf/trips-mode lands.
+
+- 2026-09-06T15:40Z eval-calib-1 rc 0 (full2-broadcast, calibrated held-out re-eval):
+**RESULT — job `trippy-eval-calib-1` (prio 15, rc 0, 15:30, MPS), full 33-frame held-out re-eval of
+  full2-broadcast's checkpoint_latest with `--calibrate`:**
+  | group | n | PSNR reported | PSNR @ best global gain | PSNR calibrated |
+  |---|---|---|---|---|
+  | all | 33 | 15.02 | 17.20 | **17.66** |
+  | shade | 6 | 8.49 | 14.59 | **15.32** |
+  | other | 27 | 16.47 | 17.78 | **18.18** |
+  Shade SSIM 0.302->0.398, LPIPS 0.689->0.502. **The shade verdict flips sign: calibrated shade
+  15.32 dB is ABOVE the Gaussian baseline's 14.94 dB, and even the structure-only closed-form-gain
+  number (14.59 dB) is level with it.** All six shade frames converge to the same fitted exposure
+  (gain 0.64-0.77) from starts 6 EV apart, and the two frames with *valid* EXIF were wrong too
+  (1.85x should have been ~0.74x): the U-Net's output scale is tuned to the training frames'
+  exposure and no held-out frame's exposure is ever adjusted to match it. Caveat kept in the open:
+  a calibrated PSNR uses the held-out photo, so 14.59 dB is the conservative number to quote, and
+  the shade dark-mass fraction (36.9% vs 19.9%) has not moved at all — this says the metric was
+  measuring exposure, not that the shade now looks right. Jordan's viewer verdict still decides.
+  Artifacts: output/runs/EXP-0003-kk-trips-train/full2-broadcast/eval_manual_20260906-153040/
+  metrics.json; leaderboard now shows a "Held-out shade PSNR (calibrated)" column (15.32 for
+  full2-broadcast, n/a for the Gaussian baseline, which has no exposure model).
