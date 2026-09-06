@@ -19,8 +19,10 @@ Invariants: every render call goes through `trippy.raster.pyramid.
     gaussian_input). It is strictly additive: with `hybrid.enabled` false
     `self.hybrid is None` and every code path below is the one that existed
     before design A, down to the `NetworkConfig` channel count.
-    Point removal (`cfg.point_removal`, TRIPS's own confidence rule; and
-    `cfg.shade_prune`, trippy's audit-aligned heuristic) is the one thing
+    Point removal (`cfg.point_removal`, TRIPS's own confidence rule, or
+    trippy's relative analogue -- `trippy.train.prune_config
+    .PointRemovalConfig.mode`; and `cfg.shade_prune`, trippy's audit-aligned
+    heuristic, same mode choice) is the one thing
     here that changes the *shape* of the trained state mid-run: see
     `_apply_keep_mask`, which index-selects every per-point parameter and
     its Adam moments together so moment row i keeps belonging to point i,
@@ -1300,6 +1302,10 @@ class Trainer:
             setattr(self.point_params, attr, new_param)
 
         self.point_params.provenance = self.point_params.provenance.index_select(0, index)
+        # init_conf travels with its point exactly like provenance: it is metadata (each
+        # point's OWN confidence at construction, for the relative removal test), never
+        # optimizer state, so it is index-selected here and left alone everywhere else.
+        self.point_params.init_conf = self.point_params.init_conf.index_select(0, index)
         # bbox_min/bbox_max are deliberately NOT recomputed: the extent penalty is
         # anchored to the *initial* cloud's bounding box (see `_extent_penalty`), and
         # shrinking it after a prune would start penalising points that were always
@@ -1333,7 +1339,15 @@ class Trainer:
         removal_cfg = self.cfg.point_removal
         if removal_cfg.fires_at(epoch):
             _xyz, _rgb, conf = self._point_arrays()
-            keep = prune.removal_keep_mask(conf, removal_cfg.conf_threshold, removal_cfg.min_points)
+            init_conf = self.point_params.init_conf.detach().cpu().numpy().astype(np.float64)
+            keep = prune.removal_keep_mask(
+                conf,
+                removal_cfg.conf_threshold,
+                removal_cfg.min_points,
+                mode=removal_cfg.mode,
+                rel_factor=removal_cfg.rel_factor,
+                init_conf=init_conf,
+            )
             result["point_removal"] = self._apply_keep_mask(keep, "point_removal")
 
         shade_cfg = self.cfg.shade_prune
@@ -1345,6 +1359,7 @@ class Trainer:
                 xyz, rgb, conf = self._point_arrays()
                 inside, _zfrac = prune.in_region(views, xyz)
                 inside &= np.isfinite(xyz).all(axis=1)
+                init_conf = self.point_params.init_conf.detach().cpu().numpy().astype(np.float64)
                 keep = prune.shade_prune_keep_mask(
                     inside,
                     prune.luminance(rgb),
@@ -1352,6 +1367,9 @@ class Trainer:
                     shade_cfg.lum_threshold,
                     shade_cfg.conf_threshold,
                     shade_cfg.min_points,
+                    mode=shade_cfg.mode,
+                    rel_factor=shade_cfg.rel_factor,
+                    init_conf=init_conf,
                 )
                 result["shade_prune"] = self._apply_keep_mask(keep, "shade_prune")
         return result
@@ -1383,6 +1401,8 @@ class Trainer:
             setattr(self.point_params, attr, new_param)
         provenance = self.point_params.provenance
         self.point_params.provenance = torch.zeros(n, dtype=provenance.dtype, device=provenance.device)
+        init_conf = self.point_params.init_conf
+        self.point_params.init_conf = torch.zeros(n, dtype=init_conf.dtype, device=init_conf.device)
 
     # --- checkpointing / export ---
 

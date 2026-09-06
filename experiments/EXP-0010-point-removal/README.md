@@ -83,6 +83,33 @@ cutoff on `sigmoid(10*raw_conf)`, on TRIPS's own schedule ratios) with
 `conf_threshold: 0.1`, which cuts only into the low-opacity tail, plus a `min_points`
 floor trippy adds and TRIPS does not have.
 
+## Arm A': the relative analogue (`point_removal.mode: relative`)
+
+Arm A's `conf_threshold: 0.1` is a workaround, not a port: it exists only because an
+absolute cutoff under trippy's own confidence init mostly measures where a point
+*started*, not what training did to it. `trippy.train.prune_config.PointRemovalConfig`
+now has a `mode` field (`absolute`, the default and exactly arm A's rule above; or
+`relative`) plus `rel_factor` (default 0.3). In `mode: relative`, a point is removed once
+`sigmoid(10*raw_conf) < rel_factor * init_conf`, where `init_conf` is that SAME point's own
+confidence at construction (`trippy.train.params.PointParams.init_conf`, a buffer
+snapshotted once and carried — index-selected, never optimizer-shrunk — through every
+later removal pass and checkpoint round trip). This is what an absolute cutoff means for
+free under TRIPS's own uniform init, and is the faithful analogue for trippy's: it rewards
+or punishes *movement*, not starting position. `conf_threshold` doubles as an optional
+absolute floor in this mode (an independent OR trigger on top of the relative test, so a
+point that starts, and stays, negligible is still caught even though it can never fall by
+`rel_factor` from an already-tiny start) — see `trippy.train.prune.confidence_drop_mask`
+and `trippy.constants.POINT_REMOVAL_MODE_ABSOLUTE` for the exact rule and the full
+rationale. `shade_prune` gets the same `mode`/`rel_factor` fields, independently, for its
+own confidence leg.
+
+`config_removal_rel.yaml` (arm A') is `config_removal.yaml` (arm A) with exactly two
+fields changed: `point_removal.mode: relative` and `point_removal.rel_factor: 0.3`.
+Everything else — recipe, schedule, `conf_threshold: 0.1` (kept as the optional floor) —
+is identical, so arm A vs. arm A' isolates the one question this analogue exists to
+answer: does thresholding on a point's own decline, instead of its absolute value, change
+which points get removed or how the dark-mass fraction moves?
+
 ## Configs
 
 Both long arms are EXP-0003's fast recipe (`config_full2_broadcast.yaml`: broadcast, kNN
@@ -98,6 +125,12 @@ held out) and differ from it only in the blocks below.
 - **`config_shade_prune.yaml` (arm B)** — arm A **plus**
   `shade_prune: {enabled, frames = SHADE_FRAMES_KK, znear_frac 0.05, zfar_frac 0.5,
   lum_threshold 0.25, conf_threshold 0.5, start_epoch 100, every_epochs 25}`.
+- **`config_removal_rel.yaml` (arm A')** — arm A with `point_removal.mode: relative` and
+  `point_removal.rel_factor: 0.3`, nothing else changed (see "Arm A': the relative
+  analogue" above). Its `run_dir` is an absolute path
+  (`/Users/nzbirdranch/trippy/output/runs/EXP-0010-point-removal/removal-rel`), not a
+  relative one, because it was queued from a git worktree (see "Artefact location
+  warning" below for why that matters).
 - **`config_smoke.yaml`** — MPS path proof: `max_points 200000`, width 504, 4 epochs,
   removal every epoch from epoch 1, shade prune at epoch 2. Minutes, not hours.
 
@@ -143,8 +176,9 @@ second for 7.36M points, so it runs at every eval.
 ## Commands
 
 ```bash
-# Arms A and B (prio 70, behind Splats' own jobs; they join a long queue).
+# Arms A, A' and B (prio 70, behind Splats' own jobs; they join a long queue).
 bash scripts/queue_training.sh experiments/EXP-0010-point-removal/config_removal.yaml --max-minutes 300
+bash scripts/queue_training.sh experiments/EXP-0010-point-removal/config_removal_rel.yaml --max-minutes 300
 bash scripts/queue_training.sh experiments/EXP-0010-point-removal/config_shade_prune.yaml --max-minutes 300
 
 # MPS smoke (prio 16, jumps the training queue).
@@ -207,7 +241,14 @@ Three things to read out of it, none of them a verdict (4 epochs on a 200k subsa
 | job | rc | epochs | points start → end | dark-mass fraction start → end | held-out shade PSNR |
 |---|---|---|---|---|---|
 | `trippy-exp0010-removal` (arm A, prio 70) | _running_ | 300 | | | |
+| `trippy-removal-rel` (arm A', prio 70) | _queued_ | 300 | | | |
 | `trippy-exp0010-shade-prune` (arm B, prio 70) | _queued_ | 300 | | | |
+
+Arm A' was submitted 2026-09-06 via `scripts/queue_training.sh
+experiments/EXP-0010-point-removal/config_removal_rel.yaml --max-minutes 300`, run_dir
+`/Users/nzbirdranch/trippy/output/runs/EXP-0010-point-removal/removal-rel` (absolute, per
+the artefact-location warning below — queued from `.worktrees/relative-removal`); see
+`research/trips-metal.md` for the submit line.
 
 Arm A's own epoch-0 reading (full cloud, logged by the run itself): **5,736,619 points,
 1,387,211 in region, mass 334,395.6, dark mass 80,859.2, fraction 0.2418**, held-out shade
@@ -223,6 +264,11 @@ write to `.worktrees/point-removal/output/runs/EXP-0010-point-removal/…`, not 
 checkout's `output/`. Do not delete that worktree by hand while they run; use
 `scripts/worktree_rm.sh point-removal`, which rescues `output/` out of it. (Their `--report`
 deliverables do land in the main `$TRIPPY_OUTPUT/deliver/`, since `gpu_submit.sh` exports it.)
+Arm A' avoids this trap on purpose: it was submitted from `.worktrees/relative-removal` with
+`run_dir` set to an *absolute* path
+(`/Users/nzbirdranch/trippy/output/runs/EXP-0010-point-removal/removal-rel`), so it writes
+straight to the main checkout's `output/` regardless of what happens to the worktree it was
+queued from.
 
 Baselines to beat, both on `kk-coherent` (EXP-0003, docs/EXPERIMENTS.md):
 plain Gaussians `kkc_15000` dark mass **19.9%**; TRIPS `full2-broadcast` after 300 epochs

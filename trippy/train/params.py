@@ -79,6 +79,19 @@ class PointParams(nn.Module):
             full-range `Uniform(0,1)` texture init (docs/TRIPS_REFERENCE.md
             Sec. 2) -- a deliberate trippy choice per this task's brief.
         provenance: (N,) uint8 buffer (not trained), from `point_set.provenance`.
+        init_conf: (N,) float32 buffer (not trained), a snapshot of `conf()`
+            at construction (equal to `point_set.conf0`). Never touched by
+            training or by an optimiser step; it exists so
+            `trippy.train.prune`'s `mode: relative` confidence test
+            (`trippy.train.prune_config.PointRemovalConfig.mode`) can
+            threshold a point's CURRENT confidence against its OWN starting
+            value rather than a fixed absolute cutoff -- see that module
+            for why trippy needs this and TRIPS does not. Like
+            `provenance`, it is index-selected (never optimizer-shrunk)
+            when `Trainer._apply_keep_mask` drops points, so entry `i`
+            keeps meaning "point `i`'s confidence when it was created", and
+            it round-trips through `state_dict`/`load_state_dict` like any
+            other buffer.
         bbox_min, bbox_max: (3,) buffers (not trained), the *initial* xyz
             bounding box -- used by the trainer's extent penalty.
     """
@@ -112,6 +125,10 @@ class PointParams(nn.Module):
         self.feat = nn.Parameter(feat)
 
         self.register_buffer("provenance", torch.from_numpy(point_set.provenance.copy()))
+        # Snapshot BEFORE any optimiser step ever touches raw_conf, so this is exactly
+        # point_set.conf0 (up to the logit/sigmoid round-trip's clamp epsilon) -- the
+        # "initial confidence" trippy's relative point-removal rule needs (see docstring).
+        self.register_buffer("init_conf", conf0.clone())
         self.register_buffer("bbox_min", xyz.min(dim=0).values.clone())
         self.register_buffer("bbox_max", xyz.max(dim=0).values.clone())
 

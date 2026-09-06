@@ -1144,6 +1144,30 @@ POINT_REMOVAL_DEFAULT_CONF_THRESHOLD = 0.3
 POINT_REMOVAL_DEFAULT_START_EPOCH = 200
 POINT_REMOVAL_DEFAULT_EVERY_EPOCHS = 50
 
+# `point_removal.mode` / `shade_prune.mode`: TRIPS's rule above is "absolute" -- a fixed
+# cutoff on sigmoid(10*raw_conf), which is TRIPS-faithful only because TRIPS initialises
+# every point's confidence identically (sigmoid(10*0.5) = 0.9933), so "below cutoff" means
+# "training pushed this point down". trippy initialises confidence from the source PLY's
+# own opacity (median 0.18 on kkc_15000), so an absolute cutoff instead mostly measures
+# where a point started, not what training did to it (see POINT_REMOVAL_DEFAULT_MIN_POINTS
+# below and docs/EXPERIMENTS.md "EXP-0010"). "relative" is the faithful analogue: drop a
+# point once its confidence has fallen to less than `rel_factor` of its OWN initial value
+# (`PointParams.init_conf`, snapshotted at construction) -- rewarding/punishing movement,
+# not starting position, which is what TRIPS's absolute rule does under its own uniform
+# init. `conf_threshold` doubles as an optional absolute floor in relative mode: a point is
+# also dropped if it is below that floor outright, so a point that never had much
+# confidence to begin with (and so can never fall by `rel_factor`) is still caught. Set
+# `conf_threshold: 0` to disable the floor and use the relative test alone.
+POINT_REMOVAL_MODE_ABSOLUTE = "absolute"
+POINT_REMOVAL_MODE_RELATIVE = "relative"
+POINT_REMOVAL_MODES = (POINT_REMOVAL_MODE_ABSOLUTE, POINT_REMOVAL_MODE_RELATIVE)
+POINT_REMOVAL_DEFAULT_MODE = POINT_REMOVAL_MODE_ABSOLUTE
+# TRIPS has no relative rule to cite a default from; 0.3 mirrors the code-default absolute
+# cutoff (POINT_REMOVAL_DEFAULT_CONF_THRESHOLD) so "0.3" means the same thing in both
+# modes' defaults: keep a point until it has lost 70% of the confidence it is being judged
+# against (its own initial value, in relative mode; TRIPS's uniform 0.9933, in absolute).
+POINT_REMOVAL_DEFAULT_REL_FACTOR = 0.3
+
 # Not in TRIPS: a floor on the surviving point count. TRIPS has no such guard
 # (RemovePoints happily empties the cloud; NeuralScene.cpp:1375-1405's
 # keep-index loop even reads one past the end of `indices_vec` when the last
