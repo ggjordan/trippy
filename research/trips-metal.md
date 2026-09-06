@@ -1660,3 +1660,4 @@ at 1080p). **Next lever, if one is wanted:** size the fragment buffers from a
 device-side count (indirect dispatch) so `render_inner` never stalls. That is a
 `brush-pyramid` change and would help the native viewer too; not attempted here.
 - 2026-09-06T00:02:45Z disk cleanup at Jordan's request: removed Zenodo zips (5.8G, extracted data kept), rust/brush-trips/target (4.5G, rebuildable), smoke runs (0.3G), EXP-0008 render/image intermediates (3.3G), old epoch checkpoints of full1-broadcast and of the running full2-broadcast (kept ep0000, two newest, latest). Retention policy being added to the trainer (fix/ckpt-retention).
+- 2026-09-06T00:33:52Z submitted job trippy-web-perf-parity prio 12: bash -c cd /Users/nzbirdranch/trippy/rust && cargo test -p brush-pyramid -p brush-unet --features gpu --release --offline -- --nocapture --test-threads=1
