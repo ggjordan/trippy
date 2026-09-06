@@ -119,6 +119,8 @@ layer_factor(s, layer, L):
 
 Worked example, `s = 5` px, `L = 8`: `lower = 2`, `upper = 3`, `f = (5-4)/(8-4) = 0.25`, so mode `"trips"` writes layers **0, 1, 2, 3 with factors 1, 1, 0.75, 0.25**; `"trilinear"` writes only layers 2 and 3 with 0.75 and 0.25; `"broadcast"` writes all 8 with 1. Measured on three held-out `tt_horse` frames from the authors' own checkpoint: `trips` **22.27 dB**, `trilinear` 21.47 dB, `broadcast` 15.14 dB (`experiments/EXP-0002-horse-parity/README.md`).
 
+Cost note, because the intuition is backwards: on the real kk-coherent point set at a 384-px crop, `trips` emits **fewer** fragments than `broadcast` (9.0M vs 24.6M from the same 1.43M culled points), yet it used to cost several times as much per training step on MPS. That was an implementation artefact of the per-layer emission loop, not a property of the rule — see docs/ARCHITECTURE.md "Emission cost".
+
 **Mode `"trips"` also brings TRIPS's footprint gate**, which the other two modes do not have (`RenderForward.cu:340-352`):
 
 ```

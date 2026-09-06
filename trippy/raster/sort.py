@@ -60,6 +60,7 @@ def sort_fragments(
     depth: Tensor,
     method: str = "composite",
     stable: bool = True,
+    max_layer_pixel: int | None = None,
 ) -> Tensor:
     """Permutation that orders fragments by (layer, pixel) then depth ascending.
 
@@ -73,6 +74,14 @@ def sort_fragments(
             whose 64-bit sort is slow or unstable at 10^7+ elements.
         stable: use a stable sort. Required for the two methods to agree on
             depth ties; pass False only if a backend lacks stable sort.
+        max_layer_pixel: caller-supplied upper bound on `layer_pixel.max()`
+            for the composite key's range check. `None` reads the real
+            maximum off the device, which costs a full device->host
+            synchronisation on MPS; emission already guarantees every index
+            is < `LayerGrid.total`, so `build_sorted_fragments` passes
+            `grid.total - 1` and the sync disappears. A bound that is too
+            small is a caller bug and raises exactly as the measured maximum
+            would.
 
     Returns:
         perm: (F,) int64, such that `layer_pixel[perm]` is non-decreasing and
@@ -86,7 +95,9 @@ def sort_fragments(
         return torch.zeros(0, dtype=torch.int64, device=layer_pixel.device)
 
     if method == "composite":
-        max_lp = int(layer_pixel.max().item())
+        # `.max().item()` is a device->host sync; skip it when the caller can
+        # already bound the index space (build_sorted_fragments always can).
+        max_lp = int(layer_pixel.max().item()) if max_layer_pixel is None else int(max_layer_pixel)
         if max_lp >= RASTER_SORT_MAX_LAYER_PIXELS:
             raise ValueError(
                 f"layer_pixel index {max_lp} does not fit the composite sort key "

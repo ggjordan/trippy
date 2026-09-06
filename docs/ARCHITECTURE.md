@@ -241,6 +241,102 @@ Two orthogonal convention options, both defaulting to trippy's own behaviour:
 
 Sizing consequence: fragment buffers must be sized for `4 · L` fragments per point in `"trips"` and `"broadcast"` modes, not `4 · 2` (docs/TRIPS_REFERENCE.md §11).
 
+### Emission cost: mode `trips` vs `broadcast` on MPS (perf/trips-mode, 2026-09-06)
+
+`emit_fragments` has two implementations, selected by `impl=` and proven
+bit-identical (same tensors, same order) by `tests/test_raster_emit_impl.py`:
+
+- **`"loop"`** — the original: a Python `for layer in range(L)` that selects the
+  points writing into that layer, gathers them, and appends per-layer fragment
+  lists that are `torch.cat`ed at the end. It is the readable statement of the
+  rule and is kept as the A/B baseline for `tools/profile_raster.py`.
+- **`"vectorised"`** (the default) — compact the culled points once, then do all
+  L layers as one `(L, M, …)` block, layer-major so the flattened order is
+  identical, and compact once more per pass.
+
+**The measured cause is not arithmetic — it is the number of distinct tensor
+shapes per render.** Three facts settle it (`tools/profile_raster.py`, 5.74M
+kk-coherent points, 384-px crop, L=5, jobs `trippy-trips-perf-1` and `-3`):
+
+1. Mode `trips` emits **fewer** fragments than `broadcast`, not more: 9.02M vs
+   24.61M from the same 1.43M culled points (6.3 vs 17.2 fragments per point).
+   A fragment-count explosion was the obvious hypothesis and it is wrong.
+2. On CPU, where a new shape costs nothing, `trips` is *cheaper* than
+   `broadcast` end to end (1.29 s vs 3.62 s for one crop's forward+backward at
+   the same sizes), and the two implementations are within 8% of each other in
+   every mode. The effect is MPS-only.
+3. MPS charges **6-9x** for an elementwise kernel on a tensor shape the process
+   has not used before — 1.90 ms vs 0.32 ms for `floor(x * 0.5)` on 1.43M rows
+   (`--shape-probe`; 3.19 vs 0.36 ms on the earlier, more contended run). And
+   the loop implementation produces a *different number of shapes per mode*: in
+   `"broadcast"` all five layers select the same rows, so one shape serves the
+   whole render, while in `"trips"`/`"trilinear"` each layer selects a different
+   count, and every one of those counts moves each step as the crop moves.
+
+That shows up directly as the gap between a frozen camera and a moving one.
+Rasteriser forward+backward on MPS, milliseconds, medians of 5
+(`trippy-trips-perf-3`):
+
+| mode | impl | fragments | emit | sort | blend fwd | backward | fixed camera | **moving camera** |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| broadcast | loop | 24.61M | 35.8 | 20.9 | 1.04 | 42.2 | 118.5 | 119.6 |
+| broadcast | **vectorised** | 24.61M | 34.9 | 20.8 | 0.96 | 27.5 | 102.7 | **108.4** |
+| trips | loop | 9.02M | 28.3 | 7.4 | 0.79 | 31.0 | 81.8 | 127.3 |
+| trips | **vectorised** | 9.02M | 21.8 | 7.4 | 0.76 | 21.5 | 65.2 | **79.6** |
+| trilinear | loop | 7.87M | 22.9 | 6.1 | 0.57 | 27.4 | 71.9 | 126.7 |
+| trilinear | **vectorised** | 7.87M | 19.0 | 6.1 | 0.63 | 20.7 | 60.2 | **65.6** |
+
+`"broadcast"`'s loop pays nothing for the camera moving (+1%); `"trips"`'s pays
++56% and `"trilinear"`'s +76%, and the vectorised implementation removes almost
+all of it. With it, the three modes finally rank by the work they do:
+`trilinear` (65.6 ms, 7.87M fragments) < `trips` (79.6, 9.02M) < `broadcast`
+(108.4, 24.61M).
+
+**Whole training steps** on the same machine and the real configs
+(`trippy-trips-perf-2`, `EXP-0003` `config_full2_*.yaml`, 20 timed steps,
+median seconds), bisected into rasteriser / +U-Net / everything:
+
+| config | impl | raster | +U-Net | **whole step** |
+|---|---|---:|---:|---:|
+| `config_full2_trips.yaml` | loop | 0.135 | 0.143 | **0.164** |
+| `config_full2_trips.yaml` | **vectorised** | 0.081 | 0.085 | **0.100** |
+| `config_full2_broadcast.yaml` | loop | 0.096 | 0.116 | **0.109** |
+| `config_full2_broadcast.yaml` | **vectorised** | 0.081 | 0.100 | **0.090** |
+
+A `trips` step goes from 164 ms to 100 ms and from 1.50x a `broadcast` step to
+1.11x. Note that neither number is the ~1.4 s/step the EXP-0003 `full2-trips`
+run logged: that run shared the machine with several heavy CPU jobs and with
+swap in use, so most of its observed 7x over `full2-broadcast` (which had the
+machine largely to itself overnight) was contention, not mode. The mode's own
+contribution, measured back to back, was 1.5x and is now 1.1x.
+
+Two secondary effects come with the same change and are worth naming because
+they are cheap to reintroduce by accident:
+
+- **Per-layer work over all N points.** The loop evaluates mode `"trips"`'s
+  four-corner gate (and `layer_factor`, and the `layer_bounds` inside it) over
+  the full point array at every layer, because it reads the gate off the
+  full-length `uv`. `alive` starts at `valid`, so none of that can matter on a
+  row the cull already dropped.
+- **Data-dependent readbacks.** Per layer the loop issues one `torch.nonzero`,
+  six boolean-mask gathers (each an implicit `nonzero`) and one
+  `bool(keep.any())` — 40 queue drains per render at L=5, against 3.
+
+What is deliberately **kept** from the loop: bilinear weights and alpha are
+computed per emitted fragment, not for all `L · M · 4` candidates, which is why
+the vectorised path runs geometry, then alpha, then the alpha floor as three
+passes. Computing alpha for every candidate was measurably worse on CPU and
+bought nothing on MPS.
+
+Two more MPS numbers from the same job, both load-bearing for the defaults:
+
+- `segment_offsets(method="bincount")` costs **81.6 ms** against
+  **0.28 ms** for `"searchsorted"` at 196k layer-pixels. `"searchsorted"` is
+  the default and must stay it on MPS.
+- `sort_method="composite"` (one stable int64 argsort) is **19.3 ms** at 24.6M
+  fragments; the `"two_pass"` fallback is **36.5 ms**. The int64 key is not the
+  problem it was assumed to be (docs/LIMITATIONS.md).
+
 ## Core principle: No atomics anywhere — a deliberate redesign, not a port
 
 **TRIPS uses `atomicAdd` extensively** — for per-pixel list counting and slot allocation in `CountTiled`/`CollectTiled2`, and for every gradient reduction in `RenderBackward.cu`. We do **not**, by design: 64-bit atomics do not compile in Metal via `torch.mps.compile_shader`, so the atomic list-building step is replaced by a global sort. Nothing below describes TRIPS's own algorithm; TRIPS's fragment counts and list caps do not carry over to an atomic-free formulation without re-deriving them (docs/TRIPS_REFERENCE.md §10.3).
