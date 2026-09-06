@@ -17,6 +17,12 @@ Coordinate frame / pixel convention: docs/GEOMETRY.md "Image coordinates"
     overshoots the source image are never given real image content --
     rgb is exactly 0 and mask is exactly 0 there, so a caller cannot
     accidentally learn from (or backprop into) padding.
+    Person masks (`masks_dir`, auto-discovered as `<scene_root>/masks`) ride
+    the same cache and the same undistortion grid as the pixels they mask --
+    nearest interpolation, because a mask is a decision, not a signal -- and
+    are folded into that same validity mask by `crop()`. One mask, two reasons
+    to be zero (padding, or a person), so every existing consumer of "mask"
+    honours them without changing.
 Related docs: docs/ARCHITECTURE.md "Module overview" (trippy/scene);
     docs/SPEC.md v0.1.0 milestone ("dataset (undistort+cache 1008/2016
     wide)"); trippy.geom.camera.undistort_maps (grid_sample coordinate
@@ -40,6 +46,10 @@ from trippy.constants import (
     EXIF_TAG_EXPOSURE_TIME,
     EXIF_TAG_ISO,
     SCENE_CACHE_META_FILENAME,
+    SCENE_MASK_CACHE_SUFFIX,
+    SCENE_MASK_KEEP_THRESHOLD,
+    SCENE_MASK_SUFFIX,
+    SCENE_MASKS_DIRNAME,
 )
 from trippy.geom import camera as camera_geom
 from trippy.scene import colmap_io
@@ -67,6 +77,29 @@ def resolve_sparse_dir(scene_root: str | Path) -> Path:
     if txt_dir.exists():
         return txt_dir
     raise FileNotFoundError(f"no sparse/0 or sparse_txt directory under {scene_root}")
+
+
+def default_masks_dir(scene_root: str | Path) -> Path | None:
+    """`<scene_root>/masks` when it exists, else None (the scene has no masks).
+
+    Auto-discovery for `SceneDataset`/`TrainConfig`: Splats' own mask writers,
+    COLMAP's `--ImageReader.mask_path` and Brush's default masks folder all use
+    this one directory name (`trippy.constants.SCENE_MASKS_DIRNAME`), so "does
+    this scene have person masks?" is answerable without configuration. Returns
+    None rather than raising -- a scene without masks trains unmasked, which is
+    a legitimate arm, not an error (see `SCENE_MASK_KEEP_THRESHOLD`).
+    """
+    candidate = Path(scene_root) / SCENE_MASKS_DIRNAME
+    return candidate if candidate.is_dir() else None
+
+
+def mask_path_for(masks_dir: str | Path, image_name: str) -> Path:
+    """The mask file for `image_name`: the image's stem with `SCENE_MASK_SUFFIX`.
+
+    `images/IMG_3683.jpg` -> `masks/IMG_3683.png` (the mask writers always emit
+    PNG, whatever the photo's own extension is).
+    """
+    return Path(masks_dir) / (Path(image_name).stem + SCENE_MASK_SUFFIX)
 
 
 def _dst_size(width_src: int, height_src: int, width_dst: int) -> tuple[int, int]:
@@ -110,7 +143,16 @@ class SceneDataset(torch.utils.data.Dataset):
 
     Attributes:
         names: sorted image names in this dataset (deterministic order).
+        masks_dir: resolved person-mask directory, or None when this dataset
+            is unmasked (see `__init__`'s `masks_dir`/`use_masks`).
     """
+
+    #: Class-level default so a subclass that reimplements `__init__` rather than
+    #: calling it -- `trippy.render.pyramid_render._NamedSceneDataset` does, to
+    #: select non-contiguous frame names -- is simply an unmasked dataset instead
+    #: of an AttributeError. Masking is opt-in machinery; not opting in must never
+    #: be a crash.
+    masks_dir: Path | None = None
 
     def __init__(
         self,
@@ -119,6 +161,8 @@ class SceneDataset(torch.utils.data.Dataset):
         cache_root: str | Path,
         device: str | torch.device = "cpu",
         limit: int | None = None,
+        masks_dir: str | Path | None = None,
+        use_masks: bool = True,
     ) -> None:
         """Build (or load) the undistortion cache for a COLMAP scene.
 
@@ -135,11 +179,31 @@ class SceneDataset(torch.utils.data.Dataset):
                 name) are loaded/cached -- use this to avoid processing an
                 entire real scene in tests (never process all of a real
                 scene's images in a test).
+            masks_dir: directory of person masks, one `<stem>.png` per image
+                (`mask_path_for`). None (the default) auto-discovers
+                `<scene_root>/masks` via `default_masks_dir`; a scene without
+                that directory is simply unmasked.
+            use_masks: False turns masking off outright, even for a scene that
+                has a `masks/` directory (the "unmasked arm" of an experiment).
+                Masks are a comparability device, not a rule -- see
+                `trippy.constants.SCENE_MASK_KEEP_THRESHOLD`.
+
+        Raises:
+            FileNotFoundError: `masks_dir` resolves to a directory but one of
+                `names` has no mask file in it. Silently training a subset of
+                the frames unmasked would make the run's numbers a mixture of
+                two protocols, so a partial mask set fails loudly.
         """
         self.scene_root = Path(scene_root)
         self.width = int(width)
         self.cache_root = Path(cache_root)
         self.device = torch.device(device)
+        if not use_masks:
+            self.masks_dir: Path | None = None
+        elif masks_dir is not None:
+            self.masks_dir = Path(masks_dir)
+        else:
+            self.masks_dir = default_masks_dir(self.scene_root)
 
         sparse_dir = resolve_sparse_dir(self.scene_root)
         self._scene = colmap_io.load_colmap_model(sparse_dir)
@@ -191,12 +255,17 @@ class SceneDataset(torch.utils.data.Dataset):
                         f"({cached_k.tolist()}) do not match the live COLMAP model's "
                         f"({fresh_k.tolist()}) at width={self.width}"
                     )
+                # A cache built before masks were configured (or before this feature
+                # existed) has valid pixels but no mask sidecar; fill it in rather than
+                # rebuilding the whole cache, so turning masks on costs one mask pass.
+                if self._ensure_mask_cached(name, cam, fx, fy, cx, cy, scale, width_dst, height_dst, cached):
+                    wrote_anything = True
                 continue
 
             rgb = self._undistort_image(name, cam, fx, fy, cx, cy, scale, width_dst, height_dst)
             np.save(npy_path, rgb)
             exif = _read_exif(self.scene_root / "images" / name)
-            meta["images"][name] = {
+            entry = {
                 "camera_id": im.camera_id,
                 "orig_width": cam.width,
                 "orig_height": cam.height,
@@ -208,15 +277,16 @@ class SceneDataset(torch.utils.data.Dataset):
                 "exposure_time": exif["exposure_time"],
                 "iso": exif["iso"],
             }
+            meta["images"][name] = entry
+            self._ensure_mask_cached(name, cam, fx, fy, cx, cy, scale, width_dst, height_dst, entry)
             wrote_anything = True
 
         if wrote_anything or not self._meta_path.exists():
             self._meta_path.write_text(json.dumps(meta, indent=2))
         return meta
 
-    def _undistort_image(
+    def _sampling_grid(
         self,
-        name: str,
         cam: colmap_io.Camera,
         fx: float,
         fy: float,
@@ -225,17 +295,15 @@ class SceneDataset(torch.utils.data.Dataset):
         scale: float,
         width_dst: int,
         height_dst: int,
-    ) -> np.ndarray:
-        """Undistort+resize one source image to (height_dst, width_dst, 3) uint8 RGB.
+    ) -> torch.Tensor:
+        """The (1, height_dst, width_dst, 2) `grid_sample` grid undistorting `cam`.
 
-        Runs once per (image, width); the caller is responsible for caching
-        the result. Pinhole source cameras (all-zero distortion) skip the
-        distortion step -- the sampling grid degenerates to a plain resize.
+        Shared by the photo and its person mask so both are resampled through
+        *exactly* the same geometry -- a mask built from a second, independently
+        constructed grid could drift by a fraction of a pixel and start
+        excluding the wrong pixels. Pinhole source cameras (all-zero distortion)
+        skip the distortion step; the grid degenerates to a plain resize.
         """
-        image_path = self.scene_root / "images" / name
-        with PILImage.open(image_path) as pil_img:
-            src = np.array(pil_img.convert("RGB"), dtype=np.uint8)  # (H_src, W_src, 3), owns its buffer
-
         fx_dst, fy_dst, cx_dst, cy_dst = fx * scale, fy * scale, cx * scale, cy * scale
         k1, k2, p1, p2 = colmap_io.distortion(cam)
         dist = camera_geom.OpenCVDistortion(k1=k1, k2=k2, p1=p1, p2=p2) if any((k1, k2, p1, p2)) else None
@@ -255,12 +323,109 @@ class SceneDataset(torch.utils.data.Dataset):
             height_dst=height_dst,
             distortion=dist,
         )
+        return torch.from_numpy(grid_np).unsqueeze(0)  # (1, height_dst, width_dst, 2)
 
+    def _undistort_image(
+        self,
+        name: str,
+        cam: colmap_io.Camera,
+        fx: float,
+        fy: float,
+        cx: float,
+        cy: float,
+        scale: float,
+        width_dst: int,
+        height_dst: int,
+    ) -> np.ndarray:
+        """Undistort+resize one source image to (height_dst, width_dst, 3) uint8 RGB.
+
+        Runs once per (image, width); the caller is responsible for caching
+        the result.
+        """
+        image_path = self.scene_root / "images" / name
+        with PILImage.open(image_path) as pil_img:
+            src = np.array(pil_img.convert("RGB"), dtype=np.uint8)  # (H_src, W_src, 3), owns its buffer
+
+        grid_t = self._sampling_grid(cam, fx, fy, cx, cy, scale, width_dst, height_dst)
         src_t = torch.from_numpy(src).to(torch.float32).permute(2, 0, 1).unsqueeze(0)  # (1, 3, H, W)
-        grid_t = torch.from_numpy(grid_np).unsqueeze(0)  # (1, height_dst, width_dst, 2)
         out = F.grid_sample(src_t, grid_t, mode="bilinear", padding_mode="zeros", align_corners=False)
         out_rgb = out.squeeze(0).permute(1, 2, 0).round().clamp(0, 255).to(torch.uint8)
         return out_rgb.numpy()
+
+    def _undistort_mask(
+        self,
+        name: str,
+        cam: colmap_io.Camera,
+        fx: float,
+        fy: float,
+        cx: float,
+        cy: float,
+        scale: float,
+        width_dst: int,
+        height_dst: int,
+    ) -> np.ndarray:
+        """Undistort+resize one person mask to (height_dst, width_dst) uint8 {0, 1}.
+
+        Same grid as the photo (`_sampling_grid`) but **nearest** interpolation:
+        a mask is a decision, not a signal, and bilinear resampling would
+        produce fractional edge values that are neither "person" nor "keep".
+        Grid points outside the source image sample 0 (`padding_mode="zeros"`),
+        i.e. excluded -- consistent with `crop`'s padding rule.
+
+        Returns 1 where the source mask is >= `SCENE_MASK_KEEP_THRESHOLD`
+        (WHITE = keep) and 0 where it is below (BLACK = person, ignore); see
+        `trippy.constants.SCENE_MASK_KEEP_THRESHOLD` for the polarity's
+        provenance.
+        """
+        assert self.masks_dir is not None  # only called when masking is on
+        path = mask_path_for(self.masks_dir, name)
+        if not path.exists():
+            raise FileNotFoundError(
+                f"masks_dir {self.masks_dir} has no mask for image {name!r} (expected {path}); "
+                "training some frames masked and others unmasked would mix two protocols -- "
+                "generate the missing masks or set use_masks: false"
+            )
+        with PILImage.open(path) as pil_mask:
+            src = np.array(pil_mask.convert("L"), dtype=np.uint8)  # (H_src, W_src)
+
+        keep = (src >= SCENE_MASK_KEEP_THRESHOLD).astype(np.float32)
+        grid_t = self._sampling_grid(cam, fx, fy, cx, cy, scale, width_dst, height_dst)
+        src_t = torch.from_numpy(keep).unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
+        out = F.grid_sample(src_t, grid_t, mode="nearest", padding_mode="zeros", align_corners=False)
+        return out.squeeze(0).squeeze(0).to(torch.uint8).numpy()
+
+    def _ensure_mask_cached(
+        self,
+        name: str,
+        cam: colmap_io.Camera,
+        fx: float,
+        fy: float,
+        cx: float,
+        cy: float,
+        scale: float,
+        width_dst: int,
+        height_dst: int,
+        entry: dict[str, Any],
+    ) -> bool:
+        """Cache `name`'s undistorted mask if masking is on and it is not on disk yet.
+
+        Records `mask` (bool) and `mask_keep_frac` (the fraction of undistorted
+        pixels the loss may use, 1.0 = nobody masked out) in `entry` so a run can
+        report per-image mask coverage without re-reading any pixels.
+
+        Returns:
+            True when `entry` was modified (the caller must rewrite meta.json).
+        """
+        if self.masks_dir is None:
+            return False
+        mask_path = self.cache_dir / f"{name}{SCENE_MASK_CACHE_SUFFIX}"
+        if mask_path.exists() and entry.get("mask_keep_frac") is not None:
+            return False
+        mask = self._undistort_mask(name, cam, fx, fy, cx, cy, scale, width_dst, height_dst)
+        np.save(mask_path, mask)
+        entry["mask"] = True
+        entry["mask_keep_frac"] = float(mask.mean())
+        return True
 
     def __len__(self) -> int:
         return len(self._names)
@@ -279,11 +444,17 @@ class SceneDataset(torch.utils.data.Dataset):
                 "tvec": (3,) float32 tensor, world->camera translation.
                 "name": str, image filename.
                 "index": int, this dataset's index for `name`.
+                "mask": (H, W) float32 tensor, 1.0 = a pixel the loss may
+                    use, 0.0 = a person pixel to exclude. **Present only
+                    when this dataset is masked** (see `__init__`'s
+                    `masks_dir`/`use_masks`); an unmasked dataset returns
+                    exactly the keys it returned before masks existed, so
+                    `item.get("mask")` is the safe way to read it.
         """
         name = self._names[index]
         meta = self._meta["images"][name]
         rgb_np = np.load(self.cache_dir / f"{name}.npy")
-        return {
+        item: dict[str, Any] = {
             "rgb": torch.from_numpy(rgb_np).to(self.device),
             "K": torch.tensor(meta["K"], dtype=torch.float32, device=self.device),
             "qvec": torch.tensor(meta["qvec"], dtype=torch.float32, device=self.device),
@@ -291,6 +462,22 @@ class SceneDataset(torch.utils.data.Dataset):
             "name": name,
             "index": index,
         }
+        if self.masks_dir is not None:
+            mask_np = np.load(self.cache_dir / f"{name}{SCENE_MASK_CACHE_SUFFIX}")
+            item["mask"] = torch.from_numpy(mask_np).to(torch.float32).to(self.device)
+        return item
+
+    def mask_keep_fracs(self) -> dict[str, float]:
+        """`{name: fraction of pixels the loss may use}` for every image, or `{}` if unmasked.
+
+        Read straight out of the cache sidecar (`_ensure_mask_cached` writes it),
+        so a run can report mask coverage -- and prove the polarity is the right
+        way round, since a "person" mask that kept ~0% of a frame would show up
+        here immediately -- without opening any imagery.
+        """
+        if self.masks_dir is None:
+            return {}
+        return {name: float(self._meta["images"][name]["mask_keep_frac"]) for name in self._names}
 
 
 def crop(
@@ -306,10 +493,22 @@ def crop(
     treated as scene content downstream. Overshoot pixels get rgb == 0 and
     mask == 0, exactly.
 
+    A person mask travels with the item ("mask", from a masked
+    `SceneDataset`) and is multiplied into the returned validity mask through
+    the *same* nearest-neighbour gather as the pixels, so a masked pixel and
+    the pixel it masks can never come from different source locations. The
+    result is one mask with two reasons to be 0 -- crop overshoot, or a person
+    -- and every consumer (L1, SSIM, LPIPS-by-zeroing, PSNR, the exposure
+    diagnostics) already honours it, so nothing downstream needs to know which
+    reason applied. `rgb` itself is left alone where the person mask is 0: the
+    photographed pixels are real content (unlike padding, which is not), they
+    simply do not count towards the loss.
+
     Args:
         item: a dataset item (as returned by `SceneDataset.__getitem__`):
-            "rgb" (H, W, 3) uint8 tensor, and optionally "K" (3, 3) float32
-            tensor.
+            "rgb" (H, W, 3) uint8 tensor, optionally "K" (3, 3) float32
+            tensor, and optionally "mask" (H, W) float32 tensor (1 = usable
+            pixel, 0 = person -- `trippy.constants.SCENE_MASK_KEEP_THRESHOLD`).
         size: output crop side length in pixels (square).
         zoom: > 1 zooms in (samples a smaller `size/zoom` source window,
             nearest-neighbour resampled up to `size`); 1.0 = no zoom.
@@ -321,8 +520,9 @@ def crop(
         dict with:
             "rgb": (size, size, 3) uint8 tensor, same dtype as `item["rgb"]`,
                 0 wherever the crop overshoots the source image.
-            "mask": (size, size) float32 tensor, 1.0 = real image content,
-                0.0 = crop overshoot (padding).
+            "mask": (size, size) float32 tensor, 1.0 = a pixel the loss may
+                use, 0.0 = crop overshoot (padding) **or** a person pixel when
+                `item` carries a "mask".
             "K": (3, 3) float32 tensor, intrinsics adjusted for the crop
                 offset and zoom -- present only if `item` has a "K".
     """
@@ -363,7 +563,15 @@ def crop(
     mask_same_dtype = mask2d.to(out_rgb.dtype)
     out_rgb = out_rgb * mask_same_dtype.unsqueeze(-1)
 
-    result: dict[str, Any] = {"rgb": out_rgb, "mask": mask2d.to(torch.float32)}
+    valid = mask2d.to(torch.float32)
+    image_mask = item.get("mask")
+    if image_mask is not None:
+        # Gathered with the SAME clamped indices as the pixels, then multiplied in:
+        # the padding mask has already zeroed everything outside the source image,
+        # so the clamped lookup at those positions cannot resurrect anything.
+        valid = valid * image_mask[row_idx][:, col_idx].to(torch.float32)
+
+    result: dict[str, Any] = {"rgb": out_rgb, "mask": valid}
 
     K = item.get("K")
     if K is not None:
