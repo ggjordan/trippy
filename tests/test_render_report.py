@@ -128,6 +128,25 @@ def test_extent_p99_max_none_on_error_or_missing() -> None:
     assert report_mod.extent_p99_max({"plys": []}) is None
 
 
+def test_heldout_split_extracts_shade_and_other() -> None:
+    held_out = {
+        "epoch": 39,
+        "psnr_mean": 14.417,
+        "shade": {"n": 6, "psnr": 12.5, "ssim": 0.3, "lpips": 0.6},
+        "other": {"n": 27, "psnr": 15.0, "ssim": 0.45, "lpips": 0.4},
+    }
+    split = report_mod.heldout_split(held_out)
+    assert split == {
+        "shade": {"n": 6, "psnr": 12.5, "ssim": 0.3, "lpips": 0.6},
+        "other": {"n": 27, "psnr": 15.0, "ssim": 0.45, "lpips": 0.4},
+    }
+
+
+def test_heldout_split_degrades_to_empty_dicts_on_missing_data() -> None:
+    assert report_mod.heldout_split({}) == {"shade": {}, "other": {}}
+    assert report_mod.heldout_split({"epoch": 0, "psnr_mean": 0.0}) == {"shade": {}, "other": {}}
+
+
 # --- comparison table ---
 
 

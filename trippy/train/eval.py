@@ -19,10 +19,12 @@ Related docs: docs/EXPERIMENTS.md "Training runs", "Held-out PSNR and
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import torch
 
+from trippy.constants import TRAIN_EVAL_MANUAL_DIRNAME_FMT
 from trippy.hybrid.gsrender_live import gaussian_provider_for
 from trippy.render.sheets import colorize, save_png, side_by_side
 from trippy.train import checkpoint_io
@@ -74,12 +76,20 @@ def evaluate_checkpoint(
         device: forwarded to `build_trainer_from_checkpoint`.
 
     Returns:
-        The `Trainer.evaluate()` metrics dict (also written to
-        `<run_dir>/eval_ep<NNNN>/metrics.json` + `sheet.jpg`, same as a
-        mid-training eval).
+        The `Trainer.evaluate()` metrics dict -- including the "per_image",
+        "shade", and "other" held-out split (see `Trainer.evaluate`) -- also
+        written to `<run_dir>/eval_manual_<timestamp>/metrics.json` +
+        `sheet.jpg` (a distinct directory from any mid-training/`--report`
+        eval, named by wall-clock time rather than epoch, so repeated manual
+        re-evals never collide with each other or with the checkpoint's own
+        epoch directory) and appended as an `{"eval": True, ...}` row to the
+        run's own `metrics.jsonl`, so `trippy leaderboard` picks up the
+        shade split for a checkpoint that finished training before this
+        split existed, without retraining it.
     """
     trainer = build_trainer_from_checkpoint(checkpoint_path, device=device)
-    return trainer.evaluate(names=images)
+    eval_dirname = TRAIN_EVAL_MANUAL_DIRNAME_FMT.format(ts=time.strftime("%Y%m%d-%H%M%S"))
+    return trainer.evaluate(names=images, eval_dirname=eval_dirname)
 
 
 def render_offpath(

@@ -21,13 +21,18 @@ Invariants:
       partially written (mid-training, or reporting failed) -- it simply
       excludes it: this module's whole job is "what's real reportable data
       right now", not "every directory that exists".
-    - No per-image shade-only PSNR/SSIM/LPIPS is recorded by `Trainer.
-      evaluate()` for a trippy-native run (only an aggregate over the whole
-      held-out split, forced-shade frames included) -- so the "shade"
-      held-out column for a *scanned* run is honestly "n/a", not a
-      fabricated split; only the two fixed non-trippy baselines (the raw
-      Gaussian render, Design C) carry a real shade-only PSNR breakdown,
-      because those come from EXP-0005's own per-bucket eval.
+    - `Trainer.evaluate()` records a per-image "shade" vs "other" held-out
+      split (`{"n", "psnr", "ssim", "lpips"}` each -- "shade" is
+      `cfg.forced_heldout` when non-empty, else `SHADE_FRAMES_KK`,
+      intersected with the images actually evaluated). `build_run_row`
+      reads it from the run's own `report.json` (`heldout_split.shade`)
+      first, else the last `metrics.jsonl` eval row's own `shade` key
+      (`_heldout_shade`) -- so a scanned run only shows a real "held-out
+      shade" number once *something* has called `Trainer.evaluate()` since
+      this split was added (mid-training, `--report`, or a standalone
+      `trippy eval --checkpoint` re-run against an existing checkpoint,
+      which needs no retraining). A run whose report.json/metrics.jsonl
+      both predate this split still degrades to "n/a", same as ever.
     - `regenerate_and_deliver` never raises past `trippy.render.report.
       run_train_report`'s own end-of-run hook: a broken leaderboard
       rebuild (e.g. a corrupt run directory somewhere under `runs/`) must
@@ -123,10 +128,11 @@ _FOOTNOTES = (
         "ascending (closer to/below 19.9% first), then held-out PSNR descending."
     ),
     (
-        "\"Held-out shade\" is n/a for scanned trippy runs: `Trainer.evaluate()` records one "
-        "aggregate PSNR/SSIM/LPIPS over the whole held-out split (forced-shade frames included), "
-        "not a per-image breakdown -- only the two fixed non-trippy baselines below have a real "
-        "shade-only number (EXP-0005's own per-bucket eval)."
+        "\"Held-out shade\" for a scanned trippy run comes from its own report.json "
+        "(heldout_split.shade) or, failing that, the last metrics.jsonl eval row's shade split -- "
+        "\"n/a\" means neither exists yet for that run (it finished before the shade split was "
+        "added); re-run `trippy eval --checkpoint <run>/checkpoints/checkpoint_latest.pt` to "
+        "backfill it without retraining."
     ),
     (
         "Wall time is approximate: run-directory metrics.jsonl creation time to the report.json's "
@@ -290,6 +296,47 @@ def _fmt_triplet(row: dict | None) -> str:
     )
 
 
+def _fmt_triplet_shade(shade: dict | None) -> str:
+    """`"psnr/ssim/lpips"` from a `Trainer.evaluate()`-shaped shade/other dict, or "n/a".
+
+    Same output shape as `_fmt_triplet`, but reads the `{"psnr", "ssim", "lpips"}` keys
+    `Trainer.evaluate()`'s "shade"/"other" sub-dicts use, not the `metrics.jsonl` eval row's own
+    top-level `{"psnr_mean", "ssim_mean", "lpips_mean"}`.
+    """
+    if not shade or shade.get("psnr") is None:
+        return "n/a"
+    return "/".join(
+        [
+            _fmt_num(shade.get("psnr"), ".2f"),
+            _fmt_num(shade.get("ssim"), ".3f"),
+            _fmt_num(shade.get("lpips"), ".3f"),
+        ]
+    )
+
+
+def _heldout_shade(report: dict, last_eval: dict | None) -> dict | None:
+    """The "shade" held-out split dict: `report.json`'s `heldout_split.shade` first, else the last eval row's own `shade` key.
+
+    Args:
+        report: this run's parsed report.json (`{}` if missing/unreadable).
+        last_eval: `_metrics_summary`'s own `"last_eval"` (the last `{"eval": True, ...}` row in
+            `metrics.jsonl`, or `None`).
+
+    Returns:
+        A `{"n", "psnr", "ssim", "lpips"}` dict, or `None` if neither source has one (a run that
+        finished before this split existed) -- `_fmt_triplet_shade` renders that as "n/a".
+    """
+    split = report.get("heldout_split") if isinstance(report, dict) else None
+    shade = split.get("shade") if isinstance(split, dict) else None
+    if isinstance(shade, dict) and shade.get("psnr") is not None:
+        return shade
+    if isinstance(last_eval, dict):
+        eval_shade = last_eval.get("shade")
+        if isinstance(eval_shade, dict) and eval_shade.get("psnr") is not None:
+            return eval_shade
+    return None
+
+
 def _fmt_pct(value: float | None) -> str:
     return f"{value * 100:.1f}%" if value is not None else "n/a"
 
@@ -389,7 +436,7 @@ def build_run_row(run_dir: Path, experiments_root: Path) -> dict[str, Any]:
     steps_cell = str(summary["max_step"]) if summary["max_step"] is not None else "n/a"
 
     held_out_all = summary["last_eval"] or report.get("held_out")
-    held_out_shade = None  # see module docstring: no per-image split is recorded for scanned runs.
+    held_out_shade = _heldout_shade(report, summary["last_eval"])
 
     candidate_audits = _candidate_audits(report)
     dark_mass = dark_mass_fraction(candidate_audits.get("shade_audit"))
@@ -409,7 +456,7 @@ def build_run_row(run_dir: Path, experiments_root: Path) -> dict[str, Any]:
         epochs_cell,
         steps_cell,
         _fmt_triplet(held_out_all),
-        _fmt_triplet(held_out_shade),
+        _fmt_triplet_shade(held_out_shade),
         _fmt_pct(dark_mass),
         _fmt_extent(extent),
         _fmt_num(dolly_coverage, ".4f"),

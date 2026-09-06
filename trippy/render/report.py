@@ -134,6 +134,21 @@ def _first_extent_record(extent_gate: dict | None) -> dict | None:
     return plys[0] if plys else None
 
 
+def heldout_split(held_out_metrics: dict) -> dict:
+    """`{"shade": {...}, "other": {...}}` from `Trainer.evaluate()`'s held-out split, or `{}` each.
+
+    `held_out_metrics` is `Trainer.evaluate()`'s own return value (see there for the "shade"/
+    "other" shape: `{"n", "psnr", "ssim", "lpips"}`). Degrades to an empty dict per side -- not
+    `None`, so `report.json`'s `heldout_split` key is always present and always a dict -- when
+    `held_out_metrics` predates this split (an older report re-serialized, or `fit()` returning
+    `{}` because a `max_minutes` budget expired before the first eval).
+    """
+    return {
+        "shade": held_out_metrics.get("shade") or {},
+        "other": held_out_metrics.get("other") or {},
+    }
+
+
 def extent_p99_max(extent_gate: dict | None) -> tuple[float, float] | None:
     """`(radius_p99, radius_max)` from a `run_extent_gate` result, or None."""
     record = _first_extent_record(extent_gate)
@@ -484,9 +499,10 @@ def run_train_report(trainer: Trainer, held_out_metrics: dict) -> dict:
 
     Returns:
         `{"checkpoint", "device", "scene_root", "export_ply", "epoch",
-        "held_out", "dolly", "offpath", "audits": {"candidate", "baseline"},
-        "bundle": {"bundle_dir", "viewer"}, "summary_line", "deliveries"}`
-        (`deliveries[0]` is always the Mac viewer launcher) -- also written
+        "held_out", "heldout_split": {"shade", "other"}, "dolly", "offpath",
+        "audits": {"candidate", "baseline"}, "bundle": {"bundle_dir",
+        "viewer"}, "summary_line", "deliveries"}` (`deliveries[0]` is always
+        the Mac viewer launcher) -- also written
         to `<run_dir>/report/report.json`, with the comparison table,
         summary line, and deliveries list (launcher first) appended to
         `<run_dir>/README.md`, and the bundle itself written to
@@ -571,6 +587,7 @@ def run_train_report(trainer: Trainer, held_out_metrics: dict) -> dict:
         "export_ply": str(export_path),
         "epoch": epoch,
         "held_out": held_out_metrics,
+        "heldout_split": heldout_split(held_out_metrics),
         "dolly": dolly_metrics,
         "offpath": offpath_metrics,
         "audits": {"candidate": candidate_audits, "baseline": baseline_audits},

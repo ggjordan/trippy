@@ -4,14 +4,19 @@ Module: tests.test_train_trainer
 Invariants under test: `train_step` (with a pinned crop) decreases loss
     over 5 steps on the synthetic scene; `evaluate` writes `metrics.json`
     + `sheet.jpg` (JPEG, not PNG -- see trainer.py's `_save_eval_sheet_jpeg`)
-    under `<run_dir>/eval_ep<N>/`, capped at `cfg.eval_max_images` rows;
+    under `<run_dir>/eval_ep<N>/` (or `eval_dirname` when given), capped at
+    `cfg.eval_max_images` rows; records a `per_image` dict plus a
+    `shade`/`other` held-out split (shade = `cfg.forced_heldout`
+    intersected with the evaluated names, else `SHADE_FRAMES_KK`), and
+    appends that same split (minus `names`) to `metrics.jsonl`;
     `save_checkpoint` + `resume` on a freshly constructed Trainer reproduces
-    identical parameters; `export_ply` round-trips through `GaussianPlySource`;
-    the checkpoint retention policy (`trippy.train.retention`, wired into
-    `save_checkpoint`) keeps `checkpoint_latest.pt`/`checkpoint_best.pt`,
-    `checkpoint_keep_every` multiples, and the last `checkpoint_keep_last`
-    epochs, deleting the rest -- and a run can still `resume` from
-    `checkpoint_latest.pt` after pruning.
+    identical parameters; `export_ply` round-trips through
+    `GaussianPlySource`; the checkpoint retention policy
+    (`trippy.train.retention`, wired into `save_checkpoint`) keeps
+    `checkpoint_latest.pt`/`checkpoint_best.pt`, `checkpoint_keep_every`
+    multiples, and the last `checkpoint_keep_last` epochs, deleting the
+    rest -- and a run can still `resume` from `checkpoint_latest.pt` after
+    pruning.
 All fixtures are the synthetic scene from `tests/test_train_helpers.py`
 (never a real Splats scene).
 """
@@ -22,6 +27,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 import torch
 from PIL import Image as PILImage
 from test_train_helpers import build_synthetic_ply, build_synthetic_scene, tiny_train_config
@@ -119,6 +125,54 @@ def test_evaluate_eval_max_images_caps_sheet_rows(tmp_path: Path) -> None:
     small_sheet = np.array(PILImage.open(small.run_dir / "eval_ep0000" / "sheet.jpg"))
     big_sheet = np.array(PILImage.open(big.run_dir / "eval_ep0000" / "sheet.jpg"))
     assert small_sheet.shape[0] < big_sheet.shape[0]
+
+
+def test_evaluate_records_per_image_and_shade_split(tmp_path: Path) -> None:
+    # forced_heldout is the shade set here (docs/EXPERIMENTS.md "Leaderboard": shade frames are
+    # cfg.forced_heldout when non-empty, else SHADE_FRAMES_KK) -- IMG_1.jpg is forced into
+    # held-out and is therefore the one and only "shade" frame; everything else held out lands
+    # in "other".
+    trainer = _build_trainer(tmp_path, forced_heldout=["IMG_1.jpg"], heldout_k=8)
+    metrics = trainer.evaluate()
+
+    assert set(metrics["per_image"].keys()) == set(metrics["names"])
+    for entry in metrics["per_image"].values():
+        assert entry["psnr"] == pytest.approx(entry["psnr"])  # a real float, not NaN/None
+        assert entry["ssim"] is not None
+        assert entry["lpips"] is None  # eval_lpips=False in tiny_train_config
+
+    assert metrics["shade"]["n"] == 1
+    assert metrics["shade"]["psnr"] == pytest.approx(metrics["per_image"]["IMG_1.jpg"]["psnr"])
+    assert metrics["shade"]["lpips"] is None
+    assert metrics["other"]["n"] == metrics["n_images"] - 1
+
+    # Also written to eval_ep0000/metrics.json, and appended (minus "names") to metrics.jsonl.
+    eval_dir = trainer.run_dir / "eval_ep0000"
+    written = json.loads((eval_dir / "metrics.json").read_text())
+    assert written["shade"]["n"] == 1
+    assert set(written["per_image"].keys()) == set(metrics["names"])
+
+    rows = [json.loads(line) for line in trainer.metrics_path.read_text().splitlines()]
+    eval_rows = [r for r in rows if r.get("eval")]
+    assert eval_rows[-1]["shade"]["n"] == 1
+    assert "per_image" in eval_rows[-1]
+    assert "names" not in eval_rows[-1]
+
+
+def test_evaluate_shade_split_empty_when_no_forced_heldout_matches(tmp_path: Path) -> None:
+    # No forced_heldout, and none of the synthetic scene's IMG_0..3.jpg names are in
+    # SHADE_FRAMES_KK -- "shade" degrades to an empty (not fabricated) group.
+    trainer = _build_trainer(tmp_path)
+    metrics = trainer.evaluate()
+    assert metrics["shade"] == {"n": 0, "psnr": None, "ssim": None, "lpips": None}
+    assert metrics["other"]["n"] == metrics["n_images"]
+
+
+def test_evaluate_eval_dirname_override(tmp_path: Path) -> None:
+    trainer = _build_trainer(tmp_path)
+    trainer.evaluate(eval_dirname="eval_manual_20260906-000000")
+    assert (trainer.run_dir / "eval_manual_20260906-000000" / "metrics.json").exists()
+    assert not (trainer.run_dir / "eval_ep0000").exists()
 
 
 def test_checkpoint_save_and_resume_reproduces_state(tmp_path: Path) -> None:

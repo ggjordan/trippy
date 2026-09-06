@@ -292,11 +292,22 @@ def _cmd_train(args: argparse.Namespace) -> int:
 
 
 def _cmd_eval(args: argparse.Namespace) -> int:
+    """Re-evaluate a checkpoint, including the shade-vs-other held-out split (see Trainer.evaluate).
+
+    Writes `<run_dir>/eval_manual_<timestamp>/metrics.json` and appends an
+    eval row to the run's own `metrics.jsonl` (`trippy.train.eval.
+    evaluate_checkpoint`), so `trippy leaderboard` picks up the split for a
+    checkpoint that finished training before the split existed -- no
+    retraining needed.
+    """
     metrics = evaluate_checkpoint(args.checkpoint, images=args.images, device=args.device)
+    shade, other = metrics.get("shade") or {}, metrics.get("other") or {}
     print(f"psnr_mean: {metrics['psnr_mean']}")
     print(f"ssim_mean: {metrics['ssim_mean']}")
     print(f"lpips_mean: {metrics['lpips_mean']}")
     print(f"n_images: {metrics['n_images']}")
+    print(f"shade: n={shade.get('n')} psnr={shade.get('psnr')} ssim={shade.get('ssim')} lpips={shade.get('lpips')}")
+    print(f"other: n={other.get('n')} psnr={other.get('psnr')} ssim={other.get('ssim')} lpips={other.get('lpips')}")
     return 0
 
 
