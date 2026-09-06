@@ -195,6 +195,37 @@ def test_checkpoint_save_and_resume_reproduces_state(tmp_path: Path) -> None:
     torch.testing.assert_close(resumed.background, trainer.background)
 
 
+def test_resume_from_pre_pr37_checkpoint_missing_init_conf_backfills_from_conf(tmp_path: Path) -> None:
+    """A checkpoint saved before PR #37 has no `init_conf` key in `point_params`.
+
+    Simulates that by stripping the key from an otherwise-real checkpoint
+    (rather than shipping a fixture `.pt`, which the "synthetic fixtures
+    only" rule in AGENTS.md would forbid) and confirms `resume` still
+    works -- `RuntimeError: Missing key(s) ... "init_conf"` was the
+    original bug report -- with `init_conf` backfilled from the loaded
+    confidence.
+    """
+    trainer = _build_trainer(tmp_path)
+    trainer.train_step()
+    ckpt_path = trainer.save_checkpoint(epoch=1)
+
+    payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    del payload["point_params"]["init_conf"]
+    torch.save(payload, ckpt_path)
+
+    scene_root, point_set = build_synthetic_scene(tmp_path / "scene2")
+    ply_path = build_synthetic_ply(tmp_path / "scene2", point_set)
+    cfg2 = tiny_train_config(scene_root, ply_path, tmp_path / "run2", tmp_path / "cache2")
+    resumed = Trainer(cfg2)
+    resumed.resume(ckpt_path)  # must not raise
+
+    assert resumed.epoch == 1
+    torch.testing.assert_close(resumed.point_params.xyz, trainer.point_params.xyz)
+    torch.testing.assert_close(resumed.point_params.init_conf, resumed.point_params.conf())
+    log_text = resumed.log_path.read_text()
+    assert "init_conf" in log_text  # the one-line compat note landed in the run log
+
+
 def test_save_checkpoint_prunes_by_keep_every_and_keep_last(tmp_path: Path) -> None:
     trainer = _build_trainer(tmp_path, checkpoint_keep_every=3, checkpoint_keep_last=1)
     for epoch in range(6):

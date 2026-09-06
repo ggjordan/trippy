@@ -1572,11 +1572,22 @@ class Trainer:
         first (`_resize_point_params`) -- otherwise `load_state_dict` would
         raise a size mismatch and no removal run could ever be resumed,
         re-evaluated or reported.
+
+        A checkpoint saved before PR #37 also has no `init_conf` buffer in
+        its `point_params`; that specific, known migration is logged here
+        and handled by `PointParams.load_state_dict` (never a blanket
+        `strict=False` -- every other missing key in every other state dict
+        below still raises).
         """
         checkpoint_n = int(payload["point_params"]["xyz"].shape[0])
         if checkpoint_n != len(self.point_params):
             self._log(f"checkpoint holds {checkpoint_n} points (source built {len(self.point_params)}); resizing")
             self._resize_point_params(checkpoint_n)
+        if "init_conf" not in payload["point_params"]:
+            self._log(
+                "checkpoint's point_params has no 'init_conf' (pre PR #37); "
+                "PointParams.load_state_dict will initialise it from loaded confidence"
+            )
         self.point_params.load_state_dict(payload["point_params"])
         self.pose_params.load_state_dict(payload["pose_params"])
         self.net.load_state_dict(payload["net"])
