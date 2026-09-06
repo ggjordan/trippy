@@ -274,6 +274,14 @@ def _run_train_report_safely(trainer: Trainer, metrics: dict) -> None:
 
 
 def _cmd_train(args: argparse.Namespace) -> int:
+    # Eager import of everything --report needs, so a multi-hour run uses ONE consistent code
+    # version even if main is updated underneath it (a lazy import mid-run hit an ImportError on
+    # 2026-09-06 after constants.py changed on disk).
+    if getattr(args, "report", False):
+        from trippy.eval import audits as _au  # noqa: F401
+        from trippy.render import candidate as _cd  # noqa: F401
+        from trippy.render import leaderboard as _lb  # noqa: F401
+        from trippy.render import report as _rp  # noqa: F401
     cfg = TrainConfig.load_yaml(args.config)
     if args.device is not None:
         cfg.device = args.device
