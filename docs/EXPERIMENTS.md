@@ -206,22 +206,29 @@ regardless of the requested mode (TRIPS's own `InterpolateFromNeighbors` is like
 this through `trippy.train.eval.evaluate_checkpoint`; omitting the flag keeps the checkpoint's own
 `cfg.eval_exposure_mode` (`"neighbours"` unless the run that produced it set something else).
 
-**Where the numbers land, and an open design question left for the next task.** `Trainer.evaluate`'s
-per-image dict gains `"exposure_mode"` (which mode actually produced *that* row -- `"own"` for every
-training-set name) and `"psnr_eval"`/`"ssim_eval"`/`"lpips_eval"` (the headline number under the resolved
-mode); the top level gains `"exposure_mode"`, `"psnr_mean_eval"`, `"shade_eval"` and `"other_eval"`. These
-are **new, parallel fields** -- the existing `"psnr"`/`"ssim"`/`"lpips"`/`"psnr_mean"`/`"shade"`/`"other"`
-fields are deliberately left meaning exactly what they meant before this feature: each frame's own raw
-exposure, unconditionally. Two existing test files pin that meaning down (`tests/test_train_regression.py`
-`test_evaluate_psnr_matches_an_independent_masked_psnr`, and several assertions in
-`tests/test_train_eval_calibrate.py` that deliberately break a held-out frame's own exposure and check the
-strict `psnr` reflects it) -- overwriting the old fields' meaning would have silently invalidated both. So
-for now, `trippy eval`'s printout and `Trainer.evaluate`'s return dict expose both the plain (`psnr_mean`,
-`shade`) and headline (`psnr_mean_eval`, `shade_eval`) numbers side by side, but **`trippy.render.leaderboard`
-and `trippy train --report` have not been repointed at the `_eval` fields yet** -- they still read the
-unaffected plain ones. Making "neighbours" visibly the default everywhere (not just in `trippy eval`'s own
-output) needs that follow-up wiring, plus a decision on whether the two locked test files above should be
-revisited to assert on `psnr_eval` instead once the rest of the pipeline has moved over.
+**Where the numbers land.** `Trainer.evaluate`'s per-image dict gains `"exposure_mode"` (which mode
+actually produced *that* row -- `"own"` for every training-set name) and
+`"psnr_eval"`/`"ssim_eval"`/`"lpips_eval"` (the headline number under the resolved mode); the top level
+gains `"exposure_mode"`, `"psnr_mean_eval"`, `"shade_eval"` and `"other_eval"`. These are **new, parallel
+fields** -- the existing `"psnr"`/`"ssim"`/`"lpips"`/`"psnr_mean"`/`"shade"`/`"other"` fields are
+deliberately left meaning exactly what they meant before this feature: each frame's own raw exposure,
+unconditionally. `tests/test_train_eval_calibrate.py`'s `test_calibration_recovers_a_broken_exposure` and
+`test_calibrated_psnr_barely_depends_on_the_broken_starting_exposure` (which deliberately break a held-out
+frame's own exposure by 5.87 EV, the kk-coherent no-EXIF artefact) pin that meaning down explicitly: they
+assert the strict `psnr` field still shows the break, **and** that the headline `psnr_eval` field does
+NOT -- it is computed entirely from the frame's TRAINING neighbours and never reads that frame's own
+(broken) row, so it stays bit-identical no matter how badly that row is broken.
+
+`trippy eval`'s printout, `trippy train --report`'s summary line/README table/`report.json`, and
+`trippy.render.leaderboard` are now all repointed at the `_eval` fields as the headline numbers (this
+task's own follow-up wiring) -- "neighbours" is visibly the default everywhere, not just in `trippy eval`'s
+own output. The strict, own-exposure numbers stay visible everywhere too: as a secondary row in the
+`--report` comparison table and summary line, and as the compact "Strict own-exposure PSNR (all/shade)"
+leaderboard column (see "Leaderboard" below) -- never confused with the headline, never silently dropped.
+A report.json/metrics.jsonl row written before this wiring landed has no `"_eval"` fields at all; every
+consumer falls back to the strict fields for its headline column in that case and marks the cell
+`" (own)"` (or, in `--report`'s table, labels the row `"(own -- pre eval-fields run)"`) so an old run's
+README/leaderboard entry still renders a real number, honestly labelled.
 
 ### Per-image exposure diagnostics
 
@@ -825,25 +832,40 @@ Columns: run name (suffixed `(smoke)` when the run name contains "smoke" --
 own `run_dir` field names this run -- `trippy.render.leaderboard.match_run_config`; matching is on
 just the last two path components, since `run_dir` is written either relative to the repo root or
 as an absolute, machine-specific path -- see EXP-0009's configs), epochs reached/planned and total
-training steps (from `metrics.jsonl`), held-out PSNR/SSIM/LPIPS (`metrics.jsonl`'s own last eval
-row), shade dark-mass fraction and extent p99/max (`trippy.render.report.dark_mass_fraction`/
-`extent_p99_max`, reused directly -- the same numbers `comparison_table_markdown` computes for a
-single run's own README), dolly mean-centre coverage (`trippy.render.report.
-dolly_mean_center_coverage`), an approximate wall time (`metrics.jsonl`'s own creation time to
-report.json's mtime -- no per-step timestamp is recorded, so this is a filesystem-timestamp
-estimate, not instrumented), and the delivered Mac viewer launcher's filename (`n/a` for
-`candidate-report` runs, which never export a viewer bundle).
+training steps (from `metrics.jsonl`), **Held-out all (neighbour-exposure) PSNR/SSIM/LPIPS** and
+**Held-out shade (neighbour-exposure) PSNR/SSIM/LPIPS** (the headline numbers, below), **Strict
+own-exposure PSNR (all/shade)** (a compact secondary column, below), shade dark-mass fraction and
+extent p99/max (`trippy.render.report.dark_mass_fraction`/`extent_p99_max`, reused directly -- the
+same numbers `comparison_table_markdown` computes for a single run's own README), dolly mean-centre
+coverage (`trippy.render.report.dolly_mean_center_coverage`), an approximate wall time
+(`metrics.jsonl`'s own creation time to report.json's mtime -- no per-step timestamp is recorded, so
+this is a filesystem-timestamp estimate, not instrumented), and the delivered Mac viewer launcher's
+filename (`n/a` for `candidate-report` runs, which never export a viewer bundle).
 
-**Held-out shade PSNR/SSIM/LPIPS**: `Trainer.evaluate()` records a per-image `shade`/`other` split
-(see "Standalone evaluation" above) -- `trippy.render.leaderboard.build_run_row` reads it from the
-run's own `report.json` (`heldout_split.shade`) first, else the last `metrics.jsonl` eval row's own
-`shade` key. A row still reads `n/a` when neither source has it, honestly: either the run predates
-this split (finished training before it was added) and hasn't been re-evaluated since, or the scene
-has neither `cfg.forced_heldout` nor any `SHADE_FRAMES_KK` frame in its held-out set. Run `trippy
-eval --checkpoint <run_dir>/checkpoints/checkpoint_latest.pt` against an existing checkpoint to
-backfill the split without retraining (it appends a fresh eval row `trippy leaderboard` then picks
-up). The two fixed baseline rows below always carry a real shade-only PSNR/SSIM/LPIPS split from
-their own source experiment's per-bucket eval, independent of any trippy-native run.
+**"Held-out all"/"Held-out shade" headline the neighbour-exposure number.** `Trainer.evaluate()`
+records a per-image `shade`/`other` split (see "Standalone evaluation" above) under both the strict
+own-exposure keys and the parallel `"_eval"`-suffixed headline keys (default
+`exposure_mode="neighbours"`, "interpolate_eval_settings ported" above) --
+`trippy.render.leaderboard.build_run_row` reads the headline split from the run's own `report.json`
+(`held_out`/`heldout_split.shade_eval`) first, else the last `metrics.jsonl` eval row's own
+`psnr_mean_eval`/`shade_eval` fields. **A row whose report.json/metrics.jsonl predate the "_eval"
+fields (PR #32) falls back to the strict split for these two columns and marks the cell `" (own)"`**
+-- there is nothing to fall back FROM in that case, so the headline number there simply IS the
+strict, own-exposure number, honestly labelled rather than hidden. A row still reads `n/a` when
+NEITHER split exists yet for a metric: either the run predates any held-out split at all, or the
+scene has neither `cfg.forced_heldout` nor any `SHADE_FRAMES_KK` frame in its held-out set. Run
+`trippy eval --checkpoint <run_dir>/checkpoints/checkpoint_latest.pt` against an existing checkpoint
+to backfill it without retraining (it appends a fresh eval row `trippy leaderboard` then picks up).
+The two fixed baseline rows below always carry a real shade-only PSNR/SSIM/LPIPS split from their
+own source experiment's per-bucket eval -- both raw Gaussians and Design C have a fixed, already-
+measured number with no per-image exposure model to fix, so their headline columns are permanently
+`" (own)"` too (see the row descriptions below).
+
+**"Strict own-exposure PSNR (all/shade)"** is a compact secondary column: the same, unmodified
+own-exposure numbers the leaderboard used before this feature, `psnr_all/psnr_shade`, kept visible
+next to the headline so the two numbers are never confused. It is not used for sorting or ranking --
+only the headline "Held-out all" column's PSNR feeds `_sort_key` (falling back to the strict number
+for a pre-"_eval" row, i.e. whatever "Held-out all" actually displays).
 
 **Held-out shade PSNR (calibrated)** is an *optional* column: it appears only once some run has a
 calibrated eval (`trippy eval --checkpoint ... --calibrate`, whose `shade_calibrated` split lands in
@@ -866,6 +888,14 @@ run with its own `metrics.jsonl`), sourced verbatim from their own experiment RE
 - **Design C: render->photo U-Net (EXP-0005)**: the same PLY's render refined by a trained U-Net
   (experiments/EXP-0005-hybrid-c/README.md's own "Refined" row, final eval epoch 1125). No point
   cloud/extent of its own to audit.
+
+**Baseline rows are unaffected by the neighbour-exposure headline change.** Raw Gaussians
+(`gsrender.py`) have no per-image exposure model at all -- there is no held-out-exposure artefact
+for `interpolate_from_train_neighbours` to fix, so its "Held-out all"/"Held-out shade" cells are the
+same as-measured numbers the leaderboard always showed, now suffixed `" (own)"` for honesty. Design
+C does have a `NeuralCamera` tone mapper, but its row is a fixed number quoted verbatim from
+EXP-0005's own README (predating this feature, and never re-evaluated), so it gets the same
+`" (own)"` treatment rather than a fabricated re-computation.
 
 Sorted by shade dark-mass fraction ascending (closer to/below the 19.9% Gaussian baseline first),
 then held-out PSNR descending -- a row missing either number (a failed audit, or a baseline with

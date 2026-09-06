@@ -37,6 +37,19 @@ standalone re-eval). A row still reads `n/a` when the run finished training befo
 hasn't been re-evaluated since -- ask for `trippy eval --checkpoint <run>/checkpoints/checkpoint_latest.pt`
 to be run against it (no retraining needed) and the next leaderboard rebuild will pick up the number.
 
+**"Held-out all"/"Held-out shade" now headline the neighbour-exposure number, not the strict one.**
+A held-out photo's own exposure/white-balance is never trained, so it can start miles off (the
+kk-coherent no-EXIF frames were 58x too bright) and that alone used to cost some rows many dB that
+had nothing to do with how good the reconstruction actually is. These two columns now copy each
+held-out frame's exposure from its nearest TRAINING neighbours instead (never reading that frame's
+own photo) before scoring it, which is the fix and the new headline number. The strict, unmodified
+number -- the one the leaderboard always showed -- is still right there: the compact "Strict
+own-exposure PSNR (all/shade)" column, and it's what `trippy eval`'s own printout calls "own". A run
+whose report predates this fix shows `" (own)"` on the two headline columns instead of a number that
+doesn't exist yet -- that just means there was nothing to switch to yet, not that anything is wrong
+with the run. Raw Gaussians and Design C (the two fixed baseline rows) always show `" (own)"` here:
+neither has a per-image exposure model this fix could do anything to.
+
 ## How to open a .command file
 
 A `.command` file is a macOS double-click shortcut:

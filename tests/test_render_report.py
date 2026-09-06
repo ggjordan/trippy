@@ -147,6 +147,22 @@ def test_heldout_split_degrades_to_empty_dicts_on_missing_data() -> None:
     assert report_mod.heldout_split({"epoch": 0, "psnr_mean": 0.0}) == {"shade": {}, "other": {}}
 
 
+def test_heldout_split_also_carries_the_neighbour_exposure_eval_split_when_present() -> None:
+    held_out = {
+        "epoch": 39,
+        "psnr_mean": 14.417,
+        "shade": {"n": 6, "psnr": 12.5, "ssim": 0.3, "lpips": 0.6},
+        "other": {"n": 27, "psnr": 15.0, "ssim": 0.45, "lpips": 0.4},
+        "shade_eval": {"n": 6, "psnr": 17.9, "ssim": 0.5, "lpips": 0.3},
+        "other_eval": {"n": 27, "psnr": 18.2, "ssim": 0.55, "lpips": 0.28},
+    }
+    split = report_mod.heldout_split(held_out)
+    assert split["shade_eval"] == {"n": 6, "psnr": 17.9, "ssim": 0.5, "lpips": 0.3}
+    assert split["other_eval"] == {"n": 27, "psnr": 18.2, "ssim": 0.55, "lpips": 0.28}
+    # The strict split is still there too -- both live side by side.
+    assert split["shade"] == {"n": 6, "psnr": 12.5, "ssim": 0.3, "lpips": 0.6}
+
+
 # --- comparison table ---
 
 
@@ -171,7 +187,28 @@ def test_comparison_table_renders_real_numbers() -> None:
     assert "40.02" in table and "124.48" in table  # candidate extent
     # Baseline has no held-out concept (it's an un-trained source PLY, not a
     # model) -- those three cells are legitimately "n/a", not fabricated.
-    assert "| Held-out PSNR (dB) | n/a | 14.42 |" in table
+    # `_REAL_HELD_OUT` predates the "_eval" fields, so the headline row falls back to the
+    # strict number and says so -- no separate secondary row is added in that case.
+    assert "| Held-out PSNR (dB) (own -- pre eval-fields run) | n/a | 14.42 |" in table
+    assert "(strict, own exposure)" not in table
+
+
+def test_comparison_table_leads_with_the_neighbour_exposure_headline_and_keeps_strict_visible() -> None:
+    held_out = {
+        "epoch": 39,
+        "psnr_mean": 12.10,
+        "ssim_mean": 0.30,
+        "lpips_mean": 0.60,
+        "exposure_mode": "neighbours",
+        "psnr_mean_eval": 17.95,
+        "ssim_mean_eval": 0.44,
+        "lpips_mean_eval": 0.40,
+    }
+    table = report_mod.comparison_table_markdown(held_out, _REAL_CANDIDATE_AUDITS, _REAL_BASELINE_AUDITS, _REAL_DOLLY)
+    # Headline: the neighbour-exposure number, clearly labelled.
+    assert "| Held-out PSNR (dB) (neighbours-exposure) | n/a | 17.95 |" in table
+    # Secondary: the strict, own-exposure number stays visible right below it.
+    assert "| Held-out PSNR (dB) (strict, own exposure) | n/a | 12.10 |" in table
 
 
 def test_comparison_table_still_renders_when_every_audit_failed() -> None:
@@ -194,6 +231,15 @@ def test_summary_line_contains_epoch_psnr_and_dark_mass_vs_baseline() -> None:
     assert "14.42" in line
     assert "36.2%" in line
     assert "19.9%" in line
+    assert "pre eval-fields run" in line  # _REAL_HELD_OUT has no "_eval" fields
+
+
+def test_summary_line_headlines_the_neighbour_exposure_psnr_and_quotes_the_strict_one() -> None:
+    held_out = {**_REAL_HELD_OUT, "exposure_mode": "neighbours", "psnr_mean_eval": 17.95}
+    line = report_mod.summary_line("full1-broadcast", 39, held_out, _REAL_CANDIDATE_AUDITS, _REAL_BASELINE_AUDITS)
+    assert "17.95" in line  # the neighbour-exposure headline number
+    assert "neighbours-exposure" in line
+    assert "strict, own exposure: 14.42" in line  # the strict number, still quoted
     assert "good" not in line.lower()  # AGENTS.md honesty rule: no verdict language
 
 

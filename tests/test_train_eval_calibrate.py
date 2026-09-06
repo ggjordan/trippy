@@ -14,6 +14,13 @@ Invariants under test:
       fitted scalar lives in a local tensor, never in the module).
     - `Trainer.evaluate(calibrate=True)` reports the strict numbers *and*
       the calibrated ones, in separate keys.
+    - The strict, own-exposure `psnr`/`psnr_calibrated` fields still show a deliberately broken
+      held-out exposure (unaffected by `exposure_mode`, docs/EXPERIMENTS.md
+      "interpolate_eval_settings ported"); the parallel headline `psnr_eval` field (default
+      `exposure_mode="neighbours"`) does NOT show it, because it is computed entirely from the
+      frame's TRAINING neighbours and never reads that frame's own (broken) exposure row --
+      confirmed both directly and by its bit-identical value across every broken starting
+      exposure tried.
 All fixtures are the synthetic scene from `tests/test_train_helpers.py`
 (never a real Splats scene, never a photo).
 """
@@ -101,12 +108,21 @@ def test_calibration_recovers_a_broken_exposure(tmp_path: Path) -> None:
     metrics = trainer.evaluate(names=[name], calibrate=True)
     row = metrics["per_image"][name]
 
+    # The strict, own-exposure field (`psnr`) is deliberately left meaning exactly what it meant
+    # before `exposure_mode` existed: each frame's own raw, never-trained exposure, unconditionally
+    # (docs/EXPERIMENTS.md "interpolate_eval_settings ported") -- it must still show the break.
     assert row["psnr_calibrated"] > row["psnr"] + 5.0, row
     assert row["exposure_gain"] > 50.0  # the render really was 58x too bright
     # The brightness-ratio diagnostic sees the same thing without any fitting at all.
     assert row["brightness_ratio"] < 0.5
     assert row["gain_best"] < 0.5
     assert row["psnr_gain"] > row["psnr"] + 5.0
+    # The headline "_eval" field (default `exposure_mode="neighbours"`) does NOT show the break:
+    # it is computed entirely from this frame's TRAINING neighbours, so it never sees the broken
+    # row this test just wrote into `exposures_values[index]` (mirrors
+    # tests/test_train_eval_interp.py's own "recovers a broken held-out exposure" test).
+    assert row["exposure_mode"] == "neighbours"
+    assert row["psnr_eval"] > row["psnr"] + 5.0, row
 
 
 def test_calibrated_psnr_barely_depends_on_the_broken_starting_exposure(tmp_path: Path) -> None:
@@ -115,13 +131,20 @@ def test_calibrated_psnr_barely_depends_on_the_broken_starting_exposure(tmp_path
     index = trainer._name_to_index[name]
 
     calibrated = []
+    headline_eval = []
     for start_ev in (-5.87, -2.0, 0.0, 2.0):
         with torch.no_grad():
             trainer.camera.exposures_values[index] = start_ev
         row = trainer.evaluate(names=[name], calibrate=True)["per_image"][name]
         calibrated.append(row["psnr_calibrated"])
+        headline_eval.append(row["psnr_eval"])
 
     assert max(calibrated) - min(calibrated) < 1.0, calibrated
+    # The default headline field ("neighbours") never reads this frame's own exposure row at
+    # all -- only its TRAINING neighbours' -- so it must be bit-identical regardless of what this
+    # test just wrote into `exposures_values[index]`, unlike the strict `psnr`/`psnr_calibrated`
+    # fields above which do depend on it.
+    assert max(headline_eval) - min(headline_eval) < 1e-6, headline_eval
 
 
 def test_calibration_leaves_geometry_network_and_camera_parameters_untouched(tmp_path: Path) -> None:

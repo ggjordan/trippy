@@ -113,6 +113,14 @@ from trippy.render.report import (
 )
 
 _EXPERIMENTS_DIRNAME = "experiments"
+# Headline columns are the neighbour-exposure numbers (`Trainer.evaluate`'s "_eval"-suffixed
+# fields, `trippy.constants.EVAL_EXPOSURE_MODES`, default "neighbours" -- docs/EXPERIMENTS.md
+# "interpolate_eval_settings ported"): the same fix `trippy eval`'s own printout headlines,
+# now also the leaderboard's ranking number. A run whose report.json/metrics.jsonl predate the
+# "_eval" fields falls back to the strict, own-exposure numbers for these two columns and the
+# cell says so (" (own)"); the strict numbers are always additionally visible, compactly, in
+# their own secondary column so the two are never confused (see `_FOOTNOTES` and
+# `build_run_row`).
 _HEADERS = [
     "Run",
     "Experiment",
@@ -120,8 +128,9 @@ _HEADERS = [
     "Point source",
     "Epochs",
     "Steps",
-    "Held-out all (PSNR/SSIM/LPIPS)",
-    "Held-out shade (PSNR/SSIM/LPIPS)",
+    "Held-out all (neighbour-exposure) PSNR/SSIM/LPIPS",
+    "Held-out shade (neighbour-exposure) PSNR/SSIM/LPIPS",
+    "Strict own-exposure PSNR (all/shade)",
     "Shade dark-mass %",
     "Extent p99/max",
     "Dolly coverage",
@@ -139,11 +148,25 @@ _FOOTNOTES = (
         "ascending (closer to/below 19.9% first), then held-out PSNR descending."
     ),
     (
-        "\"Held-out shade\" for a scanned trippy run comes from its own report.json "
-        "(heldout_split.shade) or, failing that, the last metrics.jsonl eval row's shade split -- "
-        "\"n/a\" means neither exists yet for that run (it finished before the shade split was "
-        "added); re-run `trippy eval --checkpoint <run>/checkpoints/checkpoint_latest.pt` to "
-        "backfill it without retraining."
+        "\"Held-out all\"/\"Held-out shade\" headline the neighbour-exposure number "
+        "(`Trainer.evaluate`'s `psnr_mean_eval`/`shade_eval`, default `exposure_mode=\"neighbours\"`, "
+        "docs/EXPERIMENTS.md \"interpolate_eval_settings ported\") -- it copies each held-out "
+        "frame's exposure/white-balance from its nearest TRAINING neighbours without ever reading "
+        "that frame's own photo, fixing the held-out-exposure artefact that used to cost some rows "
+        "many dB for reasons that had nothing to do with reconstruction quality. \"Strict "
+        "own-exposure PSNR (all/shade)\" is the same two numbers computed the old way -- each "
+        "frame's own never-trained exposure, unmodified -- kept visible so the two are never "
+        "confused; it is not used for sorting. A run whose report.json/metrics.jsonl predate the "
+        "\"_eval\" fields shows \" (own)\" on the two headline columns: there is nothing to fall "
+        "back FROM, so the headline number there IS the strict number."
+    ),
+    (
+        "\"Held-out all\"/\"Held-out shade\" for a scanned trippy run come from its own report.json "
+        "(`held_out`/`heldout_split.shade_eval`, or the strict `heldout_split.shade` when no "
+        "\"_eval\" split exists) or, failing that, the last metrics.jsonl eval row's own fields -- "
+        "\"n/a\" means neither source has anything for that run yet (it finished before ANY held-out "
+        "split was recorded); re-run `trippy eval --checkpoint <run>/checkpoints/checkpoint_latest.pt` "
+        "to backfill it without retraining."
     ),
     (
         f"\"{_CALIBRATED_SHADE_HEADER}\" appears only when some run has been re-evaluated with "
@@ -153,6 +176,12 @@ _FOOTNOTES = (
         "calibration\"). It is a diagnostic, not the run's PSNR: the fixed Gaussian baseline "
         "has no per-image exposure model at all, so it can never be calibrated and its shade "
         "number stays as measured."
+    ),
+    (
+        "The two fixed baseline rows (raw Gaussians, Design C) have no per-image exposure model "
+        "at all, so there is nothing for the neighbour-exposure fix to do -- their headline "
+        "columns are the same as-measured numbers as their strict column, marked \" (own)\", not "
+        "a second independent measurement."
     ),
     (
         "Wall time is approximate: run-directory metrics.jsonl creation time to the report.json's "
@@ -320,8 +349,10 @@ def _fmt_triplet_shade(shade: dict | None) -> str:
     """`"psnr/ssim/lpips"` from a `Trainer.evaluate()`-shaped shade/other dict, or "n/a".
 
     Same output shape as `_fmt_triplet`, but reads the `{"psnr", "ssim", "lpips"}` keys
-    `Trainer.evaluate()`'s "shade"/"other" sub-dicts use, not the `metrics.jsonl` eval row's own
-    top-level `{"psnr_mean", "ssim_mean", "lpips_mean"}`.
+    `Trainer.evaluate()`'s "shade"/"other"/"shade_eval"/"other_eval" sub-dicts all use (the
+    "_eval" suffix lives on the *outer* key name only -- `_aggregate_group`'s own output dict
+    keys are always the plain "psnr"/"ssim"/"lpips" names -- see trainer.py), not the
+    `metrics.jsonl` eval row's own top-level `{"psnr_mean", "ssim_mean", "lpips_mean"}`.
     """
     if not shade or shade.get("psnr") is None:
         return "n/a"
@@ -334,8 +365,67 @@ def _fmt_triplet_shade(shade: dict | None) -> str:
     )
 
 
-def _heldout_shade(report: dict, last_eval: dict | None) -> dict | None:
-    """The "shade" held-out split dict: `report.json`'s `heldout_split.shade` first, else the last eval row's own `shade` key.
+def _fmt_triplet_eval(row: dict | None) -> tuple[str, bool]:
+    """The neighbour-exposure headline triplet from an eval-row-shaped `row`, and whether it fell back.
+
+    Reads `psnr_mean_eval`/`ssim_mean_eval`/`lpips_mean_eval` (`Trainer.evaluate`'s headline
+    fields, PR #32) when present; falls back to `_fmt_triplet`'s strict `psnr_mean`/... fields
+    for a `row` that predates them (an older report.json/metrics.jsonl eval row).
+
+    Returns:
+        `(cell, used_fallback)` -- the caller appends " (own)" to `cell` when `used_fallback` is
+        True, so a pre-"_eval" run's headline column still shows a real number, honestly labelled.
+    """
+    if not row:
+        return "n/a", False
+    if row.get("psnr_mean_eval") is not None or row.get("ssim_mean_eval") is not None:
+        cell = "/".join(
+            [
+                _fmt_num(row.get("psnr_mean_eval"), ".2f"),
+                _fmt_num(row.get("ssim_mean_eval"), ".3f"),
+                _fmt_num(row.get("lpips_mean_eval"), ".3f"),
+            ]
+        )
+        return cell, False
+    return _fmt_triplet(row), True
+
+
+def _shade_cell_eval(shade_eval: dict | None, shade_strict: dict | None) -> tuple[str, bool]:
+    """The neighbour-exposure headline shade triplet, falling back to the strict split.
+
+    Args:
+        shade_eval: `_heldout_shade_eval`'s result (`None` when this run predates the "_eval"
+            fields).
+        shade_strict: `_heldout_shade`'s result -- the fallback, and also what the "Strict
+            own-exposure" secondary column always reads regardless of this function's outcome.
+
+    Returns:
+        `(cell, used_fallback)`, same contract as `_fmt_triplet_eval`.
+    """
+    if shade_eval is not None:
+        return _fmt_triplet_shade(shade_eval), False
+    if shade_strict is not None:
+        return _fmt_triplet_shade(shade_strict), True
+    return "n/a", False
+
+
+def _fmt_strict_compact(held_out_all: dict | None, held_out_shade: dict | None) -> str:
+    """`"psnr_all/psnr_shade"` from the strict, own-exposure fields -- the secondary column's compact cell."""
+    psnr_all = held_out_all.get("psnr_mean") if held_out_all else None
+    psnr_shade = held_out_shade.get("psnr") if held_out_shade else None
+    if psnr_all is None and psnr_shade is None:
+        return "n/a"
+    return f"{_fmt_num(psnr_all, '.2f')}/{_fmt_num(psnr_shade, '.2f')}"
+
+
+def _heldout_split_field(report: dict, last_eval: dict | None, key: str) -> dict | None:
+    """A `{"n", "psnr", "ssim", "lpips"}`-shaped dict from `report.json`'s `heldout_split[key]`, else the last eval row's own `key`, else None.
+
+    Generic form of the "report.json first, last metrics.jsonl eval row second" precedence every
+    held-out split field in this module uses. `key` is one of `Trainer.evaluate`'s own top-level
+    split key names -- "shade"/"other" (strict, own-exposure), "shade_eval"/"other_eval" (the
+    neighbour-exposure headline split, `trippy.render.report.heldout_split` passthrough), or
+    "shade_calibrated"/"other_calibrated" (test-time calibration, opt-in).
 
     Args:
         report: this run's parsed report.json (`{}` if missing/unreadable).
@@ -344,17 +434,32 @@ def _heldout_shade(report: dict, last_eval: dict | None) -> dict | None:
 
     Returns:
         A `{"n", "psnr", "ssim", "lpips"}` dict, or `None` if neither source has one (a run that
-        finished before this split existed) -- `_fmt_triplet_shade` renders that as "n/a".
+        finished before this split existed, or that never ran under the requested mode) --
+        `_fmt_triplet_shade` renders that as "n/a".
     """
     split = report.get("heldout_split") if isinstance(report, dict) else None
-    shade = split.get("shade") if isinstance(split, dict) else None
-    if isinstance(shade, dict) and shade.get("psnr") is not None:
-        return shade
+    value = split.get(key) if isinstance(split, dict) else None
+    if isinstance(value, dict) and value.get("psnr") is not None:
+        return value
     if isinstance(last_eval, dict):
-        eval_shade = last_eval.get("shade")
-        if isinstance(eval_shade, dict) and eval_shade.get("psnr") is not None:
-            return eval_shade
+        eval_value = last_eval.get(key)
+        if isinstance(eval_value, dict) and eval_value.get("psnr") is not None:
+            return eval_value
     return None
+
+
+def _heldout_shade(report: dict, last_eval: dict | None) -> dict | None:
+    """The strict, own-exposure "shade" held-out split (see `_heldout_split_field`)."""
+    return _heldout_split_field(report, last_eval, "shade")
+
+
+def _heldout_shade_eval(report: dict, last_eval: dict | None) -> dict | None:
+    """The neighbour-exposure headline "shade_eval" held-out split (see `_heldout_split_field`).
+
+    `None` when this run's report.json/metrics.jsonl predate the "_eval" fields (PR #32) -- the
+    caller falls back to `_heldout_shade`'s strict split and marks the cell " (own)".
+    """
+    return _heldout_split_field(report, last_eval, "shade_eval")
 
 
 def _heldout_shade_calibrated(report: dict, last_eval: dict | None) -> float | None:
@@ -364,15 +469,8 @@ def _heldout_shade_calibrated(report: dict, last_eval: dict | None) -> float | N
     for this run -- which is the normal case, and makes the whole column disappear (see
     `leaderboard_headers`).
     """
-    split = report.get("heldout_split") if isinstance(report, dict) else None
-    shade = split.get("shade_calibrated") if isinstance(split, dict) else None
-    if isinstance(shade, dict) and shade.get("psnr") is not None:
-        return float(shade["psnr"])
-    if isinstance(last_eval, dict):
-        eval_shade = last_eval.get("shade_calibrated")
-        if isinstance(eval_shade, dict) and eval_shade.get("psnr") is not None:
-            return float(eval_shade["psnr"])
-    return None
+    shade = _heldout_split_field(report, last_eval, "shade_calibrated")
+    return float(shade["psnr"]) if shade is not None else None
 
 
 def leaderboard_headers(rows: list[dict[str, Any]]) -> list[str]:
@@ -459,7 +557,9 @@ def build_run_row(run_dir: Path, experiments_root: Path) -> dict[str, Any]:
     Returns:
         `{"cells": [str, ...]` (in `_HEADERS` order), `"dark_mass": float|None,
         "psnr_all": float|None, "is_baseline": False}` -- the last two are
-        the sort key `rows_to_markdown`/`render_table_png`'s caller uses;
+        the sort key `rows_to_markdown`/`render_table_png`'s caller uses (`psnr_all` is the
+        headline neighbour-exposure number when present, else the strict fallback -- the
+        leaderboard ranks on whichever number the "Held-out all" column actually shows);
         `cells` is what's actually displayed.
     """
     metrics_path = run_dir / TRAIN_METRICS_FILENAME
@@ -490,6 +590,19 @@ def build_run_row(run_dir: Path, experiments_root: Path) -> dict[str, Any]:
 
     held_out_all = summary["last_eval"] or report.get("held_out")
     held_out_shade = _heldout_shade(report, summary["last_eval"])
+    held_out_shade_eval = _heldout_shade_eval(report, summary["last_eval"])
+
+    # Headline columns: the neighbour-exposure numbers (default `exposure_mode="neighbours"`,
+    # docs/EXPERIMENTS.md "interpolate_eval_settings ported"), falling back to the strict,
+    # own-exposure fields -- marked " (own)" -- for a report.json/metrics.jsonl that predates
+    # the "_eval" fields (PR #32).
+    all_cell, all_fallback = _fmt_triplet_eval(held_out_all)
+    if all_fallback:
+        all_cell += " (own)"
+    shade_cell, shade_fallback = _shade_cell_eval(held_out_shade_eval, held_out_shade)
+    if shade_fallback:
+        shade_cell += " (own)"
+    strict_compact_cell = _fmt_strict_compact(held_out_all, held_out_shade)
 
     candidate_audits = _candidate_audits(report)
     dark_mass = dark_mass_fraction(candidate_audits.get("shade_audit"))
@@ -508,15 +621,22 @@ def build_run_row(run_dir: Path, experiments_root: Path) -> dict[str, Any]:
         str(point_source),
         epochs_cell,
         steps_cell,
-        _fmt_triplet(held_out_all),
-        _fmt_triplet_shade(held_out_shade),
+        all_cell,
+        shade_cell,
+        strict_compact_cell,
         _fmt_pct(dark_mass),
         _fmt_extent(extent),
         _fmt_num(dolly_coverage, ".4f"),
         _fmt_duration(wall_time),
         viewer_launcher,
     ]
-    psnr_all = held_out_all.get("psnr_mean") if held_out_all else None
+    # The headline (ranking) PSNR: neighbour-exposure when present, else the strict fallback --
+    # whichever number `all_cell` above actually shows.
+    psnr_all = None
+    if held_out_all:
+        psnr_all = held_out_all.get("psnr_mean_eval")
+        if psnr_all is None:
+            psnr_all = held_out_all.get("psnr_mean")
     return {
         "cells": cells,
         "dark_mass": dark_mass,
@@ -549,14 +669,17 @@ def _baseline_rows() -> list[dict[str, Any]]:
                     f"{LEADERBOARD_BASELINE_GAUSSIAN_SSIM_ALL:.3f}",
                     f"{LEADERBOARD_BASELINE_GAUSSIAN_LPIPS_ALL:.3f}",
                 ]
-            ),
+            )
+            + " (own)",  # no per-image exposure model -- nothing for the neighbour fix to do
             "/".join(
                 [
                     f"{LEADERBOARD_BASELINE_GAUSSIAN_PSNR_SHADE:.2f}",
                     f"{LEADERBOARD_BASELINE_GAUSSIAN_SSIM_SHADE:.3f}",
                     f"{LEADERBOARD_BASELINE_GAUSSIAN_LPIPS_SHADE:.3f}",
                 ]
-            ),
+            )
+            + " (own)",
+            f"{LEADERBOARD_BASELINE_GAUSSIAN_PSNR_ALL:.2f}/{LEADERBOARD_BASELINE_GAUSSIAN_PSNR_SHADE:.2f}",
             _fmt_pct(LEADERBOARD_BASELINE_GAUSSIAN_DARK_MASS),
             f"{LEADERBOARD_BASELINE_GAUSSIAN_EXTENT_P99:.1f}/{LEADERBOARD_BASELINE_GAUSSIAN_EXTENT_MAX:.1f}",
             "n/a",
@@ -584,14 +707,17 @@ def _baseline_rows() -> list[dict[str, Any]]:
                     f"{LEADERBOARD_BASELINE_DESIGN_C_SSIM_ALL:.3f}",
                     f"{LEADERBOARD_BASELINE_DESIGN_C_LPIPS_ALL:.3f}",
                 ]
-            ),
+            )
+            + " (own)",  # fixed number from EXP-0005's own README, predates the "_eval" fields
             "/".join(
                 [
                     f"{LEADERBOARD_BASELINE_DESIGN_C_PSNR_SHADE:.2f}",
                     f"{LEADERBOARD_BASELINE_DESIGN_C_SSIM_SHADE:.3f}",
                     f"{LEADERBOARD_BASELINE_DESIGN_C_LPIPS_SHADE:.3f}",
                 ]
-            ),
+            )
+            + " (own)",
+            f"{LEADERBOARD_BASELINE_DESIGN_C_PSNR_ALL:.2f}/{LEADERBOARD_BASELINE_DESIGN_C_PSNR_SHADE:.2f}",
             "n/a (no points/extent to audit)",
             "n/a (no points/extent to audit)",
             "n/a",

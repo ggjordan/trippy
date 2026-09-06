@@ -203,13 +203,55 @@ def test_build_run_row_train_report_layout_matches_real_full1_broadcast_numbers(
     assert cells[3] == "gaussian"
     assert cells[4] == "39/40"
     assert cells[5] == "3720"
-    assert cells[6] == "14.42/0.390/0.513"
-    assert cells[8] == "36.2%"  # dark-mass fraction: 124120.0 / 342813.4
-    assert cells[9] == "40.0/124.5"
-    assert cells[12] == "OPEN_TRIPS_MAC_full1.command"  # viewer launcher, first deliveries entry
+    # `_REAL_SHAPED_TRAIN_REPORT`'s held_out has no "_eval" fields -- the headline column falls
+    # back to the strict number and says so.
+    assert cells[6] == "14.42/0.390/0.513 (own)"
+    assert cells[8] == "14.42/n/a"  # strict own-exposure secondary column: all/shade, no shade here
+    assert cells[9] == "36.2%"  # dark-mass fraction: 124120.0 / 342813.4
+    assert cells[10] == "40.0/124.5"
+    assert cells[13] == "OPEN_TRIPS_MAC_full1.command"  # viewer launcher, first deliveries entry
     assert row["dark_mass"] == pytest.approx(124120.0 / 342813.4)
     assert row["psnr_all"] == pytest.approx(14.417)
     assert row["is_baseline"] is False
+
+
+def test_build_run_row_headlines_the_neighbour_exposure_eval_fields_when_present(tmp_path: Path) -> None:
+    report = dict(_REAL_SHAPED_TRAIN_REPORT)
+    report["held_out"] = {
+        **_REAL_SHAPED_TRAIN_REPORT["held_out"],
+        "exposure_mode": "neighbours",
+        "psnr_mean_eval": 17.95,
+        "ssim_mean_eval": 0.44,
+        "lpips_mean_eval": 0.40,
+    }
+    report["heldout_split"] = {
+        "shade": {"n": 6, "psnr": 8.49, "ssim": 0.30, "lpips": 0.69},
+        "other": {"n": 27, "psnr": 16.47, "ssim": 0.45, "lpips": 0.42},
+        "shade_eval": {"n": 6, "psnr": 15.10, "ssim": 0.41, "lpips": 0.35},
+        "other_eval": {"n": 27, "psnr": 18.20, "ssim": 0.48, "lpips": 0.30},
+    }
+    metrics_rows = _TRAIN_REPORT_METRICS + [
+        {
+            "eval": True,
+            "epoch": 39,
+            "psnr_mean": 14.417,
+            "ssim_mean": 0.390,
+            "lpips_mean": 0.513,
+            "psnr_mean_eval": 17.95,
+            "ssim_mean_eval": 0.44,
+            "lpips_mean_eval": 0.40,
+            "shade": {"n": 6, "psnr": 8.49},
+            "shade_eval": {"n": 6, "psnr": 15.10},
+        }
+    ]
+    run_dir = _train_report_run(tmp_path / "runs", "EXP-A", "run-eval", report, metrics_rows)
+
+    row = lb.build_run_row(run_dir, tmp_path / "no_experiments")
+    cells = row["cells"]
+    assert cells[6] == "17.95/0.440/0.400"  # neighbour-exposure headline, no "(own)" fallback tag
+    assert cells[7] == "15.10/0.410/0.350"
+    assert cells[8] == "14.42/8.49"  # strict own-exposure secondary column stays visible
+    assert row["psnr_all"] == pytest.approx(17.95)  # sorts on the headline number, not the strict one
 
 
 def test_build_run_row_held_out_shade_reads_report_heldout_split_first(tmp_path: Path) -> None:
@@ -225,7 +267,8 @@ def test_build_run_row_held_out_shade_reads_report_heldout_split_first(tmp_path:
     run_dir = _train_report_run(tmp_path / "runs", "EXP-A", "run-shade", report, stale_metrics)
 
     row = lb.build_run_row(run_dir, tmp_path / "no_experiments")
-    assert row["cells"][7] == "12.50/0.300/0.600"
+    # No "shade_eval" in report.json -- falls back to the strict "shade" split, marked " (own)".
+    assert row["cells"][7] == "12.50/0.300/0.600 (own)"
 
 
 def test_build_run_row_held_out_shade_falls_back_to_last_eval_row(tmp_path: Path) -> None:
@@ -246,7 +289,7 @@ def test_build_run_row_held_out_shade_falls_back_to_last_eval_row(tmp_path: Path
     )
 
     row = lb.build_run_row(run_dir, tmp_path / "no_experiments")
-    assert row["cells"][7] == "13.10/0.330/0.550"
+    assert row["cells"][7] == "13.10/0.330/0.550 (own)"
 
 
 def test_build_run_row_held_out_shade_is_na_when_neither_source_has_it(tmp_path: Path) -> None:
@@ -286,9 +329,10 @@ def test_build_run_row_candidate_report_layout_no_baseline_or_bundle(tmp_path: P
     assert cells[3] == "n/a"
     assert cells[4] == "1"  # no `epochs:` in config, no `epoch` key in report -> last eval epoch only
     assert cells[5] == "48"
-    assert cells[6] == "8.88/0.162/0.860"
-    assert cells[8] == "20.0%"
-    assert cells[12] == "n/a"  # candidate-report never exports a viewer bundle
+    assert cells[6] == "8.88/0.162/0.860 (own)"
+    assert cells[8] == "8.88/n/a"  # strict own-exposure secondary column: no shade split here
+    assert cells[9] == "20.0%"
+    assert cells[13] == "n/a"  # candidate-report never exports a viewer bundle
 
 
 def test_build_run_row_tolerates_missing_and_malformed_data(tmp_path: Path) -> None:
@@ -312,8 +356,9 @@ def test_build_run_row_tolerates_missing_and_malformed_data(tmp_path: Path) -> N
     assert cells[4] == "n/a"  # no eval row, no report["epoch"] -> no epoch at all
     assert cells[5] == "1"  # max step still found despite the corrupt trailing line
     assert cells[6] == "n/a"  # no eval row -> no held-out numbers
-    assert cells[8] == "n/a"
-    assert cells[9] == "n/a"
+    assert cells[8] == "n/a"  # strict own-exposure secondary column
+    assert cells[9] == "n/a"  # dark-mass
+    assert cells[10] == "n/a"  # extent
     assert row["dark_mass"] is None
     assert row["psnr_all"] is None
 
