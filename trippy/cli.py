@@ -140,6 +140,7 @@ from trippy.constants import (
     DISTILL_MAX_JUMP_MULTIPLIER,
     DISTILL_SPARSE_DIRNAME,
     DOLLY_DEFAULT_POSE_NAME,
+    EVAL_EXPOSURE_MODES,
     GIT_DESCRIBE_MATCH_PATTERN,
     MONODEPTH_DEFAULT_CONF0,
     MONODEPTH_DEFAULT_STRIDE,
@@ -308,6 +309,16 @@ def _cmd_eval(args: argparse.Namespace) -> int:
     checkpoint that finished training before the split existed -- no
     retraining needed.
 
+    `--exposure-mode` selects what a held-out image's HEADLINE number
+    ("_eval"-suffixed fields, printed as "shade (eval)"/"other (eval)"
+    below) is computed with: "own" (the frame's own never-trained
+    exposure -- the only behaviour before this feature), "neighbours"
+    (default -- interpolated from the nearest TRAINING frames by capture
+    order, never reading the held-out photo, `trippy.net.camera_model.
+    interpolate_from_train_neighbours`), or "calibrate" (the `--calibrate`
+    fit below, promoted to be the headline number). None keeps the
+    checkpoint's own `cfg.eval_exposure_mode`.
+
     `--calibrate` additionally fits each held-out image's own exposure
     (`--calibrate-wb`: and its red/blue white balance) to its own photo
     before scoring it, with everything else frozen, and prints the
@@ -322,14 +333,26 @@ def _cmd_eval(args: argparse.Namespace) -> int:
         device=args.device,
         calibrate=True if args.calibrate else None,
         calibrate_white_balance=True if args.calibrate_wb else None,
+        exposure_mode=args.exposure_mode,
     )
     shade, other = metrics.get("shade") or {}, metrics.get("other") or {}
+    shade_eval, other_eval = metrics.get("shade_eval") or {}, metrics.get("other_eval") or {}
     print(f"psnr_mean: {metrics['psnr_mean']}")
     print(f"ssim_mean: {metrics['ssim_mean']}")
     print(f"lpips_mean: {metrics['lpips_mean']}")
     print(f"n_images: {metrics['n_images']}")
     print(f"shade: n={shade.get('n')} psnr={shade.get('psnr')} ssim={shade.get('ssim')} lpips={shade.get('lpips')}")
     print(f"other: n={other.get('n')} psnr={other.get('psnr')} ssim={other.get('ssim')} lpips={other.get('lpips')}")
+    print(f"exposure_mode: {metrics.get('exposure_mode')}")
+    print(f"psnr_mean (eval): {metrics.get('psnr_mean_eval')}")
+    print(
+        f"shade (eval): n={shade_eval.get('n')} psnr={shade_eval.get('psnr')} "
+        f"ssim={shade_eval.get('ssim')} lpips={shade_eval.get('lpips')}"
+    )
+    print(
+        f"other (eval): n={other_eval.get('n')} psnr={other_eval.get('psnr')} "
+        f"ssim={other_eval.get('ssim')} lpips={other_eval.get('lpips')}"
+    )
     if metrics.get("calibrated"):
         shade_c, other_c = metrics.get("shade_calibrated") or {}, metrics.get("other_calibrated") or {}
         print(f"psnr_mean_calibrated: {metrics.get('psnr_mean_calibrated')}")
@@ -340,19 +363,21 @@ def _cmd_eval(args: argparse.Namespace) -> int:
 
 
 def _per_image_diagnostics_table(metrics: dict) -> str:
-    """Markdown per-image table: PSNR, brightness ratio, best-gain PSNR, calibrated PSNR.
+    """Markdown per-image table: PSNR, brightness ratio, best-gain PSNR, calibrated/eval PSNR.
 
     Pure formatting over `Trainer.evaluate`'s "per_image" dict (docs/EXPERIMENTS.md
     "Per-image exposure diagnostics"); columns whose values are all missing print as "n/a",
-    so an old metrics dict still renders.
+    so an old metrics dict still renders. "mode" and "PSNR (eval)" are the headline number
+    under `exposure_mode` (docs/EXPERIMENTS.md "Test-time camera calibration") -- "own" for
+    every training-set row regardless of the requested mode, per `Trainer.evaluate`.
     """
     per_image = metrics.get("per_image") or {}
     shade = set((metrics.get("shade") or {}).get("names") or [])
     header = (
         "| image | group | PSNR | exposure gain | pred mean | photo mean | photo/pred | "
-        "best gain | PSNR@best gain | PSNR calibrated |"
+        "best gain | PSNR@best gain | mode | PSNR (eval) | PSNR calibrated |"
     )
-    lines = [header, "|" + "---|" * 10]
+    lines = [header, "|" + "---|" * 12]
     columns = [
         ("psnr", ".2f"),
         ("exposure_gain", ".3f"),
@@ -361,12 +386,14 @@ def _per_image_diagnostics_table(metrics: dict) -> str:
         ("brightness_ratio", ".3f"),
         ("gain_best", ".3f"),
         ("psnr_gain", ".2f"),
-        ("psnr_calibrated", ".2f"),
     ]
     for name in sorted(per_image):
         row = per_image[name]
         cells = [name, "shade" if name in shade else "other"]
         cells += [_fmt_diagnostic(row.get(key), spec) for key, spec in columns]
+        cells.append(str(row.get("exposure_mode", "n/a")))
+        cells.append(_fmt_diagnostic(row.get("psnr_eval"), ".2f"))
+        cells.append(_fmt_diagnostic(row.get("psnr_calibrated"), ".2f"))
         lines.append("| " + " | ".join(cells) + " |")
     return "\n".join(lines)
 
@@ -1041,6 +1068,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--calibrate-wb",
         action="store_true",
         help="with --calibrate, also fit red/blue white balance (green stays pinned, as in training)",
+    )
+    ev.add_argument(
+        "--exposure-mode",
+        choices=EVAL_EXPOSURE_MODES,
+        default=None,
+        help=(
+            "which exposure/WB a held-out image's headline '_eval' numbers use: 'own' (its own "
+            "never-trained exposure, the only behaviour before this feature), 'neighbours' "
+            "(interpolated from the nearest TRAINING frames by capture order, never reading the "
+            "held-out photo -- TRIPS's interpolate_eval_settings, NeuralCamera.cpp:481-520), or "
+            "'calibrate' (the --calibrate fit above, promoted to the headline number). Default: "
+            "the checkpoint's own cfg.eval_exposure_mode ('neighbours' unless the run set it "
+            "explicitly)."
+        ),
     )
     ev.set_defaults(func=_cmd_eval)
 

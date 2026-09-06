@@ -143,8 +143,9 @@ exposure by only ~`lr` per step and a broken frame can start 5.87 EV away.
 
 Rules for reporting it:
 
-- **Default off.** Every training-time eval is the strict protocol; `trippy eval --checkpoint ... --calibrate`
-  turns it on for a diagnostic re-run, which reports both numbers side by side (`psnr_mean` and
+- **Default off** (`eval_calibrate_camera: false`, the `--calibrate` side column below). Every
+  training-time eval computes the strict protocol; `trippy eval --checkpoint ... --calibrate` turns this
+  side column on for a diagnostic re-run, which reports both numbers side by side (`psnr_mean` and
   `psnr_mean_calibrated`, `shade` and `shade_calibrated`).
 - A calibrated PSNR **uses the held-out photo** and is therefore not a novel-view number. It answers one
   question: how much of the gap is photometric. Quote it as "calibrated", never as the run's PSNR.
@@ -152,6 +153,70 @@ Rules for reporting it:
   come out a few tenths of a dB *below* the strict one. That is expected, not a bug.
 - **The Gaussian baseline cannot be calibrated**: raw Gaussians have no per-image exposure model at all.
   Its shade PSNR is what it is. The leaderboard's calibrated column is blank for it, on purpose.
+
+### `interpolate_eval_settings` ported: `eval_exposure_mode` (default `neighbours`)
+
+TRIPS's second opt-in answer above -- `interpolate_eval_settings` -- is now ported too
+(`trippy.net.camera_model.interpolate_from_train_neighbours`, feat/eval-interp, 2026-09-06). It fixes the
+same held-out-exposure artefact **without ever reading the held-out photo**, which is why it is the
+default rather than an opt-in diagnostic: the wrong 8.49 dB EXP-0003 shade number (STATE.md's
+2026-09-05 correction) was mostly this artefact, not a reconstruction failure.
+
+**The exact TRIPS rule, and what trippy ports instead of it.** `NeuralCameraImpl::InterpolateFromNeighbors`
+(`NeuralCamera.cpp:481-520`) does not do a single distance-weighted lerp between the nearest train frame on
+each side. It runs **10 Jacobi passes** of `exp[i] = 0.5*(exp[i-1] + exp[i+1])` over every non-training
+index `i` (`TestEpoch`'s `not_training_indices`, `train.cpp:1604-1611`), with `i-1`/`i+1` wrapping
+circularly at the dataset's ends (`index_before = (i-1)>=0 ? i-1 : n-1`); training rows are never
+themselves overwritten, so they act as fixed boundary values. Two non-training indices sitting next to
+each other therefore feed off each other's *previous-pass* value across all 10 passes, not just their nearest
+train neighbours in one step. This is the standard Jacobi iteration for the 1-D discrete Laplace equation on
+a path graph with those boundaries, and its exact fixed point -- the equation the iteration is converging
+toward -- is the **linear interpolation, by index distance, between the two nearest fixed (training) values
+surrounding any run of non-training indices** (a linear function already equals the average of its own
+neighbours everywhere, so it solves the difference equation exactly, boundaries included).
+
+`interpolate_from_train_neighbours` computes that fixed point directly instead of iterating 10 times:
+for an isolated run of held-out frames (kk-coherent's 6-consecutive shade frames, or any single held-out
+frame) this is mathematically identical to what TRIPS's own 10 passes converge toward, and it is exact
+regardless of how long that run is, whereas a fixed 10-pass budget only fully converges for short runs.
+Given `is_train` (per-frame-index, True for a TRAINING frame, in capture order) and a held-out `index`, it
+walks backward and forward circularly (same wrap-around as TRIPS) to the nearest training index each way,
+then weights each by the *other* direction's distance (the nearer training frame dominates); when both
+directions resolve to the same single training frame, that frame's value is used unweighted; when no
+training frame exists anywhere (impossible via `Trainer`, whose `__init__` already requires a non-empty
+training split, but exercised directly in `tests/test_train_eval_interp.py`) it falls back to
+`values.mean(dim=0)`, a plain scene-mean.
+
+**Config and CLI.** `TrainConfig.eval_exposure_mode` (`trippy.constants.EVAL_EXPOSURE_MODES`):
+
+| mode | what a held-out frame's headline number uses |
+|---|---|
+| `own` | its own never-trained exposure/WB row, unmodified -- the only behaviour before this feature |
+| `neighbours` (**default**) | `interpolate_from_train_neighbours`'s exposure/WB, per the rule above |
+| `calibrate` | the `eval_calibrate_camera` per-image Adam fit above, promoted to be the headline number instead of only a side column |
+
+`Trainer.evaluate(exposure_mode=...)` resolves per row: a name in `self.train_names` is **always** "own"
+regardless of the requested mode (TRIPS's own `InterpolateFromNeighbors` is likewise only ever called on
+`not_training_indices`). `trippy eval --checkpoint ... --exposure-mode {own,neighbours,calibrate}` threads
+this through `trippy.train.eval.evaluate_checkpoint`; omitting the flag keeps the checkpoint's own
+`cfg.eval_exposure_mode` (`"neighbours"` unless the run that produced it set something else).
+
+**Where the numbers land, and an open design question left for the next task.** `Trainer.evaluate`'s
+per-image dict gains `"exposure_mode"` (which mode actually produced *that* row -- `"own"` for every
+training-set name) and `"psnr_eval"`/`"ssim_eval"`/`"lpips_eval"` (the headline number under the resolved
+mode); the top level gains `"exposure_mode"`, `"psnr_mean_eval"`, `"shade_eval"` and `"other_eval"`. These
+are **new, parallel fields** -- the existing `"psnr"`/`"ssim"`/`"lpips"`/`"psnr_mean"`/`"shade"`/`"other"`
+fields are deliberately left meaning exactly what they meant before this feature: each frame's own raw
+exposure, unconditionally. Two existing test files pin that meaning down (`tests/test_train_regression.py`
+`test_evaluate_psnr_matches_an_independent_masked_psnr`, and several assertions in
+`tests/test_train_eval_calibrate.py` that deliberately break a held-out frame's own exposure and check the
+strict `psnr` reflects it) -- overwriting the old fields' meaning would have silently invalidated both. So
+for now, `trippy eval`'s printout and `Trainer.evaluate`'s return dict expose both the plain (`psnr_mean`,
+`shade`) and headline (`psnr_mean_eval`, `shade_eval`) numbers side by side, but **`trippy.render.leaderboard`
+and `trippy train --report` have not been repointed at the `_eval` fields yet** -- they still read the
+unaffected plain ones. Making "neighbours" visibly the default everywhere (not just in `trippy eval`'s own
+output) needs that follow-up wiring, plus a decision on whether the two locked test files above should be
+revisited to assert on `psnr_eval` instead once the rest of the pipeline has moved over.
 
 ### Per-image exposure diagnostics
 
@@ -165,6 +230,7 @@ separate an exposure artefact from a structural failure:
 | `brightness_ratio` | `target_mean / pred_mean` -- a pure gain error shows up here directly |
 | `gain_best` | the closed-form least-squares global gain, `sum(p*t)/sum(p*p)` (`trippy.train.trainer.best_global_gain`) |
 | `psnr_gain` | PSNR after applying `gain_best` -- the best any single global brightness factor can do, no training involved |
+| `exposure_mode` / `psnr_eval` / `ssim_eval` / `lpips_eval` | which `eval_exposure_mode` produced this row's headline number (see above), and that number -- `"own"` for every training-set row regardless of the requested mode |
 
 `trippy eval` prints them as a markdown table. A frame where `psnr_gain` is many dB above `psnr` is being
 scored on its exposure; a frame where they are equal has a structural problem.
@@ -552,7 +618,10 @@ fresh `<run_dir>/eval_manual_<timestamp>/` directory (never collides with a mid-
 checkpoint that finished training before that split existed, with no retraining required. Omitting
 `--images` evaluates the checkpoint's own held-out split. `--calibrate` (plus optional `--calibrate-wb`)
 adds the test-time photometric calibration described above -- the strict numbers are still computed and
-printed, with the calibrated ones next to them, and a per-image diagnostics table underneath. `trippy.train.eval.render_offpath` renders
+printed, with the calibrated ones next to them, and a per-image diagnostics table underneath.
+`--exposure-mode {own,neighbours,calibrate}` selects `eval_exposure_mode` ("`interpolate_eval_settings`
+ported: `eval_exposure_mode`" above) for that run; omitting it keeps the checkpoint's own config
+(`"neighbours"` by default). `trippy.train.eval.render_offpath` renders
 honesty triplets (no ground truth) at arbitrary poses from a JSON file; the dolly/off-path camera-path
 generators below use the richer `trippy.render.candidate.render_candidate` pipeline instead (per-frame
 raw/net/coverage/honesty PNGs, videos, a summary honesty sheet, and `metrics.json`), not this JSON-file API.

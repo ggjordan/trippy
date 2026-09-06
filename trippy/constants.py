@@ -701,6 +701,42 @@ TRAIN_PSNR_EPS = 1e-10
 EVAL_CALIBRATE_DEFAULT_STEPS = 200
 EVAL_CALIBRATE_DEFAULT_LR = 0.05
 
+# --- eval_exposure_mode: which exposure/WB a HELD-OUT frame renders through at eval
+# (trippy.train.trainer.Trainer.evaluate, trippy.net.camera_model.
+# interpolate_from_train_neighbours) ---
+# The 8.49 dB EXP-0003 shade number was largely this artefact, not a reconstruction failure
+# (STATE.md 2026-09-05 correction; docs/EXPERIMENTS.md "Test-time camera calibration"): a
+# held-out row of `NeuralCamera.exposures_values`/`white_balance_values` never receives a
+# gradient (only sampled TRAIN frames do), so it renders through whatever EXIF/zero
+# initialisation it happened to get. TRIPS's own `interpolate_eval_settings`
+# (NeuralCamera.cpp:481-520, called from `TestEpoch`, train.cpp:1604-1611) fixes this WITHOUT
+# touching the held-out photo: it overwrites each test frame's exposure/WB with a value
+# derived only from its TRAINED neighbours' rows -- legitimate because no pixel of the
+# held-out image is ever read to produce it.
+#   "own"        the frame's own (never-trained) row, unmodified -- the old, only behaviour.
+#   "neighbours" (default) interpolated from the nearest TRAINING frames by dataset index
+#                (capture order) -- see camera_model.interpolate_from_train_neighbours for the
+#                exact rule and how it relates to TRIPS's own iterative version.
+#   "calibrate"  the existing `eval_calibrate_camera` per-image Adam fit
+#                (`Trainer.calibrate_frame`) promoted to be the row's primary number instead
+#                of only a side column -- this is the one mode that DOES use the held-out
+#                photo (see calibrate_frame's own docstring for why that is still legitimate
+#                but answers a different question).
+# `Trainer.evaluate`'s own strict `psnr`/`ssim`/`lpips`/`psnr_mean`/`shade`/`other` fields are
+# UNCHANGED by this setting -- always the frame's own raw exposure, exactly as before this
+# feature existed (tests/test_train_regression.py, tests/test_train_eval_calibrate.py pin
+# that meaning down). This feature instead adds parallel `_eval`-suffixed fields
+# (`psnr_eval`, `psnr_mean_eval`, `shade_eval`, `other_eval`, ...) plus a per-image
+# `"exposure_mode"` key recording which mode actually produced that row (a training frame's
+# row is always "own", regardless of the requested mode -- TRIPS's `InterpolateFromNeighbors`
+# is likewise only ever called on `not_training_indices`). Callers that want "the" held-out
+# number under this feature should read the `_eval` fields.
+EVAL_EXPOSURE_MODE_OWN = "own"
+EVAL_EXPOSURE_MODE_NEIGHBOURS = "neighbours"
+EVAL_EXPOSURE_MODE_CALIBRATE = "calibrate"
+EVAL_EXPOSURE_MODES = (EVAL_EXPOSURE_MODE_OWN, EVAL_EXPOSURE_MODE_NEIGHBOURS, EVAL_EXPOSURE_MODE_CALIBRATE)
+EVAL_EXPOSURE_MODE_DEFAULT = EVAL_EXPOSURE_MODE_NEIGHBOURS
+
 # --- hybrid/ : Design C, render->photo U-Net refinement (docs/PLAN-2026-09-05.md
 # "Hybrid (v0.3): (C) render->photo U-Net refinement on gsrender.py outputs first (cheap,
 # validates net/losses)"; docs/EXPERIMENTS.md "Training runs" for the sibling point-based
