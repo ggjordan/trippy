@@ -1876,3 +1876,7 @@ the areas I want". Artefacts: `$SPLATS_ROOT/tools/gpu_queue/logs/trippy-viewer-k
   final code. Artifacts: `output/profile/trips-perf-{1,3}.json`,
   `output/profile/trips-perf-cpu-full{,2}.json`, and the three job logs under
   `~/Splats/tools/gpu_queue/logs/`.
+- 2026-09-06T05:27:04Z submitted job trippy-full2-trips-resume prio 70: bash -c PYTHONPATH=. /Users/nzbirdranch/trippy/.venv/bin/python -m trippy.cli train --config experiments/EXP-0003-kk-trips-train/config_full2_trips.yaml --resume output/runs/EXP-0003-kk-trips-train/full2-trips/checkpoints/checkpoint_latest.pt --device mps --max-minutes 300 --report
+- 2026-09-06T05:27:04Z submitted job trippy-hybrid-a-all-levels prio 70: trippy train --config experiments/EXP-0009-hybrid-a/config.yaml --report --max-minutes 300
+- 2026-09-06T05:27:04Z submitted job trippy-union-trips prio 70: trippy train --config experiments/EXP-0006-union/config_trips.yaml --report --max-minutes 300
+- 2026-09-06T05:27:04Z submitted job trippy-full3-alt prio 70: trippy train --config experiments/EXP-0003-kk-trips-train/config_full3_alt.yaml --report --max-minutes 300
