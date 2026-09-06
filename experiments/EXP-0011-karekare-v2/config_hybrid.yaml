@@ -1,0 +1,210 @@
+# EXP-0011 HYBRID arm (design A): config.yaml plus the Gaussian render of kklid_20000 fed
+# to the U-Net ALONGSIDE the TRIPS point pyramid, on the full Karekare outing.
+#
+# Everything outside the `hybrid:` block is config.yaml verbatim (same scene, masks, point
+# source, split, schedule), so "hybrid vs plain TRIPS on karekare-v2" is a one-variable
+# comparison against kkv2-full-masked. This is EXP-0009's design on Jordan's actual target
+# scene, and it is the arm he cares most about ("Splats combined with TRIPS").
+#
+# PREREQUISITE: the 756 rgb/depth/alpha triples must already exist in renders_dir. They are
+# produced by three sharded queue jobs (kkv2-render-1/2/3) BEFORE this run is queued -- see
+# README "Hybrid renders". `missing: zeros` means a half-finished render set still trains
+# (those frames just see an all-zero Gaussian block), so a shard that died does not corrupt
+# the run silently -- but it does dilute it, so check the manifests first.
+#
+# Run via: scripts/queue_training.sh experiments/EXP-0011-karekare-v2/config_hybrid.yaml \
+#   --max-minutes 420      (never invoked directly -- AGENTS.md "GPU and compute").
+
+# The run_dir basename carries a queue-ORDER digit (kkv2-0-smoke, -1-full-masked, ...)
+# because scripts/queue_training.sh derives the queue job name from it and the runner picks
+# the lowest-sorted filename within a priority (~/Splats/tools/gpu_queue/runner.sh). All
+# EXP-0011 jobs sit at prio 70, so the digit is what makes the smoke run before the 7-hour
+# trainings and the render shards before the hybrid.
+run_dir: /Users/nzbirdranch/trippy/output/runs/EXP-0011-karekare-v2/kkv2-5-hybrid
+
+scene_root: /Users/nzbirdranch/Splats/scenes/karekare/karekare-v2
+
+# Person masks. "" auto-discovers <scene_root>/masks (1376 PNGs, BLACK = person,
+# WHITE = keep -- verified numerically, see README "Masks"). ON here because the
+# Gaussian baseline this run is compared against (kklid_20000) was itself trained
+# with these masks: scoring TRIPS over pixels the splat never had to reconstruct
+# would compare two different quantities. config_unmasked.yaml is the same run with
+# use_masks: false, which is what Jordan asked to see next to it.
+masks_dir: ""
+use_masks: true
+
+width: 1008
+crop: 384
+# broadcast: trips mode measured ~1.1x broadcast per step after the vectorised-emission
+# fix (PR #35), but every EXP-0003/0009/0010 arm on this recipe is broadcast, so this
+# stays broadcast to keep the comparison one-variable.
+mode: broadcast
+layers: 5
+epochs: 300
+# 1.0 x 664 training images = 664 crops per epoch.
+train_factor: 1.0
+
+point_source:
+  type: gaussian
+  # Jordan's best splat, trained on exactly this COLMAP model (756 registered images).
+  path: /Users/nzbirdranch/Splats/output/Training-Data/karekare/karekare-lid/kklid_20000.ply
+  min_opacity: 0.05
+  # knn: mean 4-NN distance (TRIPS's own size init). Gaussian scales project sub-pixel
+  # at 1008 wide, leaving the U-Net to invent ~90% of every frame (measured, EXP-0003).
+  size_mode: knn
+
+# 1 in 16 of the non-shade frames is held out (not the default 1 in 8): 756 images is
+# 3.4x kk-coherent, and a full-frame eval at 1008 costs ~3 s a frame, so the default
+# stride would spend hours of a 300-epoch run on eval alone. 664 train / 92 held out.
+heldout_k: 16
+eval_every: 20
+checkpoint_every: 20
+eval_max_images: 8
+# 189 of 756 frames (every 4K video frame) carry no EXIF at all, so a quarter of this
+# scene has a never-trained per-image exposure when held out. "neighbours" is what makes
+# their held-out numbers mean something (trippy.constants "eval_exposure_mode").
+eval_exposure_mode: neighbours
+
+hybrid:
+  enabled: true
+  # 756 rgb/depth/alpha triples rendered from kklid_20000.ply onto this scene's OWN
+  # undistorted 1008-wide grid (trippy.hybrid.render_splat_views reuses SceneDataset, so
+  # a render and its photo share pixel-for-pixel the same (H, W, K) -- which is what makes
+  # the crop alignment true by construction rather than by luck). gsrender takes K per view
+  # from that meta, so the scene's 202 camera models cost it nothing.
+  renders_dir: /Users/nzbirdranch/trippy/output/hybrid-v2/renders/w1008
+  channels: [rgb, alpha, depth]
+  # all_levels: TRIPS's CombineBridge re-concatenates each level's RAW input twice per
+  # level, so a level-0-only signal never reaches the coarse blocks that decide large-scale
+  # structure -- which is exactly where a shade volume lives.
+  mode: all_levels
+  # Ablation 1: a fifth of the crops see zeros in the Gaussian channels, so the point
+  # branch has to stay a working renderer rather than becoming a thin residual.
+  dropout_gaussian_p: 0.2
+  # Ablation 2: rgb * alpha, so an uncovered pixel reads as "nothing here" rather than as
+  # gsrender's background colour.
+  mask_by_alpha: true
+  # null = measure the scene's median camera-to-Gaussian depth at startup and record it in
+  # the checkpoint, so eval and report normalise identically.
+  depth_scale: null
+  # Rendered live (MPS, inside the queue job) for the candidate report's dolly and off-path
+  # poses, which no precomputed render exists for.
+  ply_path: /Users/nzbirdranch/Splats/output/Training-Data/karekare/karekare-lid/kklid_20000.ply
+  missing: zeros
+
+# --- the shade under the big tree, MEASURED (README "Finding the shade frames") ---
+# 93 frames in 9 contiguous dark runs whose cameras all sit within 2.5 world units of one
+# spot: mean luminance 99.50 vs the scene's 121.31 (sd 14.72), and EXIF ISO median 400 at
+# 1/60 s vs ISO 80 at 1/99 s everywhere else -- two unrelated signals agreeing, which is
+# what PROJECT.md prescribes. Plus kk-coherent's own 6 shade frames (IMG_3828-3833, mean
+# luminance 113.17), which are registered here but 5.79 units away, i.e. a DIFFERENT shady
+# place; they are kept in the group so this run stays comparable with EXP-0003.
+forced_heldout:
+  - IMG_3828.jpg
+  - IMG_3829.jpg
+  - IMG_3830.jpg
+  - IMG_3831.jpg
+  - IMG_3832.jpg
+  - IMG_3833.jpg
+  - IMG_4032.jpg
+  - IMG_4033.jpg
+  - IMG_4034.jpg
+  - IMG_4035.jpg
+  - IMG_4036.jpg
+  - IMG_4037.jpg
+  - IMG_4039.jpg
+  - IMG_4040.jpg
+  - IMG_4041.jpg
+  - IMG_4057.jpg
+  - IMG_4058.jpg
+  - IMG_4059.jpg
+  - IMG_4060.jpg
+  - IMG_4061.jpg
+  - IMG_4062.jpg
+  - IMG_4083.jpg
+  - IMG_4084.jpg
+  - IMG_4085.jpg
+  - IMG_4116.jpg
+  - IMG_4117.jpg
+  - IMG_4118.jpg
+  - IMG_4260.jpg
+  - IMG_4261.jpg
+  - IMG_4264.jpg
+  - IMG_4265.jpg
+  - IMG_4266.jpg
+  - IMG_4267.jpg
+  - IMG_4269.jpg
+  - IMG_4270.jpg
+  - IMG_4271.jpg
+  - IMG_4272.jpg
+  - IMG_4273.jpg
+  - IMG_4274.jpg
+  - IMG_4280.jpg
+  - IMG_4281.jpg
+  - IMG_4282.jpg
+  - IMG_4283.jpg
+  - IMG_4284.jpg
+  - IMG_4292.jpg
+  - IMG_4293.jpg
+  - IMG_4294.jpg
+  - IMG_4295.jpg
+  - IMG_4296.jpg
+  - IMG_4297.jpg
+  - IMG_4298.jpg
+  - IMG_4299.jpg
+  - IMG_4300.jpg
+  - IMG_4301.jpg
+  - IMG_4302.jpg
+  - IMG_4303.jpg
+  - IMG_4304.jpg
+  - IMG_4305.jpg
+  - IMG_4309.jpg
+  - IMG_4310.jpg
+  - IMG_4311.jpg
+  - IMG_4312.jpg
+  - IMG_4313.jpg
+  - IMG_4319.jpg
+  - IMG_4320.jpg
+  - IMG_4321.jpg
+  - IMG_5540.jpg
+  - IMG_5541.jpg
+  - IMG_5542.jpg
+  - IMG_5543.jpg
+  - IMG_5544.jpg
+  - IMG_5545.jpg
+  - IMG_5546.jpg
+  - IMG_5547.jpg
+  - IMG_5548.jpg
+  - IMG_5549.jpg
+  - IMG_5550.jpg
+  - IMG_5551.jpg
+  - IMG_5552.jpg
+  - IMG_5557.jpg
+  - IMG_5558.jpg
+  - IMG_5559.jpg
+  - IMG_5560.jpg
+  - IMG_5561.jpg
+  - IMG_5646.jpg
+  - IMG_5647.jpg
+  - IMG_5648.jpg
+  - IMG_5649.jpg
+  - IMG_5650.jpg
+  - IMG_5651.jpg
+  - IMG_5652.jpg
+  - IMG_5653.jpg
+  - IMG_5654.jpg
+  - IMG_5655.jpg
+  - IMG_5656.jpg
+  - IMG_5657.jpg
+  - IMG_5658.jpg
+  - IMG_5659.jpg
+  - IMG_5660.jpg
+
+# alternate: every other shade frame (sorted) is held out and the REST are pushed into
+# training -- 50 held out, 49 trained. That is the whole point of this experiment: the
+# network must have SEEN the tree before "does it render the shade as shading?" is a fair
+# question. `all` would ask the unobserved-region question instead (EXP-0003 full2's 8.49 dB).
+forced_heldout_mode: alternate
+
+device: mps
+seed: 0

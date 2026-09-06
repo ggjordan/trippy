@@ -171,6 +171,12 @@ class TrainConfig:
     run_dir: str = "output/runs/default"
     width: int = TRAIN_DEFAULT_WIDTH
     limit_images: int | None = None  # test/debug hook, forwarded to SceneDataset's own `limit`
+    # Person masks (trippy.scene.dataset, trippy.constants "scene/dataset.py person masks").
+    # `masks_dir: ""` auto-discovers `<scene_root>/masks`; set it to pin a different directory.
+    # `use_masks: false` trains unmasked even when the scene has masks. Masked pixels are
+    # excluded from L1/SSIM/PSNR and zeroed for LPIPS, in training and in `evaluate`.
+    masks_dir: str = ""
+    use_masks: bool = True
 
     # --- crop / zoom sampling (docs/TRIPS_REFERENCE.md Sec. 7 "Crop augmentation") ---
     crop: int = TRAIN_DEFAULT_CROP

@@ -1974,3 +1974,46 @@ the areas I want". Artefacts: `$SPLATS_ROOT/tools/gpu_queue/logs/trippy-viewer-k
   per this task's brief). *Artifacts:* 238 PNGs at
   /Users/nzbirdranch/trippy/output/masks/kk-coherent/, log at
   output/logs/kk-masks.log, full writeup experiments/MASKS.md.
+- 2026-09-06T07:02:33Z submitted job trippy-kkv2-0-smoke prio 70: trippy train --config experiments/EXP-0011-karekare-v2/config_smoke.yaml --report --max-minutes 40
+- 2026-09-06T07:02:33Z submitted job trippy-kkv2-1-full-masked prio 70: trippy train --config experiments/EXP-0011-karekare-v2/config.yaml --report --max-minutes 420
+- 2026-09-06T07:02:33Z submitted job trippy-kkv2-2-full-unmasked prio 70: trippy train --config experiments/EXP-0011-karekare-v2/config_unmasked.yaml --report --max-minutes 420
+- 2026-09-06T07:02:33Z submitted job trippy-kkv2-3-removal prio 70: trippy train --config experiments/EXP-0011-karekare-v2/config_removal.yaml --report --max-minutes 420
+- 2026-09-06T07:02:42Z submitted job trippy-kkv2-4-render-1 prio 70: python -m trippy.hybrid.render_splat_views --scene /Users/nzbirdranch/Splats/scenes/karekare/karekare-v2 --ply /Users/nzbirdranch/Splats/output/Training-Data/karekare/karekare-lid/kklid_20000.ply --out /Users/nzbirdranch/trippy/output/hybrid-v2/renders/w1008 --width 1008 --device mps --start-index 0 --end-index 252
+- 2026-09-06T07:02:42Z submitted job trippy-kkv2-4-render-2 prio 70: python -m trippy.hybrid.render_splat_views --scene /Users/nzbirdranch/Splats/scenes/karekare/karekare-v2 --ply /Users/nzbirdranch/Splats/output/Training-Data/karekare/karekare-lid/kklid_20000.ply --out /Users/nzbirdranch/trippy/output/hybrid-v2/renders/w1008 --width 1008 --device mps --start-index 252 --end-index 504
+- 2026-09-06T07:02:42Z submitted job trippy-kkv2-4-render-3 prio 70: python -m trippy.hybrid.render_splat_views --scene /Users/nzbirdranch/Splats/scenes/karekare/karekare-v2 --ply /Users/nzbirdranch/Splats/output/Training-Data/karekare/karekare-lid/kklid_20000.ply --out /Users/nzbirdranch/trippy/output/hybrid-v2/renders/w1008 --width 1008 --device mps --start-index 504 --end-index 756
+- 2026-09-06T07:02:43Z submitted job trippy-kkv2-5-hybrid prio 70: trippy train --config experiments/EXP-0011-karekare-v2/config_hybrid.yaml --report --max-minutes 420
+
+- **2026-09-06 — EXP-0011 set up: TRIPS on the FULL Karekare outing (`karekare-v2`), masks wired in.**
+  *Question:* does TRIPS render the shade under the big tree as SHADING once it has seen the tree?
+  Every Karekare run so far trained on `kk-coherent`, a 238-image subset that does not contain the big
+  tree at all -- the simplest available explanation for why those runs "break" when Jordan walks there.
+  *Where the shade is, MEASURED (PROJECT.md's rule, no frame picked by eye):* per-image Rec.709 mean
+  luminance over all **756 registered** photos -> scene mean **121.31**, sd **14.72**; ten contiguous
+  runs below `mean - 1 sd`; **nine of them sit within 1.7 world units of one camera spot** and the tenth
+  (`IMG_4204`-`IMG_4206`) is **9.28** away and was dropped. The kept **93 frames** average luminance
+  **99.50** and their EXIF reads **ISO median 400 @ 1/60 s** against **ISO 80 @ 1/99 s** everywhere else
+  -- two unrelated signals, same frames. **The kk-coherent shade frames are a different place:**
+  `IMG_3828`-`IMG_3833` are registered and dark (113.17) but their centroid is **5.79 units** from the
+  big-tree cluster; within 0.5 units of *their* spot the 74 registered frames average 121.7, and
+  luminance there correlates with view direction (**+0.592**), not position. Both groups are in
+  `forced_heldout` (99 frames) so EXP-0011 stays comparable with EXP-0003, but they must be reported
+  separately, never averaged. `forced_heldout_mode: alternate` -> **50 held out / 49 in training**.
+  *Scale, measured on CPU before any GPU time was committed:* dataset build 756 images @ w1008 + masks
+  **132.6 s**, cache **2.91 GB**; `GaussianPlySource(min_opacity=0.05)` on `kklid_20000` (2.1 GB,
+  8,910,382 Gaussians) -> **7,542,137 points**; `size_mode: scale` **2.7 s** (median 0.002673),
+  `size_mode: knn` **31.1 s** (median 0.005975, ratio 2.235), peak RSS **4.12 GB**. **The feared >10 min
+  kNN on 7-9M points was 31 s** -- full cloud, no subsample, no calibration factor. Full-frame eval cost
+  measured at **3.4-37.8 M fragments (0.16-1.82 GB)** per view; it fits. 70.0% of the cloud is already
+  below TRIPS's 0.3 confidence cutoff at epoch 0 (88% below 0.5), which is why the removal arm uses
+  EXP-0010 arm A' (`mode: relative`).
+  *Person masks (new, `masks_dir`/`use_masks`):* polarity **BLACK = person, WHITE = keep**, confirmed
+  from Splats' `make_masks{,2,3}.py` headers AND numerically -- binary `{0,255}` at photo resolution,
+  keep fraction **95.83% mean / 97.47% median / 43.5% min**, 161 frames with nobody masked. Folded into
+  the crop validity mask (one mask, two reasons to be zero) and applied in `evaluate` too, because
+  `kklid_20000` was itself trained masked. 13 new CPU tests; 972 CPU tests pass.
+  *Job names:* `trippy-kkv2-0-smoke`, `-1-full-masked`, `-2-full-unmasked`, `-3-removal`,
+  `-4-render-1/2/3`, `-5-hybrid`, all prio **70** (the digit orders them within the priority; the runner
+  picks the lowest-sorted filename). *Verdict:* pending -- ~7 prio-70 jobs are ahead of them.
+  *Artifacts:* `experiments/EXP-0011-karekare-v2/`; run dirs are ABSOLUTE under
+  `/Users/nzbirdranch/trippy/output/runs/EXP-0011-karekare-v2/`. **`.worktrees/karekare-v2` must stay
+  until all eight jobs finish** -- the generated job files `cd` into it.

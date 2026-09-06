@@ -1,0 +1,204 @@
+# EXP-0011 REMOVAL arm: config.yaml plus EXP-0010 arm A' (TRIPS's point-removal rule in
+# its `relative` form). Everything else is config.yaml verbatim, so the only difference
+# from kkv2-full-masked's numbers is the removal itself.
+#
+# Why `relative` and not arm A's `absolute`: trippy initialises each point's confidence
+# from the source PLY's own opacity, not from TRIPS's uniform sigmoid(10*0.5) = 0.9933,
+# so an absolute cutoff mostly measures where a point STARTED. `relative` drops a point
+# once its confidence has fallen below rel_factor (0.3) times its OWN initial value --
+# what TRIPS's absolute cutoff means for free under its uniform init. See
+# experiments/EXP-0010-point-removal/README.md and docs/EXPERIMENTS.md "Point removal".
+#
+# Run via: scripts/queue_training.sh experiments/EXP-0011-karekare-v2/config_removal.yaml \
+#   --max-minutes 420      (never invoked directly -- AGENTS.md "GPU and compute").
+
+# The run_dir basename carries a queue-ORDER digit (kkv2-0-smoke, -1-full-masked, ...)
+# because scripts/queue_training.sh derives the queue job name from it and the runner picks
+# the lowest-sorted filename within a priority (~/Splats/tools/gpu_queue/runner.sh). All
+# EXP-0011 jobs sit at prio 70, so the digit is what makes the smoke run before the 7-hour
+# trainings and the render shards before the hybrid.
+run_dir: /Users/nzbirdranch/trippy/output/runs/EXP-0011-karekare-v2/kkv2-3-removal
+
+scene_root: /Users/nzbirdranch/Splats/scenes/karekare/karekare-v2
+
+# Person masks. "" auto-discovers <scene_root>/masks (1376 PNGs, BLACK = person,
+# WHITE = keep -- verified numerically, see README "Masks"). ON here because the
+# Gaussian baseline this run is compared against (kklid_20000) was itself trained
+# with these masks: scoring TRIPS over pixels the splat never had to reconstruct
+# would compare two different quantities. config_unmasked.yaml is the same run with
+# use_masks: false, which is what Jordan asked to see next to it.
+masks_dir: ""
+use_masks: true
+
+width: 1008
+crop: 384
+# broadcast: trips mode measured ~1.1x broadcast per step after the vectorised-emission
+# fix (PR #35), but every EXP-0003/0009/0010 arm on this recipe is broadcast, so this
+# stays broadcast to keep the comparison one-variable.
+mode: broadcast
+layers: 5
+epochs: 300
+# 1.0 x 664 training images = 664 crops per epoch.
+train_factor: 1.0
+
+point_source:
+  type: gaussian
+  # Jordan's best splat, trained on exactly this COLMAP model (756 registered images).
+  path: /Users/nzbirdranch/Splats/output/Training-Data/karekare/karekare-lid/kklid_20000.ply
+  min_opacity: 0.05
+  # knn: mean 4-NN distance (TRIPS's own size init). Gaussian scales project sub-pixel
+  # at 1008 wide, leaving the U-Net to invent ~90% of every frame (measured, EXP-0003).
+  size_mode: knn
+
+# 1 in 16 of the non-shade frames is held out (not the default 1 in 8): 756 images is
+# 3.4x kk-coherent, and a full-frame eval at 1008 costs ~3 s a frame, so the default
+# stride would spend hours of a 300-epoch run on eval alone. 664 train / 92 held out.
+heldout_k: 16
+eval_every: 20
+checkpoint_every: 20
+eval_max_images: 8
+# 189 of 756 frames (every 4K video frame) carry no EXIF at all, so a quarter of this
+# scene has a never-trained per-image exposure when held out. "neighbours" is what makes
+# their held-out numbers mean something (trippy.constants "eval_exposure_mode").
+eval_exposure_mode: neighbours
+
+# --- the shade under the big tree, MEASURED (README "Finding the shade frames") ---
+# 93 frames in 9 contiguous dark runs whose cameras all sit within 2.5 world units of one
+# spot: mean luminance 99.50 vs the scene's 121.31 (sd 14.72), and EXIF ISO median 400 at
+# 1/60 s vs ISO 80 at 1/99 s everywhere else -- two unrelated signals agreeing, which is
+# what PROJECT.md prescribes. Plus kk-coherent's own 6 shade frames (IMG_3828-3833, mean
+# luminance 113.17), which are registered here but 5.79 units away, i.e. a DIFFERENT shady
+# place; they are kept in the group so this run stays comparable with EXP-0003.
+forced_heldout:
+  - IMG_3828.jpg
+  - IMG_3829.jpg
+  - IMG_3830.jpg
+  - IMG_3831.jpg
+  - IMG_3832.jpg
+  - IMG_3833.jpg
+  - IMG_4032.jpg
+  - IMG_4033.jpg
+  - IMG_4034.jpg
+  - IMG_4035.jpg
+  - IMG_4036.jpg
+  - IMG_4037.jpg
+  - IMG_4039.jpg
+  - IMG_4040.jpg
+  - IMG_4041.jpg
+  - IMG_4057.jpg
+  - IMG_4058.jpg
+  - IMG_4059.jpg
+  - IMG_4060.jpg
+  - IMG_4061.jpg
+  - IMG_4062.jpg
+  - IMG_4083.jpg
+  - IMG_4084.jpg
+  - IMG_4085.jpg
+  - IMG_4116.jpg
+  - IMG_4117.jpg
+  - IMG_4118.jpg
+  - IMG_4260.jpg
+  - IMG_4261.jpg
+  - IMG_4264.jpg
+  - IMG_4265.jpg
+  - IMG_4266.jpg
+  - IMG_4267.jpg
+  - IMG_4269.jpg
+  - IMG_4270.jpg
+  - IMG_4271.jpg
+  - IMG_4272.jpg
+  - IMG_4273.jpg
+  - IMG_4274.jpg
+  - IMG_4280.jpg
+  - IMG_4281.jpg
+  - IMG_4282.jpg
+  - IMG_4283.jpg
+  - IMG_4284.jpg
+  - IMG_4292.jpg
+  - IMG_4293.jpg
+  - IMG_4294.jpg
+  - IMG_4295.jpg
+  - IMG_4296.jpg
+  - IMG_4297.jpg
+  - IMG_4298.jpg
+  - IMG_4299.jpg
+  - IMG_4300.jpg
+  - IMG_4301.jpg
+  - IMG_4302.jpg
+  - IMG_4303.jpg
+  - IMG_4304.jpg
+  - IMG_4305.jpg
+  - IMG_4309.jpg
+  - IMG_4310.jpg
+  - IMG_4311.jpg
+  - IMG_4312.jpg
+  - IMG_4313.jpg
+  - IMG_4319.jpg
+  - IMG_4320.jpg
+  - IMG_4321.jpg
+  - IMG_5540.jpg
+  - IMG_5541.jpg
+  - IMG_5542.jpg
+  - IMG_5543.jpg
+  - IMG_5544.jpg
+  - IMG_5545.jpg
+  - IMG_5546.jpg
+  - IMG_5547.jpg
+  - IMG_5548.jpg
+  - IMG_5549.jpg
+  - IMG_5550.jpg
+  - IMG_5551.jpg
+  - IMG_5552.jpg
+  - IMG_5557.jpg
+  - IMG_5558.jpg
+  - IMG_5559.jpg
+  - IMG_5560.jpg
+  - IMG_5561.jpg
+  - IMG_5646.jpg
+  - IMG_5647.jpg
+  - IMG_5648.jpg
+  - IMG_5649.jpg
+  - IMG_5650.jpg
+  - IMG_5651.jpg
+  - IMG_5652.jpg
+  - IMG_5653.jpg
+  - IMG_5654.jpg
+  - IMG_5655.jpg
+  - IMG_5656.jpg
+  - IMG_5657.jpg
+  - IMG_5658.jpg
+  - IMG_5659.jpg
+  - IMG_5660.jpg
+
+# alternate: every other shade frame (sorted) is held out and the REST are pushed into
+# training -- 50 held out, 49 trained. That is the whole point of this experiment: the
+# network must have SEEN the tree before "does it render the shade as shading?" is a fair
+# question. `all` would ask the unobserved-region question instead (EXP-0003 full2's 8.49 dB).
+forced_heldout_mode: alternate
+
+# TRIPS's schedule ratios scaled to 300 epochs: start_removing_points_epoch/num_epochs =
+# 200/600 -> epoch 100, point_removal_epoch_interval/num_epochs = 50/600 -> every 25
+# epochs (src/lib/data/Settings.h:403-406). Eight passes: 100, 125, ..., 275.
+# `conf_threshold: 0.1` is the optional absolute floor (an independent OR trigger), the
+# same value arm A used, so a point that starts negligible and stays there is still caught.
+# `min_points` is a trippy addition with no TRIPS counterpart: this cloud is ~4x kkc_15000,
+# so the floor is scaled with it.
+point_removal:
+  enabled: true
+  start_epoch: 100
+  every_epochs: 25
+  mode: relative
+  conf_threshold: 0.1
+  rel_factor: 0.3
+  min_points: 4000000
+
+# Measurement only (the default): every eval logs the point count. The shade audit's
+# in-region dark-mass region is built from kk-coherent's own frames and is NOT the big
+# tree, so `frames` is pinned to the measured big-tree run instead -- and nothing here
+# prunes on that number.
+shade_prune:
+  enabled: false
+  log_dark_mass: true
+
+device: mps
+seed: 0

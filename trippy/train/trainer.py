@@ -14,6 +14,13 @@ Invariants: every render call goes through `trippy.raster.pyramid.
     crop's fragments are ever rasterised (the "K-adjust" strategy -- see
     `tests/test_train_crop_equivalence.py` for the proof this equals
     cropping a full render of the same points/pose).
+    Person masks (`cfg.masks_dir`/`cfg.use_masks`) reach this module only as
+    part of the validity mask `trippy.scene.dataset.crop` already returns, so
+    `train_step`'s loss call is unchanged; `evaluate` applies the same mask to
+    the full frame, because a held-out PSNR measured over pixels the run was
+    never asked to reconstruct is not the quantity the Gaussian baseline (also
+    trained masked) reports. Both paths record what they excluded
+    (`mask_excluded_frac`, `mask_stats`).
     Hybrid design A (`cfg.hybrid.enabled`) concatenates a Gaussian-splat
     render onto every pyramid level before the U-Net (trippy.hybrid.
     gaussian_input). It is strictly additive: with `hybrid.enabled` false
@@ -247,8 +254,15 @@ class Trainer:
         self.metrics_path = self.run_dir / TRAIN_METRICS_FILENAME
 
         self.dataset = SceneDataset(
-            cfg.scene_root, cfg.width, cache_root, device=self.device, limit=cfg.limit_images
+            cfg.scene_root,
+            cfg.width,
+            cache_root,
+            device=self.device,
+            limit=cfg.limit_images,
+            masks_dir=cfg.masks_dir or None,
+            use_masks=cfg.use_masks,
         )
+        self._log_mask_coverage()
         self._name_to_index = {name: i for i, name in enumerate(self.dataset.names)}
         self.train_names, self.heldout_names = splits.split_with_forced_heldout(
             self.dataset.names, cfg.forced_heldout, k=cfg.heldout_k, mode=cfg.forced_heldout_mode
@@ -360,6 +374,47 @@ class Trainer:
         self._best_psnr: float = float("-inf")
 
     # --- construction helpers ---
+
+    def mask_stats(self) -> dict:
+        """Person-mask coverage over this run's dataset, from the cache sidecar only.
+
+        `{"masked": bool, "masks_dir", "n_images", "frac_masked_mean",
+        "frac_masked_max", "n_images_fully_visible"}` -- `frac_masked` is
+        `1 - mask_keep_frac`, i.e. the share of each undistorted frame the loss
+        ignores. Reported so a run *proves* its masks are the right way round
+        without anyone opening an image: person masks over a family outing cover
+        a few percent to a few tens of percent of a frame, so a mean near 1.0
+        would mean the polarity is inverted and the run is training on almost
+        nothing. `{"masked": False}` when the run is unmasked.
+        """
+        fracs = self.dataset.mask_keep_fracs()
+        if not fracs:
+            return {"masked": False}
+        masked = np.array([1.0 - v for v in fracs.values()], dtype=np.float64)
+        return {
+            "masked": True,
+            "masks_dir": str(self.dataset.masks_dir),
+            "n_images": int(masked.size),
+            "frac_masked_mean": float(masked.mean()),
+            "frac_masked_max": float(masked.max()),
+            "n_images_fully_visible": int((masked <= 0.0).sum()),
+        }
+
+    def _log_mask_coverage(self) -> None:
+        """One `log.txt` line stating whether this run is masked, and by how much."""
+        stats = self.mask_stats()
+        if not stats["masked"]:
+            self._log(
+                "person masks: OFF (no masks/ directory for this scene, or use_masks: false) -- "
+                "the loss scores every pixel"
+            )
+            return
+        self._log(
+            f"person masks: ON from {stats['masks_dir']} for {stats['n_images']} images; "
+            f"mean {stats['frac_masked_mean'] * 100:.2f}% of each frame excluded "
+            f"(max {stats['frac_masked_max'] * 100:.2f}%, "
+            f"{stats['n_images_fully_visible']} frames with nobody masked)"
+        )
 
     def _initial_exposure(self) -> torch.Tensor:
         """Per-image EV_log2 from cached EXIF, **relative to the scene mean**.
@@ -662,6 +717,10 @@ class Trainer:
             "extent_penalty": float(extent_penalty.detach().item()),
             "camera_reg": float(camera_reg.detach().item()),
             "nonfinite_grads": int(nonfinite_grads.item()),
+            # Share of this crop's pixels the loss ignored -- crop overshoot plus, on a
+            # masked run, the people in it. Per step, so a run's masked fraction is
+            # visible in metrics.jsonl without re-reading the scene.
+            "mask_excluded_frac": float(1.0 - mask.mean().item()),
         }
         if self.hybrid is not None:
             record["gaussian_dropped"] = bool(dropped)
@@ -933,7 +992,11 @@ class Trainer:
             "gain_best" (the closed-form global gain of `best_global_gain`)
             and "psnr_gain" (PSNR after applying it), plus "exposure_ev"/
             "exposure_gain", the frame's own exposure (whether or not it
-            was used for this row's headline number). With `calibrate` on,
+            was used for this row's headline number), plus
+            "mask_excluded_frac" (the share of the frame the person mask
+            removed from every number in the row; 0.0 unmasked). The top
+            level carries "masks" (`mask_stats`) for the same reason.
+            With `calibrate` on,
             "psnr_calibrated"/"ssim_calibrated"/"lpips_calibrated"/
             "calibration" are added per image and "psnr_mean_calibrated",
             "shade_calibrated" and "other_calibrated" at the top level
@@ -998,7 +1061,17 @@ class Trainer:
                 item = self.dataset[frame_index]
                 height, width = int(item["rgb"].shape[0]), int(item["rgb"].shape[1])
                 target = item["rgb"].to(torch.float32).permute(2, 0, 1).unsqueeze(0) / 255.0
-                mask = torch.ones((1, 1, height, width), device=self.device)
+                # Eval is masked by exactly the same rule as training: a person pixel is
+                # not scored. Reporting a held-out PSNR over pixels the run was never
+                # asked to reconstruct -- and that the Gaussian baseline was not asked to
+                # either, since kklid_20000 trained with these same masks -- would compare
+                # two different quantities. Unmasked datasets return no "mask" key and fall
+                # back to the all-ones mask this used before masks existed.
+                image_mask = item.get("mask")
+                if image_mask is None:
+                    mask = torch.ones((1, 1, height, width), device=self.device)
+                else:
+                    mask = image_mask.reshape(1, 1, height, width).to(torch.float32)
 
                 R, t = self._pose_for(item, frame_index)
                 # Renders exist on disk for every registered image (held-out included),
@@ -1050,6 +1123,9 @@ class Trainer:
                     "psnr_gain": _psnr(pred * gain_best, target_c, mask_c),
                     "exposure_ev": exposure_ev,
                     "exposure_gain": float(2.0**-exposure_ev),
+                    # Share of this frame that every number in this row ignores (people,
+                    # on a masked run; 0.0 on an unmasked one).
+                    "mask_excluded_frac": float(1.0 - mask_c.mean().item()),
                 }
 
                 # Headline "_eval" numbers (docs/EXPERIMENTS.md "Test-time camera
@@ -1153,6 +1229,10 @@ class Trainer:
             # removal run's effect on the metric is visible per eval rather than only
             # at export time. See `point_stats`.
             "points": self.point_stats(),
+            # Whether these numbers were scored with person masks, and how much of the
+            # scene they excluded (`mask_stats`) -- so a masked and an unmasked arm of
+            # the same experiment are never compared without the difference being visible.
+            "masks": self.mask_stats(),
         }
         if calibrate:
             metrics["psnr_mean_calibrated"] = float(np.mean(psnr_cal_vals)) if psnr_cal_vals else 0.0

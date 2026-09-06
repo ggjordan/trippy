@@ -55,6 +55,30 @@ Run directories are **gitignored**. Only the `experiments/` README lives in vers
 
 ## Ranking candidates: metrics and gates
 
+### Which frames are "the shade"? Measure it, per scene
+
+`trippy.constants.SHADE_FRAMES_KK` (`IMG_3828`-`IMG_3833`) is **the kk-coherent shade region and
+nothing else**. It is the default for `shade_prune.frames` and for `depthprior_shade_audit.py --frames`,
+and on any other scene that default is wrong.
+
+`~/Splats/PROJECT.md`: *"Find the shade frames by MEASURING, not by eye. Every shade experiment in this
+project picked its test frames by assumption, and one of them misdiagnosed the defect as a result."*
+The method, as run for EXP-0011 (`experiments/EXP-0011-karekare-v2/README.md` has the full working):
+
+1. Rec.709 **mean luminance of every registered photo** (JPEG at 1/8 scale via PIL's `draft` is the same
+   pixels, cheaply); take contiguous runs below `mean - 1 sd` in sorted-name order.
+2. **EXIF corroboration**: auto-exposure compensates on the same frames, so ISO/exposure time jump
+   there. Two unrelated signals agreeing is what pins the region.
+3. On a **multi-location** scene, add a third test: the camera centroid (`C = -R^T t`) of each dark run.
+   `karekare-v2` covers a whole outing, where "dark" alone can equally mean a different place or a
+   different time of day; nine of its ten dark runs sit within 1.7 world units of one spot and the tenth
+   is 9.28 away and was dropped. This step is what separates the big tree from every other shady corner.
+
+The measurement can also say a region is *not* where you assumed. On `karekare-v2` the six
+`SHADE_FRAMES_KK` frames are registered and genuinely dark, but their camera centroid is 5.79 world
+units from the big-tree cluster -- a different shady place. Report the two groups separately rather than
+averaging them.
+
 ### Shade audit
 
 ```bash
@@ -582,6 +606,41 @@ Resume a run: `trippy train --config <cfg.yaml> --resume <run_dir>/checkpoints/c
 Override the wall-clock budget from the CLI without editing the file: `--max-minutes 90`.
 Override the output directory the same way: `--run-dir <abs path>` (useful when the job runs from a
 git worktree but its artefacts should land in the main checkout's `output/`).
+
+### Person masks: `masks_dir:` / `use_masks:`
+
+```yaml
+masks_dir: ""        # "" (default) auto-discovers <scene_root>/masks; set to pin another directory
+use_masks: true      # false trains and scores every pixel, even on a scene that has masks
+```
+
+A scene may ship one PNG mask per photo, named by the photo's **stem** (`images/IMG_3683.jpg` ->
+`masks/IMG_3683.png`). **Polarity: BLACK (0) = person, ignore; WHITE (255) = keep** -- the convention
+Splats' own writers emit (`~/Splats/tools/make_masks{,2,3}.py`), which COLMAP's
+`--ImageReader.mask_path` and Brush's default masks folder also use. That is already trippy's validity
+convention (1 = the loss may use this pixel), so a mask is simply multiplied into the mask
+`trippy.scene.dataset.crop` already returns: **one mask, two reasons to be zero** -- crop overshoot, or
+a person. Every existing consumer honours it unchanged (L1, SSIM, LPIPS by zeroing, PSNR, the exposure
+diagnostics). The masked pixels' `rgb` is *not* zeroed: unlike padding, those are real photographed
+pixels that simply do not count.
+
+Masks ride the photo's own undistortion grid, resampled **nearest** (a mask is a decision, not a
+signal), and are cached next to the pixels as `<name>.mask.npy`. Turning masks on over an existing
+unmasked cache backfills only the masks -- the photos are not re-undistorted. A `masks_dir` with a
+mask *missing* for a registered image raises: training some frames masked and others unmasked would
+silently mix two protocols.
+
+**`Trainer.evaluate` applies them too**, which is the point: a Gaussian baseline trained with masks
+(e.g. `kklid_20000`) was never asked to reconstruct those pixels either, so scoring TRIPS over them
+would compare two different quantities. Every eval's `metrics.json` carries `masks`
+(`{"masked", "masks_dir", "n_images", "frac_masked_mean", "frac_masked_max",
+"n_images_fully_visible"}`) and a per-image `mask_excluded_frac`; every `train_step` record carries
+`mask_excluded_frac` for its crop. **Check `masks` before comparing two runs' PSNRs** -- a masked and
+an unmasked run do not score the same pixels.
+
+Masks are a comparability device, not a rule: there is no refusal to train without them, and an
+unmasked arm is a legitimate experiment. EXP-0011 queues both (`kkv2-1-full-masked` /
+`kkv2-2-full-unmasked`, differing in exactly this one boolean).
 
 **How long is an epoch?** `steps_per_epoch = ceil(train_factor * n_train)` and each step is **one** crop
 (`crops_per_step` is in `TrainConfig` but the trainer does not batch yet). With the default

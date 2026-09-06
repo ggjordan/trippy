@@ -202,6 +202,39 @@ COLMAP_CAMERA_MODEL_TABLE: dict[int, tuple[str, int]] = {
 # validate the cache is still current on the next construction).
 SCENE_CACHE_META_FILENAME = "meta.json"
 
+# --- scene/dataset.py person masks (`masks_dir`) ---
+
+# Directory name auto-discovered under a scene root when no `masks_dir` is
+# configured. Splats' own mask writers (`~/Splats/tools/make_masks{,2,3}.py`)
+# write here, and COLMAP's `--ImageReader.mask_path` / Brush's default masks
+# folder both use the same name, so a scene that has masks at all has them here.
+SCENE_MASKS_DIRNAME = "masks"
+
+# A mask file is the image's stem with this suffix: `images/IMG_3683.jpg` ->
+# `masks/IMG_3683.png` (the mask writers always emit PNG, whatever the photo's
+# own extension is).
+SCENE_MASK_SUFFIX = ".png"
+
+# Masks are a *comparability* device here, not a rule: the Gaussian baseline
+# this project compares against (kklid_20000) was itself trained with these same
+# person masks, so a TRIPS run scored over unmasked pixels is not measuring the
+# same thing. They are therefore ON whenever a scene has them and OFF via
+# `TrainConfig.use_masks: false`; training unmasked is a legitimate arm, not an
+# error (EXP-0011 queues both).
+
+# Cache filename suffix for one image's undistorted mask, alongside that
+# image's own `<name>.npy` in the SceneDataset cache directory.
+SCENE_MASK_CACHE_SUFFIX = ".mask.npy"
+
+# **Polarity.** Splats' mask writers document and emit "BLACK = ignore (person),
+# WHITE = keep" (`make_masks.py:3`, `make_masks2.py:9`, `make_masks3.py:11`), and
+# the delivered karekare-v2 masks are verifiably binary uint8 {0, 255} at exactly
+# the photo's resolution. So a stored value >= this threshold means KEEP, i.e. it
+# maps to validity 1.0 -- the same convention as `trippy.scene.dataset.crop`'s
+# padding mask (1 = real content the loss may use, 0 = excluded). Anything below
+# is a person pixel and is excluded from L1/SSIM and zeroed for LPIPS.
+SCENE_MASK_KEEP_THRESHOLD = 128
+
 # EXIF tag ids (TIFF/Exif spec, not COLMAP-specific) SceneDataset reads for
 # the tone-mapper's per-image exposure/ISO init. Missing tags are fine.
 EXIF_TAG_EXPOSURE_TIME = 33434
