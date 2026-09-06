@@ -353,8 +353,21 @@ pub struct BlendStatus {
     pub requested: BlendMode,
     /// What was drawn. Equal to `requested` unless something was missing.
     pub applied: BlendMode,
-    /// Whether a precomputed splat render existed for this view.
+    /// Whether a splat image existed for this frame at all -- live or
+    /// precomputed.
     pub splat_available: bool,
+    /// Whether that image was rendered **live** from the bundle's own
+    /// `blend.splat_ply` at this exact pose, rather than read out of the
+    /// precomputed capture-view archive. `false` also when there was no splat
+    /// at all; read it together with `splat_available`.
+    pub splat_live: bool,
+    /// Whether a `.ply` is loaded at all, i.e. whether the live path was even
+    /// available to try.
+    ///
+    /// `splat_live == false` with `splat_loaded == true` means the ply IS open
+    /// and its render failed for this camera -- a different situation from "this
+    /// bundle has no ply", and [`Self::note`] says so.
+    pub splat_loaded: bool,
     /// Whether the network carries the gate head.
     pub gate_available: bool,
 }
@@ -393,10 +406,18 @@ impl BlendStatus {
                     .to_owned(),
             );
         }
+        if self.splat_loaded {
+            return Some(
+                "the splat ply is loaded but did not render at this camera (see the log) -- \
+                 showing TRIPS"
+                    .to_owned(),
+            );
+        }
         Some(
-            "no splat for THIS pose: the bundle carries renders of the capture views only, \
-             and reusing one from a view you have flown off would be a picture taken from \
-             somewhere else. Press R or N/P to sit on a capture view -- showing TRIPS"
+            "no splat for THIS pose: this bundle has no `splat_ply` to render live, and the \
+             precomputed archive covers the capture views only -- reusing one from a view you \
+             have flown off would be a picture taken from somewhere else. Press R or N/P to sit \
+             on a capture view -- showing TRIPS"
                 .to_owned(),
         )
     }
@@ -481,6 +502,18 @@ pub struct Renderer {
     /// upload into a per-*view-change* one. A `RefCell` for exactly the reason
     /// [`Self::uploaded`] is one — the borrow is never held across an `await`.
     splat_cache: std::cell::RefCell<Option<((usize, usize, usize), Tensor<4>)>>,
+    /// The Gaussian splat, loaded from `blend.splat_ply` and resident on the
+    /// device, when the bundle named one and it opened.
+    ///
+    /// This is what makes the Blend panel work at **any** pose: with it,
+    /// [`Self::splat_tensor`] renders the real Gaussians at the frame's own
+    /// camera instead of looking up a precomputed picture of a capture view.
+    /// `None` means the bundle named no ply (or it failed to load), and the
+    /// precomputed path below is used exactly as before.
+    ///
+    /// Native only, for the reason `crate::splat`'s `cfg` gives.
+    #[cfg(not(target_family = "wasm"))]
+    live_splat: Option<crate::splat::LiveSplat>,
     /// The bundle's `blend` block, or `None` on a non-hybrid bundle.
     blend_manifest: Option<crate::bundle::BlendManifest>,
     /// The Gaussian block, pooled and uploaded per pyramid level, cached on
@@ -564,6 +597,8 @@ impl Renderer {
             pinned: true,
             splats,
             splat_cache: std::cell::RefCell::new(None),
+            #[cfg(not(target_family = "wasm"))]
+            live_splat: None,
             blend_manifest,
             block_cache: std::cell::RefCell::new(None),
         })
@@ -583,22 +618,83 @@ impl Renderer {
         out
     }
 
-    /// True when `frame_index` has a precomputed splat render **that is valid
-    /// for the camera right now** -- i.e. it exists AND the camera is sitting on
-    /// that view.
+    /// Whether a live splat is loaded, i.e. whether the Blend panel works away
+    /// from the capture views.
     ///
-    /// The `pinned` half is not a detail. A stored block is a render of the
-    /// Gaussians *from that view's camera*; once you have flown off it, feeding
-    /// it to the network (or blending it into the frame) would be showing a
-    /// picture taken from somewhere else and calling it this pose. Training
-    /// refuses the same substitution for the same reason -- see
+    /// Always `false` on wasm (`crate::splat` is native-only).
+    #[must_use]
+    pub fn has_live_splat(&self) -> bool {
+        #[cfg(not(target_family = "wasm"))]
+        {
+            self.live_splat.is_some()
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            false
+        }
+    }
+
+    /// Attach a splat loaded from `blend.splat_ply`.
+    ///
+    /// Separate from [`Self::new`] on purpose: loading a 2 GB `.ply` is a long,
+    /// *optional* step with its own progress line and its own failure mode, and
+    /// a bundle whose ply is missing must still open. The caller loads it,
+    /// reports how long it took, and hands it over -- or does not, and the
+    /// precomputed path stays exactly what it was.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn set_live_splat(&mut self, splat: crate::splat::LiveSplat) {
+        self.live_splat = Some(splat);
+    }
+
+    /// The loaded splat, for the HUD.
+    #[cfg(not(target_family = "wasm"))]
+    #[must_use]
+    pub fn live_splat(&self) -> Option<&crate::splat::LiveSplat> {
+        self.live_splat.as_ref()
+    }
+
+    /// Read `path` and keep it on **this renderer's own device**, so the splat
+    /// image and the TRIPS frame are tensors on one allocator and compose
+    /// without a copy.
+    ///
+    /// # Arguments
+    /// - `path`: the `.ply`, normally `bundle.json`'s `blend.splat_ply`.
+    /// - `subsample`: keep every `n`-th Gaussian while parsing, or `None`.
+    ///
+    /// # Errors
+    /// Returns `Err` when the file cannot be read; the caller warns and stays on
+    /// the precomputed path.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn load_live_splat(
+        &mut self,
+        path: &std::path::Path,
+        subsample: Option<u32>,
+    ) -> Result<&crate::splat::LiveSplat, String> {
+        let device = self.device.clone().into();
+        self.live_splat = Some(crate::splat::LiveSplat::load(path, &device, subsample)?);
+        Ok(self.live_splat.as_ref().expect("just set"))
+    }
+
+    /// True when `frame_index` can be drawn with a splat right now.
+    ///
+    /// Two ways that can be true, and the difference matters:
+    ///
+    /// - a **live** splat is loaded, in which case the answer is yes at every
+    ///   pose, because the Gaussians are rasterised at the frame's own camera;
+    /// - or the camera is sitting exactly on a capture view that carries a
+    ///   **precomputed** render.
+    ///
+    /// The `pinned` half of the second case is not a detail. A stored block is a
+    /// render of the Gaussians *from that view's camera*; once you have flown
+    /// off it, feeding it to the network (or blending it into the frame) would
+    /// be showing a picture taken from somewhere else and calling it this pose.
+    /// Training refuses the same substitution for the same reason -- see
     /// `trippy.hybrid.gsrender_live.gaussian_provider_for`, which renders the PLY
     /// live at the pose rather than reusing the anchor image's render. The live
-    /// splat path is what will make this true everywhere; until then, off a
-    /// capture view the answer is honestly "no".
+    /// path above is that same answer, in the viewer.
     #[must_use]
     pub fn has_splat(&self, frame_index: usize) -> bool {
-        self.pinned && self.splats.contains_key(&frame_index)
+        self.has_live_splat() || (self.pinned && self.splats.contains_key(&frame_index))
     }
 
     /// The stored block for `frame_index`, or `None` when it must not be used.
@@ -609,13 +705,80 @@ impl Renderer {
         self.splats.get(&frame_index)
     }
 
-    /// The splat render for `frame_index`, resampled to `height x width` and
-    /// resident on the device, or `None` when this view has none.
+    /// The splat image for this frame as `[1, 3, H, W]`, and whether it was
+    /// rendered live.
+    ///
+    /// Live first: with a `.ply` loaded, the Gaussians are rasterised at the
+    /// frame's own camera, so the answer is a real picture of THIS pose. Only
+    /// without one does the precomputed capture-view archive get a look in.
+    async fn splat_tensor(
+        &self,
+        camera: &Camera,
+        frame_index: usize,
+        height: usize,
+        width: usize,
+    ) -> Option<(Tensor<4>, bool)> {
+        if let Some(live) = self.live_splat_tensor(camera, height, width).await {
+            return Some((live, true));
+        }
+        self.precomputed_splat_tensor(frame_index, height, width)
+            .map(|tensor| (tensor, false))
+    }
+
+    /// Rasterise the loaded `.ply` at `camera`, or `None` when there is none.
+    ///
+    /// A live render that fails does **not** fail the frame: it warns and
+    /// returns `None`, which drops through to the precomputed path and, failing
+    /// that, to the honest "showing TRIPS" note. A viewer that died mid-flight
+    /// because one camera went degenerate would be worse than one that says so.
+    #[allow(clippy::unused_async)]
+    async fn live_splat_tensor(
+        &self,
+        camera: &Camera,
+        height: usize,
+        width: usize,
+    ) -> Option<Tensor<4>> {
+        #[cfg(not(target_family = "wasm"))]
+        {
+            let splat = self.live_splat.as_ref()?;
+            match splat.render(camera).await {
+                Ok(image) => {
+                    let dims = image.dims();
+                    if dims == [1, 3, height, width] {
+                        Some(image)
+                    } else {
+                        log::warn!(
+                            "live splat returned {dims:?}, expected [1, 3, {height}, {width}]"
+                        );
+                        None
+                    }
+                }
+                Err(e) => {
+                    log::warn!("live splat render failed: {e}");
+                    None
+                }
+            }
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            let _ = (camera, height, width);
+            None
+        }
+    }
+
+    /// The **precomputed** splat render for `frame_index`, resampled to
+    /// `height x width` and resident on the device, or `None` when this view has
+    /// none.
     ///
     /// Cached in [`Self::splat_cache`] on `(frame, height, width)`, so panning
     /// the split-screen slider or holding a view costs one upload, not sixty a
     /// second.
-    fn splat_tensor(&self, frame_index: usize, height: usize, width: usize) -> Option<Tensor<4>> {
+    fn precomputed_splat_tensor(
+        &self,
+        frame_index: usize,
+        height: usize,
+        width: usize,
+    ) -> Option<Tensor<4>> {
         let key = (
             if self.pinned { frame_index } else { usize::MAX },
             height,
@@ -710,24 +873,32 @@ impl Renderer {
     ///
     /// Returns `(image, status)`; `status` records what was actually drawn (see
     /// [`BlendStatus`]), which is never silently different from what was asked.
-    fn compose(
+    async fn compose(
         &self,
         trips: Tensor<4>,
         gate: Option<Tensor<4>>,
+        camera: &Camera,
         frame_index: usize,
         blend: Blend,
     ) -> Result<(Tensor<4>, BlendStatus), String> {
         let [_, _, height, width] = trips.dims();
         let gate_available = gate.is_some();
-        let splat = if blend.mode.needs_splat() {
-            self.splat_tensor(frame_index, height, width)
+        // `camera` is this frame's own camera, at the render resolution, so the
+        // live splat is rasterised from exactly where the TRIPS frame was.
+        let (splat, splat_live) = if blend.mode.needs_splat() {
+            match self.splat_tensor(camera, frame_index, height, width).await {
+                Some((image, live)) => (Some(image), live),
+                None => (None, false),
+            }
         } else {
-            None
+            (None, false)
         };
         let mut status = BlendStatus {
             requested: blend.mode,
             applied: blend.mode,
             splat_available: splat.is_some(),
+            splat_live,
+            splat_loaded: self.has_live_splat(),
             gate_available,
         };
 
@@ -940,7 +1111,7 @@ impl Renderer {
                     frame_index,
                     self.exposure_override(),
                 )?;
-                let (rgb, status) = self.compose(trips, gate, frame_index, blend)?;
+                let (rgb, status) = self.compose(trips, gate, camera, frame_index, blend).await?;
                 blend_status = Some(status);
                 let [_, out_c, h, w] = rgb.dims();
                 if h != height as usize || w != width as usize {
@@ -1031,7 +1202,7 @@ impl Renderer {
         let trips =
             self.tone
                 .forward_with_exposure(colour, frame_index, self.exposure_override())?;
-        let (rgb, _status) = self.compose(trips, gate, frame_index, blend)?;
+        let (rgb, _status) = self.compose(trips, gate, camera, frame_index, blend).await?;
         let [_, channels, height, width] = rgb.dims();
         let data = rgb
             .into_data_async()
@@ -1040,6 +1211,72 @@ impl Renderer {
             .into_vec::<f32>()
             .map_err(|e| format!("expected f32: {e:?}"))?;
         Ok((data, channels, height, width))
+    }
+}
+
+#[cfg(test)]
+mod blend_status_tests {
+    use super::*;
+
+    fn status(requested: BlendMode, applied: BlendMode) -> BlendStatus {
+        BlendStatus {
+            requested,
+            applied,
+            splat_available: false,
+            splat_live: false,
+            splat_loaded: false,
+            gate_available: false,
+        }
+    }
+
+    #[test]
+    fn a_frame_that_drew_what_was_asked_has_nothing_to_say() {
+        for mode in [
+            BlendMode::Trips,
+            BlendMode::Splat,
+            BlendMode::Gated,
+            BlendMode::Mix,
+            BlendMode::Split,
+        ] {
+            let s = status(mode, mode);
+            assert!(!s.degraded(), "{mode:?}");
+            assert!(s.note().is_none(), "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn a_missing_gate_head_is_reported_as_a_gate_problem_not_a_splat_one() {
+        let mut s = status(BlendMode::Gated, BlendMode::Trips);
+        s.splat_available = true;
+        s.splat_live = true;
+        s.splat_loaded = true;
+        let note = s.note().expect("degraded frames explain themselves");
+        assert!(note.contains("gate head"), "{note}");
+    }
+
+    #[test]
+    fn a_bundle_with_no_ply_is_told_apart_from_a_ply_that_would_not_render() {
+        // No ply at all: the pre-live-splat message, pointing at R / N / P.
+        let absent = status(BlendMode::Mix, BlendMode::Trips)
+            .note()
+            .expect("degraded");
+        assert!(absent.contains("no `splat_ply`"), "{absent}");
+        assert!(absent.contains("capture view"), "{absent}");
+
+        // Ply open, render refused: a different situation and a different note.
+        // Saying "this bundle has no splat_ply" here would be a lie, and the
+        // panel's own line already says the splat is live.
+        let mut loaded = status(BlendMode::Mix, BlendMode::Trips);
+        loaded.splat_loaded = true;
+        let note = loaded.note().expect("degraded");
+        assert!(note.contains("did not render"), "{note}");
+        assert!(!note.contains("no `splat_ply`"), "{note}");
+    }
+
+    #[test]
+    fn trips_only_is_never_degraded_even_though_nothing_is_available() {
+        let s = status(BlendMode::Trips, BlendMode::Trips);
+        assert!(!s.degraded());
     }
 }
 

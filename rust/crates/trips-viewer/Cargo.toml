@@ -36,12 +36,31 @@ serde.workspace = true
 serde_json.workspace = true
 log.workspace = true
 
-# The window/UI stack, and only the binary needs it. Kept out of the wasm graph
-# on purpose: `eframe` drags in winit and `rfd` a native file dialog, neither of
-# which builds for wasm32-unknown-unknown, and the web viewer has no use for
-# either (its "file dialog" is a URL and its window is a <canvas>).
-# docs/WEB_VIEWER.md records this split.
+# Everything the wasm build must NOT see. Two groups, one reason each:
+#
+#   * the window/UI stack -- `eframe` drags in winit and `rfd` a native file
+#     dialog, neither of which builds for wasm32-unknown-unknown, and the web
+#     viewer has no use for either (its "file dialog" is a URL and its window is
+#     a <canvas>);
+#   * the LIVE Gaussian-splat half of the Blend panel (`src/splat.rs`) -- Brush's
+#     own rasteriser and its .ply reader, reached by path into the submodule
+#     exactly the way `brush-pyramid` already reaches
+#     `brush-cube`/`brush-sort`/`brush-prefix-sum` (ADR-0005). A browser has no
+#     filesystem to open a 2 GB .ply from, and `src/lib.rs` keeps
+#     `pub mod splat` behind the same cfg, so the wasm graph is byte-for-byte
+#     the one v0.5.0 shipped.
+#
+# `brush-serde` -- NOT `brush-dataset` -- is the ply loader: the dataset crate is
+# the same loader plus `image`, `jpeg-decoder`, `reqwest`, `async_zip`,
+# `colmap-reader` and `clap`, none of which a viewer needs. `tokio` is here only
+# for its `AsyncRead` trait, which `src/splat.rs` implements over a plain
+# `std::fs::File` so a multi-GB ply streams instead of being read into memory
+# whole. docs/WEB_VIEWER.md records this split.
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
+brush-render = { path = "../../brush-trips/crates/brush-render" }
+brush-serde = { path = "../../brush-trips/crates/brush-serde" }
+tokio.workspace = true
+
 eframe.workspace = true
 egui.workspace = true
 wgpu.workspace = true

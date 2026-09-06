@@ -1124,3 +1124,70 @@ held-out exposure calibration being explored in `feat/eval-calib`.
   image's own learned exposure, which is the right thing for an eval and the reason the
   bug was visible in the per-image numbers at all. Re-running eval on this checkpoint
   will still report ~6.2 dB for those six images.
+
+## Live Gaussian splat in the viewer (v0.6.0, `trips-viewer/src/splat.rs`)
+
+The Blend panel now renders `bundle.json`'s `blend.splat_ply` at the viewer's own
+pose every frame instead of looking up a precomputed capture-view render
+(`docs/USER_GUIDE.md` "The Blend panel"). Four things it deliberately does not do.
+
+### The splat is rendered as a plain pinhole, the TRIPS half is not
+
+`brush_render::camera::Camera` carries its own distortion models
+(`Pinhole`, `KannalaBrandt4`, `RadialTangential8`, `ThinPrismFisheye`); a trippy
+bundle carries Saiga's 8-parameter set (`k1..k6 p1 p2`, applied to the normalised
+image point — `brush_pyramid::scene::distort_normalized`). These are different
+parameterisations, and converting one to the other is a fit, not a rename. So
+`splat::to_brush_camera` builds a `CameraModel::Pinhole` and the splat half is
+undistorted while the TRIPS half is not.
+
+How much this matters is the scene's own `k1`/`k2`. On the horse
+(`k1 = -0.064`, `k2 = 0.044`) distortion moves a corner pixel by ~21 px at
+1008x756, so the two halves would disagree by that much *in the corners* and by
+almost nothing near the centre. It is a real, bounded, corner-weighted
+disagreement, not a global misregistration — and it is invisible in `splat only`
+or `TRIPS only`, which is where most looking happens. Fixing it means either
+fitting a RadTan8 to each view's Saiga parameters at bundle-load time, or adding
+Saiga's model to `brush-render` (a submodule change).
+
+### The network's Gaussian input block is still precomputed-only
+
+A design-A (hybrid) network takes `C + G` input channels, where the `G` extra ones
+are the Gaussian block: rgb, alpha and **normalised depth**, concatenated onto
+every pyramid level. `Renderer::network_inputs` still fills that block from the
+bundle's `splat.npz` when the camera sits on a capture view, and with honest zeros
+otherwise — the live splat is **not** wired into it.
+
+The reason is the depth channel: `render_splats` returns `[H, W, 4]` where the
+fourth channel is coverage (`1 - T`), and `RenderAux` has `max_radius` per *splat*,
+not per pixel. There is no composited per-pixel depth on this renderer (the same
+gap `docs/EDITOR.md` §2 works around for region weights). Feeding the network rgb
+and alpha live while zeroing depth would be feeding it a combination it was never
+trained on, which is worse than the zeros `dropout_gaussian_p` did train it to
+render through.
+
+The consequence, precisely: **off a capture view, on a hybrid bundle, the TRIPS
+half of the frame is the "no Gaussian information here" render, and the gate `g`
+is that network's opinion.** The *splat* half of `g*splat + (1-g)*trips` is live
+and correct everywhere; the other half degrades off-path exactly as it did before.
+`splat only`, `manual mix` and `split screen` are unaffected on any bundle, and
+nothing at all changes on a non-hybrid Gaussian-seeded bundle (`G = 0`).
+
+### Loading is not incremental, and it is not cheap
+
+`LiveSplat::load` blocks until the whole `.ply` is parsed and uploaded. On
+`kklid_20000.ply` (2.1 GB, 8.9 M Gaussians, SH degree 3) that is tens of seconds
+before the window appears, and the parser allocates the full per-attribute
+`Vec<f32>`s up front (~2.2 GB) on top of the device tensors. `brush-serde` can
+stream partial `Splats` (`stream_splat_from_ply(..., streaming = true)`) and
+`apps/brush-app` uses that to show a splat filling in as it loads; the viewer does
+not, because a half-loaded splat blended into a TRIPS frame is a picture of
+neither. `--splat-subsample <n>` is the lever if a `.ply` will not fit at all.
+
+### The web viewer has no live splat
+
+`crate::splat`, `brush-render` and `brush-serde` are all `cfg`-gated to non-wasm.
+A browser has no filesystem to open a multi-gigabyte `.ply` from, and fetching one
+over loopback on top of the 80 MB `points.npz` it already pulls is a different
+feature. `trips-web` passes a constant `BlendMode::Trips`, which is a hard no-op in
+`Renderer::compose`, so its frame is byte-for-byte the one v0.5.0 shipped.

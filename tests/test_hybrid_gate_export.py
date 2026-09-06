@@ -38,8 +38,10 @@ from trippy.render.bundle import (
     BUNDLE_SPLAT_FILENAME,
     BUNDLE_SPLAT_MAX_VIEWS,
     export_bundle,
+    gaussian_ply_path,
     splat_view_positions,
 )
+from trippy.train.config import PointSourceConfig
 from trippy.train.trainer import Trainer
 
 _LOW_LR = {"lr_points": 0.0, "lr_size": 0.0, "lr_confidence": 0.0, "lr_poses": 0.0}
@@ -191,21 +193,22 @@ def _bundle_from(tmp_path: Path, gate: bool) -> tuple[Path, dict]:
     return bundle_dir, json.loads((bundle_dir / BUNDLE_JSON_FILENAME).read_text())
 
 
-def _plain_bundle(tmp_path: Path) -> tuple[Path, dict]:
-    """A bundle from a NON-hybrid run: the pre-blend-gate bundle, unchanged."""
+def _plain_bundle(tmp_path: Path, point_source: PointSourceConfig | None = None) -> tuple[Path, dict, Path]:
+    """A bundle from a NON-hybrid run. Returns `(dir, document, ply_path)`."""
     scene_root, point_set = build_synthetic_scene(tmp_path / "plain")
     ply_path = build_synthetic_ply(tmp_path / "plain", point_set)
     cfg = tiny_train_config(scene_root, ply_path, tmp_path / "plain-run", tmp_path / "plain-cache")
+    if point_source is not None:
+        cfg.point_source = point_source
     for key, value in _LOW_LR.items():
         setattr(cfg, key, value)
     checkpoint = Trainer(cfg).save_checkpoint()
     bundle_dir, _document = export_bundle(checkpoint, tmp_path / "bundle-plain", name="synthetic")
-    return bundle_dir, json.loads((bundle_dir / BUNDLE_JSON_FILENAME).read_text())
+    return bundle_dir, json.loads((bundle_dir / BUNDLE_JSON_FILENAME).read_text()), ply_path
 
 
-def test_a_non_hybrid_bundle_is_exactly_what_it_always_was(tmp_path: Path) -> None:
-    bundle_dir, document = _plain_bundle(tmp_path)
-    assert "blend" not in document
+def test_a_non_hybrid_bundle_still_has_only_the_three_files(tmp_path: Path) -> None:
+    bundle_dir, document, _ply = _plain_bundle(tmp_path)
     assert not (bundle_dir / BUNDLE_SPLAT_FILENAME).exists()
     assert sorted(p.name for p in bundle_dir.iterdir()) == [
         "bundle.json",
@@ -213,6 +216,56 @@ def test_a_non_hybrid_bundle_is_exactly_what_it_always_was(tmp_path: Path) -> No
         "weights.safetensors",
     ]
     assert document["format"] == "trippy-bundle-1"
+
+
+def test_a_gaussian_seeded_run_records_its_ply_so_the_viewer_can_render_it_live(
+    tmp_path: Path,
+) -> None:
+    """The live splat path's one input: which PLY to open.
+
+    A plain Karekare run is seeded from `kklid_20000.ply` and trains no hybrid,
+    so before this it recorded nothing and the viewer's Blend panel was
+    unavailable on it. It now carries a MINIMAL blend block: `splat_ply` and
+    nothing else that changes behaviour -- no gate, no Gaussian input channels
+    (so the network's `in_channels` is untouched) and no precomputed renders.
+    """
+    _bundle_dir, document, ply_path = _plain_bundle(tmp_path)
+    blend = document["blend"]
+    assert blend["splat_ply"] == str(ply_path)
+    assert blend["gate"] is False
+    assert blend["channels"] == []
+    assert blend["splat_renders"] == ""
+    assert blend["splat_views"] == []
+
+
+def test_a_gaussian_seeded_run_does_not_claim_a_gate_head_it_does_not_have(
+    tmp_path: Path,
+) -> None:
+    """`brush_unet::weights` refuses gate=1 with out_channels=3, so we must not write it."""
+    bundle_dir, _document, _ply = _plain_bundle(tmp_path)
+    _tensors, metadata = read_safetensors(bundle_dir / "weights.safetensors")
+    assert "gate" not in metadata
+    assert metadata["out_channels"] == "3"
+    assert metadata["splat_ply"].endswith(".ply")
+
+
+def test_a_run_with_no_gaussian_ply_gets_no_blend_block_at_all(tmp_path: Path) -> None:
+    """A COLMAP-sparse or npz point source has no splat to render: nothing changes."""
+    _scene_root, point_set = build_synthetic_scene(tmp_path / "npz")
+    npz_path = tmp_path / "npz" / "points.npz"
+    point_set.save_npz(npz_path)
+    _bundle_dir, document, _ply = _plain_bundle(
+        tmp_path, point_source=PointSourceConfig(type="npz", path=str(npz_path))
+    )
+    assert "blend" not in document
+
+
+def test_a_union_source_reports_its_gaussian_member(tmp_path: Path) -> None:
+    child = PointSourceConfig(type="gaussian", path="/tmp/inner.ply")
+    union = PointSourceConfig(type="union", sources=[PointSourceConfig(type="colmap"), child])
+    assert gaussian_ply_path(union) == "/tmp/inner.ply"
+    assert gaussian_ply_path(PointSourceConfig(type="colmap", path="/tmp/sparse")) == ""
+    assert gaussian_ply_path(None) == ""
 
 
 def test_a_hybrid_bundle_without_the_gate_still_carries_its_block(tmp_path: Path) -> None:

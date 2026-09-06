@@ -47,6 +47,30 @@ in `docs/decisions/ADR-0006-viewer-integration.md` and read directly from
   Click-to-cluster needs a ray from a clicked pixel; that ray is
   `Controller`'s own forward/right/down basis plus the pixel's NDC offset —
   no new camera code, just a new method next to `render_camera`.
+- **A live Gaussian splat at every pose** (added 2026-09-07, after this document
+  was first written). `Renderer` now holds an optional `crate::splat::LiveSplat`:
+  `bundle.json`'s `blend.splat_ply` loaded once into `brush_render::Splats`
+  (device-resident `transforms [N,10]`, `sh_coeffs [N,C,3]`, `raw_opacities [N]`)
+  and rasterised by `brush_render::render_splats` at the frame's own camera,
+  composed with the TRIPS frame in `Renderer::compose`. Two consequences for this
+  design:
+  - §2's splat-side trick — "the region weight rides as a Gaussian's own scalar
+    attribute, rendered as a second forward pass with the scalar in place of the
+    SH DC term" — now has a renderer in-process to do it with. It is a second
+    `render_splats` call on a `Splats` whose `sh_coeffs` DC row has been replaced
+    by `w_edit`, on the same device, with no new kernel. That was hypothetical
+    when §2 was written; it is now a dozen lines.
+  - The per-point region test (§1, §2) has to be evaluated against **two** point
+    clouds, not one: `points.npz`'s `xyz` for the TRIPS half and
+    `Splats::means()` for the Gaussian half. They are different clouds with
+    different indices — which is exactly the `pointset`-vs-`box/sphere/lid`
+    distinction ADR-0007 §4 already draws, arriving one stage earlier than
+    expected: a `pointset` region selected on the TRIPS cloud cannot be replayed
+    against the *live splat* either, not just against a distilled one.
+- **A camera conversion into Brush's frame**, `crate::splat::to_brush_camera`,
+  unit-tested to project a world point to the same pixel in both renderers.
+  Anything that needs to ask "where does this world point land in the splat
+  render" now has it.
 - **A sidecar-friendly bundle.** `Bundle::load` reads exactly the two files
   `bundle.json` names (`src/bundle.rs`'s own doc comment: "only the two files
   it actually names are touched"). Nothing in the loader enumerates the
@@ -211,7 +235,11 @@ remove the point from the input entirely (next section).
 
 Both renderers were checked (`docs/decisions/ADR-0007-viewer-editing.md`
 "Consequences") and **neither exposes a composited per-pixel depth buffer
-today**: `brush_pyramid::output::LayerImage` has `feature`/`t_final`/
+today** — re-confirmed 2026-09-07 while wiring the live splat, which calls
+`render_splats` for real: it returns `(Tensor<3> [H, W, 4], RenderAux)`, the
+fourth channel of the image is **coverage** (`1 - T`), and `RenderAux` carries
+`num_visible` / `num_intersections` / `visible` / `max_radius` (per *splat*) /
+`tile_offsets` and nothing composited per pixel: `brush_pyramid::output::LayerImage` has `feature`/`t_final`/
 `n_used`, no depth; `brush-render`'s `RenderOutput`/`RenderAuxInner`
 (`rust/brush-trips/crates/brush-render/src/render_aux.rs`) has `out_img` and
 per-*splat* (not per-pixel) `max_radius`, nothing composited per pixel

@@ -67,15 +67,53 @@ All notable changes to trippy. Format: Keep a Changelog. Versions: semver tags `
   buffer the network already produced, so `blit.wgsl`, its uniform block and `--screenshot` are
   all unchanged -- which means a screenshot measures the picture on screen. Headless flags
   `--blend-mode`, `--gate-scale`, `--mix`, `--split`.
-  - **Shipped with precomputed splat renders, not live ones.** The bundle carries a `splat.npz`
-    of the capture views' Gaussian blocks (12 views, downscaled to 512 px on the long edge);
-    the moment the camera leaves one of those views the panel greys out the splat modes and says
-    so, rather than fading to black or reusing the view you just left — a stored render is a
-    picture of the Gaussians from *that* view's camera, and showing it at another pose would be
-    showing somewhere else (training refuses the same substitution). The bundle also records the
-    source `.ply`
-    path, which is what the follow-up (Brush's `brush-render` at the viewer's own pose) will
-    open. See docs/USER_GUIDE.md "The Blend panel".
+  - The precomputed `splat.npz` of capture-view renders is now the **fallback**, not the only
+    source — see "the splat is rendered live" below. It still behaves exactly as it did: off a
+    capture view the panel greys out the splat modes and says so, rather than fading to black or
+    reusing the view you just left. See docs/USER_GUIDE.md "The Blend panel".
+- **Viewer: the Gaussian splat is rendered LIVE, at any pose** (`trips-viewer/src/splat.rs`).
+  The viewer opens `bundle.json`'s `blend.splat_ply` once into Brush's own `Splats` (means,
+  quats, log-scales, SH coefficients, raw opacity, device-resident) via `brush-serde`, and calls
+  `brush_render::render_splats` at the frame's own camera and resolution every frame. So
+  `splat` / `gated` / `mix` / `split` work **everywhere**, not just on the dozen capture views
+  the bundle carried renders of, and the gate blend `g*splat + (1-g)*trips` is a real picture of
+  this pose on both sides.
+  - **Camera conversion**: trippy's COLMAP world-to-camera `(R row-major, t, fx, fy, cx, cy)`
+    into Brush's camera-to-world `(position, rotation quat, fov_x, fov_y, center_uv)`. The two
+    share a camera frame (`+X` right, `+Y` down, `+Z` forward), so there is **no axis flip** —
+    only `rotation = R^T`, `position = -R^T t`, `fov = focal_to_fov(focal, pixels)`,
+    `center_uv = (cx/W, cy/H)`. Pinned by a CPU unit test that projects five world points
+    through both cameras using each library's own code and requires the same pixel to 1e-2 px.
+  - **`blit.wgsl` is unchanged.** `TextureMode::Float` gives a real `[H, W, 4]` f32 image, which
+    is sliced/permuted into the same planar `[1, 3, H, W]` buffer the tone mapper already
+    produces, so the splat reaches the screen through the existing `MODE_NETWORK` path. (Brush's
+    own app uses `TextureMode::Packed` RGBA8, which would have to be unpacked at 8 bits a
+    channel before it could be blended at all.)
+  - **Composed in display space**, deliberately and documented: the splat's `f_dc_*` colours
+    were fitted against display-referred photographs, and the TRIPS frame reaches `compose`
+    after the tone mapper, so both operands are already graded the same way and neither gets a
+    transfer function. The render uses `background = 0`, so its RGB is premultiplied by coverage
+    — the same convention the precomputed `mask_by_alpha` renders use.
+  - **Never fatal.** A bundle with no `splat_ply`, a missing file, `--no-live-splat`, or a
+    render that errors all fall back to the precomputed path and then to TRIPS, with a line
+    saying which. New flags: `--splat-ply`, `--no-live-splat`, `--splat-subsample`,
+    `--render-size WxH`, `--splat-bench N`.
+  - `brush-render` + `brush-serde` are path dependencies into the submodule (not `brush-dataset`,
+    which is the same loader plus `image`/`reqwest`/`async_zip`/`clap`), `cfg`-gated to non-wasm
+    so `trips-web`'s graph is unchanged. **The submodule itself is untouched.**
+  - Proof without a window: `scripts/viewer_splat_check.sh` renders a synthetic bundle three
+    times at a pose yawed off a capture view — `mix 0` (live splat), `mix 1` (TRIPS) and
+    `mix 0 --no-live-splat` (control) — and fails unless the first two differ *and* the control
+    is byte-identical to the TRIPS frame. On the synthetic fixture: mean |a-b| **58.1/255, 100%
+    of pixels changed**, control **0.000**. `tools/make_synthetic_splat_bundle.py` writes the
+    fixture (a generated 3DGS `.ply` + a two-epoch CPU run + `export-bundle`).
+- **Export: `bundle.json` records `blend.splat_ply` for any Gaussian-seeded run**, not just a
+  hybrid one — every Karekare run is seeded from `kklid_20000.ply` and could not offer the Blend
+  panel before. Such a run gets a *minimal* `blend` block: `splat_ply` and nothing that changes
+  behaviour (`channels` empty, so the Gaussian block's width `G` is 0 and the network's
+  `in_channels` check is unchanged; no gate; no `splat.npz`). A run with no Gaussian PLY still
+  gets no `blend` key at all. `trippy.render.bundle.gaussian_ply_path` walks a `union` source to
+  find its Gaussian member.
 - **Export**: `weights.safetensors` gains `gate`/`gate_channel`/`gate_scale` metadata **only when
   the gate is on**, so a gate-less export stays byte-identical to the file it was (including the
   committed Rust parity fixture). The gate adds **no new tensor** -- it is extra rows of
@@ -92,6 +130,17 @@ All notable changes to trippy. Format: Keep a Changelog. Versions: semver tags `
 - `experiments/EXP-0011-karekare-v2/config_hybrid_gate.yaml`: `config_hybrid.yaml` with the gate
   on and nothing else changed, queued as `kkv2-7-hybrid-gate`.
 ### Fixed
+- **`rust/crates/trips-web` did not compile.** The Blend panel changed `Renderer::render` and
+  `render_to_host` to take a `Blend`, and the web viewer's three call sites were not updated;
+  `wasm32` is not on the push path (`scripts/build.sh` checks the native graph only) so nothing
+  caught it. They now pass a `WEB_BLEND` constant fixed at `BlendMode::Trips`, which is a hard
+  no-op in `compose`, so the browser draws exactly the frame v0.5.0 shipped. Checked with
+  `cargo check -p trips-web --target wasm32-unknown-unknown`.
+- **A gate-less hybrid bundle wrote `gate = "1"` into `weights.safetensors`.** `export_bundle`
+  set the key whenever a `blend` block existed, but the block is written for *any* design-A run,
+  gate or not — and `brush_unet::weights` refuses a file whose `gate` key disagrees with
+  `out_channels` ("metadata says gate=true but out_channels=3"). The key is now written only
+  when the run really has the head.
 - **A hybrid (design A) checkpoint's bundle could never be rendered — by the viewer or by
   `trippy bundle-parity`.** A design-A network's `in_channels` is `feature_channels + G`
   (9 on the kkv2 hybrids), but a bundle carried only the `C = 4` point features, so the first
