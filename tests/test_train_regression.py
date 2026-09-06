@@ -134,6 +134,53 @@ def test_initial_exposure_of_an_image_without_exif_is_the_scene_mean(tmp_path: P
     others = [float(v) for i, v in enumerate(exposures) if i != index]
     assert abs(sum(others) / len(others)) < 1e-4
 
+# Both of the above and the one below assert the same *behaviour* deliberately, by two
+# different routes: the one above mutates the cached EXIF metadata and calls
+# `_initial_exposure()` directly, while this one starts from a synthetic photograph
+# written with **no EXIF block at all** and checks the value that reaches
+# `trainer.camera`. Only the second would catch a regression on the dataset side -- an
+# EXIF reader that wrote `exposure_time: 0` instead of omitting the key would sail past
+# the first and put the frame back at a 58x gain.
+
+def test_an_image_without_exif_starts_at_gain_one(tmp_path: Path) -> None:
+    """"No EXIF" must mean "no exposure of its own", not "EV = 0".
+
+    The bug (found 2026-09-06 in EXP-0003 full2-broadcast): the sentinel EV 0
+    was written for an image with no ExposureTime/ISO and *then* the scene
+    mean was subtracted, giving that image a relative EV of `-mean`. On
+    kk-coherent, mean EV 5.87, that is a gain of `2 ** 5.87 = 58.5`, which
+    saturates the response LUT to a white frame; on this fixture the mean EV
+    is ~8.2, i.e. a gain of ~294. Ten of kk-coherent's 219 images were hit,
+    and those exact ten -- and no others -- scored 6.2-6.9 dB held-out
+    against 17-19 dB for the rest.
+    """
+    scene_root, point_set = build_synthetic_scene(tmp_path, without_exif=(1,))
+    ply_path = build_synthetic_ply(tmp_path, point_set)
+    cfg = tiny_train_config(scene_root, ply_path, tmp_path / "run", tmp_path / "cache")
+    trainer = Trainer(cfg)
+
+    names = list(trainer.dataset.names)
+    index = names.index("IMG_1.jpg")
+    exposures = trainer.camera.exposures_values.detach().reshape(-1)
+
+    assert abs(float(exposures[index])) < 1e-5, (
+        f"the EXIF-less image initialised at EV {float(exposures[index]):+.3f}, a gain of "
+        f"{2 ** -float(exposures[index]):.1f}x; with no measurement it must start at gain 1"
+    )
+    gain = torch.exp2(-exposures)
+    assert float(gain.max()) < 2.0 and float(gain.min()) > 0.5, f"gains out of range: {gain.tolist()}"
+
+    # And it must not drag the images that DO have EXIF: their relative EVs
+    # are still centred on the mean of the measured ones only.
+    measured = [i for i in range(len(names)) if i != index]
+    raw = {i: math.log2(1.0 / EXIF_EXPOSURE_TIMES[int(names[i][4]) % len(EXIF_EXPOSURE_TIMES)])
+           + math.log2(EXIF_ISO / 100.0) for i in measured}
+    mean = sum(raw.values()) / len(raw)
+    for i in measured:
+        assert abs(float(exposures[i]) - (raw[i] - mean)) < 1e-4, (
+            f"{names[i]} initialised at {float(exposures[i]):+.4f}, expected {raw[i] - mean:+.4f}"
+        )
+
 
 # --- 2. masked MSE / PSNR ------------------------------------------------
 

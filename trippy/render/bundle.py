@@ -29,7 +29,11 @@ Invariants:
       always writes -- `trippy.scene.dataset` undistorts on ingest).
     - `weights.safetensors` is whatever `trippy.net.export_safetensors.export`
       writes today, format `trippy-unet-1`, unchanged. This module never
-      touches that schema.
+      touches that schema. It does sanitise ONE tensor's values before
+      handing them over: `camera.exposure`, see `trusted_exposures` -- a
+      per-view EV more than `BUNDLE_EXPOSURE_TRUST_STOPS` from the scene
+      median is an unconverged initialisation, not a colour grade, and the
+      substitution is recorded in the file's `__metadata__`.
     - `params` must equal the render settings the checkpoint's *own* engine
       uses, or the Rust render is a different picture: TRIPS checkpoints get
       TRIPS's thresholds (`PARITY_*`), trippy-native checkpoints get their
@@ -65,6 +69,7 @@ Related docs: docs/GEOMETRY.md (frames, up vector), docs/TRIPS_REFERENCE.md
 
 from __future__ import annotations
 
+import copy
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -102,6 +107,19 @@ BUNDLE_UP = (0.0, -1.0, 0.0)
 
 #: Number of Saiga lens-distortion coefficients (k1 k2 k3 k4 k5 k6 p1 p2).
 BUNDLE_DISTORTION_COEFFS = 8
+
+#: How far, in stops (EV), a view's per-image exposure may sit from the
+#: scene's median before the bundle stops treating it as a colour grade.
+#:
+#: `NeuralCamera` applies exposure as a gain of `2 ** -EV`, so 2 stops is a
+#: factor of 4 either way -- far more spread than any hand-held capture of one
+#: place shows, and comfortably inside the gap this threshold has to land in.
+#: Measured on EXP-0003 full2-broadcast (219 views, median EV 0.250): the
+#: nearest kept view is 1.14 stops out and the nearest replaced view is 4.46
+#: stops out, so anything from ~1.2 to ~4.4 selects exactly the same 10 views
+#: -- and those 10 are exactly the 10 images whose EXIF carried no
+#: ExposureTime/ISO. See `trusted_exposures`.
+BUNDLE_EXPOSURE_TRUST_STOPS = 2.0
 
 #: Largest intrinsic skew `s` (pixels) tolerated before refusing to export.
 #: The bundle's camera is `fx/fy/cx/cy` only -- `brush_pyramid::scene::Camera`
@@ -278,6 +296,137 @@ def default_view_position(views: list[BundleView], dataset_index: int) -> int:
     return 0
 
 
+# --- exposure hygiene --------------------------------------------------------
+
+
+def trusted_exposures(
+    exposure: np.ndarray, max_stops: float = BUNDLE_EXPOSURE_TRUST_STOPS
+) -> tuple[np.ndarray, list[int], float]:
+    """Replace per-view EVs that are an initialisation, not a colour grade.
+
+    A bundle is a *walkthrough*: it renders arbitrary poses, and the frame
+    index only picks which image's learned exposure/white balance to apply.
+    That is sound as long as every per-view exposure is a measurement. It is
+    not, in two ways that both produce a white or a black frame:
+
+    - a **held-out** image's exposure never receives a gradient, so it is
+      still whatever the initialiser wrote;
+    - an image whose EXIF carried no ExposureTime/ISO was initialised to a
+      wrong value by the bug fixed in `Trainer._initial_exposure`
+      (2026-09-06), and `lr_exposure = 5e-4` recovers only part of it even
+      over 300 epochs.
+
+    Both show up the same way: an EV far from the scene's median. This
+    replaces those with the median -- the grade of the average photograph,
+    which is the honest stand-in for "this frame has no exposure of its own"
+    and is exactly what a correct initialisation would have given it. The
+    median (not the mean) is the reference precisely because the values being
+    rejected would drag a mean.
+
+    Args:
+        exposure: `(M,)` per-image EV, applied downstream as a `2 ** -EV`
+            gain.
+        max_stops: how far from the median an EV may sit and still be kept.
+
+    Returns:
+        `(values, replaced, reference_ev)`: the sanitised copy, the sorted
+        frame indices that were replaced, and the median EV used.
+    """
+    values = np.array(exposure, dtype=np.float32).reshape(-1).copy()
+    if values.size == 0:
+        return values, [], 0.0
+    reference = float(np.median(values))
+    outlier = np.abs(values - reference) > float(max_stops)
+    replaced = [int(i) for i in np.flatnonzero(outlier)]
+    values[outlier] = np.float32(reference)
+    return values, replaced, reference
+
+
+def default_view_with_trusted_exposure(
+    views: list[BundleView], exposure: np.ndarray, fallback: int, max_stops: float = BUNDLE_EXPOSURE_TRUST_STOPS
+) -> int:
+    """Dataset index of the view the bundle should open at, exposure-aware.
+
+    A viewer opens on `default_view` before the user has touched anything, so
+    that frame is the scene's first impression and has to be one the model can
+    actually be judged by. Opening on a view whose exposure was never trained
+    is how the delivered Karekare bundle came to show a white frame
+    (docs/LIMITATIONS.md "Per-image exposure").
+
+    So: prefer `fallback` when its own exposure is trustworthy (which keeps
+    every well-behaved scene, the public horse included, opening exactly where
+    it always did). Otherwise pick the trustworthy view whose exposure is
+    **nearest the scene median** -- the most ordinary-looking photograph of the
+    capture -- breaking ties towards the lowest dataset index so the choice is
+    deterministic.
+
+    Args:
+        views: the bundle's views, in the order they will be serialised.
+        exposure: `(M,)` per-image EV, indexed by *dataset* index.
+        fallback: the dataset index the loader would otherwise have picked.
+        max_stops: the `trusted_exposures` threshold.
+
+    Returns:
+        A dataset image index. `fallback` unchanged when there is no exposure
+        table, when `fallback` is already trustworthy, or when no view is.
+    """
+    values = np.asarray(exposure, dtype=np.float32).reshape(-1)
+    if values.size == 0 or not views:
+        return fallback
+    reference = float(np.median(values))
+
+    def trusted(index: int) -> bool:
+        return 0 <= index < values.size and abs(float(values[index]) - reference) <= float(max_stops)
+
+    if trusted(fallback):
+        return fallback
+    candidates = [v.index for v in views if trusted(v.index)]
+    if not candidates:
+        return fallback
+    return min(candidates, key=lambda i: (abs(float(values[i]) - reference), i))
+
+
+def _sanitise_camera_exposure(
+    camera: NeuralCamera | None, max_stops: float = BUNDLE_EXPOSURE_TRUST_STOPS
+) -> tuple[NeuralCamera | None, dict[str, str]]:
+    """`trusted_exposures` applied to a copy of `camera`; the metadata it earns.
+
+    The copy matters: `write_bundle` is handed the *live* tone mapper of a
+    Trainer that a caller may keep using (`trippy train --report` exports a
+    bundle and then goes on to evaluate), so the exported table must not be
+    written back into it.
+
+    Returns:
+        `(camera_or_copy, metadata)`. The metadata keys land in the
+        safetensors `__metadata__` block, so a delivered bundle always says
+        on its own whether any exposure was substituted and which.
+    """
+    if camera is None or camera.exposures_values is None:
+        return camera, {}
+    original = camera.exposures_values.detach().cpu().numpy().reshape(-1)
+    values, replaced, reference = trusted_exposures(original, max_stops)
+    metadata = {
+        "exposure_reference_ev": f"{reference:.6f}",
+        "exposure_trust_stops": f"{float(max_stops):.6f}",
+        "exposure_substituted_count": str(len(replaced)),
+        "exposure_substituted_frames": ",".join(str(i) for i in replaced),
+    }
+    if not replaced:
+        return camera, metadata
+
+    sanitised = copy.deepcopy(camera)
+    with torch.no_grad():
+        sanitised.exposures_values.copy_(
+            torch.from_numpy(values).view_as(sanitised.exposures_values)
+        )
+    print(
+        f"export-bundle: {len(replaced)} of {values.size} per-view exposures were more than "
+        f"{max_stops} stops from the scene median EV {reference:.3f} and are not a colour "
+        f"grade; substituted the median (frames {replaced})"
+    )
+    return sanitised, metadata
+
+
 # --- writing -----------------------------------------------------------------
 
 
@@ -293,7 +442,18 @@ def bundle_document(source: BundleSource) -> dict[str, Any]:
 
     Split out from `write_bundle` so tests can validate the schema without
     touching the filesystem.
+
+    `default_view` is the loader's preferred view unless that view's own
+    exposure is untrustworthy, in which case the most ordinarily-exposed view
+    is chosen instead -- see `default_view_with_trusted_exposure`.
     """
+    default_index = source.default_view_index
+    if source.camera is not None and source.camera.exposures_values is not None:
+        default_index = default_view_with_trusted_exposure(
+            source.views,
+            source.camera.exposures_values.detach().cpu().numpy().reshape(-1),
+            default_index,
+        )
     return {
         "format": BUNDLE_FORMAT,
         "name": source.name,
@@ -304,7 +464,7 @@ def bundle_document(source: BundleSource) -> dict[str, Any]:
         "background": [float(v) for v in np.asarray(source.background).reshape(-1)],
         "params": source.params.to_json(),
         "up": [float(v) for v in BUNDLE_UP],
-        "default_view": default_view_position(source.views, source.default_view_index),
+        "default_view": default_view_position(source.views, default_index),
         "views": [view.to_json() for view in source.views],
     }
 
@@ -347,14 +507,16 @@ def write_bundle(source: BundleSource, out_dir: str | Path) -> Path:
     # point set is already float32 noise that deflate barely shrinks.
     np.savez(out / BUNDLE_POINTS_FILENAME, xyz=xyz, size=size, feat=feat, conf=conf)
 
+    camera, exposure_metadata = _sanitise_camera_exposure(source.camera)
     metadata = {
         "source": "trippy.render.bundle",
         "bundle_format": BUNDLE_FORMAT,
         "bundle_name": source.name,
         "num_points": str(n),
     }
+    metadata.update(exposure_metadata)
     metadata.update(source.metadata or {})
-    export(source.net, source.camera, out / BUNDLE_WEIGHTS_FILENAME, extra_metadata=metadata)
+    export(source.net, camera, out / BUNDLE_WEIGHTS_FILENAME, extra_metadata=metadata)
 
     document = bundle_document(source)
     (out / BUNDLE_JSON_FILENAME).write_text(json.dumps(document, indent=2) + "\n")

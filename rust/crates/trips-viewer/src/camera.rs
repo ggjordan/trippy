@@ -52,7 +52,13 @@ pub const SPEED_STEP: f32 = 1.25;
 pub const MIN_SPEED_SCALE: f32 = 0.01;
 
 /// Fly speed is clamped to this multiple of the scene's base speed, at most.
-pub const MAX_SPEED_SCALE: f32 = 10.0;
+///
+/// Was 10.0 until 2026-09-06. With [`crate::bundle::BASE_SPEED_FRACTION`] at
+/// 2.0 this puts the top of the scroll range at 100 median camera gaps per
+/// second — one press-and-hold crosses any capture in well under a second —
+/// while [`SPEED_STEP`] still needs 18 notches to get there from the default,
+/// so the wheel stays usable for small corrections.
+pub const MAX_SPEED_SCALE: f32 = 50.0;
 
 /// Pitch is clamped this far short of straight up/down, so the basis never
 /// degenerates against the world up axis.
@@ -806,7 +812,7 @@ mod tests {
     }
 
     #[test]
-    fn the_base_speed_is_half_the_median_camera_spacing() {
+    fn the_base_speed_is_two_median_camera_gaps_per_second() {
         // A ring of 24 cameras of radius 4: the chord between neighbours is
         // 2 * 4 * sin(pi / 24) = 1.0405...
         let views = ring(24, 4.0);
@@ -818,7 +824,15 @@ mod tests {
             scene.median_spacing
         );
         let c = Controller::new(&views, 0, UP);
-        assert!((c.move_speed() - 0.5 * chord).abs() < 1e-3, "{}", c.move_speed());
+        // The shipped default, named as a number and not just as the constant:
+        // one second of held `W` crosses two capture positions (2026-09-06,
+        // Jordan: "I move so slow I can't explore the areas I want").
+        assert!((crate::bundle::BASE_SPEED_FRACTION - 2.0).abs() < 1e-6);
+        assert!(
+            (c.move_speed() - 2.0 * chord).abs() < 1e-3,
+            "{} should be 2 x the {chord} chord",
+            c.move_speed()
+        );
         // Ten thousand times bigger scene, ten thousand times the speed: the
         // ratio to the scene is what stays fixed.
         let big = Controller::new(&ring(24, 40000.0), 0, UP);
@@ -827,6 +841,57 @@ mod tests {
             "{} vs {}",
             big.speed_in_scenes(),
             c.speed_in_scenes()
+        );
+    }
+
+    #[test]
+    fn the_scroll_wheel_reaches_fifty_times_the_base_speed() {
+        // The top of the range, stated as a number: 50x the default, which on
+        // a scene whose views are one chord apart is 100 capture gaps per
+        // second. Reaching it takes ceil(ln 50 / ln 1.25) = 18 notches, so the
+        // wheel is still fine-grained near the default.
+        assert!((MAX_SPEED_SCALE - 50.0).abs() < 1e-6);
+        let views = ring(24, 4.0);
+        let mut c = Controller::new(&views, 0, UP);
+        c.set_mode(Mode::Free);
+        let base = c.move_speed();
+        let notches = (MAX_SPEED_SCALE.ln() / SPEED_STEP.ln()).ceil() as usize;
+        assert_eq!(notches, 18);
+        for _ in 0..notches {
+            c.scroll(1.0);
+        }
+        assert!(
+            (c.move_speed() - base * MAX_SPEED_SCALE).abs() < 1e-3 * base,
+            "{} vs {}",
+            c.move_speed(),
+            base * MAX_SPEED_SCALE
+        );
+    }
+
+    #[test]
+    fn orbit_zoom_moves_a_fixed_fraction_of_the_pivot_distance() {
+        // Zoom is multiplicative, so the world-space step one notch takes is
+        // proportional to how far the camera is from what it is looking at:
+        // close in it creeps, far out it strides. A subtractive zoom would
+        // take the same step at both distances and either crawl or overshoot.
+        let views = ring(24, 4.0);
+        let mut c = Controller::new(&views, 0, UP);
+        let far = c.orbit_distance();
+        c.scroll(1.0);
+        let far_step = far - c.orbit_distance();
+        assert!((c.orbit_distance() - far / SPEED_STEP).abs() < 1e-4 * far);
+
+        // Now start ten times closer and measure the same single notch.
+        for _ in 0..11 {
+            c.scroll(1.0);
+        }
+        let near = c.orbit_distance();
+        assert!(near < far / 5.0, "expected to be much closer: {near} vs {far}");
+        c.scroll(1.0);
+        let near_step = near - c.orbit_distance();
+        assert!(
+            (near_step / near - far_step / far).abs() < 1e-3,
+            "step is not proportional: {near_step}/{near} vs {far_step}/{far}"
         );
     }
 

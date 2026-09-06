@@ -92,22 +92,32 @@ Controls:
 |---|---|
 | **left-drag** | **orbit** the scene — or look around, in free mode |
 | **right-drag** or **middle-drag** | pan sideways / up and down |
-| **scroll** | orbit: move closer or further · free: change how fast you fly |
+| **scroll** | **free: FASTER / slower** · orbit: move closer or further |
 | `W` `A` `S` `D` | move forward / left / back / right |
 | `Q` / `E` | move down / up |
 | `R` | back to the view it opened at (use this whenever you are lost) |
 | `N` / `P` | jump to the next / previous real camera of the capture |
 | `F` | switch between **orbit** and **free fly** |
 | `V` | cycle the view: **network** -> **raw level-0** -> **coverage** |
+| `X` | cycle the **exposure**: auto -> this view's -> scene median -> manual |
 | `-` / `=` | render at a smaller / larger fraction of the window |
 | `TAB` | hide the panel |
 
+**Too slow? Press `F`, then scroll up.** Each notch is 25% faster and the wheel goes to
+**50x** the default, which crosses a whole capture in under a second. The panel says
+`scroll = faster` while you are in free mode.
+
 **Speed is set from the scene, not guessed.** The viewer measures how far apart the real
-cameras are and flies at half that distance per second, so one tap of `W` is a step, not
-a teleport, whether the scene is a horse on a plinth or a whole beach. The panel shows
-both numbers: world units per second, and the same speed as a fraction of the captured
-area per second. Scroll changes it by 25% a notch, between 1/100 and 10 times the
-default.
+cameras are and flies **two of those gaps per second**, so one second of held `W` takes
+you past two capture positions whether the scene is a horse on a plinth or a whole
+beach. The panel shows both numbers: world units per second, and the same speed as a
+fraction of the captured area per second. Scroll changes it by 25% a notch, between
+1/100 and **50** times the default.
+
+(That default was 0.5 gaps per second up to 2026-09-06 — 4x slower. On Karekare the
+photographs are ~0.2 world units apart, so the old default needed about two and a half
+minutes of held `W` to cross the capture. It now takes about forty seconds, and one
+scroll-up ladder takes it to under a second.)
 
 If you do fly out of the captured area in free mode, the panel says so and tells you to
 press `R`. In orbit mode you cannot: the point you are turning around is pinned inside
@@ -116,6 +126,16 @@ the box the real cameras occupy, and the camera moves with it.
 The "jump to view" dropdown lists every real camera in the capture; picking one puts you
 exactly where that photograph was taken, which is the fair place to compare the render
 with the photograph.
+
+**Why the brightness can change when you move.** Each photograph was taken at its own
+exposure, and the model learned that per photograph — it is the only part of the colour
+handling that differs between two views of one scene. A viewpoint that is *not* a
+photograph has no exposure of its own, so the viewer has to choose one. The default,
+`auto`, uses the exposure of the camera you are sitting on and the scene's **median**
+once you move off it; the panel always says which EV it is applying. Press `X` to force
+`view` (always the nearest capture camera's — right when you are comparing a render with
+its photograph), `median` (one grade for the whole scene — right when you are flying
+around judging it), or `manual` and set the EV yourself.
 
 The three views are the honesty sheet, live:
 
@@ -184,6 +204,13 @@ trippy export-bundle --checkpoint <checkpoint> --out <folder> [--name NAME]
 ```
 
 The folder holds exactly three files — `bundle.json` (the cameras and render settings), `points.npz` (the point cloud) and `weights.safetensors` (the network). The points are stored in **world space** with every real camera of the scene listed alongside them, so the viewer can fly anywhere rather than replay one fixed frame; it opens on the scene's reference view. It accepts either a published TRIPS checkpoint (add `--scene <scene folder>`) or one of trippy's own training checkpoints, and prints which kind it found. It runs on the CPU, so it does not need to queue for the GPU.
+
+If any of the scene's photographs had a per-image exposure the training never converged
+on (a photo with no EXIF, or one that was held out), `export-bundle` says so and
+substitutes the scene's median exposure for those views, so the viewer cannot open on a
+blown-white frame. It prints a line like `10 of 219 per-view exposures were more than 2.0
+stops from the scene median`; that line is normal and the substitution is recorded inside
+the bundle. See docs/LIMITATIONS.md "Per-image exposure".
 
 **Every self-reporting training run does this for you automatically.** `trippy train --report`
 exports this same bundle from the run's own final checkpoint and delivers a

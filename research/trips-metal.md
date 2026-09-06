@@ -1747,3 +1747,60 @@ device-side count (indirect dispatch) so `render_inner` never stalls. That is a
   full2-broadcast, n/a for the Gaussian baseline, which has no exposure model).
 - 2026-09-06T03:43:36Z delivered trips-leaderboard: One table of every TRIPS run so far vs the Gaussian baseline: held-out PSNR, shade dark-mass, extent, coverage. Regenerated after every training. (/Users/nzbirdranch/trippy/output/leaderboard/leaderboard.png)
 - 2026-09-06T03:54:56Z submitted job trippy-eval-neighbours-full2 prio 15: bash -c PYTHONPATH=. /Users/nzbirdranch/trippy/.venv/bin/python -m trippy.cli eval --checkpoint output/runs/EXP-0003-kk-trips-train/full2-broadcast/checkpoints/checkpoint_latest.pt --device mps && PYTHONPATH=. /Users/nzbirdranch/trippy/.venv/bin/python -m trippy.cli eval --checkpoint output/runs/EXP-0003-kk-trips-train/full1-broadcast/checkpoints/checkpoint_latest.pt --device mps && PYTHONPATH=. /Users/nzbirdranch/trippy/.venv/bin/python -m trippy.cli leaderboard --deliver
+- 2026-09-06T02:21:25Z submitted job trippy-viewer-kk-1 prio 12: bash /Users/nzbirdranch/trippy/output/jobs-src/viewer-kk-1.sh
+
+## fix/viewer-kk (2026-09-06): the white Karekare frame was an untrained exposure, not the viewer
+
+**Question.** The delivered `full2-broadcast-viewer.command` opened on a nearly white frame
+with coloured speckle in the `network` view. Viewer bug, bundle bug, f16, or the checkpoint?
+
+**Answer: the checkpoint, and the viewer was reproducing it faithfully.**
+`Trainer._initial_exposure` encoded "no EXIF" as "EV 0" *before* subtracting the scene
+mean, so an EXIF-less photo got a relative EV of `-mean(scene)` = **-5.870477** on
+kk-coherent = a tone-mapper gain of **58.5x**, which clips the response LUT to
+`LUT(1) = (0.888, 0.875, 0.863)`. Ten of 219 images have no EXIF (indices
+`0, 44, 87, 120, 122, 123, 124, 131, 174, 218`); six are held out, so their exposure never
+received a gradient in 300 epochs, and one of the six is view 0, the bundle's opening view.
+The run's own per-image held-out PSNRs already said so: the six worst (6.19-6.92 dB) are
+exactly those six views, against 12.3-19.8 dB for the rest.
+
+**Job `trippy-viewer-kk-1`** (prio 12, rc 0), one batched diagnostic, numbers only:
+
+| measurement | before | after |
+|---|---:|---:|
+| viewer vs Python reference, view 0, f32 | 85.78 dB | 74.56 dB |
+| viewer vs Python reference, view 0, f16 | 59.98 dB | 60.42 dB |
+| view 0 mean RGB | 0.874/0.867/0.848 | 0.456/0.452/0.402 |
+| view 0 PSNR vs its own photograph | **6.20 dB** | **14.92 dB** |
+| view 1 (`IMG_3704`) and view 121 (`IMG_3830`) | — | byte-identical |
+| horse `--screenshot` vs `render_frame_full` | 82.68 dB | **82.68470 dB** |
+
+85.78 dB parity *on the broken bundle* is what rules out the f16 network, the response
+LUT, the background colour and the feature layout in one measurement: the viewer renders
+what the bundle says, to one 8-bit LSB, even when that is a white frame.
+
+**Fixed:** (1) trainer — no EXIF now initialises at the scene mean (relative EV 0, gain 1);
+(2) exporter — `trusted_exposures` substitutes the scene median for any per-view EV more
+than 2.0 stops out, recorded in the bundle's metadata (on full2-broadcast it caught exactly
+the ten EXIF-less views; the nearest kept view is 1.14 stops out and the nearest replaced
+one 4.46, so the threshold sits in a wide gap); (3) `default_view` moves off an
+untrustworthy view (full2-broadcast: view 0 -> view 26 `IMG_3735`, EV +0.25011 = the scene
+median); (4) the viewer chooses an exposure and says which — `ExposureMode::Auto` uses the
+pinned view's own EV and the scene median once you fly off it, `X` / `--exposure` override.
+
+**Side finding, and it agrees with `eval-calib-1` above.** `IMG_3830` is a held-out shade
+frame with valid EXIF, untouched by any of the fixes here, and it still goes
+**12.30 -> 15.46 dB** when rendered with the scene median instead of its own
+never-trained EV. That is the same effect `feat/eval-calib` measured by fitting the
+exposure per held-out image (shade 8.49 -> 15.32 dB calibrated): a held-out frame's
+exposure is never adjusted to the scale the U-Net learned on the training frames, whether
+or not its EXIF was present. Reached independently, from a viewer screenshot rather than
+from a fitted gain.
+
+**Also:** viewer fly speed 4x (`BASE_SPEED_FRACTION` 0.5 -> 2.0 median camera gaps per
+second) with a 50x scroll ceiling (was 10x), on Jordan's "I move so slow I can't explore
+the areas I want". Artefacts: `$SPLATS_ROOT/tools/gpu_queue/logs/trippy-viewer-kk-1.log`,
+`$TRIPPY_OUTPUT/brush/viewer-kk/` (renders + JSON, not committed).
+- 2026-09-06T03:33:05Z delivered full2-broadcast-viewer-v2: Karekare full2-broadcast, fixed. WHAT WAS WRONG: the white frame was not the viewer -- it renders the checkpoint faithfully (85.78 dB vs the Python reference on the SAME broken bundle). Ten of the 219 photos have no EXIF exposure, and the trainer initialised those at -5.87 EV = a 58.5x brightness gain, which clips the response curve to flat white; six of the ten are held out so that value never trained, and one of them was view 0, the view this launcher opened at. WHAT CHANGED: the exporter substitutes the scene's median exposure for any view whose exposure was never trained (10 of 219 here), the viewer now picks a sane exposure itself when you fly off a capture pose (press X to change it), and it opens on IMG_3735 instead of IMG_3703. View 0 vs its own photograph went 6.20 dB -> 14.92 dB; the views that were fine are byte-identical. SPEED: 4x faster by default and scroll now goes to 50x -- press F to fly, then SCROLL UP. (/Users/nzbirdranch/trippy/output/deliver/full2-broadcast/OPEN_TRIPS_MAC_full2-broadcast.command)
+- 2026-09-06T03:33:15Z delivered trips-kk-full1-viewer-v2: Karekare full1-broadcast (the earlier 40-epoch run) re-exported with the same exposure fix: its bundle had the identical 10 untrained exposures and also opened on a white frame. Now opens on IMG_3794. Same viewer as full2-broadcast-viewer-v2: 4x faster navigation, scroll to 50x, X changes the exposure. full2-broadcast is the better model -- this one is only here so the old link is not a white frame. (/Users/nzbirdranch/trippy/output/deliver/trips-kk-full1/OPEN_TRIPS_MAC_trips-kk-full1.command)
+- 2026-09-06T03:33:39Z delivered trips-mac-viewer-horse-v3: Public horse scene, same viewer build as the Karekare v2 launchers. The horse BUNDLE is unchanged (its exposures were already sane: 0.12 stops of spread, nothing substituted, still opens on view 8) and its render parity is unchanged at 82.68 dB against the reference path. What is new is the navigation: 4x faster by default, scroll now goes to 50x (press F to fly, then SCROLL UP), and X cycles which exposure the tone mapper applies. (/Users/nzbirdranch/trippy/output/deliver/trips-horse/OPEN_TRIPS_MAC_trips-horse.command)

@@ -91,17 +91,27 @@ cat > "$CMDFILE" <<LAUNCHER
 #
 #   left-drag         turn around the scene (orbit) — or look around, in free mode
 #   right/middle-drag pan sideways
-#   scroll            orbit: closer / further      free: change fly speed
+#   scroll            = FASTER (in free mode; in orbit mode it zooms)
 #   W A S D           move           Q / E   down / up
+#   F                 orbit <-> free fly
 #   R                 back to the view it opened at
 #   N / P             next / previous real camera of the capture
-#   F                 orbit <-> free fly
 #   V                 cycle view: network -> raw level-0 -> coverage
+#   X                 cycle exposure: auto -> this view's -> scene median -> manual
 #   - / =             render scale   TAB     hide the panel
 #
+# TOO SLOW? Press F to fly, then SCROLL UP. Each notch is 25% faster and the
+# wheel goes to 50x, which crosses the whole capture in under a second.
+#
 # It opens on a real camera of the capture and orbits inside it, so you cannot
-# get lost. Speed is set from how far apart the real cameras are, so one tap of
-# W is a step, not a teleport.
+# get lost. The default speed is set from how far apart the real cameras are:
+# one second of held W crosses two capture positions.
+#
+# BRIGHTNESS: each photograph has its own exposure, and a viewpoint that is not
+# a photograph has none, so the panel shows which one is being applied. "auto"
+# (the default) uses the exposure of the camera you are sitting on, and the
+# scene's median once you move off it. Press X to force one, or set an EV by
+# hand.
 #
 # The panel's top line is the frame time and fps. "coverage" is the honesty
 # view: dark means the rasteriser drew nothing there and the network invented

@@ -154,6 +154,77 @@ impl ViewMode {
     }
 }
 
+/// Which exposure the tone mapper applies to the frame.
+///
+/// The tone mapper's exposure is **per image**: it is the one term of the
+/// whole camera model that differs between two views of the same scene (white
+/// balance and vignette are frozen in every TRIPS config we run). A viewer
+/// that renders arbitrary poses therefore has to answer a question a training
+/// run never asks — *whose* exposure does a pose that is not a photograph
+/// get? See `docs/LIMITATIONS.md` "Per-image exposure".
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum ExposureMode {
+    /// The reference view's own exposure while the camera is sitting exactly
+    /// on it, the scene median once you have moved off it. The default,
+    /// because both halves are the honest answer: on a capture pose the
+    /// frame is comparable with that photograph, and off it there is no
+    /// photograph to be comparable with, so the scene's own grade is better
+    /// than whichever view you last pressed `N` past.
+    #[default]
+    Auto,
+    /// Always the reference view's own exposure, moved or not.
+    View,
+    /// Always the scene median, moved or not — one grade for the whole scene.
+    Median,
+    /// A hand-set EV, applied as a gain of `2 ** -EV`.
+    Manual(f32),
+}
+
+/// Range of the manual EV slider, in stops either side of 0.
+///
+/// Wider than any capture's own spread (kk-coherent's learned EVs span 2.3
+/// stops) so it can also be used to inspect a frame that is nearly black or
+/// nearly clipped, and narrow enough that the slider stays usable.
+pub const MANUAL_EXPOSURE_LIMIT: f32 = 8.0;
+
+impl ExposureMode {
+    /// The EV to apply, or `None` for "image `frame`'s own learned value".
+    ///
+    /// Pure, so the policy is testable without a device.
+    ///
+    /// # Arguments
+    /// - `pinned`: is the camera exactly on the reference view?
+    /// - `median`: the scene's median EV, or `None` when the tone mapper has
+    ///   no exposure table at all (in which case there is nothing to override
+    ///   and every mode falls back to `None`).
+    #[must_use]
+    pub fn resolve(self, pinned: bool, median: Option<f32>) -> Option<f32> {
+        match self {
+            Self::Auto => {
+                if pinned {
+                    None
+                } else {
+                    median
+                }
+            }
+            Self::View => None,
+            Self::Median => median,
+            Self::Manual(ev) => Some(ev),
+        }
+    }
+
+    /// Short label for the on-screen readout.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::View => "view",
+            Self::Median => "median",
+            Self::Manual(_) => "manual",
+        }
+    }
+}
+
 /// The runtime-settable performance levers, all defaulting to exact.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Settings {
@@ -314,6 +385,14 @@ pub struct Renderer {
     /// Why [`Self::net_half`] is `None`, verbatim from Burn.
     half_net_error: Option<String>,
     tone: NeuralCamera,
+    /// Which per-image exposure the tone mapper applies, and whether the
+    /// camera is currently sitting on its reference view. Set once per frame
+    /// by the UI (see [`Self::set_exposure`]); resolved to an EV, or to
+    /// "use the frame's own", by [`ExposureMode::resolve`].
+    exposure: ExposureMode,
+    /// Whether the camera is pinned to its reference view — the one input
+    /// [`ExposureMode::Auto`] needs that the renderer cannot see for itself.
+    pinned: bool,
 }
 
 impl Renderer {
@@ -359,7 +438,46 @@ impl Renderer {
             net_half,
             half_net_error,
             tone,
+            exposure: ExposureMode::default(),
+            pinned: true,
         })
+    }
+
+    /// Choose the exposure policy for the frames that follow.
+    ///
+    /// # Arguments
+    /// - `mode`: the policy.
+    /// - `pinned`: whether the camera is sitting exactly on its reference
+    ///   view. Only [`ExposureMode::Auto`] reads it.
+    pub fn set_exposure(&mut self, mode: ExposureMode, pinned: bool) {
+        self.exposure = mode;
+        self.pinned = pinned;
+    }
+
+    /// The current exposure policy.
+    #[must_use]
+    pub fn exposure(&self) -> ExposureMode {
+        self.exposure
+    }
+
+    /// The scene's median learned EV, or `None` when there is no exposure
+    /// table. What the HUD shows next to the "median" choice.
+    #[must_use]
+    pub fn median_exposure(&self) -> Option<f32> {
+        self.tone.median_exposure()
+    }
+
+    /// The learned EV of one image, or `None` when there is no exposure table.
+    #[must_use]
+    pub fn view_exposure(&self, frame: usize) -> Option<f32> {
+        self.tone.exposure_of(frame)
+    }
+
+    /// The EV this frame will actually be tone mapped with, or `None` for
+    /// "image `frame`'s own learned value".
+    #[must_use]
+    fn exposure_override(&self) -> Option<f32> {
+        self.exposure.resolve(self.pinned, self.tone.median_exposure())
     }
 
     /// `N`, the number of points.
@@ -470,7 +588,11 @@ impl Renderer {
             ViewMode::Network => {
                 let rgb = self
                     .tone
-                    .forward(self.net(settings).forward(&render.layer_tensors())?, frame_index)?;
+                    .forward_with_exposure(
+                        self.net(settings).forward(&render.layer_tensors())?,
+                        frame_index,
+                        self.exposure_override(),
+                    )?;
                 let [_, out_c, h, w] = rgb.dims();
                 if h != height as usize || w != width as usize {
                     return Err(format!(
@@ -551,9 +673,11 @@ impl Renderer {
         let points = self.resident_points(&params)?;
         let render =
             render_pyramid_uploaded(&points, camera, &params, self.background.as_deref()).await?;
-        let rgb = self
-            .tone
-            .forward(self.net(settings).forward(&render.layer_tensors())?, frame_index)?;
+        let rgb = self.tone.forward_with_exposure(
+            self.net(settings).forward(&render.layer_tensors())?,
+            frame_index,
+            self.exposure_override(),
+        )?;
         let [_, channels, height, width] = rgb.dims();
         let data = rgb
             .into_data_async()
@@ -562,5 +686,57 @@ impl Renderer {
             .into_vec::<f32>()
             .map_err(|e| format!("expected f32: {e:?}"))?;
         Ok((data, channels, height, width))
+    }
+}
+
+#[cfg(test)]
+mod exposure_tests {
+    use super::*;
+
+    const MEDIAN: Option<f32> = Some(0.25);
+
+    #[test]
+    fn auto_uses_the_view_while_pinned_and_the_median_once_moved() {
+        // Pinned: `None` means "image `frame`'s own learned EV", which is what
+        // makes a frame taken from a capture pose comparable with that photo.
+        assert_eq!(ExposureMode::Auto.resolve(true, MEDIAN), None);
+        // Moved off: the scene's grade, not whichever view was last touched.
+        assert_eq!(ExposureMode::Auto.resolve(false, MEDIAN), MEDIAN);
+    }
+
+    #[test]
+    fn the_explicit_modes_ignore_whether_the_camera_moved() {
+        for pinned in [true, false] {
+            assert_eq!(ExposureMode::View.resolve(pinned, MEDIAN), None);
+            assert_eq!(ExposureMode::Median.resolve(pinned, MEDIAN), MEDIAN);
+            assert_eq!(
+                ExposureMode::Manual(-1.5).resolve(pinned, MEDIAN),
+                Some(-1.5)
+            );
+        }
+    }
+
+    #[test]
+    fn a_scene_with_no_exposure_table_falls_back_to_the_frames_own() {
+        // `Manual` is the exception: an EV the user typed is still an EV, and
+        // the tone mapper simply has nothing to apply it to.
+        assert_eq!(ExposureMode::Auto.resolve(false, None), None);
+        assert_eq!(ExposureMode::Median.resolve(false, None), None);
+        assert_eq!(ExposureMode::Manual(2.0).resolve(false, None), Some(2.0));
+    }
+
+    #[test]
+    fn every_mode_has_a_label() {
+        assert_eq!(ExposureMode::Auto.label(), "auto");
+        assert_eq!(ExposureMode::View.label(), "view");
+        assert_eq!(ExposureMode::Median.label(), "median");
+        assert_eq!(ExposureMode::Manual(0.0).label(), "manual");
+    }
+
+    #[test]
+    fn the_manual_slider_spans_more_than_any_capture_needs() {
+        // kk-coherent's learned EVs span 2.3 stops after the exposure fix; the
+        // slider has to cover that and leave room to inspect a clipped frame.
+        assert!(MANUAL_EXPOSURE_LIMIT >= 4.0);
     }
 }

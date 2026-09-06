@@ -34,7 +34,7 @@ use eframe::egui;
 use crate::blit::{BlitCallback, BlitResources};
 use crate::bundle::Bundle;
 use crate::camera::{Controller, Mode};
-use crate::renderer::{Renderer, Settings, ViewMode};
+use crate::renderer::{ExposureMode, Renderer, Settings, ViewMode, MANUAL_EXPOSURE_LIMIT};
 
 /// How many recent frame intervals the fps readout averages over.
 const FPS_WINDOW: usize = 30;
@@ -58,6 +58,11 @@ pub struct ViewerApp {
     scene_name: String,
     mode: ViewMode,
     settings: Settings,
+    /// Which per-image exposure the tone mapper applies (panel + `X` key).
+    exposure: ExposureMode,
+    /// The EV the manual slider last held, kept across a trip through the
+    /// other modes so switching back does not reset it.
+    manual_exposure_ev: f32,
     show_panel: bool,
     intervals: std::collections::VecDeque<f64>,
     last_frame: Option<std::time::Instant>,
@@ -124,6 +129,8 @@ impl ViewerApp {
             scene_name,
             mode: ViewMode::default(),
             settings,
+            exposure: ExposureMode::default(),
+            manual_exposure_ev: 0.0,
             show_panel: true,
             intervals: std::collections::VecDeque::with_capacity(FPS_WINDOW),
             last_frame: None,
@@ -204,6 +211,9 @@ impl ViewerApp {
         ctx.input(|i| {
             if i.key_pressed(egui::Key::V) {
                 self.mode = self.mode.next();
+            }
+            if i.key_pressed(egui::Key::X) {
+                self.exposure = next_exposure_mode(self.exposure, self.manual_exposure_ev);
             }
             if i.key_pressed(egui::Key::Tab) {
                 self.show_panel = !self.show_panel;
@@ -343,7 +353,7 @@ impl ViewerApp {
             self.controller.move_speed(),
             self.controller.speed_in_scenes(),
             if self.controller.mode() == Mode::Free {
-                "scroll changes it"
+                "scroll = faster"
             } else {
                 "scroll zooms"
             },
@@ -351,8 +361,55 @@ impl ViewerApp {
         ));
         ui.label(
             "left-drag orbit/look | right- or middle-drag pan | WASD move, Q/E up/down\n\
-             R home view | N / P next / previous capture view | F orbit-free | V honesty view",
+             scroll = faster (up to 50x; in orbit mode it zooms) | F orbit-free\n\
+             R home view | N / P next / previous capture view | V honesty view | X exposure",
         );
+
+        // Exposure is the ONE per-image term of the tone mapper (white balance
+        // and vignette are frozen in every config we train), so it is the only
+        // thing that makes two views of the same scene differ in brightness,
+        // and a free-flown pose has no image whose exposure is "the right
+        // one". See docs/LIMITATIONS.md "Per-image exposure".
+        ui.horizontal(|ui| {
+            ui.label("exposure (X):");
+            let manual = ExposureMode::Manual(self.manual_exposure_ev);
+            for candidate in [ExposureMode::Auto, ExposureMode::View, ExposureMode::Median, manual] {
+                let selected = std::mem::discriminant(&self.exposure) == std::mem::discriminant(&candidate);
+                if ui.selectable_label(selected, candidate.label()).clicked() {
+                    self.exposure = candidate;
+                }
+            }
+        });
+        if let ExposureMode::Manual(_) = self.exposure {
+            if ui
+                .add(
+                    egui::Slider::new(
+                        &mut self.manual_exposure_ev,
+                        -MANUAL_EXPOSURE_LIMIT..=MANUAL_EXPOSURE_LIMIT,
+                    )
+                    .text("EV (gain = 2^-EV)"),
+                )
+                .changed()
+            {
+                self.exposure = ExposureMode::Manual(self.manual_exposure_ev);
+            }
+        }
+        let applied = self
+            .exposure
+            .resolve(self.controller.is_pinned(), self.renderer.median_exposure())
+            .or_else(|| self.renderer.view_exposure(self.controller.reference().index));
+        match applied {
+            Some(ev) => ui.label(format!(
+                "  applying EV {ev:+.3} (gain {:.2}x){}",
+                (-ev).exp2(),
+                if self.exposure == ExposureMode::Auto && self.controller.is_pinned() {
+                    " — this view's own; move off it for the scene median"
+                } else {
+                    ""
+                }
+            )),
+            None => ui.label("  this scene has no per-image exposure"),
+        };
         if self.controller.is_lost() {
             ui.colored_label(
                 egui::Color32::from_rgb(255, 200, 120),
@@ -437,6 +494,10 @@ impl eframe::App for ViewerApp {
         let reference = self.controller.reference().clone();
         let camera = self.controller.render_camera(width, height, &reference);
         let frame_index = reference.index;
+        // The renderer cannot see whether the camera is still on its reference
+        // view, and `ExposureMode::Auto` is defined in terms of exactly that.
+        self.renderer
+            .set_exposure(self.exposure, self.controller.is_pinned());
 
         match block_on(self.renderer.render(
             &camera,
@@ -482,5 +543,37 @@ impl eframe::App for ViewerApp {
         // The renderer only produces a frame when asked, and flying needs a
         // continuous stream, so never idle.
         ctx.request_repaint();
+    }
+}
+
+/// Cycle order for the `X` key: auto -> view -> median -> manual -> auto.
+///
+/// A free function so the order is testable without an egui context.
+#[must_use]
+fn next_exposure_mode(current: ExposureMode, manual_ev: f32) -> ExposureMode {
+    match current {
+        ExposureMode::Auto => ExposureMode::View,
+        ExposureMode::View => ExposureMode::Median,
+        ExposureMode::Median => ExposureMode::Manual(manual_ev),
+        ExposureMode::Manual(_) => ExposureMode::Auto,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_x_key_cycles_every_exposure_mode_and_returns() {
+        let mut mode = ExposureMode::default();
+        assert_eq!(mode, ExposureMode::Auto);
+        mode = next_exposure_mode(mode, 1.5);
+        assert_eq!(mode, ExposureMode::View);
+        mode = next_exposure_mode(mode, 1.5);
+        assert_eq!(mode, ExposureMode::Median);
+        mode = next_exposure_mode(mode, 1.5);
+        assert_eq!(mode, ExposureMode::Manual(1.5));
+        mode = next_exposure_mode(mode, 1.5);
+        assert_eq!(mode, ExposureMode::Auto);
     }
 }

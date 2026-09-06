@@ -680,6 +680,81 @@ def _cmd_bundle_launcher(args: argparse.Namespace) -> int:
     return 0
 
 
+
+def _cmd_bundle_parity(args: argparse.Namespace) -> int:
+    """`trippy bundle-parity`: render a bundle in Python and compare it with the viewer, as numbers.
+
+    The bundle directory is the whole interface between trippy's Python and
+    the Rust viewer (ADR-0006), so a disagreement between the two is either a
+    bundle bug or a viewer bug and nothing else. This command renders the
+    bundle's own view through `trippy.render.bundle_render` -- the reference
+    rasteriser, the same U-Net weights, the same tone mapper -- and prints
+    per-channel brightness, the saturated-pixel fraction and, with
+    `--compare`, the PSNR against a `trips-viewer --screenshot` PNG of the
+    same view.
+
+    It never displays an image, so it is safe on Jordan's own scenes: the
+    only thing that leaves this process is numbers (AGENTS.md Sec. 6).
+    """
+    import numpy as np
+
+    from trippy.render import bundle_render
+
+    device = pick_device(args.device)
+    bundle = bundle_render.load_bundle(args.bundle, device=device)
+    positions = (
+        [bundle.view_position(None)]
+        if not args.view
+        else [bundle.view_position(v) for v in args.view]
+    )
+    out_dir = Path(args.out) if args.out else None
+    report: dict[str, object] = {
+        "bundle": str(Path(args.bundle).resolve()),
+        "device": device.type,
+        "scale": args.scale,
+        "views": [],
+    }
+    for position in positions:
+        rgb, info = bundle_render.render_view(bundle, position, scale=args.scale)
+        rgb8 = bundle_render.to_rgb8(rgb)
+        entry: dict[str, object] = dict(info)
+        entry["python"] = bundle_render.stats(rgb8)
+        if out_dir is not None:
+            path = out_dir / f"view_{info['frame_index']:05d}_python.png"
+            bundle_render.write_png(path, rgb)
+            entry["python_png"] = str(path)
+        if args.compare:
+            match = [c for c in args.compare if f"{info['frame_index']:05d}" in Path(c).name]
+            candidate = match[0] if match else (args.compare[0] if len(positions) == 1 else None)
+            if candidate is None:
+                entry["compare"] = {"status": "no --compare PNG matches this view"}
+            else:
+                other = bundle_render.read_png(candidate)
+                if other.shape != rgb8.shape:
+                    entry["compare"] = {
+                        "status": "shape mismatch",
+                        "png": str(candidate),
+                        "png_size": [int(other.shape[1]), int(other.shape[0])],
+                    }
+                else:
+                    # `psnr` is +inf for byte-identical PNGs, which is not
+                    # valid JSON; report the fact instead of the float.
+                    value = bundle_render.psnr(rgb8, other)
+                    entry["compare"] = {
+                        "status": "ok",
+                        "png": str(candidate),
+                        "identical": value == float("inf"),
+                        "psnr_db": None if value == float("inf") else value,
+                        "max_abs_diff_8bit": int(
+                            np.abs(rgb8.astype(np.int32) - other.astype(np.int32)).max()
+                        ),
+                        "viewer": bundle_render.stats(other),
+                    }
+        report["views"].append(entry)
+    print(json.dumps(report, indent=2))
+    return 0
+
+
 def _cmd_leaderboard(args: argparse.Namespace) -> int:
     """`trippy leaderboard --out <dir> [--deliver]`: one comparison table across every run."""
     # Deferred import: pulls in PIL/yaml, which `trippy smoke`/`density` have no need for.
@@ -1236,6 +1311,31 @@ def build_parser() -> argparse.ArgumentParser:
         help="bundle directory to write (default: <run_dir>/bundle when detectable, else alongside the checkpoint)",
     )
     bundle_launcher.set_defaults(func=_cmd_bundle_launcher)
+
+    bundle_parity = sub.add_parser(
+        "bundle-parity",
+        help="render a bundle in Python and report brightness / saturation / PSNR vs a viewer screenshot",
+    )
+    bundle_parity.add_argument("--bundle", required=True, help="bundle directory (holds bundle.json)")
+    bundle_parity.add_argument(
+        "--view",
+        type=int,
+        nargs="*",
+        default=None,
+        help="dataset view indices to render (default: the bundle's own default_view)",
+    )
+    bundle_parity.add_argument(
+        "--scale", type=float, default=1.0, help="render at this fraction of the view size (viewer --scale)"
+    )
+    bundle_parity.add_argument("--out", default=None, help="directory for the Python PNGs (optional)")
+    bundle_parity.add_argument(
+        "--compare",
+        nargs="*",
+        default=None,
+        help="viewer --screenshot PNG(s) to measure PSNR against; matched to a view by its 5-digit index",
+    )
+    bundle_parity.add_argument("--device", choices=["cpu", "mps"], default=None, help="render device")
+    bundle_parity.set_defaults(func=_cmd_bundle_parity)
 
     leaderboard = sub.add_parser(
         "leaderboard",

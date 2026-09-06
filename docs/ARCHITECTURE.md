@@ -19,7 +19,9 @@ trippy/
 │                render->photo only), config_a/gaussian_input/gsrender_live (design A,
 │                render + TRIPS pyramid together inside train/'s own Trainer)
 ├── train/       trainer loop, config, eval harness, export to 3DGS PLY
-├── render/      dolly camera paths, off-path rendering, video export, honesty sheets
+├── render/      dolly camera paths, off-path rendering, video export, honesty sheets,
+│                bundle.py (the `trippy-bundle-1` writer) and bundle_render.py
+│                (the Python twin of the Rust viewer, for numeric parity)
 └── cli.py       command-line interface, smoke tests
 ```
 
