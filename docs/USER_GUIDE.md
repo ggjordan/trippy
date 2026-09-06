@@ -166,6 +166,84 @@ rust/target/release/trips-viewer <bundle folder>
 
 or with no argument at all, and it opens a folder picker.
 
+## The Blend panel: splat vs TRIPS, with a slider
+
+Only appears on a **hybrid** scene trained with the blend gate. On every other scene the
+viewer looks exactly as it always has.
+
+A hybrid run draws the scene from two things at once: your Gaussian splat, and TRIPS's point
+cloud. Until now, how much of any pixel came from which was buried in the network's weights.
+The Blend panel puts it on screen and puts a slider on it.
+
+**Press `B`** to cycle the five modes, or click them in the panel:
+
+| Mode | What you get |
+|---|---|
+| **TRIPS only** | the network's own frame, no splat mixed in. The default, and the frame every number in the run's report was measured on. |
+| **splat only** | the Gaussian render at this pose, on its own. |
+| **gated blend** | what the run itself chose, per pixel. |
+| **manual mix** | you choose one blend for the whole frame. |
+| **split screen** | splat on the left, TRIPS on the right, same pose, one slider to move the seam. |
+
+Two sliders:
+
+- **gate scale** (gated blend only), **0 to 2**. 0 is pure TRIPS, 1 is what training chose, 2
+  pushes every pixel the network already leaned towards the splat all the way to the splat.
+  This is the knob for "the network was too shy / too eager about the Gaussians".
+- **mix** (manual mix only), **0 = splat, 1 = TRIPS**. This one ignores what the network
+  learned and just crossfades.
+
+### The honest limitation, and what is coming
+
+Right now the splat half comes from **precomputed renders of the capture views**, carried
+inside the bundle (a `splat.npz` next to `bundle.json`: a dozen views, downscaled to 512 px
+on the long edge). So:
+
+- On a capture view that has one — press `N`/`P` to step between them, or use "jump to view" —
+  every mode works.
+- The moment you fly off a capture view, there is no splat for *that pose*. The panel greys out
+  the modes that need one and says so. **It will not fade to black and it will not reuse the
+  view you just left**, because a stored render is a picture of the Gaussians taken from that
+  view's camera — showing it at your new pose would be showing a photograph of somewhere else.
+  (The training code refuses the same substitution, for the same reason.) Press `R` or `N`/`P`
+  to sit back on a capture view.
+
+The panel tells you how many of the scene's views carry a render.
+
+**Coming next: live splat rendering.** The bundle already records the path to the Gaussian
+`.ply` the splat half came from. The follow-up wires Brush's own Gaussian renderer
+(`brush-render`, in the `rust/brush-trips` submodule) into the viewer so the splat is rendered
+at *your* pose, wherever you fly — at which point the cap of a dozen views and the greying-out
+both disappear. The plumbing it needs (the shared wgpu device, the Burn tensor bridge into
+egui's render pass, the patched shader stack) is already in place and working; what is left is
+the camera conversion and a packed-RGBA8 branch in the blit shader.
+
+### From the command line
+
+Useful for making two frames to compare side by side:
+
+```
+rust/target/release/trips-viewer <bundle> --blend-mode mix --mix 0 --screenshot splat.png
+rust/target/release/trips-viewer <bundle> --blend-mode mix --mix 1 --screenshot trips.png
+rust/target/release/trips-viewer <bundle> --blend-mode gated --gate-scale 2 --screenshot pushed.png
+rust/target/release/trips-viewer <bundle> --blend-mode split --split 0.5 --screenshot split.png
+```
+
+### The gate map, as a picture
+
+Every eval of a gate run writes a **heatmap of the mix** per held-out frame, at
+`<run>/eval_ep*/gate/<name>.gate.png`, and the candidate report writes one per dolly frame at
+`<report>/dolly/frames/<pose>/gate.png`. Dark is TRIPS, bright is splat. These are drawn from
+the gate values alone and contain no photograph, so they are safe for anyone (and any agent) to
+open. `report.json` carries the same thing as numbers: mean and percentiles.
+
+To re-score a finished run at a different mix without retraining:
+
+```
+trippy eval --checkpoint <run>/checkpoints/checkpoint_best.pt --gate-scale 0
+trippy eval --checkpoint <run>/checkpoints/checkpoint_best.pt --gate-scale 2
+```
+
 ## How to open the TRIPS viewer in a web browser (Mac, v0.5.0)
 
 The same scene, the same renderer, in a browser tab instead of an app window.

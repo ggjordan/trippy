@@ -32,7 +32,7 @@ use burn::tensor::module::interpolate;
 use burn::tensor::ops::{InterpolateMode, InterpolateOptions};
 use burn::tensor::{Device, Tensor, TensorData};
 
-use crate::config::{UnetConfig, GATED_KERNEL, GATED_PADDING, UPSAMPLE_SCALE};
+use crate::config::{UnetConfig, GATED_KERNEL, GATED_PADDING, GATE_CHANNEL, RGB_CHANNELS, UPSAMPLE_SCALE};
 use crate::weights::{HostTensor, Weights};
 
 /// ELU's `alpha`. PyTorch's `nn.ELU()` and libtorch's both default to 1.
@@ -398,4 +398,61 @@ impl Unet {
             .forward(state)
             .cast(Precision::F32))
     }
+
+    /// Split a `forward` result into `(rgb, gate)`.
+    ///
+    /// `rgb` is channels `0..RGB_CHANNELS` -- byte for byte what a gate-less
+    /// network of the same weights emits, which is why the tone mapper needs no
+    /// change. `gate` is `sigmoid(out[GATE_CHANNEL])`, the per-pixel weight on
+    /// the Gaussian splat, or `None` when this network has no gate head.
+    ///
+    /// Mirrors `trippy.hybrid.gate.split_output`; the two must agree channel
+    /// for channel or a Python-trained checkpoint renders differently here.
+    #[must_use]
+    pub fn split_gate(&self, out: Tensor<4>) -> (Tensor<4>, Option<Tensor<4>>) {
+        if !self.config.has_gate() {
+            return (out, None);
+        }
+        let rgb = out.clone().slice_dim(1, 0..RGB_CHANNELS);
+        let gate = burn::tensor::activation::sigmoid(
+            out.slice_dim(1, GATE_CHANNEL..GATE_CHANNEL + 1),
+        );
+        (rgb, Some(gate))
+    }
+}
+
+/// `g * splat + (1 - g) * trips`, with `g = clamp(gate * scale, 0, 1)`.
+///
+/// The Rust twin of `trippy.hybrid.gate.blend`. Both extremes are exact: at
+/// `scale = 0` the result is `trips` unchanged, and wherever `gate * scale >= 1`
+/// it is `splat` unchanged.
+///
+/// # Errors
+/// Returns `Err` when the three tensors do not share a spatial size, or when
+/// `splat`/`trips` are not 3-channel.
+pub fn blend_gate(
+    splat: Tensor<4>,
+    trips: Tensor<4>,
+    gate: Tensor<4>,
+    scale: f32,
+) -> Result<Tensor<4>, String> {
+    let [_, splat_c, splat_h, splat_w] = splat.dims();
+    let [_, trips_c, trips_h, trips_w] = trips.dims();
+    let [_, gate_c, gate_h, gate_w] = gate.dims();
+    if splat_c != RGB_CHANNELS || trips_c != RGB_CHANNELS {
+        return Err(format!(
+            "blend_gate needs {RGB_CHANNELS}-channel operands, got splat={splat_c} trips={trips_c}"
+        ));
+    }
+    if gate_c != 1 {
+        return Err(format!("blend_gate needs a 1-channel gate, got {gate_c}"));
+    }
+    if (splat_h, splat_w) != (trips_h, trips_w) || (gate_h, gate_w) != (trips_h, trips_w) {
+        return Err(format!(
+            "blend_gate needs matching spatial sizes, got splat={splat_h}x{splat_w} \
+             trips={trips_h}x{trips_w} gate={gate_h}x{gate_w}"
+        ));
+    }
+    let g = gate.mul_scalar(scale).clamp(0.0, 1.0);
+    Ok(g.clone().mul(splat).add(g.neg().add_scalar(1.0).mul(trips)))
 }

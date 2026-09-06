@@ -134,6 +134,56 @@ def _first_extent_record(extent_gate: dict | None) -> dict | None:
     return plys[0] if plys else None
 
 
+def gate_summary(held_out_metrics: dict, dolly_metrics: dict | None = None) -> dict | None:
+    """The blend gate's numbers for `report.json`, or None on a gate-less run.
+
+    Pulls the held-out eval's gate block (mean/percentiles of the per-pixel
+    splat weight, plus the `gate_scale` it was rendered at) and, when the dolly
+    render produced one, its own -- the two answer different questions: the eval
+    gate is measured at photographed poses where a precomputed splat render
+    exists, the dolly gate at poses where the splat had to be rendered live (or
+    could not be, `n_frames_without_splat`).
+
+    Returns None -- and the caller then writes no "gate" key at all -- when the
+    run was trained without the gate, so an old report and a gate-off report are
+    the same document they always were.
+    """
+    heldout = held_out_metrics.get("gate")
+    dolly = (dolly_metrics or {}).get("gate")
+    if not heldout and not dolly:
+        return None
+    out: dict = {}
+    if heldout:
+        out["held_out"] = heldout
+    if dolly:
+        out["dolly"] = dolly
+    return out
+
+
+def gate_markdown(gate: dict | None) -> str:
+    """One markdown line per gate block, or "" when the run had no gate.
+
+    Goes into the run README under the comparison table so the mix is visible
+    next to the PSNR it produced -- a gate mean is not a quality number and must
+    not be read as one, but "17.9 dB with 80% of the pixels coming from the
+    splat" and "17.9 dB with 5%" are very different results.
+    """
+    if not gate:
+        return ""
+    lines = ["", "### Blend gate (0 = TRIPS, 1 = splat)", ""]
+    for where, block in gate.items():
+        pcts = block.get("percentiles", {})
+        spread = " ".join(f"{k}={v:.3f}" for k, v in pcts.items())
+        extra = ""
+        if block.get("n_frames_without_splat"):
+            extra = f", {block['n_frames_without_splat']} frame(s) had no splat to blend"
+        lines.append(
+            f"- **{where}** ({block.get('n_frames', 0)} frames, gate_scale "
+            f"{block.get('gate_scale', 1.0):g}): mean {block['mean']:.3f}, {spread}{extra}"
+        )
+    return "\n".join(lines) + "\n"
+
+
 def heldout_split(held_out_metrics: dict) -> dict:
     """`{"shade": {...}, "other": {...}}` from `Trainer.evaluate()`'s held-out split, or `{}` each.
 
@@ -584,7 +634,8 @@ def run_train_report(trainer: Trainer, held_out_metrics: dict) -> dict:
         "held_out", "heldout_split": {"shade", "other"}, "dolly", "offpath",
         "audits": {"candidate", "baseline"}, "bundle": {"bundle_dir",
         "viewer"}, "summary_line", "deliveries"}` (`deliveries[0]` is always
-        the Mac viewer launcher) -- also written
+        the Mac viewer launcher), plus `"gate"` on a blend-gate run
+        (`gate_summary`) -- also written
         to `<run_dir>/report/report.json`, with the comparison table,
         summary line, and deliveries list (launcher first) appended to
         `<run_dir>/README.md`, and the bundle itself written to
@@ -658,9 +709,13 @@ def run_train_report(trainer: Trainer, held_out_metrics: dict) -> dict:
         _deliver(export_path, f"{run_name}-export", line),
     ]
 
+    gate = gate_summary(held_out_metrics, dolly_metrics)
     readme_path = _ensure_run_readme(run_dir)
     with open(readme_path, "a") as f:
-        f.write(f"\n## Report: epoch {epoch}\n\n{line}\n\n{_deliveries_markdown(deliveries)}\n\n{table}\n")
+        f.write(
+            f"\n## Report: epoch {epoch}\n\n{line}\n\n{_deliveries_markdown(deliveries)}\n\n"
+            f"{table}\n{gate_markdown(gate)}"
+        )
 
     report = {
         "checkpoint": str(checkpoint_path),
@@ -677,6 +732,8 @@ def run_train_report(trainer: Trainer, held_out_metrics: dict) -> dict:
         "summary_line": line,
         "deliveries": deliveries,
     }
+    if gate is not None:
+        report["gate"] = gate
     (out_dir / CANDIDATE_REPORT_JSON_FILENAME).write_text(json.dumps(report, indent=2) + "\n")
 
     # Jordan always has one up-to-date "trips-leaderboard" sheet: rebuild it from every

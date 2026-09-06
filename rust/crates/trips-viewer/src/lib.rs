@@ -23,6 +23,7 @@
 //!       needed — only the discipline of not calling it.
 //! Related docs: `docs/WEB_VIEWER.md`; `docs/decisions/ADR-0006-viewer-integration.md`.
 
+pub mod blend;
 pub mod bundle;
 pub mod camera;
 pub mod renderer;

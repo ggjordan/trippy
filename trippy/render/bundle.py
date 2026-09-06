@@ -65,13 +65,40 @@ Related docs: docs/GEOMETRY.md (frames, up vector), docs/TRIPS_REFERENCE.md
                     index), name, width, height, fx, fy, cx, cy,
                     R (9 floats, row-major world-to-camera),
                     t (3 floats), distortion (8 floats, Saiga order).
+    blend           OPTIONAL, present only on a hybrid (design A) run
+                    (`BlendInfo`): gate (bool -- whether the weights carry the
+                    gate head), gate_channel (int, always 3), gate_scale
+                    (float), splat_ply (str, "" if none), splat_renders (str
+                    filename, "" if none), splat_views (array positions with a
+                    stored Gaussian block), splat_scale (float), mask_by_alpha
+                    (bool), channels (the block's groups, in
+                    HYBRID_A_CHANNEL_ORDER), mode ("all_levels" |
+                    "concat_level0") and feature_channels (C). A reader that
+                    does not know the key ignores it, and a bundle without it is
+                    byte-for-byte the document it always was -- which is why
+                    `format` stays `trippy-bundle-1`.
+
+-- splat.npz (only alongside a `blend` block) --------------------------------
+    view_<p>        (H, W, 3) uint8,   the block's rgb channels for `views[p]`,
+                    downscaled by `blend.splat_scale`.
+    alpha_<p>       (H, W)    uint8,   the block's alpha channel.
+    depth_<p>       (H, W)    float32, the block's NORMALISED depth channel
+                    (already divided by the run's `depth_scale`).
+Only the groups `blend.channels` lists are written. Plain uncompressed `.npz`,
+i.e. exactly what `brush_pyramid::npz` already reads (`|u1` and `<f4`; it has no
+float16, which is why depth is f32), so the viewer gains no dependency.
+
+This archive is what makes a hybrid bundle **renderable at all**: a design-A
+network's `in_channels` is `feature_channels + G`, so without the block there is
+nothing to feed channels C..C+G and the U-Net fails at the first forward. The
+Blend panel's splat half is then the same pixels, for free.
 """
 
 from __future__ import annotations
 
 import copy
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -79,6 +106,9 @@ import numpy as np
 import torch
 
 from trippy.constants import (
+    HYBRID_A_GATE_CHANNEL_INDEX,
+    HYBRID_A_GATE_SCALE_DEFAULT,
+    HYBRID_A_MODES,
     RASTER_ALPHA_MIN,
     RASTER_MAX_FRAGS,
     RASTER_T_CUTOFF,
@@ -95,10 +125,55 @@ if TYPE_CHECKING:  # pragma: no cover -- typing only, keeps import cost off the 
 #: Wire format tag written into `bundle.json`; bump on any breaking change.
 BUNDLE_FORMAT = "trippy-bundle-1"
 
-#: The three files a bundle directory contains. Nothing else is written.
+#: The three files every bundle directory contains. A blend-gate bundle adds a
+#: fourth, `BUNDLE_SPLAT_FILENAME` -- and only that one.
 BUNDLE_JSON_FILENAME = "bundle.json"
 BUNDLE_POINTS_FILENAME = "points.npz"
 BUNDLE_WEIGHTS_FILENAME = "weights.safetensors"
+
+#: Precomputed Gaussian-splat renders for the viewer, as a plain uncompressed
+#: `.npz` -- the same container `points.npz` uses, so the Rust side reads it with
+#: `brush_pyramid::npz` and gains no new dependency. Members, per array position:
+#:   `view_<p>`  (H, W, 3) uint8   the block's rgb channels
+#:   `alpha_<p>` (H, W)    uint8   the block's alpha channel
+#:   `depth_<p>` (H, W)    float32 the block's NORMALISED depth channel
+#: (only the groups `blend.channels` lists are written). Only present when the
+#: source actually has renders (a hybrid run); absent otherwise, and the viewer's
+#: Blend panel is then simply unavailable.
+#:
+#: This archive is **not only** the Blend panel's splat half. A design-A network
+#: takes `feature_channels + G` input channels, so without the Gaussian block a
+#: hybrid bundle's U-Net cannot be run at all -- the viewer would have nothing to
+#: feed channels 4..9 and would fail at the first forward. Carrying the block is
+#: what makes a hybrid bundle renderable in the first place; the splat half of
+#: the blend then falls out of it for free, because it is literally the same
+#: pixels the network is shown.
+BUNDLE_SPLAT_FILENAME = "splat.npz"
+
+#: Depth is stored float32, not uint8: rgb and alpha are [0, 1] and quantise to
+#: 8 bits with no visible loss, but the normalised depth channel is an unbounded
+#: positive number the network was trained on directly, and rounding it to 256
+#: levels would change what it sees. `brush_pyramid::npz` reads `<f4` and `|u1`
+#: and no float16, so these two are the available choices.
+BUNDLE_SPLAT_DEPTH_DTYPE = "float32"
+
+#: How many views get a precomputed splat render. A full capture is hundreds of
+#: 1008-wide frames -- 756 of them is over a gigabyte, which is not a bundle, it
+#: is a second copy of the dataset. Twelve is enough to step between and see the
+#: mix change at several places in the scene, and costs ~19 MB at
+#: `BUNDLE_SPLAT_MAX_DIM`. The live path (rendering the PLY in the viewer, see
+#: `blend.splat_ply`) is what removes the cap; until it lands this is the
+#: honest limit and `blend.splat_views` says exactly which views have one.
+BUNDLE_SPLAT_MAX_VIEWS = 12
+
+#: Longest edge of a stored splat render, in pixels. Downscaled from the run's
+#: own render resolution rather than stored at it: the panel compares *where*
+#: the splat and TRIPS disagree, which survives a halving, and the alternative
+#: is a bundle bigger than the checkpoint that produced it. The cost is real and
+#: worth stating: a view rendered at 1080p upsamples this block on the way into
+#: the network, so a hybrid bundle's frame is close to, not identical with, the
+#: run's own eval frame. The live path removes that too.
+BUNDLE_SPLAT_MAX_DIM = 512
 
 #: Scene up vector for the viewer's orbit controls. COLMAP/ADOP put +Y *down*
 #: (docs/GEOMETRY.md "Camera conventions" and "ADOP format for COLMAP export",
@@ -229,6 +304,80 @@ class BundleParams:
 
 
 @dataclass
+class BlendInfo:
+    """The `blend:` block of `bundle.json`: everything a viewer needs to mix.
+
+    Present only on a bundle exported from a run trained with the blend gate
+    (`hybrid.gate.enabled`). A viewer that does not understand it ignores the
+    key; a bundle without it is byte-for-byte the document every previous
+    bundle was, which is why `BUNDLE_FORMAT` does **not** change.
+
+    Attributes:
+        gate: whether `weights.safetensors` carries the gate head. Always True
+            here (the block is not written otherwise), but explicit so the
+            document is readable on its own.
+        gate_channel: which U-Net output channel is the gate logit (3).
+        gate_scale: the run's own default scale; the viewer's slider starts here.
+        splat_ply: absolute path to the Gaussian PLY the splat half came from,
+            or "" if the run recorded none. This is what the **live** splat path
+            (rendering the PLY in the viewer through Brush's `brush-render`)
+            will open; it is carried now so a bundle exported today is already
+            complete when that lands.
+        splat_renders: filename of the precomputed render archive
+            (`BUNDLE_SPLAT_FILENAME`), or "" when none were written.
+        splat_views: array positions into `views` that have a precomputed
+            render. The viewer offers splat-only / blend / split-screen at
+            exactly these and says so plainly at the others -- inventing a
+            splat image for a pose that has none would be precisely the kind of
+            fabricated pixel this project refuses to ship.
+        splat_scale: the fraction of each view's own size the stored render was
+            downscaled to (1.0 = full size).
+        mask_by_alpha: whether the stored rgb is already alpha-masked. Recorded
+            so a reader never has to guess whether to multiply -- the gate's
+            splat half is "the splat where the splat exists", which is the
+            masked render either way.
+        channels: the Gaussian block's channel groups, in
+            `HYBRID_A_CHANNEL_ORDER`, exactly as the network was trained with.
+            This is what tells a reader the block's width `G` and which members
+            of `splat.npz` to expect.
+        mode: `"all_levels"` or `"concat_level0"` -- how the block reaches the
+            U-Net's pyramid levels (`trippy.hybrid.gaussian_input.attach`). A
+            reader that pooled it to every level on a `concat_level0` run would
+            feed the network something it was never trained on.
+        feature_channels: `C`, the TRIPS feature width, so a reader can check
+            `C + G` against the weight file's own `in_channels`.
+    """
+
+    gate: bool
+    gate_channel: int
+    gate_scale: float
+    splat_ply: str = ""
+    splat_renders: str = ""
+    splat_views: list[int] = field(default_factory=list)
+    splat_scale: float = 1.0
+    mask_by_alpha: bool = True
+    channels: list[str] = field(default_factory=list)
+    mode: str = HYBRID_A_MODES[0]
+    feature_channels: int = 0
+
+    def to_json(self) -> dict[str, Any]:
+        """This block as plain JSON types."""
+        return {
+            "gate": bool(self.gate),
+            "gate_channel": int(self.gate_channel),
+            "gate_scale": float(self.gate_scale),
+            "splat_ply": str(self.splat_ply),
+            "splat_renders": str(self.splat_renders),
+            "splat_views": [int(v) for v in self.splat_views],
+            "splat_scale": float(self.splat_scale),
+            "mask_by_alpha": bool(self.mask_by_alpha),
+            "channels": [str(c) for c in self.channels],
+            "mode": str(self.mode),
+            "feature_channels": int(self.feature_channels),
+        }
+
+
+@dataclass
 class BundleSource:
     """Everything `write_bundle` needs, independent of which loader built it.
 
@@ -247,6 +396,14 @@ class BundleSource:
             (converted to an array position by `write_bundle`).
         metadata: extra string->string entries merged into the
             safetensors `__metadata__` block.
+        blend: the blend-gate block (`BlendInfo`), or None on a run with no
+            gate -- in which case `bundle.json` gets no "blend" key and no
+            `splat.npz` is written, i.e. exactly the bundle this produced
+            before the gate existed.
+        splat_renders: `{array position: {"rgb": (H, W, 3), "alpha": (H, W),
+            "depth": (H, W)}}` for the views `blend.splat_views` lists -- the
+            Gaussian block's own channels, in the block's own normalisation.
+            Held out of `BlendInfo` because it is pixels, not schema.
     """
 
     name: str
@@ -261,6 +418,8 @@ class BundleSource:
     views: list[BundleView]
     default_view_index: int = NATIVE_DEFAULT_VIEW_INDEX
     metadata: dict[str, str] | None = None
+    blend: BlendInfo | None = None
+    splat_renders: dict[int, dict[str, np.ndarray]] = field(default_factory=dict)
 
     @property
     def num_points(self) -> int:
@@ -437,6 +596,13 @@ def _as_f32(array: torch.Tensor | np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(np.asarray(array, dtype=np.float32))
 
 
+def _to_u8(array: np.ndarray) -> np.ndarray:
+    """Clamp a float image in [0, 1] to a C-contiguous uint8 array."""
+    return np.ascontiguousarray(
+        np.round(np.clip(np.asarray(array, dtype=np.float32), 0.0, 1.0) * 255.0).astype(np.uint8)
+    )
+
+
 def bundle_document(source: BundleSource) -> dict[str, Any]:
     """Build `bundle.json`'s document for `source` (no file is written).
 
@@ -454,7 +620,7 @@ def bundle_document(source: BundleSource) -> dict[str, Any]:
             source.camera.exposures_values.detach().cpu().numpy().reshape(-1),
             default_index,
         )
-    return {
+    document: dict[str, Any] = {
         "format": BUNDLE_FORMAT,
         "name": source.name,
         "points": BUNDLE_POINTS_FILENAME,
@@ -467,10 +633,13 @@ def bundle_document(source: BundleSource) -> dict[str, Any]:
         "default_view": default_view_position(source.views, default_index),
         "views": [view.to_json() for view in source.views],
     }
+    if source.blend is not None:
+        document["blend"] = source.blend.to_json()
+    return document
 
 
 def write_bundle(source: BundleSource, out_dir: str | Path) -> Path:
-    """Write `source` as a bundle directory: the three files, nothing else.
+    """Write `source` as a bundle directory: the three files, plus `splat.npz` on a blend bundle.
 
     Args:
         source: the loaded scene (see `load_trips_bundle` /
@@ -516,7 +685,40 @@ def write_bundle(source: BundleSource, out_dir: str | Path) -> Path:
     }
     metadata.update(exposure_metadata)
     metadata.update(source.metadata or {})
-    export(source.net, camera, out / BUNDLE_WEIGHTS_FILENAME, extra_metadata=metadata)
+    blend = source.blend
+    if blend is not None:
+        metadata["gate"] = "1"
+        metadata["gate_scale"] = str(float(blend.gate_scale))
+        metadata["splat_ply"] = blend.splat_ply
+    export(
+        source.net,
+        camera,
+        out / BUNDLE_WEIGHTS_FILENAME,
+        extra_metadata=metadata,
+        gate=None if blend is None else blend.gate,
+        gate_scale=HYBRID_A_GATE_SCALE_DEFAULT if blend is None else blend.gate_scale,
+    )
+
+    splat_path = out / BUNDLE_SPLAT_FILENAME
+    if source.splat_renders:
+        # uint8, uncompressed: the same container and dtype rules
+        # `brush_pyramid::npz` already reads (it converts `|u1` to f32 itself).
+        arrays: dict[str, np.ndarray] = {}
+        for position, planes in sorted(source.splat_renders.items()):
+            if "rgb" in planes:
+                arrays[f"view_{position}"] = _to_u8(planes["rgb"])
+            if "alpha" in planes:
+                arrays[f"alpha_{position}"] = _to_u8(planes["alpha"])
+            if "depth" in planes:
+                # float32, not uint8 -- see BUNDLE_SPLAT_DEPTH_DTYPE.
+                arrays[f"depth_{position}"] = np.ascontiguousarray(
+                    np.asarray(planes["depth"], dtype=np.float32)
+                )
+        np.savez(splat_path, **arrays)
+    elif splat_path.exists():
+        # Re-exporting a gate-less checkpoint over an old blend bundle must not
+        # leave a stale splat archive that `blend` no longer refers to.
+        splat_path.unlink()
 
     document = bundle_document(source)
     (out / BUNDLE_JSON_FILENAME).write_text(json.dumps(document, indent=2) + "\n")
@@ -835,6 +1037,125 @@ def native_params(cfg: Any) -> BundleParams:
     )
 
 
+def splat_view_positions(views: list[BundleView], default_position: int, limit: int) -> list[int]:
+    """Which array positions get a precomputed splat render (see `BUNDLE_SPLAT_MAX_VIEWS`).
+
+    The default view first -- it is the frame the viewer opens on, and a Blend
+    panel that is greyed out on the very first frame is a Blend panel nobody
+    trusts -- then positions spread evenly across the rest, so stepping through
+    them walks the whole capture rather than one corner of it.
+
+    Args:
+        views: the bundle's views, in serialisation order.
+        default_position: array position of the view the bundle opens at.
+        limit: cap on how many positions are returned.
+
+    Returns:
+        Sorted, deduplicated array positions; at most `min(limit, len(views))`.
+    """
+    if not views or limit <= 0:
+        return []
+    chosen = {max(0, min(default_position, len(views) - 1))}
+    remaining = limit - 1
+    if remaining > 0 and len(views) > 1:
+        step = max(1, len(views) // (remaining + 1))
+        for position in range(0, len(views), step):
+            if len(chosen) >= limit:
+                break
+            chosen.add(position)
+    return sorted(chosen)[:limit]
+
+
+def native_splat_renders(
+    trainer: Any,
+    views: list[BundleView],
+    positions: list[int],
+    max_dim: int = BUNDLE_SPLAT_MAX_DIM,
+) -> tuple[dict[int, dict[str, np.ndarray]], float]:
+    """Read the run's own Gaussian block for `positions`, downscaled to `max_dim`.
+
+    Reuses `GaussianInputs.frame` -- the exact loader, normalisation and alpha
+    masking the network was trained with -- rather than re-rendering the PLY, so
+    what the viewer feeds the network is what the run fed it, and the splat half
+    of the blend is literally the same pixels. A view whose render triple is
+    missing is skipped silently (design A's `missing: zeros` policy means such
+    frames legitimately exist).
+
+    Returns:
+        `({position: {"rgb": (h, w, 3), "alpha": (h, w), "depth": (h, w)}},
+        scale)` -- only the groups `cfg.hybrid.channels` lists, each in the
+        block's own units (rgb/alpha unitless in [0, 1], depth already divided by
+        `depth_scale`), and `scale` the fraction of the views' own size kept.
+    """
+    hybrid = getattr(trainer, "hybrid", None)
+    if hybrid is None or not positions:
+        return {}, 1.0
+    cfg = trainer.cfg.hybrid
+
+    longest = max(max(v.width, v.height) for v in views)
+    scale = min(1.0, float(max_dim) / float(longest)) if longest > 0 else 1.0
+
+    out: dict[int, dict[str, np.ndarray]] = {}
+    for position in positions:
+        view = views[position]
+        if not hybrid.has(view.name):
+            continue
+        height = max(1, round(view.height * scale))
+        width = max(1, round(view.width * scale))
+        block = hybrid.frame(view.name, (height, width))
+        if block is None:
+            continue
+        planes: dict[str, np.ndarray] = {}
+        for group in cfg.channels:
+            values = block[cfg.channel_slice(group)]
+            if group == "rgb":
+                planes["rgb"] = values.permute(1, 2, 0).cpu().numpy()
+            else:
+                planes[group] = values[0].cpu().numpy()
+        out[position] = planes
+    return out, scale
+
+
+def native_blend(trainer: Any, views: list[BundleView], default_position: int) -> tuple[
+    BlendInfo | None, dict[int, dict[str, np.ndarray]]
+]:
+    """The `blend:` block and its splat renders for a trippy-native run, or `(None, {})`.
+
+    Written for **any** design-A run, gate or not (`blend.gate` says which). The
+    block is not an optional extra there: a design-A network takes
+    `feature_channels + G` input channels, so a bundle without it cannot run its
+    own U-Net at all. Before this, exporting a hybrid checkpoint produced a
+    bundle that failed at the first forward with "expected 9 channels, got 4";
+    that is the bug this fixes, and the Blend panel's splat half is the same
+    pixels, for free.
+
+    None -- and therefore no "blend" key in `bundle.json` and no `splat.npz` --
+    on a non-hybrid run. That is the whole backwards-compatibility story:
+    nothing about an existing bundle changes.
+    """
+    cfg_hybrid = getattr(trainer.cfg, "hybrid", None)
+    if cfg_hybrid is None or not cfg_hybrid.enabled:
+        return None, {}
+    positions = splat_view_positions(views, default_position, BUNDLE_SPLAT_MAX_VIEWS)
+    renders, scale = native_splat_renders(trainer, views, positions)
+    return (
+        BlendInfo(
+            gate=bool(cfg_hybrid.gate_enabled),
+            gate_channel=HYBRID_A_GATE_CHANNEL_INDEX,
+            gate_scale=float(getattr(trainer, "gate_scale", cfg_hybrid.gate_scale)),
+            splat_ply=str(cfg_hybrid.ply_path or ""),
+            splat_renders=BUNDLE_SPLAT_FILENAME if renders else "",
+            splat_views=sorted(renders),
+            splat_scale=scale,
+            mask_by_alpha=bool(cfg_hybrid.mask_by_alpha),
+            channels=list(cfg_hybrid.channels),
+            mode=str(cfg_hybrid.mode),
+            feature_channels=int(trainer.cfg.feature_channels),
+        ),
+        renders,
+    )
+
+
 def load_native_bundle(checkpoint: Path, name: str | None = None) -> BundleSource:
     """Build a `BundleSource` from a trippy-native checkpoint (`trippy train`).
 
@@ -861,6 +1182,10 @@ def load_native_bundle(checkpoint: Path, name: str | None = None) -> BundleSourc
     with torch.no_grad():
         size = points.size()
         conf = points.conf()
+    views = native_views(trainer)
+    blend, splat_renders = native_blend(
+        trainer, views, default_view_position(views, NATIVE_DEFAULT_VIEW_INDEX)
+    )
     return BundleSource(
         name=name or Path(trainer.cfg.run_dir).name,
         xyz=_as_f32(points.xyz),
@@ -871,9 +1196,11 @@ def load_native_bundle(checkpoint: Path, name: str | None = None) -> BundleSourc
         net=trainer.net,
         camera=trainer.camera,
         params=native_params(trainer.cfg),
-        views=native_views(trainer),
+        views=views,
         default_view_index=NATIVE_DEFAULT_VIEW_INDEX,
         metadata={"checkpoint": str(path), "scene": str(trainer.cfg.scene_root), "kind": "native"},
+        blend=blend,
+        splat_renders=splat_renders,
     )
 
 

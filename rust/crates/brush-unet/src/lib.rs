@@ -49,13 +49,13 @@ pub mod camera;
 #[cfg(feature = "gpu")]
 pub mod net;
 
-pub use config::{CameraConfig, UnetConfig};
-pub use weights::{HostTensor, Weights};
+pub use config::{CameraConfig, UnetConfig, GATE_CHANNEL, RGB_CHANNELS};
+pub use weights::{GateConfig, HostTensor, Weights};
 
 #[cfg(feature = "gpu")]
 pub use camera::NeuralCamera;
 #[cfg(feature = "gpu")]
-pub use net::{combine_bridge, GatedBlock, UpBlock, Unet};
+pub use net::{blend_gate, combine_bridge, upload, GatedBlock, UpBlock, Unet};
 
 /// Repository root, derived from this crate's manifest directory.
 ///

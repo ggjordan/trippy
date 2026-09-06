@@ -415,9 +415,11 @@ rust/
 │       ├── examples/render_frame_full.rs  whole frame -> PNG + per-stage ms
 │       └── tests/{schema_cpu,parity_gpu}.rs
 │   └── trips-viewer/                the native Mac viewer (v0.4.0, ADR-0006)
-│       ├── src/bundle.rs            the `trippy-bundle-1` reader
+│       ├── src/bundle.rs            the `trippy-bundle-1` reader (+ the optional
+│       │                             `blend` block and its `splat.npz`)
+│       ├── src/blend.rs             the Blend panel's modes and sliders
 │       ├── src/camera.rs            fly camera -> brush_pyramid::Camera per frame
-│       ├── src/renderer.rs          one frame; the performance levers
+│       ├── src/renderer.rs          one frame; the performance levers; the blend
 │       ├── src/app.rs               egui shell, ms/fps readout, view toggle
 │       ├── src/blit.rs + shaders/   bind a Burn buffer into egui's render pass
 │       └── src/main.rs              window, --screenshot, --bench, --profile
@@ -460,8 +462,13 @@ L x CubeTensor (P, C)   the flat composited buffer
                         `Tensor<4>` [1, C, h_l, w_l] per layer  (zero-copy)
    -> Unet              start gated block on the coarsest level, then L-1
                         upsample blocks (bilinear x2, CombineBridge centre-crop,
-                        gated conv), then a 1x1 conv to RGB
+                        gated conv), then a 1x1 conv to RGB -- or to RGB + the
+                        blend gate's own channel on a `hybrid.gate` run, in
+                        which case the gate is split off here and only the
+                        three colour channels go on
    -> NeuralCamera      x * 2**-ev  ->  wb * x  ->  vignette(uv) * x  ->  LUT(x)
+   -> blend gate        g * splat_rgb + (1 - g) * trips_rgb   (gate runs only;
+                        after the tone mapper, see "The blend gate" below)
    -> [1, 3, H, W] display RGB
 ```
 
@@ -499,6 +506,11 @@ fly camera (WASD/drag)  -> brush_pyramid::Camera  (R row-major, t, fx/fy/cx/cy,
    -> render_pyramid_uploaded              the six kernels above, binding the
                                            resident buffers -- no upload
    -> Unet + NeuralCamera                  (view mode "network" only)
+   -> Renderer::compose                    the Blend panel: TRIPS / splat / gated /
+                                           mix / split, all as Burn tensor ops on
+                                           the device, producing the SAME planar
+                                           CHW buffer -- so blit.wgsl, the shader
+                                           uniforms and --screenshot are unchanged
    -> resolve_to_cube_float                back to one bindable buffer
    -> egui paint callback + blit.wgsl      fullscreen triangle samples it
 ```
@@ -735,3 +747,30 @@ Design A's three load-bearing decisions:
 
 `enabled: false` is the default and a hard no-op: `Trainer.hybrid is None`, the network keeps
 its old width, and every code path is the pre-design-A one.
+
+### The blend gate (`trippy/hybrid/gate.py`, v0.5.x)
+
+Design A makes the mix of splat and TRIPS *implicit in the weights*. `hybrid.gate` makes it an
+explicit tensor: **one extra U-Net output channel**, whose sigmoid is a per-pixel weight `g`,
+with `final = g * splat_rgb + (1 - g) * trips_rgb`. Its four load-bearing decisions:
+
+1. **Only the output widens, and colour stays first.**
+   `TrainConfig.net_output_channels = 3 + (1 if gate else 0)`. `net_out[:, :3]` is bit-identical
+   to what a gate-less network of the same weights emits, so the tone mapper, the calibration
+   fit, the honesty artifacts and the Rust blit shader all need no change at all.
+2. **The blend is applied after the tone mapper.** Both operands are then display-referred, and
+   the splat -- rendered from a 3DGS fitted to these same photos -- already has its exposure
+   baked in. It also makes `gate_scale = 0` exactly the TRIPS path and a saturated gate exactly
+   the splat, which is what the tests assert as equalities rather than tolerances.
+3. **A missing splat is never blended.** `apply_gate` returns the prediction untouched when
+   there is no Gaussian block, for the same reason design A's decision 3 exists: an all-zero
+   stand-in is honest as *input*, and a lie as *output*.
+4. **`gate_scale` is a viewing knob, not a training one.** Training always blends at 1.0;
+   `trippy eval --gate-scale`, `candidate-report --gate-scale` and the viewer's Blend panel move
+   it afterwards. `Trainer.gate_scale` is therefore a runtime attribute seeded from the
+   checkpoint's own `hybrid.gate_scale`, not a config read at every call site.
+
+Wire format: the gate is extra **rows** of `unet.final.weight`/`.bias`, not a new tensor, so
+`brush_unet::weights`' "no unknown tensor" schema rule is untouched; `gate`/`gate_channel`/
+`gate_scale` metadata is written only when the gate is on, so a gate-less export is
+byte-identical to the file it used to be. See docs/EXPERIMENTS.md "The blend gate".

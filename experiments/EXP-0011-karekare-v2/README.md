@@ -222,12 +222,52 @@ from EXP-0010's 1M to **4M**, since this cloud is ~4× `kkc_15000`.
 | `config_unmasked.yaml` | `kkv2-2-full-unmasked` | `use_masks: false`. Otherwise byte-identical |
 | `config_removal.yaml` | `kkv2-3-removal` | + EXP-0010 arm A' point removal (`mode: relative`) |
 | `config_hybrid.yaml` | `kkv2-5-hybrid` | + design A: the `kklid_20000` render fed to the U-Net |
+| `config_hybrid_gate.yaml` | `kkv2-7-hybrid-gate` | `config_hybrid.yaml` + the **blend gate** (see below) |
 
-All five carry `eval_exposure_mode: neighbours`, `forced_heldout_mode: alternate`, the same
+All six carry `eval_exposure_mode: neighbours`, `forced_heldout_mode: alternate`, the same
 99-frame shade list, `heldout_k: 16`, and **absolute** `run_dir`s under
 `/Users/nzbirdranch/trippy/output/runs/EXP-0011-karekare-v2/` (these are queued from the
 `.worktrees/karekare-v2` worktree; a relative `run_dir` would resolve inside it and be lost
 when the worktree is removed — the way EXP-0005's renders were).
+
+### The blend-gate arm (`config_hybrid_gate.yaml`, `kkv2-7-hybrid-gate`)
+
+Byte-identical to `config_hybrid.yaml` except the `run_dir` and four keys at the bottom of the
+`hybrid:` block, so "gate vs no gate on karekare-v2" is a one-variable comparison against
+`kkv2-5-hybrid`:
+
+```yaml
+  gate:
+    enabled: true          # one extra U-Net output channel: g in [0, 1]
+  gate_prior:
+    target: 0.5
+    weight: 0.0            # OFF -- see below
+  gate_scale: 1.0          # the default mix eval/report/viewer open at
+```
+
+**What it buys.** `kkv2-5-hybrid` can tell us *whether* feeding the splat to the U-Net helps.
+It cannot tell us *where*, or *how much*, because the mix is implicit in the weights. This arm
+makes it a tensor: the displayed image is `g * splat_rgb + (1 - g) * trips_rgb`, and every eval
+writes the gate map out as a heatmap (`eval_ep*/gate/*.gate.png`, from-scratch colour ramp, no
+photographed pixels) plus mean/percentiles in `metrics.json` and `report.json`. See
+docs/EXPERIMENTS.md "The blend gate".
+
+**Read the map, not just the PSNR.** Three outcomes are interesting, in order:
+
+1. The gate is a **structured map** rather than a constant — the two renderers are genuinely
+   complementary, which is design A's whole thesis.
+2. The gate is near 0 in the shade — TRIPS is carrying the big tree and the splat is not.
+3. The gate is near 1 in the shade — the splat is, and TRIPS is not.
+
+A constant map either way says the mix is not where the win is.
+
+**Why the prior is off.** The first question is "what mix does this scene choose when nothing
+pushes it?"; a prior would answer a different one. If the unpushed answer is degenerate, re-run
+with `weight: 0.1` and `target: 0.2` / `0.8` and see what the scene gives up.
+
+**Nothing has to be retrained to change the mix.** `trippy eval --gate-scale 0|1|2` re-scores
+the same checkpoint at pure TRIPS / as trained / pushed-to-splat, `trippy candidate-report
+--gate-scale` re-renders it, and the viewer's Blend panel moves it live.
 
 ### Hybrid renders
 
@@ -294,8 +334,15 @@ before the hybrid:
 | 4 | `trippy-kkv2-3-removal` | `scripts/queue_training.sh experiments/EXP-0011-karekare-v2/config_removal.yaml --max-minutes 420` |
 | 5–7 | `trippy-kkv2-4-render-{1,2,3}` | `scripts/gpu_submit.sh --train kkv2-4-render-N -- python -m trippy.hybrid.render_splat_views --scene …/karekare-v2 --ply …/kklid_20000.ply --out $TRIPPY_OUTPUT/hybrid-v2/renders/w1008 --width 1008 --device mps --start-index S --end-index E` (shards 0–252, 252–504, 504–756) |
 | 8 | `trippy-kkv2-5-hybrid` | `scripts/queue_training.sh experiments/EXP-0011-karekare-v2/config_hybrid.yaml --max-minutes 420` |
+| 9 | `trippy-kkv2-7-hybrid-gate` | `scripts/gpu_submit.sh --prio 45 kkv2-7-hybrid-gate -- trippy train --config <abs>/experiments/EXP-0011-karekare-v2/config_hybrid_gate.yaml --report --max-minutes 420` |
 
-All eight returned `submit.sh rc=0`; the exact lines are also in `research/trips-metal.md`.
+Job 9 is at **prio 45** (the hybrid band under the 2026-09-07 queue policy) and is named
+`kkv2-7`, not `-6`, so that once the earlier kkv2 jobs are rebanded to prio 40 the filename
+order keeps it behind `kkv2-6-shade-prune`. **Until that rebanding happens it sorts ahead of
+them** (they are still at 70) and ahead of Splats' own `60-hunua-run01` — reband the kkv2 jobs
+before this one's turn comes, or hold it.
+
+The first eight returned `submit.sh rc=0`; the exact lines are also in `research/trips-metal.md`.
 
 **`--max-minutes 420` will not reach epoch 300.** At ~664 steps/epoch the full run is
 ~15 h; the budget stops it cleanly at roughly epoch 150 with a checkpoint and an eval
@@ -321,6 +368,11 @@ _Placeholders — filled in as each run reports._
 | `kkv2-2-full-unmasked` | | | | | | | |
 | `kkv2-3-removal` | | | | | | | |
 | `kkv2-5-hybrid` | | | | | | | |
+| `kkv2-7-hybrid-gate` | | | | | | | |
+
+For `kkv2-7-hybrid-gate`, also record the gate: mean and p5/p50/p95 from
+`report.json`'s `gate.held_out` block, whether the map is structured or constant, and the
+held-out PSNR re-scored at `--gate-scale 0` (pure TRIPS) and `2` (pushed to the splat).
 
 Baselines to beat: EXP-0003 `full2-broadcast` on `kk-coherent` scored all 17.12 dB / shade
 15.27 dB under neighbour-exposure eval, against plain Gaussians at 15.53 / 14.94. Those are

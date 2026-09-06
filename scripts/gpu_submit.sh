@@ -2,6 +2,7 @@
 # gpu_submit.sh — submit a self-contained job to Splats' GPU queue.
 # Usage: scripts/gpu_submit.sh [--prio N | --train] [--wait] [--dry-run] <name> -- <command...>
 #   Default prio 15 (trippy short jobs live at 10-19). --train sets prio 70 (behind Splats' 60).
+#   Trainings from 2026-09-07: --prio 40 (target scene), 45 (hybrids), 50 (other trippy runs).
 #   --wait  block until done and print the log (execs scripts/gpu_wait.sh).
 #   --dry-run  write and print the job file only; skip all queue/runner/memory checks and never
 #              calls Splats' submit.sh or writes to research/trips-metal.md.
@@ -50,8 +51,16 @@ CMD=("$@")
 case "$PRIO" in
   ''|*[!0-9]*) echo "✗ --prio must be numeric" >&2; exit 2 ;;
 esac
-if [ "$PRIO" -lt 10 ] || { [ "$PRIO" -gt 19 ] && [ "$PRIO" -ne 70 ]; }; then
-  echo "✗ prio must be 10-19 (trippy short jobs) or 70 (trainings, behind Splats' 60)." >&2
+# Bands (AGENTS.md "GPU and compute"): 10-19 trippy short jobs; from 2026-09-07 trippy
+# manages the queue, so trainings use 40 (target-scene runs), 45 (hybrids) and 50 (other).
+# 70 is kept because every job queued before that change sits there and must stay valid.
+PRIO_OK=0
+if [ "$PRIO" -ge 10 ] && [ "$PRIO" -le 19 ]; then PRIO_OK=1; fi
+if [ "$PRIO" -ge 40 ] && [ "$PRIO" -le 59 ]; then PRIO_OK=1; fi
+if [ "$PRIO" -eq 70 ]; then PRIO_OK=1; fi
+if [ "$PRIO_OK" -ne 1 ]; then
+  echo "✗ prio must be 10-19 (trippy short jobs), 40-59 (trainings: 40 target scene," >&2
+  echo "  45 hybrids, 50 other) or 70 (pre-2026-09-07 trainings, behind Splats' 60)." >&2
   echo "  Jordan can override this by editing the scripts/gpu_submit.sh call." >&2
   exit 2
 fi

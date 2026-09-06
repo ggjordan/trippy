@@ -334,6 +334,7 @@ def _cmd_eval(args: argparse.Namespace) -> int:
         calibrate=True if args.calibrate else None,
         calibrate_white_balance=True if args.calibrate_wb else None,
         exposure_mode=args.exposure_mode,
+        gate_scale=args.gate_scale,
     )
     shade, other = metrics.get("shade") or {}, metrics.get("other") or {}
     shade_eval, other_eval = metrics.get("shade_eval") or {}, metrics.get("other_eval") or {}
@@ -358,6 +359,15 @@ def _cmd_eval(args: argparse.Namespace) -> int:
         print(f"psnr_mean_calibrated: {metrics.get('psnr_mean_calibrated')}")
         print(f"shade (calibrated): n={shade_c.get('n')} psnr={shade_c.get('psnr')} ssim={shade_c.get('ssim')}")
         print(f"other (calibrated): n={other_c.get('n')} psnr={other_c.get('psnr')} ssim={other_c.get('ssim')}")
+    gate = metrics.get("gate")
+    if gate:
+        pcts = gate.get("percentiles", {})
+        spread = " ".join(f"{k}={v:.3f}" for k, v in pcts.items())
+        print(
+            f"gate (0=TRIPS, 1=splat) at gate_scale {gate['gate_scale']:g}: "
+            f"mean={gate['mean']:.3f} {spread}"
+        )
+        print(f"gate heatmaps: <eval dir>/{gate['heatmaps']}/")
     print(_per_image_diagnostics_table(metrics))
     return 0
 
@@ -887,6 +897,22 @@ def _candidate_report_readme(report: dict) -> str:
     if "videos" in dolly:
         lines.append(f"- Video (network output): `{dolly['videos']['net']}`")
         lines.append(f"- Video (raw level-0): `{dolly['videos']['raw']}`")
+    gate = report.get("gate")
+    if gate:
+        lines.append("")
+        lines.append("## Blend gate (0 = TRIPS, 1 = splat)")
+        for where, block in gate.items():
+            pcts = " ".join(f"{k}={v:.3f}" for k, v in block.get("percentiles", {}).items())
+            lines.append(
+                f"- {where}: mean {block['mean']:.3f} ({pcts}) at gate_scale "
+                f"{block.get('gate_scale', 1.0):g}, {block.get('n_frames', 0)} frames"
+                + (
+                    f", {block['n_frames_without_splat']} with no splat to blend"
+                    if block.get("n_frames_without_splat")
+                    else ""
+                )
+            )
+        lines.append("- Per-frame heatmaps: `frames/<pose>/gate.png`")
     if "honesty_sheet" in dolly:
         lines.append(f"- Honesty sheet: `{dolly['honesty_sheet']}`")
 
@@ -953,6 +979,7 @@ def _cmd_candidate_report(args: argparse.Namespace) -> int:
         device=str(device),
         write_video_files=True,
         stop_at_low_coverage=True,
+        gate_scale=args.gate_scale,
     )
     offpath_metrics = render_candidate(
         args.checkpoint,
@@ -960,6 +987,7 @@ def _cmd_candidate_report(args: argparse.Namespace) -> int:
         out_dir / CANDIDATE_REPORT_OFFPATH_DIRNAME,
         device=str(device),
         write_video_files=False,
+        gate_scale=args.gate_scale,
     )
 
     audits = audit_report([str(export_path)], scene_root / "sparse_txt", frames=None)
@@ -973,6 +1001,14 @@ def _cmd_candidate_report(args: argparse.Namespace) -> int:
         "offpath": offpath_metrics,
         "audits": audits,
     }
+    if dolly_metrics.get("gate") or offpath_metrics.get("gate"):
+        # The mix these renders were made at, so a report read months later is not
+        # ambiguous about which slider position produced its pictures.
+        report["gate"] = {
+            k: v
+            for k, v in (("dolly", dolly_metrics.get("gate")), ("offpath", offpath_metrics.get("gate")))
+            if v
+        }
     (out_dir / CANDIDATE_REPORT_JSON_FILENAME).write_text(json.dumps(report, indent=2) + "\n")
     (out_dir / CANDIDATE_REPORT_README_FILENAME).write_text(_candidate_report_readme(report))
 
@@ -1156,6 +1192,14 @@ def build_parser() -> argparse.ArgumentParser:
             "'calibrate' (the --calibrate fit above, promoted to the headline number). Default: "
             "the checkpoint's own cfg.eval_exposure_mode ('neighbours' unless the run set it "
             "explicitly)."
+        ),
+    )
+    ev.add_argument(
+        "--gate-scale",
+        type=float,
+        default=None,
+        help=(
+            "blend-gate scale (hybrid runs trained with hybrid.gate.enabled only): multiply the trained per-pixel splat weight g by this and clamp back into [0, 1]. 0 = pure TRIPS, 1 = the mix training chose, 2 = pushed all the way to the splat wherever the gate already leaned that way. Default: the checkpoint's own hybrid.gate_scale. Silently ignored on a checkpoint with no gate."
         ),
     )
     ev.set_defaults(func=_cmd_eval)
@@ -1396,6 +1440,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="comma-separated registered image names for off-path honesty poses (default: SHADE_FRAMES_KK)",
     )
     candidate_report.add_argument("--device", choices=["cpu", "mps"], default=None, help="override the checkpoint's device")
+    candidate_report.add_argument(
+        "--gate-scale",
+        type=float,
+        default=None,
+        help=(
+            "blend-gate scale for every render in this report (hybrid runs trained with "
+            "hybrid.gate.enabled only): 0 = pure TRIPS, 1 = the mix training chose, 2 = "
+            "pushed all the way to the splat. Default: the checkpoint's own "
+            "hybrid.gate_scale. Silently ignored on a checkpoint with no gate."
+        ),
+    )
     candidate_report.set_defaults(func=_cmd_candidate_report)
 
     distill = sub.add_parser(

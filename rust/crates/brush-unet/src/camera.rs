@@ -89,11 +89,21 @@ impl NeuralCamera {
             (None, [0.0, 0.0])
         };
         let response = if config.enable_response {
-            let host = weights.get("camera.response")?;
-            // `[O, P]` -> `[1, O*P]`: one flat LUT the per-channel gather
+            // `get_shaped`, not `get`: a shape disagreement between the file and this
+            // reader must be a message, never a `reshape` panic three lines later.
+            let host = weights.get_shaped(
+                "camera.response",
+                &[RGB, config.response_params],
+            )?;
+            // `[RGB, P]` -> `[1, RGB*P]`: one flat LUT the per-channel gather
             // indexes with `channel * P + i`.
-            let flat: Tensor<2> = upload::<2>(host, device)?
-                .reshape([1, config.response_params * weights.unet.out_channels]);
+            //
+            // RGB, **not** `unet.out_channels`: the tone mapper is colour-only, and
+            // a blend-gate network emits a fourth channel that is never tone-mapped
+            // (see `brush_unet::config::GATE_CHANNEL`). Using `out_channels` here
+            // reshaped a [3, P] tensor to [1, 4*P] and panicked at load.
+            let flat: Tensor<2> =
+                upload::<2>(host, device)?.reshape([1, config.response_params * RGB]);
             Some(flat)
         } else {
             None

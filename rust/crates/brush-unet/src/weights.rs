@@ -22,7 +22,7 @@ use std::path::Path;
 
 use safetensors::tensor::{Dtype, SafeTensors};
 
-use crate::config::{CameraConfig, UnetConfig, EXPORT_FORMAT};
+use crate::config::{CameraConfig, UnetConfig, EXPORT_FORMAT, GATE_CHANNEL, RGB_CHANNELS};
 
 /// One tensor, host-side.
 #[derive(Debug, Clone, PartialEq)]
@@ -56,7 +56,37 @@ pub struct Weights {
     pub unet: UnetConfig,
     /// Tone-mapper shape, or `None` when `has_camera = 0`.
     pub camera: Option<CameraConfig>,
+    /// The blend gate's parameters, or `None` on a three-channel file.
+    pub gate: Option<GateConfig>,
     tensors: HashMap<String, HostTensor>,
+}
+
+/// The blend gate declared by a weight file's metadata.
+///
+/// Present exactly when the exporter wrote a `gate = "1"` key, which it does
+/// only for a four-channel network (`trippy.net.export_safetensors`). A file
+/// written before the gate existed has no such key and yields `None` here, so
+/// every existing bundle loads unchanged.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GateConfig {
+    /// Output-channel index of the gate logit; always [`GATE_CHANNEL`].
+    pub channel: usize,
+    /// The run's own default `gate_scale`: the trained gate is multiplied by it
+    /// and the product clamped back into `[0, 1]`. 0 renders the pure TRIPS
+    /// path, 1 the mix training chose, 2 pushes towards the splat. A viewer
+    /// starts its slider here and may move it freely.
+    pub scale: f32,
+}
+
+impl GateConfig {
+    /// The effective per-pixel weight for a raw gate value: `clamp(g * s, 0, 1)`.
+    ///
+    /// The one place the scaling rule lives, so the viewer, a headless
+    /// screenshot and `trippy.hybrid.gate.effective_gate` cannot disagree.
+    #[must_use]
+    pub fn effective(gate: f32, scale: f32) -> f32 {
+        (gate * scale).clamp(0.0, 1.0)
+    }
 }
 
 fn meta_get<'a>(meta: &'a HashMap<String, String>, key: &str) -> Result<&'a str, String> {
@@ -102,6 +132,36 @@ impl Weights {
             num_layers: meta_usize(&metadata, "num_layers")?,
         };
         unet.validate()?;
+
+        // The gate is optional and additive: an absent key means the original
+        // three-channel schema. A file that declares one but has no fourth
+        // channel (or the reverse) is a corrupt export, not something to guess at.
+        let declares_gate = metadata.get("gate").map(String::as_str) == Some("1");
+        if declares_gate != unet.has_gate() {
+            return Err(format!(
+                "metadata says gate={declares_gate} but out_channels={} (the gate is \
+                 channel {GATE_CHANNEL}, i.e. out_channels must be {})",
+                unet.out_channels,
+                RGB_CHANNELS + 1
+            ));
+        }
+        let gate = if declares_gate {
+            let channel = meta_usize(&metadata, "gate_channel")?;
+            if channel != GATE_CHANNEL {
+                return Err(format!(
+                    "gate_channel = {channel} is not implemented in the Burn port \
+                     (only {GATE_CHANNEL}, i.e. rgb first, is)"
+                ));
+            }
+            Some(GateConfig {
+                channel,
+                scale: meta_get(&metadata, "gate_scale")?
+                    .parse::<f32>()
+                    .map_err(|e| format!("metadata key \"gate_scale\": {e}"))?,
+            })
+        } else {
+            None
+        };
 
         // The Burn port only implements what TRIPS actually ships; anything
         // else would silently render something different.
@@ -160,6 +220,7 @@ impl Weights {
             metadata,
             unet,
             camera,
+            gate,
             tensors,
         };
         weights.check_schema()?;
@@ -221,8 +282,11 @@ impl Weights {
                 ("camera.vignette_params".into(), vec![3]),
                 ("camera.vignette_center".into(), vec![2]),
                 (
+                    // RGB, never `out_channels`: the gate is not tone-mapped, so the
+                    // response LUT keeps exactly three rows whether or not the network
+                    // emits a fourth channel.
                     "camera.response".into(),
-                    vec![self.unet.out_channels, camera.response_params],
+                    vec![RGB_CHANNELS, camera.response_params],
                 ),
             ];
             let required = camera.weight_keys();

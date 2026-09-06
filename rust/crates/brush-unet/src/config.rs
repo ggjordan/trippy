@@ -32,6 +32,22 @@ pub const UPSAMPLE_SCALE: usize = 2;
 /// `format` metadata value this crate can read.
 pub const EXPORT_FORMAT: &str = "trippy-unet-1";
 
+/// Colour channels of the displayed image. The tone mapper is RGB-only
+/// (`NeuralCamera` applies a per-channel response LUT with exactly three rows),
+/// so this is fixed even when the network emits more.
+pub const RGB_CHANNELS: usize = 3;
+
+/// Output-channel index of the blend gate's logit, when present.
+///
+/// The gate (trippy design A, `trippy.hybrid.gate`) is ONE extra channel after
+/// the three colour ones: `out[..3]` is rgb exactly as before, and
+/// `sigmoid(out[3])` is the per-pixel weight on the Gaussian splat, so the
+/// displayed image is `g * splat + (1 - g) * trips`. Colour stays first
+/// precisely so that everything downstream of the U-Net -- the tone mapper, the
+/// blit shader, the screenshot path -- keeps reading channels 0..3 and needs no
+/// change.
+pub const GATE_CHANNEL: usize = RGB_CHANNELS;
+
 /// Shape of `MultiScaleUnet2dDecOnlySmallFixed`.
 ///
 /// Defaults are TRIPS's shipped `train_normalnet.ini` values, i.e. what
@@ -40,7 +56,8 @@ pub const EXPORT_FORMAT: &str = "trippy-unet-1";
 pub struct UnetConfig {
     /// `C`: channels per raw pyramid input (the rasteriser's feature width).
     pub in_channels: usize,
-    /// `O`: channels of the final image (RGB).
+    /// `O`: channels the final 1x1 conv emits: RGB, plus the blend gate's own
+    /// channel when [`UnetConfig::has_gate`] (see [`GATE_CHANNEL`]).
     pub out_channels: usize,
     /// `F`: the constant channel budget at every level.
     pub filters: usize,
@@ -61,12 +78,31 @@ impl Default for UnetConfig {
 }
 
 impl UnetConfig {
+    /// True when the final conv carries the blend gate's extra channel.
+    ///
+    /// Derived from the channel count rather than stored, so a weight file
+    /// written before the gate existed (three channels, no `gate` metadata key)
+    /// is read exactly as it always was.
+    #[must_use]
+    pub const fn has_gate(&self) -> bool {
+        self.out_channels > RGB_CHANNELS
+    }
+
     /// Validate the channel bookkeeping.
     ///
     /// # Errors
-    /// Returns `Err` if `num_layers < 2` or `filters <= 2 * in_channels`
-    /// (either makes a block's output width zero or negative).
+    /// Returns `Err` if `num_layers < 2`, `filters <= 2 * in_channels`
+    /// (either makes a block's output width zero or negative), or
+    /// `out_channels` is neither `RGB_CHANNELS` nor `RGB_CHANNELS + 1` --
+    /// the only two layouts the schema defines.
     pub fn validate(&self) -> Result<(), String> {
+        if self.out_channels != RGB_CHANNELS && self.out_channels != RGB_CHANNELS + 1 {
+            return Err(format!(
+                "out_channels must be {RGB_CHANNELS} (rgb) or {} (rgb + blend gate); got {}",
+                RGB_CHANNELS + 1,
+                self.out_channels
+            ));
+        }
         if self.num_layers < 2 {
             return Err(format!(
                 "num_layers must be >= 2 (a decoder-only U-Net needs a start block and at \

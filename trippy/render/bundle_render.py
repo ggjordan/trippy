@@ -38,13 +38,19 @@ Related docs: docs/decisions/ADR-0006-viewer-integration.md ("the bundle
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
 
+from trippy.constants import (
+    HYBRID_A_CHANNEL_WIDTHS,
+    HYBRID_A_GATE_CHANNEL_INDEX,
+    NET_DEFAULT_NUM_OUTPUT_CHANNELS,
+)
+from trippy.hybrid.gaussian_input import resample_to
 from trippy.net.camera_model import NeuralCamera, NeuralCameraConfig
 from trippy.net.export_safetensors import read_safetensors
 from trippy.net.unet import MultiScaleUnet2dDecOnlySmallFixed, NetworkConfig
@@ -86,6 +92,10 @@ class LoadedBundle:
         net: the U-Net with the bundle's weights loaded, in eval mode.
         camera: the tone mapper with the bundle's parameters, in eval mode.
         metadata: the safetensors `__metadata__` block.
+        blend: `bundle.json`'s `blend` block on a hybrid (design A) bundle,
+            else None. A design-A network takes `C + G` input channels, so
+            without this the pyramid alone cannot be fed to it.
+        splats: the Gaussian block per dataset image index, from `splat.npz`.
     """
 
     directory: Path
@@ -98,6 +108,11 @@ class LoadedBundle:
     net: MultiScaleUnet2dDecOnlySmallFixed
     camera: NeuralCamera | None
     metadata: dict[str, str]
+    #: `bundle.json`'s optional `blend` block, or None on a non-hybrid bundle.
+    blend: dict[str, Any] | None = None
+    #: `{dataset image index: {"rgb"/"alpha"/"depth": (h, w[, 3]) float32}}`
+    #: decoded from `splat.npz`; empty without one.
+    splats: dict[int, dict[str, np.ndarray]] = field(default_factory=dict)
 
     def view_position(self, dataset_index: int | None) -> int:
         """Array position in `manifest["views"]` for a dataset image index.
@@ -252,6 +267,8 @@ def load_bundle(directory: str | Path, device: torch.device | str = "cpu") -> Lo
     tensors, metadata = read_safetensors(directory / manifest.get("weights", BUNDLE_WEIGHTS_FILENAME))
     background = manifest.get("background") or None
     camera = build_camera(tensors, metadata)
+    blend = manifest.get("blend")
+    splats = _load_splats(directory, manifest, blend)
     return LoadedBundle(
         directory=directory,
         manifest=manifest,
@@ -265,7 +282,85 @@ def load_bundle(directory: str | Path, device: torch.device | str = "cpu") -> Lo
         net=build_net(tensors, metadata).to(device),
         camera=None if camera is None else camera.to(device),
         metadata=metadata,
+        blend=blend,
+        splats=splats,
     )
+
+
+def _load_splats(
+    directory: Path, manifest: dict[str, Any], blend: dict[str, Any] | None
+) -> dict[int, dict[str, np.ndarray]]:
+    """Decode `splat.npz` into `{dataset image index: planes}` (see `LoadedBundle`).
+
+    Keyed by dataset index rather than array position so a renderer can look one
+    up from the view it is drawing. A missing or unreadable archive gives `{}`:
+    the network then sees zeros in its Gaussian channels, which is design A's own
+    "no Gaussian information here" state, not a fabrication.
+    """
+    if not blend or not blend.get("splat_renders"):
+        return {}
+    path = directory / str(blend["splat_renders"])
+    if not path.exists():
+        return {}
+    views = manifest.get("views", [])
+    out: dict[int, dict[str, np.ndarray]] = {}
+    with np.load(path) as archive:
+        for position in blend.get("splat_views", []):
+            if not 0 <= int(position) < len(views):
+                continue
+            planes: dict[str, np.ndarray] = {}
+            for group, key in (("rgb", "view"), ("alpha", "alpha"), ("depth", "depth")):
+                name = f"{key}_{int(position)}"
+                if name not in archive:
+                    continue
+                values = np.asarray(archive[name], dtype=np.float32)
+                # rgb/alpha are stored uint8; depth is already float32 and
+                # already normalised, so it is taken verbatim.
+                planes[group] = values / 255.0 if group != "depth" else values
+            if planes:
+                out[int(views[int(position)]["index"])] = planes
+    return out
+
+
+def gaussian_block(
+    bundle: LoadedBundle, frame_index: int, image_hw: tuple[int, int]
+) -> torch.Tensor | None:
+    """The `(1, G, H, W)` Gaussian block for `frame_index`, or None.
+
+    Reassembles the block in `blend["channels"]` order -- the same order
+    `trippy.hybrid.gaussian_input.block_from_arrays` writes it -- and resamples
+    it to `image_hw` exactly as `trippy.hybrid.gaussian_input.resample_to` does
+    (area when shrinking, bilinear when growing). None when this bundle has no
+    blend block; an all-zero block when it has one but this view carries no
+    render.
+    """
+    if not bundle.blend:
+        return None
+    channels = [str(c) for c in bundle.blend.get("channels", [])]
+    width = sum(HYBRID_A_CHANNEL_WIDTHS.get(group, 0) for group in channels)
+    if width == 0:
+        return None
+    height, image_width = int(image_hw[0]), int(image_hw[1])
+    planes = bundle.splats.get(int(frame_index))
+    if planes is None:
+        return torch.zeros((1, width, height, image_width), dtype=torch.float32)
+
+    parts: list[torch.Tensor] = []
+    for group in channels:
+        values = planes.get(group)
+        if values is None:
+            parts.append(torch.zeros((HYBRID_A_CHANNEL_WIDTHS.get(group, 1), 1, 1)))
+            continue
+        tensor = torch.from_numpy(np.ascontiguousarray(values, dtype=np.float32))
+        tensor = tensor.permute(2, 0, 1) if tensor.dim() == 3 else tensor.unsqueeze(0)
+        parts.append(tensor)
+    # A group with no stored plane was appended at 1x1; broadcast it to the block's
+    # own size before stacking, so its channels are honest zeros of the right shape.
+    stored = [p for p in parts if p.shape[-1] > 1 or p.shape[-2] > 1]
+    block_hw = (stored[0].shape[-2], stored[0].shape[-1]) if stored else (height, image_width)
+    parts = [p if p.shape[-2:] == block_hw else p.expand(p.shape[0], *block_hw) for p in parts]
+    block = torch.cat(parts, dim=0).unsqueeze(0)
+    return resample_to(block, (height, image_width))
 
 
 def view_camera(view: dict[str, Any], scale: float) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
@@ -345,7 +440,35 @@ def render_view(
             pixel_center=str(params["pixel_center"]),
             pyramid_halving=str(params["halving"]),
         )
-        net_out = bundle.net([layer.unsqueeze(0) for layer in layers])
+        frame_index_for_block = int(view["index"])
+        inputs = [layer.unsqueeze(0) for layer in layers]
+        block = gaussian_block(bundle, frame_index_for_block, (height, width))
+        if block is not None:
+            # Mirror `GaussianInputs.attach`: the block is pooled to each level's
+            # own size in `all_levels` mode, and only level 0 carries it in
+            # `concat_level0` mode (the coarser levels get zeros, whose width is
+            # still G because the U-Net requires every level to be the same).
+            all_levels = str((bundle.blend or {}).get("mode", "all_levels")) != "concat_level0"
+            attached = []
+            for level, x in enumerate(inputs):
+                hw = (x.shape[-2], x.shape[-1])
+                if level > 0 and not all_levels:
+                    extra = x.new_zeros((1, block.shape[1], hw[0], hw[1]))
+                else:
+                    extra = resample_to(block, hw).to(x.device, x.dtype)
+                attached.append(torch.cat([x, extra], dim=1))
+            inputs = attached
+        net_out = bundle.net(inputs)
+        # A blend-gate bundle's network emits a fourth channel (the gate logit).
+        # `bundle-parity` compares the TRIPS half against the viewer's own TRIPS
+        # frame, so the colour channels are what it renders; the gate is reported
+        # as a number rather than blended, because the splat half of the blend
+        # lives in `splat.npz` and is a *viewer* concern (see
+        # `trippy.hybrid.gate` and docs/USER_GUIDE.md "The Blend panel").
+        gate = None
+        if net_out.shape[1] > NET_DEFAULT_NUM_OUTPUT_CHANNELS:
+            gate = torch.sigmoid(net_out[:, HYBRID_A_GATE_CHANNEL_INDEX : HYBRID_A_GATE_CHANNEL_INDEX + 1])
+            net_out = net_out[:, :NET_DEFAULT_NUM_OUTPUT_CHANNELS]
         frame_index = int(view["index"])
         if bundle.camera is not None:
             index = torch.tensor([frame_index], device=device, dtype=torch.long)
@@ -363,6 +486,8 @@ def render_view(
         "height": height,
         "exposure_ev": exposure,
         "exposure_gain": None if exposure is None else float(2.0**-exposure),
+        # None on a bundle with no gate, so an old parity report is unchanged.
+        "gate_mean": None if gate is None else float(gate.mean().item()),
         # `aux["t_final"]` is one tensor per pyramid level; level 0 is the one
         # the honesty sheets call "coverage".
         "coverage_mean": float((1.0 - aux["t_final"][0]).clamp(0.0, 1.0).mean().item()),

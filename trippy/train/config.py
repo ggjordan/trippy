@@ -35,10 +35,12 @@ from trippy.constants import (
     EVAL_EXPOSURE_MODES,
     FORCED_HELDOUT_MODE_ALL,
     FORCED_HELDOUT_MODES,
+    HYBRID_A_GATE_CHANNELS,
     LOSS_DEFAULT_WEIGHT_L1,
     LOSS_DEFAULT_WEIGHT_LPIPS,
     LOSS_DEFAULT_WEIGHT_SSIM,
     LOSS_DEFAULT_WEIGHT_VGG,
+    NET_DEFAULT_NUM_OUTPUT_CHANNELS,
     RASTER_MODES,
     RASTER_PIXEL_CENTERS,
     RASTER_PYRAMID_HALVINGS,
@@ -351,6 +353,19 @@ class TrainConfig:
         `feature_channels`, i.e. the pre-design-A value.
         """
         return self.feature_channels + (self.hybrid.num_channels if self.hybrid.enabled else 0)
+
+    @property
+    def net_output_channels(self) -> int:
+        """Channels the U-Net emits: rgb, plus the blend gate's own channel if enabled.
+
+        The colour channels stay first (`net_out[:, :3]`), so the tone mapper,
+        `Trainer.calibrate_frame` and every honesty artifact are unchanged and a
+        gate-off run is bit-identical to a build without the gate -- see
+        `trippy.hybrid.gate`.
+        """
+        return NET_DEFAULT_NUM_OUTPUT_CHANNELS + (
+            HYBRID_A_GATE_CHANNELS if self.hybrid.gate_enabled else 0
+        )
 
     @property
     def lock_cameras_epochs(self) -> int:
