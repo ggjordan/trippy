@@ -443,9 +443,16 @@ pub struct SceneScale {
 }
 
 /// Default fly speed, as a multiple of [`SceneScale::median_spacing`] per
-/// second: one second of held `W` advances half the gap between two capture
-/// positions, which is a step, not a teleport.
-pub const BASE_SPEED_FRACTION: f32 = 0.5;
+/// second: one second of held `W` crosses two capture positions.
+///
+/// Was 0.5 (half a gap per second) until 2026-09-06. That is a step rather
+/// than a teleport, which was the right instinct and the wrong number: on
+/// kk-coherent the median gap between consecutive photographs is ~0.2 world
+/// units, so half a gap per second crossed the 15-unit capture area in about
+/// two and a half minutes of held `W` and Jordan reported he "moves so slow he
+/// can't explore the areas he wants". At 2.0 the same traverse is ~40 s, and
+/// the scroll wheel reaches [`crate::camera::MAX_SPEED_SCALE`] x that.
+pub const BASE_SPEED_FRACTION: f32 = 2.0;
 
 /// Fallback spacing for a bundle whose views are all in one place: this
 /// fraction of the camera box's diagonal.
@@ -788,8 +795,8 @@ mod scene_scale_tests {
         assert!((scene.bounds.min[0] - 0.0).abs() < 1e-6);
         assert!((scene.bounds.max[0] - 8.0).abs() < 1e-6);
         assert!((scene.median_spacing - 2.0).abs() < 1e-6);
-        // 0.5 x the median spacing per second.
-        assert!((scene.base_speed() - 1.0).abs() < 1e-6);
+        // BASE_SPEED_FRACTION x the median spacing per second.
+        assert!((scene.base_speed() - BASE_SPEED_FRACTION * 2.0).abs() < 1e-6);
     }
 
     #[test]
@@ -800,7 +807,7 @@ mod scene_scale_tests {
         views[4].t[0] = -1000.0;
         let scene = SceneScale::from_views(&views);
         assert!((scene.median_spacing - 1.0).abs() < 1e-6, "{}", scene.median_spacing);
-        assert!((scene.base_speed() - 0.5).abs() < 1e-6);
+        assert!((scene.base_speed() - BASE_SPEED_FRACTION).abs() < 1e-6);
     }
 
     #[test]

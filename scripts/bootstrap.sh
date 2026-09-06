@@ -18,8 +18,10 @@ TRIPPY_OUTPUT=${TRIPPY_OUTPUT:-$PWD/output}
 
 git config core.hooksPath .githooks
 
-if [ -f .env.example ]; then
-  cp -n .env.example .env
+# BSD `cp -n` exits 1 when it declines to overwrite, which under `set -e` aborted
+# the whole (idempotent, re-run-every-session) script the moment a .env existed.
+if [ -f .env.example ] && [ ! -f .env ]; then
+  cp .env.example .env
 fi
 
 UV=""

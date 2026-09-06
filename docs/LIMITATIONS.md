@@ -909,5 +909,216 @@ of the actual egui pass, which would need a headless eframe harness.
   come from the *reference view* the camera was last pinned or snapped to, so flying
   far from that view keeps its exposure. There is no principled alternative — a
   free-flown camera has no image of its own — but it means the colour grade is a
-  choice, not a measurement, and it changes when you jump views.
+  choice, not a measurement, and it changes when you jump views. Since 2026-09-06
+  the exporter at least guarantees that every per-view exposure it ships *is* a
+  colour grade rather than a stuck initialisation — see "Per-image exposure" below.
 - **No `.ply` or splat rendering.** That is Brush's binary, which this does not touch.
+
+
+## Per-image exposure (fix/viewer-kk, 2026-09-06): the white Karekare frame
+
+**Symptom.** The delivered `full2-broadcast-viewer.command` (EXP-0003, kk-coherent,
+5,736,619 points, C = 4, 219 views) opened on a **nearly white frame with coloured
+speckle** in the `network` view. The same checkpoint's held-out mean was 15.02 dB, so
+the checkpoint was not broken; the first suspicion was the viewer, the bundle exporter,
+the f16 network or the background colour.
+
+**It was none of those. The viewer was rendering the checkpoint faithfully, and the
+checkpoint's frame 0 really is white.** The per-image exposure of six of the 219 views —
+including view 0, the one the bundle opens at — was still sitting at its *initial* value
+of `EV = -5.8705`, and `NeuralCamera` applies exposure as a gain of `2 ** -EV`:
+
+| | EV | gain `2 ** -EV` |
+|---|---:|---:|
+| scene median | +0.250 | 0.84x |
+| the six stuck views | **-5.8705** | **58.5x** |
+| four more, partly recovered by training | -4.44 … -4.21 | 21.7x … 18.5x |
+
+A 58.5x gain drives every pixel through `clamp(x, 0, 1)` inside the response LUT's
+`grid_sample`, so the frame collapses onto `LUT(1) = (0.888, 0.875, 0.863)` — a warm
+near-white, `(226, 223, 220)` in 8 bits — except where the U-Net's raw output was
+negative, which lands on `LUT(0) = (0.027, 0.035, 0.040)` = `(7, 9, 10)`. The LUT is
+monotonic, so everything between those two is a colour ramp. That is exactly "nearly
+white with blue/yellow speckles".
+
+Two facts make this the *only* possible explanation on this checkpoint. First, the
+checkpoint's white balance is all-ones and its vignette polynomial is all-zeros (TRIPS
+freezes both by default), so **exposure is the only per-view term in the whole tone
+mapper** — two views can differ by a scalar gain and by nothing else. Second, view 0's
+gain is **67.5x** view 1's. Whatever the network draws, view 0 is that picture multiplied
+by 67.5 and then clipped.
+
+**Root cause: "this photo has no EXIF" was encoded as "this photo has EV 0".**
+`Trainer._initial_exposure` computes `EV = log2(1/ExposureTime) + log2(ISO/100)` and then
+subtracts the scene mean, which is right (`NeuralScene.cpp:38`). But when a photo carried
+no ExposureTime/ISO it wrote the sentinel `0.0` into the vector *before* the mean was
+subtracted, giving that photo a relative EV of `-mean(scene)`. kk-coherent's mean EV is
+**5.870477**, hence the `-5.8705`. **Ten of kk-coherent's 219 images have no EXIF
+exposure**, at dataset indices `[0, 44, 87, 120, 122, 123, 124, 131, 174, 218]`. The
+sentinel also dragged the mean itself, shifting every *other* image's initialisation
+slightly.
+
+Six of the ten never recovered because they are in the held-out split: a held-out image
+is never in a `train_step`, so its exposure never receives a gradient and stays at the
+initialisation for all 300 epochs. The other four were trained, and at `lr_exposure =
+5e-4` they climbed only from -5.87 to about -4.2 in 300 epochs — still an 18-22x gain.
+The network cannot compensate for a *per-frame* gain (it is shared across frames and has
+no frame conditioning), so those four frames stayed saturated for the whole run.
+
+Why they recovered so slowly is worth naming: a saturated sample has **no gradient**
+through the response LUT. `grid_sample(..., padding_mode="border")` clamps the *coordinate*,
+so `d out / d x = 0` for every `x > 1`. The only reason the exposure moved at all is
+TRIPS's training-only "leak" term (`CameraResponseNetImpl`, `leak_factor`), which adds
+`-leak/sqrt(|x|) + leak` above 1 purely so the parameter can climb back. It works, at
+`lr_exposure = 5e-4`, at about 1.7 stops per 300 epochs. The corollary is that those four
+training images contributed almost nothing to the *network's* weights for the whole run —
+4.6% of the training set was, in effect, absent rather than wrong.
+
+**The number that proves it.** EXP-0003 full2-broadcast's own per-image held-out PSNRs at
+epoch 299, sorted:
+
+```
+IMG_3703  6.19   IMG_3829  6.28   IMG_3832  6.50   IMG_3831  6.59
+IMG_3833  6.82   IMG_3896  6.92 | IMG_3830 12.29   IMG_3828 12.45   … IMG_3936 19.82
+```
+
+The six worst images in the entire held-out set are **exactly** the six views with
+`EV = -5.8705` -- dataset indices `[0, 120, 122, 123, 124, 174]` = `IMG_3703, 3829, 3831,
+3832, 3833, 3896` -- and nothing else is within 5 dB of them. The other four EXIF-less
+images (`44, 87, 131, 218` = `IMG_3753, 3796, 3840, 3940`) are in the *training* split,
+which is why theirs moved at all. `IMG_3830` and `IMG_3828` are shade frames from the
+same burst *with* EXIF and score 12.3-12.5 dB.
+
+**This also contaminated the EXP-0003 shade verdict.** The "held-out SHADE frames 8.49 dB"
+figure averages the six forced-held-out shade frames, and four of those six
+(`IMG_3829/3831/3832/3833`) are in the broken ten. The two shade frames with valid EXIF
+score 12.29 and 12.45 dB. The shade result is still poor — but 8.49 dB is not the honest
+number for it, and the comparison against Gaussians at 14.94 dB was made against a
+partly-white render. Re-measuring it is queued.
+
+### What changed
+
+1. **`Trainer._initial_exposure`** (the root cause, for every future run): images with no
+   usable EXIF are excluded from the scene mean and initialised *at* that mean, i.e. a
+   relative EV of exactly 0 and a gain of exactly 1 — the honest "same exposure as the
+   average photograph" prior. Regression test:
+   `tests/test_train_regression.py::test_an_image_without_exif_starts_at_gain_one`.
+
+2. **`trippy.render.bundle.trusted_exposures`** (for checkpoints that already exist,
+   including this one): the bundle exporter replaces any per-view EV further than
+   `BUNDLE_EXPOSURE_TRUST_STOPS = 2.0` stops from the scene's **median** EV with that
+   median, and records `exposure_reference_ev`, `exposure_trust_stops`,
+   `exposure_substituted_count` and `exposure_substituted_frames` in the safetensors
+   `__metadata__`. The median, not the mean, precisely because the values being rejected
+   would drag a mean.
+
+   The threshold is not delicate. On full2-broadcast the nearest *kept* view is 1.14
+   stops from the median and the nearest *replaced* view is 4.46 stops out, so anything
+   from ~1.2 to ~4.4 selects the same set — and that set is exactly the ten images with
+   no EXIF, with no false positives. On the public horse checkpoint the whole EV range is
+   ±0.066 stops, so nothing is substituted and the horse bundle is byte-identical.
+
+   Re-exporting full2-broadcast changed **one tensor**, `camera.exposure`; `points.npz`
+   and `bundle.json` are byte-identical, and the per-view gain range went from
+   0.37x–58.5x to 0.37x–1.85x.
+
+3. **The viewer chooses an exposure, and says which** (`trips_viewer::renderer::ExposureMode`).
+   A free-flown pose has no photograph and therefore no exposure of its own; carrying the
+   last-pinned view's made the whole scene's brightness depend on which view you last
+   pressed `N` past. The default is now `Auto`: the reference view's own EV while the
+   camera is exactly on it (so a frame at a capture pose stays comparable with that
+   photograph), the scene **median** once you move off it. `X` cycles
+   `auto -> view -> median -> manual`, the panel shows the EV and the gain being applied,
+   and `trips-viewer --exposure auto|view|median|<EV>` does the same headlessly.
+   `NeuralCamera::forward_with_exposure` is the one-line addition underneath;
+   `forward` still means "this image's own", so no existing caller changed behaviour.
+
+4. **`default_view` avoids an untrustworthy exposure**
+   (`trippy.render.bundle.default_view_with_trusted_exposure`). The bundle's opening frame
+   is the scene's first impression, and full2-broadcast's was view 0 — one of the six
+   stuck ones. The exporter now keeps the loader's preferred view when its *own* exposure
+   is trustworthy (so the horse still opens on view 8, where every recorded parity number
+   was measured) and otherwise opens on the trustworthy view nearest the scene median.
+   full2-broadcast moves from view 0 (`IMG_3703`, EV -5.8705) to **view 26
+   (`IMG_3735`, EV +0.25011)** — a photograph whose exposure is a measurement and is
+   exactly the scene median.
+
+5. **`trippy.render.bundle_render` + `trippy bundle-parity`** (so this class of bug is
+   answerable next time without a window): a Python renderer that reads a bundle's own
+   three files and nothing else, plus a CLI that reports per-channel brightness,
+   saturated/black fractions and PSNR against a `trips-viewer --screenshot` PNG. Numbers
+   only — no image is displayed, so it is usable on Jordan's scenes.
+   `scripts/viewer_parity_check.sh` runs both halves for a list of views.
+
+### Measured (job `trippy-viewer-kk-1`, prio 12, rc 0, 2026-09-06)
+
+Every number below is a render of a Karekare view at `--scale 1.0`, compared only as
+numbers; nobody looked at any of them. "Python" is `trippy bundle-parity`, which reads the
+*same bundle directory* and nothing else.
+
+**Is the viewer wrong?  No — it reproduces the Python reference on the broken bundle too.**
+
+| bundle | view | net | viewer vs Python | max 8-bit diff |
+|---|---|---|---:|---:|
+| before | 0 `IMG_3703` | f32 | **85.78 dB** | 4 |
+| before | 1 `IMG_3704` | f32 | 75.57 dB | 5 |
+| before | 121 `IMG_3830` | f32 | 78.00 dB | 10 |
+| before | 0 `IMG_3703` | **f16** | 59.98 dB | 43 |
+| after | 0 `IMG_3703` | f32 | 74.56 dB | 8 |
+| after | 0 `IMG_3703` | **f16** | 60.42 dB | 9 |
+
+The acceptance bar was 40 dB (f32) and ~1 dB (f16). So suspects 2-5 of the original
+investigation — response-LUT direction, the f16 network, the background colour, and the
+feature channel order/scale — are all ruled out at once: **the Rust viewer renders what
+the bundle says, to within one 8-bit LSB, including when what the bundle says is a white
+frame.** f16 costs ~15-25 dB against f32 and is nowhere near an explanation for a 0.87
+mean brightness.
+
+**What the frame actually was, and what it is now.**
+
+| | view 0 `IMG_3703` | view 1 `IMG_3704` | view 121 `IMG_3830` |
+|---|---|---|---|
+| mean RGB, before | **0.874, 0.867, 0.848** | 0.458, 0.454, 0.404 | 0.638, 0.622, 0.570 |
+| mean RGB, after | 0.456, 0.452, 0.402 | 0.458, 0.454, 0.404 | 0.638, 0.622, 0.570 |
+| PSNR vs its own photograph, before | **6.20 dB** | 15.49 dB | 12.30 dB |
+| PSNR vs its own photograph, after | **14.92 dB** | 15.49 dB | 12.30 dB |
+| before vs after, viewer to viewer | 6.46 dB | **byte-identical** | **byte-identical** |
+
+View 0's "before" mean is `LUT(1) = (0.888, 0.875, 0.863)` to within the few pixels that
+were not clipped — the frame *is* the top of the response curve. Afterwards it scores
+14.92 dB against its photograph, in line with its neighbour's 15.49 dB, and it matches
+`Trainer.evaluate`'s independent 6.19 dB for the same image before the fix. **The two
+views that were never affected are byte-identical before and after**, which is the check
+that the substitution is surgical rather than a global regrade.
+
+**The viewer-side defence, on the unfixed bundle.** Yawing 12 degrees off view 0 unpins
+the camera, so `--exposure auto` falls back to the scene median:
+
+| | mean RGB | p50 | p99 |
+|---|---|---|---|
+| `--exposure view` (the old behaviour) | 0.874, 0.867, 0.853 | 0.886, 0.874, 0.863 | 0.886, 0.874, 0.863 |
+| `--exposure auto` (the new default) | 0.479, 0.471, 0.429 | 0.498, 0.486, 0.439 | 0.871, 0.874, 0.839 |
+
+In the first row p50 *equals* p99 and both equal the LUT's top: the frame is a flat clip.
+
+**Horse, unchanged.** `--screenshot` vs `render_frame_full`: **82.68470 dB** (bar 80; the
+number recorded for v0.4.0 was 82.68). `scripts/viewer_camera_check.sh` still passes
+(mean |a-b| 43.674/255 over a 12-degree yaw). The horse bundle's exposure spread is
+±0.066 stops, so nothing about it was substituted and its `default_view` is still 8.
+
+**One more thing the numbers say.** `IMG_3830` is a *held-out shade* frame whose EXIF was
+present, so nothing above touched it — yet rendering it with the scene median instead of
+its own learned EV takes it from **12.30 dB to 15.46 dB**. Its exposure was never trained
+either (held out); it merely started closer. So the shade split is exposure-limited more
+generally, not only through the ten EXIF-less images, which is more evidence for the
+held-out exposure calibration being explored in `feat/eval-calib`.
+
+### What is still true (and is not a bug)
+
+- A bundle's per-view exposure for a **held-out** view is still an initialisation rather
+  than a learned value; it is now merely a *sane* initialisation. Only the images the run
+  actually trained on have a measured colour grade.
+- Nothing here changes what `trippy eval` reports. `Trainer.evaluate` still applies each
+  image's own learned exposure, which is the right thing for an eval and the reason the
+  bug was visible in the per-image numbers at all. Re-running eval on this checkpoint
+  will still report ~6.2 dB for those six images.

@@ -107,8 +107,23 @@ def _exif_for(image_index: int) -> PILImage.Exif:
     return exif
 
 
-def build_synthetic_scene(tmp_path: Path, n_images: int = N_IMAGES, seed: int = 0) -> tuple[Path, PointSet]:
+def build_synthetic_scene(
+    tmp_path: Path,
+    n_images: int = N_IMAGES,
+    seed: int = 0,
+    without_exif: tuple[int, ...] = (),
+) -> tuple[Path, PointSet]:
     """Write a minimal 1-camera PINHOLE COLMAP scene with `n_images` rendered photos.
+
+    Args:
+        tmp_path: directory to build the scene in.
+        n_images: how many photos to render.
+        seed: point-cloud seed.
+        without_exif: image indices written with NO EXIF at all. Real
+            captures contain these (10 of kk-coherent's 219 photos have no
+            ExposureTime/ISO -- screenshots, edited exports, a second body),
+            and "no EXIF" is the case `Trainer._initial_exposure` used to get
+            catastrophically wrong: see tests/test_train_regression.py.
 
     Returns:
         (scene_root, point_set): `scene_root` contains `images/` and
@@ -122,7 +137,10 @@ def build_synthetic_scene(tmp_path: Path, n_images: int = N_IMAGES, seed: int = 
     names = [f"IMG_{i}.jpg" for i in range(n_images)]
     for i, name in enumerate(names):
         img = render_reference_image(point_set, i)
-        PILImage.fromarray(img, mode="RGB").save(images_dir / name, exif=_exif_for(i))
+        if i in without_exif:
+            PILImage.fromarray(img, mode="RGB").save(images_dir / name)
+        else:
+            PILImage.fromarray(img, mode="RGB").save(images_dir / name, exif=_exif_for(i))
 
     sparse_dir = scene_root / "sparse_txt"
     sparse_dir.mkdir(parents=True)

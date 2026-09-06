@@ -37,7 +37,7 @@ use brush_pyramid::gpu::{block_on, WgpuDevice};
 use brush_pyramid::png;
 
 use crate::bundle::Bundle;
-use crate::renderer::{Renderer, Settings, ViewMode};
+use crate::renderer::{ExposureMode, Renderer, Settings, ViewMode};
 
 const USAGE: &str = "\
 trips-viewer — a TRIPS scene, live, on Metal
@@ -55,6 +55,9 @@ Options:
   --half-net           run the U-Net in f16 (the big one at 1080p)
   --view <n>           open at this dataset view index (default: the bundle's)
   --mode <m>           network | raw | coverage (default network)
+  --exposure <e>       auto | view | median | <EV>  (default auto: the view's
+                       own exposure while pinned to it, the scene median once
+                       you have moved off it)
   --free               open in free-fly mode instead of orbit
 
 Headless (no window; used by the acceptance check and the perf table):
@@ -72,6 +75,7 @@ Keys:
   F          orbit <-> free      R  back to the view it opened at
   N / P      next / previous capture view
   V          cycle network / raw level-0 / coverage
+  X          cycle the exposure the tone mapper applies
   - / =      render scale        TAB  hide the panel
 ";
 
@@ -113,6 +117,7 @@ struct Args {
     settings: Settings,
     view: Option<usize>,
     mode: ViewMode,
+    exposure: ExposureMode,
     screenshot: Option<PathBuf>,
     warmup: usize,
     bench: Option<usize>,
@@ -128,6 +133,7 @@ fn parse_args() -> Result<Args, String> {
         settings: Settings::default(),
         view: None,
         mode: ViewMode::Network,
+        exposure: ExposureMode::default(),
         screenshot: None,
         warmup: 2,
         bench: None,
@@ -158,6 +164,19 @@ fn parse_args() -> Result<Args, String> {
                     "raw" => ViewMode::RawLevel0,
                     "coverage" => ViewMode::Coverage,
                     other => return Err(format!("--mode {other:?}\n\n{USAGE}")),
+                };
+            }
+            "--exposure" => {
+                let raw = value()?;
+                args.exposure = match raw.as_str() {
+                    "auto" => ExposureMode::Auto,
+                    "view" => ExposureMode::View,
+                    "median" => ExposureMode::Median,
+                    other => ExposureMode::Manual(
+                        other
+                            .parse()
+                            .map_err(|e| format!("--exposure {other:?}: {e}\n\n{USAGE}"))?,
+                    ),
                 };
             }
             "--screenshot" => args.screenshot = Some(PathBuf::from(value()?)),
@@ -211,7 +230,7 @@ fn run_headless(args: &Args, bundle: Bundle) -> Result<(), String> {
     });
     let frame_index = view.index;
     let camera_view = view.clone();
-    let renderer = Renderer::new(bundle, device)?;
+    let mut renderer = Renderer::new(bundle, device)?;
     let scale = args.settings.render_scale.clamp(0.1, 1.0);
     let width = ((camera_view.width as f32 * scale).round() as usize).max(16);
     let height = ((camera_view.height as f32 * scale).round() as usize).max(16);
@@ -227,11 +246,25 @@ fn run_headless(args: &Args, bundle: Bundle) -> Result<(), String> {
         eprintln!("camera yawed {degrees} deg off view {}", camera_view.index);
     }
     let camera = controller.render_camera(width, height, &camera_view);
+    // `--camera-yaw-deg` unpins the controller, so `ExposureMode::Auto` here
+    // means exactly what it means in the window: the view's own exposure for a
+    // frame taken from that view, the scene median for one taken from
+    // somewhere else.
+    renderer.set_exposure(args.exposure, controller.is_pinned());
 
     eprintln!(
-        "{} points, {width}x{height}, view {frame_index} ({}), levers: {}",
+        "{} points, {width}x{height}, view {frame_index} ({}), exposure {} (EV {}), levers: {}",
         renderer.num_points(),
         camera_view.name,
+        args.exposure.label(),
+        match renderer
+            .exposure()
+            .resolve(controller.is_pinned(), renderer.median_exposure())
+            .or_else(|| renderer.view_exposure(frame_index))
+        {
+            Some(ev) => format!("{ev:+.4}"),
+            None => "none".to_owned(),
+        },
         if args.settings.is_exact() {
             "exact".to_owned()
         } else {

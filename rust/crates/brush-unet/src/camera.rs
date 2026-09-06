@@ -115,6 +115,33 @@ impl NeuralCamera {
         self.config
     }
 
+    /// The learned EV of image `frame`, or `None` when exposure is disabled.
+    #[must_use]
+    pub fn exposure_of(&self, frame: usize) -> Option<f32> {
+        self.exposure.as_ref().and_then(|e| e.get(frame).copied())
+    }
+
+    /// The **median** learned EV over every image, or `None` when exposure is
+    /// disabled or the table is empty.
+    ///
+    /// This is the scene's colour grade with no single photograph's opinion in
+    /// it, and it is what a *free-flown* camera should use: once you leave a
+    /// capture pose there is no image whose exposure is the right one, and
+    /// carrying the last-touched view's exposure makes the whole scene's
+    /// brightness depend on which view you happened to press `N` past.
+    /// Median rather than mean so one unconverged entry cannot move it (see
+    /// `trippy.render.bundle.trusted_exposures` for why that matters).
+    #[must_use]
+    pub fn median_exposure(&self) -> Option<f32> {
+        let values = self.exposure.as_ref()?;
+        if values.is_empty() {
+            return None;
+        }
+        let mut sorted = values.clone();
+        sorted.sort_by(f32::total_cmp);
+        Some(sorted[sorted.len() / 2])
+    }
+
     /// Apply the tone mapper to `x`, `[1, 3, H, W]`, for image `frame`.
     ///
     /// # Arguments
@@ -124,6 +151,28 @@ impl NeuralCamera {
     /// # Errors
     /// Returns `Err` on a wrong channel count or an out-of-range `frame`.
     pub fn forward(&self, x: Tensor<4>, frame: usize) -> Result<Tensor<4>, String> {
+        self.forward_with_exposure(x, frame, None)
+    }
+
+    /// [`Self::forward`], with the per-image exposure optionally overridden.
+    ///
+    /// # Arguments
+    /// - `x`: the U-Net's raw output.
+    /// - `frame`: index into the per-image white-balance table (and the
+    ///   exposure table when `exposure_ev` is `None`).
+    /// - `exposure_ev`: EV to apply instead of image `frame`'s own, as a gain
+    ///   of `2 ** -EV`. `None` keeps the learned per-image value, which is the
+    ///   right choice when the camera is sitting exactly on a capture pose and
+    ///   the frame is being compared with that photograph.
+    ///
+    /// # Errors
+    /// Returns `Err` on a wrong channel count or an out-of-range `frame`.
+    pub fn forward_with_exposure(
+        &self,
+        x: Tensor<4>,
+        frame: usize,
+        exposure_ev: Option<f32>,
+    ) -> Result<Tensor<4>, String> {
         let [batch, channels, height, width] = x.dims();
         if channels != RGB {
             return Err(format!("expected {RGB} channels, got {channels}"));
@@ -135,9 +184,12 @@ impl NeuralCamera {
         let mut out = x;
 
         if let Some(exposure) = &self.exposure {
-            let ev = *exposure
-                .get(frame)
-                .ok_or_else(|| format!("frame {frame} out of range ({} images)", exposure.len()))?;
+            let ev = match exposure_ev {
+                Some(value) => value,
+                None => *exposure.get(frame).ok_or_else(|| {
+                    format!("frame {frame} out of range ({} images)", exposure.len())
+                })?,
+            };
             out = out.mul_scalar((-ev).exp2());
         }
 
