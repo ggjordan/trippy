@@ -26,6 +26,7 @@ Last updated: 2026-09-06 (fix/viewer-kk session; previous: web-perf)
 
 ## In flight
 - GPU queue: full-trips-2-bc (Hunua clip5923_best, running), trips-perf-2/3 (profiler), eval-neighbours-full2 (backfills neighbour-exposure numbers for full1/full2 + leaderboard), then full3-alt-bc, hybrid-a-all-levels-bc, union-broadcast (all self-reporting with viewer launchers).
+- EXP-0010 point removal (PR #36): arm A (TRIPS rule) running, arm B (TRIPS rule + shade_prune probe) queued, ahead of the other prio-70 runs by filename order. Worktree .worktrees/point-removal must stay until both finish (their run_dirs are relative to it); remove with scripts/worktree_rm.sh afterwards.
 - Trips-mode variants requeued after the perf fix (full2-trips resumes from epoch ~22; hybrid-a, union-trips, full3-alt in trips mode) behind tonight's broadcast runs.
 
 ## Next (in order)
