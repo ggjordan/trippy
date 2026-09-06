@@ -26,7 +26,7 @@ Last updated: 2026-09-06 (fix/viewer-kk session; previous: web-perf)
 
 ## In flight
 - GPU queue: full-trips-2-bc (Hunua clip5923_best, running), trips-perf-2/3 (profiler), eval-neighbours-full2 (backfills neighbour-exposure numbers for full1/full2 + leaderboard), then full3-alt-bc, hybrid-a-all-levels-bc, union-broadcast (all self-reporting with viewer launchers).
-- perf/trips-mode (large/high): why trips mode is 10x slower per step on MPS; full2-trips requeue waits on it.
+- Trips-mode variants requeued after the perf fix (full2-trips resumes from epoch ~22; hybrid-a, union-trips, full3-alt in trips mode) behind tonight's broadcast runs.
 
 ## Next (in order)
 1. Merge scene-io + points; launch feat/raster (large/high: numpy reference + Metal blend_fwd + pyramid forward) and feat/net (mid/high: U-Net + tone mapper ports) once TRIPS_REFERENCE.md lands.
@@ -42,6 +42,7 @@ Last updated: 2026-09-06 (fix/viewer-kk session; previous: web-perf)
 - **A second, independent reading of the exposure effect (2026-09-06).** `IMG_3830` is a held-out shade frame whose EXIF was valid, so none of the exposure fixes touched it -- and its viewer render still goes **12.30 -> 15.46 dB** when tone mapped with the scene median instead of its own never-trained EV. That is the same conclusion `eval-calib-1` reached by fitting the exposure per image (shade 8.49 -> 15.32 dB), reached instead from a screenshot. Two methods, one answer: a held-out frame's exposure is never brought to the scale the U-Net learned on the training frames.
 - REVIEW: open `trips-mac-viewer-horse.command` (4-other) to step into the public horse scene rendered live by TRIPS on this Mac; V toggles network/raw/coverage.
 - Disk cleanup 2026-09-06 12:15 (Jordan's request): 49 -> 71 GB free. Removed re-downloadable Zenodo zips, the fork's rebuildable target dir, smoke runs, distillation intermediates, and old epoch checkpoints (kept latest/best-so-far/ep0000). Trainer retention policy in progress (fix/ckpt-retention) so 300-epoch runs stop writing ~24 GB each.
+- PERF (PR #35): trips mode was never 10x slower; contention was. Vectorised emission makes trips 1.11x broadcast per step. NOTE: that agent ran the GPU-marked pytest suite outside the queue twice (~60 s) before correcting itself; logged.
 - EXP-0007 Hunua clip5923_best (broadcast, 120 ep, 4 h): held-out 13.28 dB / SSIM 0.215 / LPIPS 0.555 (no Gaussian baseline number for this clip yet); `full-trips-2-bc-viewer.command` + dolly/honesty delivered.
 - FIXED + DELIVERED (16:00): viewer v3 launchers (`full2-broadcast-viewer-v2`, `trips-kk-full1-viewer-v2`, `trips-mac-viewer-horse-v3`): trusted per-view exposure (median substituted for the 10 EXIF-less views), X-cycled exposure modes, 4x speed / 50x scroll, opens on a trusted view. Viewer matched the Python reference at 85.8 dB even on the broken bundle.
 - BUG (Jordan 14:00): `full2-broadcast-viewer.command` shows a near-white frame with speckles for Karekare while the Python path renders it at 15 dB -> export/viewer camera-model or f16 path wrong for this scene (fix/viewer-kk, numbers-only parity). Also: default fly speed too slow -> 4x base, 50x scroll range.
