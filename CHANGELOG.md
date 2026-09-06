@@ -2,6 +2,9 @@
 All notable changes to trippy. Format: Keep a Changelog. Versions: semver tags `vX.Y.Z`. Every push also gets a `build-NNNN` tag.
 
 ## [Unreleased]
+### Added
+- Person masks (`masks_dir`, auto-discovered) in training loss and eval; EXP-0011 trains TRIPS on the full karekare-v2 scene (756 images, seeded from kklid_20000) masked and unmasked, plus removal and hybrid arms; shade frames measured per scene (93 big-tree frames; kk-coherent's six are a different spot).
+- Point removal (TRIPS rule + relative mode) and the audit-aligned shade-prune probe (EXP-0010).
 ### Changed
 - Rasteriser emission vectorised (bit-identical): a trips-mode training step 164 -> 100 ms on MPS (1.11x broadcast). The earlier "10x slower" reading was mostly machine contention. searchsorted segments; no per-step device sync.
 ### Measured
