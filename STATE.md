@@ -35,6 +35,7 @@ Last updated: 2026-09-06 (fix/viewer-kk session; previous: web-perf)
 3. v0.2.0: blend_bwd gradcheck, trainer, MonoDepthSource, eval/export/dolly, source experiments.
 4. v0.3.0: Hybrid designs C then A1, comparison harness.
 5. v0.4.0: Brush fork viewer (Mac), v0.5.0 web viewer, Quest measurement.
+6. Viewer editing: `docs/decisions/ADR-0007-viewer-editing.md` + `docs/EDITOR.md` (architecture written 2026-09-07, docs only); start at E1 (region data model + box/sphere blend + undo/save) once `feat/blend-gate` lands.
 
 ## Blocked
 - None.
