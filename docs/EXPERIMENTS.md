@@ -1386,3 +1386,18 @@ runs steps 1 and 3 in one command (step 2's actual training always needs the sep
 directory. See `experiments/EXP-0008-distill/README.md` for the worked pipeline-proof run
 against a weak (40-epoch, 14.4 dB) EXP-0003 checkpoint, including the audit comparison table
 and an honest read of the numbers.
+
+## Person masks
+
+`kk-coherent` trained without person-exclusion masks, so people show up as ghosts in TRIPS
+outputs. `experiments/MASKS.md` documents the fix: 238 masks generated with Splats'
+`tools/make_masks3.py` (Vision-framework instance masks, BLACK=ignore/person, WHITE=keep) into
+`output/masks/kk-coherent/`, one PNG per source image basename, with polarity verified
+numerically against Splats' own already-validated `karekare-v2` masks for the identical
+photographs (Pearson corr 0.9485 on person-fraction, no imagery viewed — see AGENTS.md "Never
+send scene imagery to a model"). That doc also lists every config under `experiments/` whose
+`scene_root:` is kk-coherent (17 configs, 5 experiments) with the `masks_dir:` line each needs
+once the trainer supports it (landing on `feat/karekare-v2`, not yet merged — no config was
+edited here). Per Jordan, masked runs are additive, not a replacement: existing unmasked runs
+stay queued, and `scripts/requeue_with_masks.sh` (prepared, not run) submits a masked *sibling*
+config/run per config given, leaving the original untouched.

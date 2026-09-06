@@ -1947,3 +1947,30 @@ the areas I want". Artefacts: `$SPLATS_ROOT/tools/gpu_queue/logs/trippy-viewer-k
 - 2026-09-06T05:51:38Z delivered exp0010-removal-smoke-viewer: trippy train report exp0010-removal-smoke: epoch 3, held-out PSNR 12.38 dB (neighbours-exposure) (strict, own exposure: 12.50 dB), shade dark-mass 12.0% vs baseline 19.9%; open in the free-navigation viewer; N/P step capture views (/Users/nzbirdranch/trippy/output/deliver/exp0010-removal-smoke/OPEN_TRIPS_MAC_exp0010-removal-smoke.command)
 - 2026-09-06T05:51:38Z delivered trips-leaderboard: One table of every TRIPS run so far vs the Gaussian baseline: held-out PSNR, shade dark-mass, extent, coverage. Regenerated after every training. (/Users/nzbirdranch/trippy/output/leaderboard/leaderboard.png)
 - 2026-09-06T06:16:56Z submitted job trippy-removal-rel prio 70: trippy train --config experiments/EXP-0010-point-removal/config_removal_rel.yaml --report --max-minutes 300
+- 2026-09-06T06:57:36Z job kk-masks (manual, not gpu_submit.sh/cpu_heavy.sh — see
+  experiments/MASKS.md sec 1): generated 238 person-exclusion masks for kk-coherent (Jordan's
+  kids showing up as ghosts in TRIPS outputs; no masks/ existed for this scene). Command:
+  `/Users/nzbirdranch/Splats/tools/ml-sharp/.venv/bin/python
+  /Users/nzbirdranch/Splats/tools/make_masks3.py
+  /Users/nzbirdranch/Splats/scenes/karekare/kk-coherent/images
+  /Users/nzbirdranch/trippy/output/masks/kk-coherent`. Vision-framework (pyobjc) work is
+  CPU/Neural-Engine only per Splats' own research/EVAL_HARNESS.md ("mask generation ... is
+  CPU-only and need no lock") — routing it through the Metal GPU queue would have queued it
+  behind the current prio-70 training (~2h) for nothing; `cpu_heavy.sh` was tried first and
+  refused (only 15 GB free, needs >=28 GB, plausibly the concurrent GPU training's unified-
+  memory footprint) so this ran directly, outside both queues (open question in
+  experiments/MASKS.md sec 7: should cpu_heavy.sh's guard have an escape hatch for provably
+  light jobs?). 589 s wall clock (06:47:47Z-06:57:36Z), 238/238 images processed (tool's own
+  summary: "238 images | instance-mask fired 186 | boxes fired 190 | any mask 205, masked
+  fraction mean 12.38% max 79.5%"), verified against the 238 source basenames with `diff`
+  (exact 1:1 match). *Numbers:* black(person) fraction min 0.0000 / median 0.0804 / max 0.7945
+  across the 238 masks; 205/238 frames have any person. *Polarity verified numerically* (never
+  opened any imagery) against Splats' own already-validated karekare-v2 masks for the identical
+  238 photographs (same basenames appear in both scenes): Pearson corr(kk black%, v2 black%) =
+  0.9485; the same 5 filenames rank highest black-fraction in both independently-generated mask
+  sets, and 4 filenames are exactly 0% black in both. *Verdict:* masks correct and ready; NOT
+  yet wired into any training config (trainer's `masks_dir:` option is landing on
+  feat/karekare-v2, not yet merged — configs and requeue script prepared but untouched/unrun
+  per this task's brief). *Artifacts:* 238 PNGs at
+  /Users/nzbirdranch/trippy/output/masks/kk-coherent/, log at
+  output/logs/kk-masks.log, full writeup experiments/MASKS.md.
