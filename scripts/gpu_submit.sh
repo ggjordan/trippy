@@ -8,7 +8,7 @@
 # Invariants:
 #   - This script NEVER touches the GPU itself; it only ever hands a script to Splats' queue.
 #   - Refuses (exit 3) if the command text mentions gpu_lock.sh — only the queue runner holds that lock.
-#   - Unless --dry-run: refuses if the GPU-queue runner is not alive (exit 4) or free memory < 28 GB (exit 5).
+#   - Unless --dry-run: refuses if the GPU-queue runner is not alive (exit 4) or free memory < 28 GB (warning only; the runner guards at start).
 #   - The generated job file uses only absolute paths and trippy's own ./.venv, never the caller's PATH.
 set -eu
 cd "$(dirname "$0")/.."
@@ -78,7 +78,9 @@ if [ "$DRYRUN" -eq 0 ]; then
   [ "$RUNNER_OK" -eq 1 ] || { echo "✗ GPU-queue runner not alive ($SPLATS_ROOT/tools/gpu_queue/runner.pid)" >&2; exit 4; }
 
   FREEGB=$(vm_stat | awk '/Pages free/ {f=$3} /Pages inactive/ {i=$3} /Pages speculative/ {s=$3} END {gsub("\\.","",f); gsub("\\.","",i); gsub("\\.","",s); printf "%d", (f+i+s)*16384/1073741824}')
-  [ "$FREEGB" -ge 28 ] || { echo "✗ only ${FREEGB} GB free; need >=28 GB before submitting a GPU job" >&2; exit 5; }
+  # The queue runner enforces the 28 GB guard when it STARTS a job (runner.sh); at enqueue time a
+  # running training legitimately holds memory, so this is a warning, not a refusal (2026-09-06).
+  [ "$FREEGB" -ge 28 ] || echo "⚠ only ${FREEGB} GB free now; the runner will wait for >=28 GB before starting this job" >&2
 fi
 
 # Rewrite a leading `python` -> the absolute venv python; a leading `trippy` -> the venv CLI module.
