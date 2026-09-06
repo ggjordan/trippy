@@ -94,6 +94,10 @@ class PointParams(nn.Module):
             other buffer.
         bbox_min, bbox_max: (3,) buffers (not trained), the *initial* xyz
             bounding box -- used by the trainer's extent penalty.
+
+    Backward compatibility: `load_state_dict` tolerates a checkpoint saved
+    before `init_conf` existed (pre PR #37) -- see that method's docstring.
+    Every other key is still required; this is not a blanket `strict=False`.
     """
 
     def __init__(
@@ -147,6 +151,45 @@ class PointParams(nn.Module):
 
     def __len__(self) -> int:
         return self.xyz.shape[0]
+
+    def load_state_dict(self, state_dict, strict: bool = True):  # type: ignore[override]
+        """Load a saved state dict, tolerating a checkpoint from before `init_conf` existed.
+
+        `init_conf` was added in PR #37 (see class docstring); every
+        checkpoint saved before that PR has `xyz`, `raw_size`, `raw_conf`,
+        `feat`, `provenance`, `bbox_min`, `bbox_max` but no `init_conf` key,
+        so a plain `nn.Module.load_state_dict` raises `Missing key(s):
+        "init_conf"` and an otherwise-resumable checkpoint can never be
+        resumed again.
+
+        When `init_conf` is absent, this inserts a same-shape placeholder
+        (the module's own current buffer -- overwritten immediately below)
+        so the normal strict `nn.Module.load_state_dict` machinery still
+        runs, unmodified, for every other key: any OTHER missing or
+        unexpected key still raises exactly as before. This is deliberately
+        not a blanket `strict=False` -- only this one, specifically-known
+        migration is tolerated. After loading, `init_conf` is synthesised
+        from the just-loaded confidence (`conf()`, i.e.
+        `sigmoid(CONF_SIGMOID_SCALE * raw_conf)`) -- exactly the value it
+        would have been snapshotted as had this checkpoint been saved after
+        PR #37 (construction snapshots `init_conf` before any optimiser
+        step ever touches `raw_conf`; a checkpoint saved at epoch 0 with
+        this fallback is identical either way).
+        """
+        has_init_conf_buffer = "init_conf" in self.state_dict()
+        missing_init_conf = has_init_conf_buffer and "init_conf" not in state_dict
+        if missing_init_conf:
+            state_dict = dict(state_dict)
+            state_dict["init_conf"] = self.init_conf.clone()
+        result = super().load_state_dict(state_dict, strict=strict)
+        if missing_init_conf:
+            with torch.no_grad():
+                self.init_conf.copy_(self.conf())
+            print(
+                "PointParams.load_state_dict: 'init_conf' missing from checkpoint "
+                "(pre PR #37) -- initialised from loaded confidence (sigmoid(10*raw_conf))"
+            )
+        return result
 
 
 class PoseParams(nn.Module):

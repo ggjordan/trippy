@@ -5,7 +5,11 @@ Invariants under test: `softplus(raw_size) == size0` and
     `sigmoid(CONF_SIGMOID_SCALE * raw_conf) == conf0` (the exact inverse
     functions the task brief asks for); `feat[:, :3] == rgb0` at init;
     `PoseParams.compose_pose` with a zero delta is the identity (returns
-    `R`, `t` unchanged); a non-zero delta actually moves the pose.
+    `R`, `t` unchanged); a non-zero delta actually moves the pose;
+    `PointParams.load_state_dict` backfills a missing `init_conf` (pre
+    PR #37 checkpoints) from `conf()`, round-trips it unchanged when
+    present, and still raises for any OTHER missing key (never a blanket
+    `strict=False`).
 """
 
 from __future__ import annotations
@@ -106,6 +110,61 @@ def test_point_params_init_conf_survives_training_moves() -> None:
         params.raw_conf += 5.0  # simulate a large optimiser step pushing confidence up
     assert not torch.allclose(params.conf(), before, atol=1e-3)
     torch.testing.assert_close(params.init_conf, before)
+
+
+def test_point_params_load_state_dict_without_init_conf_backfills_from_conf() -> None:
+    """Backward compatibility for pre-PR#37 checkpoints (no `init_conf` key)."""
+    ps = _random_point_set(n=5)
+    params = PointParams(ps)
+    with torch.no_grad():
+        params.raw_conf += 3.0  # move confidence away from its init_conf snapshot
+
+    state = params.state_dict()
+    del state["init_conf"]
+    assert "init_conf" not in state
+
+    fresh = PointParams(ps)  # a differently-seeded init_conf, to prove it gets overwritten
+    fresh.load_state_dict(state)
+
+    torch.testing.assert_close(fresh.raw_conf, params.raw_conf)
+    torch.testing.assert_close(fresh.init_conf, fresh.conf())
+    # Not the old (pre-load) init_conf, and not `ps.conf0` either -- it must reflect the
+    # confidence the checkpoint actually held, not fresh's own construction-time snapshot.
+    assert not torch.allclose(fresh.init_conf, torch.from_numpy(ps.conf0.copy()), atol=1e-3)
+
+
+def test_point_params_load_state_dict_with_init_conf_loads_unchanged() -> None:
+    ps = _random_point_set(n=5)
+    params = PointParams(ps)
+    with torch.no_grad():
+        params.raw_conf += 3.0
+        params.init_conf.copy_(torch.rand(5))  # a value distinct from conf(), to prove it round-trips as-is
+
+    state = params.state_dict()
+    assert "init_conf" in state
+
+    fresh = PointParams(ps)
+    fresh.load_state_dict(state)
+
+    torch.testing.assert_close(fresh.init_conf, params.init_conf)
+    # Round-tripped verbatim -- NOT recomputed from conf() (that would silently discard the
+    # checkpoint's own snapshot whenever conf() happens to have drifted since it was taken).
+    assert not torch.allclose(fresh.init_conf, fresh.conf(), atol=1e-3)
+
+
+def test_point_params_load_state_dict_other_missing_keys_still_raise() -> None:
+    ps = _random_point_set(n=5)
+    params = PointParams(ps)
+    state = dict(params.state_dict())
+    del state["provenance"]  # some OTHER key going missing must not be silently tolerated
+
+    fresh = PointParams(ps)
+    try:
+        fresh.load_state_dict(state)
+    except RuntimeError as exc:
+        assert "provenance" in str(exc)
+        return
+    raise AssertionError("expected RuntimeError for a missing 'provenance' key")
 
 
 def test_pose_params_zero_delta_is_identity() -> None:
