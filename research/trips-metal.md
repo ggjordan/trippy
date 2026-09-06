@@ -1676,3 +1676,5 @@ device-side count (indirect dispatch) so `render_inner` never stalls. That is a
 - 2026-09-06T01:44:39Z delivered trips-leaderboard: One table of every TRIPS run so far vs the Gaussian baseline: held-out PSNR, shade dark-mass, extent, coverage. Regenerated after every training. (/Users/nzbirdranch/trippy/output/leaderboard/leaderboard.png)
 
 - 2026-09-06T13:50Z EXP-0003 full2-broadcast final (300 ep, 55.8k steps, 3.2 h): held-out all 15.02/0.423/0.468; shade (6 frames) 8.49/0.302/0.689; other 16.47/0.450/0.419; shade dark mass 36.9% (baseline 19.9%); dolly coverage 0.195. VERDICT so far: plain TRIPS from Gaussian centres is worse than the Gaussians in the shade. Leaderboard refreshed and delivered. full1-broadcast backfilled: shade 7.55 dB.
+- 2026-09-06T01:49:46Z EXP-0007 first run was bogus: scenes/hunua/clips/clip5923/sparse/0 holds a 2-image stub; the real model is clip5923_best (371 registered). Run dir + its review links removed; requeued as full-trips-2.
+- 2026-09-06T01:49:46Z submitted job trippy-full-trips-2 prio 70: trippy train --config experiments/EXP-0007-hunua/config.yaml --report --max-minutes 240

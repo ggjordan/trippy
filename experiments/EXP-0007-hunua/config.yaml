@@ -2,8 +2,8 @@
 # Same recipe as EXP-0003 full2 (trips mode, knn sizes, train_factor 1.0). No known shade
 # frames here, so the report's dolly anchors on the first held-out image; treat the shade
 # audit columns as not applicable for this scene.
-scene_root: /Users/nzbirdranch/Splats/scenes/hunua/clips/clip5923
-run_dir: output/runs/EXP-0007-hunua-clip5923/full-trips
+scene_root: /Users/nzbirdranch/Splats/scenes/hunua/clips/clip5923_best
+run_dir: output/runs/EXP-0007-hunua-clip5923/full-trips-2
 
 width: 1008
 crop: 384

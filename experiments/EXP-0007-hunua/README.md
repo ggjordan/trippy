@@ -6,4 +6,4 @@ Config: `config.yaml` (trips mode, knn sizes, 300 epochs, train_factor 1.0). Que
 `scripts/queue_training.sh` so the run self-reports (held-out PSNR/SSIM/LPIPS, extent gate,
 dolly + honesty sheet delivered). Shade-audit columns do not apply (no measured shade frames).
 Gate: none of its own; informs v0.2.0 (does the method work beyond Karekare).
-First attempt on clip4982 failed: its frames had been deleted from ~/Splats by the clip driver (job trippy-full-trips rc 1). Re-pointed at clip5923 (439 frames, sparse model, trained ply). Numbers: pending.
+First attempt on clip4982 failed: its frames had been deleted from ~/Splats by the clip driver (job trippy-full-trips rc 1). Re-pointed at clip5923_best (371 registered of 439 frames; the plain clip5923 sparse dir is a 2-image stub that produced a bogus 120-step run, deleted). Numbers: pending.
