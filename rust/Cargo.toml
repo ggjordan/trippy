@@ -70,6 +70,13 @@ serde = { version = "1.0.215", default-features = false, features = [
 ] }
 serde_json = { version = "1.0.133", default-features = false, features = ["std"] }
 tracing = "0.1.41"
+# The live Gaussian-splat path (`trips-viewer::splat`). Only the trait
+# `tokio::io::AsyncRead` is used, to stream a .ply off disk into
+# `brush_serde::load_splat_from_ply` without a 2 GB intermediate copy; the spec
+# is a verbatim copy of `rust/brush-trips/Cargo.toml`'s for the usual reason
+# (one tokio in the graph, or the trait we implement is not the trait
+# `brush-serde` calls).
+tokio = { version = "1.42.0", default-features = false }
 
 # The viewer's window/UI stack. Every spec here is a verbatim copy of
 # `rust/brush-trips/Cargo.toml`'s, for exactly the reason the burn specs above

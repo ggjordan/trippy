@@ -42,6 +42,7 @@ use std::rc::Rc;
 
 use brush_pyramid::png;
 use brush_pyramid::scene::Camera;
+use trips_viewer::blend::{Blend, BlendMode};
 use trips_viewer::bundle::{Bundle, BundleView, Manifest};
 use trips_viewer::camera::{Controller, Mode};
 use trips_viewer::renderer::{Renderer, Settings, ViewMode};
@@ -49,6 +50,22 @@ use wasm_bindgen::prelude::*;
 
 use crate::blit::Blit;
 use crate::gpu::Gpu;
+
+/// The web viewer draws the TRIPS frame and nothing else.
+///
+/// It has no Blend panel: the splat half of a blend is either a `splat.npz` the
+/// browser would have to fetch on top of the 80 MB it already does, or -- since
+/// v0.6.0 -- a multi-gigabyte `.ply` rendered live, which is native-only
+/// (`trips_viewer::splat` is `cfg`-gated off wasm, and so are `brush-render`
+/// and `brush-serde`). `BlendMode::Trips` is a hard no-op in
+/// `Renderer::compose`, so this is exactly the frame the browser drew before
+/// the Blend panel existed. See `docs/WEB_VIEWER.md`.
+const WEB_BLEND: Blend = Blend {
+    mode: BlendMode::Trips,
+    gate_scale: 1.0,
+    mix: 0.5,
+    split: 0.5,
+};
 
 /// Render-scale presets the `-`/`=` keys step between, as in the native app.
 const SCALE_STEPS: [f32; 4] = [0.5, 0.75, 0.9, 1.0];
@@ -407,7 +424,10 @@ pub async fn frame() -> Result<String, JsValue> {
     })
     .map_err(js)?;
 
-    let rendered = match renderer.render(&camera, frame_index, mode, &settings).await {
+    let render = renderer
+        .render(&camera, frame_index, mode, &settings, WEB_BLEND)
+        .await;
+    let rendered = match render {
         Ok(frame) => frame,
         Err(first) if settings.half_net => {
             // The documented web fallback: an adapter can advertise SHADER_F16
@@ -418,7 +438,7 @@ pub async fn frame() -> Result<String, JsValue> {
                 ..settings
             };
             let frame = renderer
-                .render(&camera, frame_index, mode, &retry)
+                .render(&camera, frame_index, mode, &retry, WEB_BLEND)
                 .await
                 .map_err(|second| {
                     js(format!(
@@ -504,7 +524,7 @@ pub async fn screenshot_png() -> Result<Vec<u8>, JsValue> {
     .map_err(js)?;
 
     let (data, channels, height, width) = renderer
-        .render_to_host(&camera, frame_index, &settings)
+        .render_to_host(&camera, frame_index, &settings, WEB_BLEND)
         .await
         .map_err(js)?;
     // `scale = 1.0`: the network's output is already display-referred, and

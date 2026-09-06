@@ -157,6 +157,31 @@ finally read. `web/trips.js` does not send it: the diagnostic is two lines
 added to the *copy* of `trips.js` inside a scratch dist, next to
 `Error.stackTraceLimit = 300`, so the shipped page stays free of it.
 
+## The wasm target is not on the push path — and it broke once because of that
+
+`scripts/build.sh` and `scripts/test.sh` check the **native** graph only
+(`cargo check -p trips-viewer --all-targets`); nothing on the push path compiles
+`trips-web` for `wasm32-unknown-unknown`, because doing so would pull the whole
+wasm dependency tree into every push. The cost of that showed up on 2026-09-07:
+the Blend panel had added a `Blend` argument to `Renderer::render` and
+`render_to_host` and the web viewer's three call sites were never updated, so
+`trips-web` had not compiled since that merge and no check noticed. Fixed by
+passing a `WEB_BLEND` constant pinned at `BlendMode::Trips` — a hard no-op in
+`Renderer::compose`, so the browser draws exactly the frame v0.5.0 shipped.
+
+**Run this after any change to `trips_viewer`'s public API:**
+
+```bash
+( cd rust && cargo check -p trips-web --target wasm32-unknown-unknown )
+```
+
+The same session added the live Gaussian splat to the native viewer
+(`trips_viewer::splat`, `brush-render` + `brush-serde`). All three are
+`cfg(not(target_family = "wasm"))`, so the browser's dependency graph is
+unchanged: a browser has no filesystem to open a multi-gigabyte `.ply` from, and
+fetching one over loopback on top of the 80 MB `points.npz` it already pulls is a
+different feature, not this one.
+
 ## Blockers hit, and what each one turned out to be
 
 All five were found in this order. None of them is in TRIPS code: three are in

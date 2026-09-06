@@ -236,7 +236,8 @@ is the 1:1 reader and refuses a file that deviates.
 | key | meaning |
 |---|---|
 | `format` | `trippy-unet-1` |
-| `num_layers` `filters` `in_channels` `out_channels` | `L`, `F`, `C`, `O` |
+| `num_layers` `filters` `in_channels` `out_channels` | `L`, `F`, `C`, `O`. **`O` is 3 or 4**: 3 = RGB, 4 = RGB plus the blend gate's logit in channel 3 |
+| `gate` `gate_channel` `gate_scale` | written **only** on a 4-channel file (`gate = "1"`, `gate_channel = 3`, and the run's own default scale). An absent `gate` key means "no gate", which is what every pre-gate file says. `brush_unet::weights` **refuses** a file whose `gate` key and `out_channels` disagree, so an exporter must not write `gate = "1"` next to `out_channels = 3` |
 | `activation` `norm` `upsample_mode` `last_act` | must be `elu` / `id` / `bilinear` / `id`; anything else is rejected rather than silently approximated |
 | `has_camera` | `1` when the tone mapper is included |
 | `num_frames` `response_params` | `M`, `P` |
@@ -251,7 +252,7 @@ Tensors:
 | `unet.start.gate.{weight,bias}` | same | `start.conv.gate_conv` |
 | `unet.up.{k}.feature.{weight,bias}` | `(out_k, F, 3, 3)`, `(out_k,)` | `up[k].conv.feature_conv` |
 | `unet.up.{k}.gate.{weight,bias}` | same | `up[k].conv.gate_conv` |
-| `unet.final.{weight,bias}` | `(O, F, 1, 1)`, `(O,)` | `final[0]` |
+| `unet.final.{weight,bias}` | `(O, F, 1, 1)`, `(O,)` | `final[0]` — the gate is a fourth **row**, not a new tensor name, so a gate export adds no key the schema check does not already know |
 | `camera.exposure` | `(M,)` | `exposures_values`, squeezed |
 | `camera.white_balance` | `(M, 3)` | `white_balance_values`, squeezed |
 | `camera.vignette_params` | `(3,)` | `vignette_net.vignette_params` |
@@ -370,6 +371,9 @@ crates/trips-viewer/
 ├── src/bundle.rs      the `trippy-bundle-1` reader (bundle.json + points.npz + weights)
 ├── src/camera.rs      the fly camera; how a drag becomes (R, t)
 ├── src/renderer.rs    one frame: pyramid -> U-Net -> tone map, or a diagnostic buffer
+├── src/blend.rs       the Blend panel's state (modes, mix, gate scale, split)
+├── src/splat.rs       the LIVE Gaussian splat: .ply -> device, camera conversion,
+│                      brush-render at the viewer's own pose (native only)
 ├── src/shaders/blit.wgsl   re-exported as `trips_viewer::BLIT_WGSL`
 ├── src/main.rs        BINARY: argv, the eframe launch, --screenshot/--bench
 ├── src/app.rs         the egui shell: input, the ms/fps readout, the lever checkboxes
@@ -400,10 +404,78 @@ read-only storage buffer in an egui paint callback, and a fullscreen triangle sa
 it. Nothing round-trips through host memory.
 
 `resolve_to_cube_float` (the reverse of the existing `float_tensor`) and `gpu::sync`
-were added to `brush-pyramid` for this, so the viewer needs no dependency on
-`brush-render`. The same `resolve_to_cube_float` runs in the browser: it is not
-`cfg`-split, and contrary to what v0.5.0 recorded it does **not** end in
+were added to `brush-pyramid` for this, so the TRIPS half of the frame needs no
+dependency on `brush-render`. The same `resolve_to_cube_float` runs in the browser:
+it is not `cfg`-split, and contrary to what v0.5.0 recorded it does **not** end in
 CubeCL's `read_sync` on wasm (`docs/WEB_VIEWER.md` blocker 4).
+
+The **splat** half does depend on `brush-render` (and on `brush-serde` for the
+`.ply`), by path into the submodule, `cfg`-gated to non-wasm — see the next
+section.
+
+### The live Gaussian splat (v0.6.0)
+
+The Blend panel's splat half used to be a lookup: `bundle.json`'s `blend.splat_renders`
+carries a `splat.npz` of a dozen **capture views**, and the panel greyed out the moment
+you flew off one, because reusing a stored render at a new pose would be showing a
+picture taken from somewhere else. `src/splat.rs` replaces that with a real render:
+
+```
+bundle.json  blend.splat_ply
+   │
+   ├── brush_serde::load_splat_from_ply   .ply -> Vec<f32> (streamed, no whole-file copy)
+   │      └── SplatData::into_splats(&device)   -> brush_render::Splats, device-resident
+   │                                               transforms [N,10], sh_coeffs [N,C,3],
+   │                                               raw_opacities [N]   -- LOADED ONCE
+   └── per frame:
+          splat::to_brush_camera(&trips_camera)     COLMAP w2c -> Brush c2w + fov
+          brush_render::render_splats(..., TextureMode::Float)  -> Tensor<3> [H,W,4]
+          slice/permute/reshape                     -> Tensor<4> [1,3,H,W]
+          Renderer::compose                         -> g*splat + (1-g)*trips
+```
+
+Three things are worth knowing about it.
+
+**The camera conversion is six lines, and that is the finding.** trippy and Brush
+agree on the camera frame — `+X` right, `+Y` down, `+Z` forward, depth positive in
+front — so there is **no axis flip** (the one `brush-dataset::opengl_c2w_to_pose`
+applies for nerfstudio scenes is for OpenGL data, not COLMAP data). They differ only in
+direction and parameterisation: trippy stores world-to-camera `(R row-major, t)` with
+`fx/fy/cx/cy` in pixels; Brush stores camera-to-world (`position` = the camera centre,
+`rotation` = camera into world) with `fov_x/fov_y` in radians and `center_uv` as a
+fraction. So `rotation = R^T`, `position = -R^T t`, `fov = focal_to_fov(focal, pixels)`,
+`center_uv = (cx/W, cy/H)`. The `R^T` is free: `R` is row-major and
+`glam::Mat3::from_cols_array` reads column-major, so passing it straight through *is*
+the transpose. `splat::tests` pins all of it by projecting five world points through
+both cameras with each library's own code and requiring the same pixel to 1e-2 px.
+
+**No new blit branch was needed.** `apps/brush-app` displays its splat with
+`TextureMode::Packed` — a `[H, W, 1]` buffer whose f32 bits are an RGBA8 u32, unpacked
+in `splat_backbuffer.wgsl`. The viewer uses `TextureMode::Float` instead, a real
+`[H, W, 4]` f32 image, because the splat is not going straight to the screen: it has to
+be *blended with the TRIPS frame* first. Packed would have to be unpacked before the
+blend anyway, at 8 bits a channel, and would then need its own path in `blit.wgsl`.
+Float composites at full precision and comes out of `compose` in exactly the planar
+`[1, 3, H, W]` layout `blit.wgsl`'s existing `MODE_NETWORK` branch already indexes.
+`blit.wgsl` is unchanged.
+
+**Everything composes in display space.** `render_splats` returns the Gaussians' own
+colours (an `f_dc_*` coefficient fitted against the capture's display-referred pixels)
+and `Renderer::compose` sees the TRIPS frame *after* `NeuralCamera` has applied
+exposure, white balance, vignette and the response LUT. Both sides are therefore
+display-referred and the blend is a straight per-pixel lerp with no transfer function
+on either operand. The render uses `background = 0`, so its RGB is premultiplied by
+coverage and a pixel no Gaussian covers is exactly 0 — the same convention
+`SplatImage::masked_rgb` produces, which is what lets the live and precomputed operands
+be interchangeable.
+
+`brush-render` and `brush-serde` are path dependencies into the submodule under
+`[target.'cfg(not(target_family = "wasm"))'.dependencies]`, exactly the way
+`brush-pyramid` already reaches `brush-cube`/`brush-sort`/`brush-prefix-sum` (ADR-0005).
+`brush-serde`, **not** `brush-dataset`: the dataset crate is the same loader plus
+`image`, `jpeg-decoder`, `reqwest`, `async_zip`, `colmap-reader` and `clap`, none of
+which a viewer needs. The `cfg` is what keeps both out of the wasm graph, so
+`trips-web` builds and behaves exactly as v0.5.0 shipped.
 
 ### Building and running
 
@@ -445,6 +517,17 @@ bash scripts/gpu_submit.sh --prio 12 --wait mac-viewer-gpu-N -- bash -c \
   0.4 ms in `raw`. `StageTimings` also carries `upload_ms`, which is non-zero
   only for the `PointSet` entry points — the viewer's own path uploads nothing
   per frame.
+- `--splat-bench N` times the **splat render alone** — no pyramid, no U-Net, no
+  compositing — and reports how many Gaussians were visible, so a figure taken with the
+  camera looking away from the splat cannot be mistaken for a rasteriser measurement.
+  `--render-size WxH` sets an explicit headless resolution, so any bundle can be
+  measured at 1080p whatever its capture size. `--splat-ply`, `--splat-subsample` and
+  `--no-live-splat` choose, thin, or disable the splat.
+- `scripts/viewer_splat_check.sh <bundle> <out>` is the live path's acceptance check:
+  three screenshots at a pose yawed off a capture view (`mix 0` live splat, `mix 1`
+  TRIPS, and `mix 0 --no-live-splat` as the control) and a refusal if the first two
+  match or the control is not byte-identical to the TRIPS frame. Public and synthetic
+  scenes only, same guard as `viewer_camera_check.sh`.
 - `--half-net`, `--scale F`, `--no-cull`, `--cap-fragments`, `--fp16`,
   `--packed-sort` are the performance levers, all off / 1.0 by default.
   `docs/LIMITATIONS.md` says what each costs and `research/trips-metal.md` has
@@ -524,7 +607,16 @@ The viewer knows nothing about checkpoints or ADOP scenes. It reads a directory:
 <bundle>/bundle.json          format "trippy-bundle-1"; params + every camera
 <bundle>/points.npz           xyz (N,3) WORLD space, size (N,), feat (N,C), conf (N,)
 <bundle>/weights.safetensors  format "trippy-unet-1", unchanged
+<bundle>/splat.npz            OPTIONAL: precomputed Gaussian renders of a dozen capture
+                              views, the Blend panel's fallback when no .ply opens
 ```
+
+`bundle.json` gains an optional `blend` block on a hybrid (design A) run **and** on any
+run whose point source is a Gaussian `.ply`. On the second kind it carries only
+`splat_ply` — `channels` is empty, so the Gaussian block's width `G` is 0 and the
+network's `in_channels` check is unchanged. Its one job is to tell the viewer which
+`.ply` to render live. A bundle with no `blend` key is byte-for-byte the document every
+pre-gate bundle was, which is why `BUNDLE_FORMAT` has not changed.
 
 written by `trippy export-bundle --checkpoint <ckpt> --out <dir>`. World space, not
 the camera-space pre-distorted points `tools/export_unet_safetensors.py horse-e2e`

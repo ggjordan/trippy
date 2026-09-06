@@ -16,6 +16,10 @@
 //!       `wasm32-unknown-unknown` ("time not implemented on this platform")
 //!       and the second parks a thread the browser has no way to unpark. Both
 //!       are `cfg`-gated at their definition sites.
+//!     - The live splat ([`splat`]) is the one part of the pipeline that is
+//!       **not** platform-neutral: it is `cfg`-gated to non-wasm, and
+//!       [`renderer::Renderer`] carries its handle behind the same `cfg`, so the
+//!       browser build's graph and behaviour are unchanged.
 //!     - `std::fs` is still used by [`bundle::Bundle::load`], which is the
 //!       *native* entry point; the web front end calls
 //!       [`bundle::Bundle::from_parts`] with bytes it fetched instead. `fs`
@@ -27,6 +31,17 @@ pub mod blend;
 pub mod bundle;
 pub mod camera;
 pub mod renderer;
+
+/// The live Gaussian splat (`blend.splat_ply` rendered at the viewer's own
+/// pose through Brush's `brush-render`).
+///
+/// **Native only.** The browser has no filesystem to open a 2 GB `.ply` from,
+/// and keeping the module behind this `cfg` is what keeps `brush-render` and
+/// `brush-serde` out of the wasm dependency graph entirely (they are declared
+/// under the same `cfg` in `Cargo.toml`). On the web the Blend panel keeps the
+/// precomputed behaviour v0.5.0 shipped.
+#[cfg(not(target_family = "wasm"))]
+pub mod splat;
 
 /// The blit shader, shared verbatim by both front ends.
 ///

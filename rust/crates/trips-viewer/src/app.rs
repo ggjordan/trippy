@@ -90,6 +90,7 @@ impl ViewerApp {
         cc: &eframe::CreationContext<'_>,
         bundle: Bundle,
         settings: Settings,
+        splat_args: &crate::SplatArgs,
     ) -> Result<Self, String> {
         let state = cc
             .wgpu_render_state
@@ -133,7 +134,19 @@ impl ViewerApp {
         );
         let has_blend = bundle.manifest.blend.is_some();
 
-        let renderer = Renderer::new(bundle, burn_device)?;
+        let bundle_dir = bundle.dir.clone();
+        let blend_manifest = bundle.manifest.blend.clone();
+        let mut renderer = Renderer::new(bundle, burn_device)?;
+        // On the SAME device eframe just handed Burn, so the splat image and the
+        // TRIPS frame are two tensors on one allocator (`crate::splat`'s first
+        // invariant). Blocking here is deliberate: the window has not been drawn
+        // yet, and a half-loaded scene would be worse than a slow first frame.
+        crate::attach_live_splat(
+            &mut renderer,
+            &bundle_dir,
+            blend_manifest.as_ref(),
+            splat_args,
+        );
         let controller = Controller::new(&views, home, up);
 
         cc.egui_ctx
@@ -292,16 +305,22 @@ impl ViewerApp {
 
     /// The Blend panel: how much of the frame is splat and how much is TRIPS.
     ///
-    /// Drawn only for a bundle exported from a run trained with the blend gate
-    /// (`bundle.json`'s `blend` block); on every other scene this is a no-op and
-    /// the overlay is unchanged.
+    /// Drawn only for a bundle that carries a `blend` block -- a hybrid (design
+    /// A) run, or any run seeded from a Gaussian `.ply`; on every other scene
+    /// this is a no-op and the overlay is unchanged.
     ///
-    /// The controls deliberately state what they cannot do. The splat half comes
-    /// from **precomputed renders of the capture views** carried in the bundle,
-    /// so away from those views there is no splat to show and the panel says so
-    /// rather than fading to black or reusing a neighbouring view's pixels. The
-    /// live path -- rendering `blend.splat_ply` at the viewer's own pose through
-    /// Brush's `brush-render` -- is the follow-up (`docs/USER_GUIDE.md`).
+    /// The controls deliberately state what they cannot do, and since v0.6.0
+    /// there are two quite different things they might be doing:
+    ///
+    /// - **live** — `bundle.json`'s `blend.splat_ply` is loaded and Brush's
+    ///   `brush-render` rasterises it at the viewer's own pose, so every mode
+    ///   works everywhere and the readout says `live`;
+    /// - **precomputed** — no ply (or `--no-live-splat`), so the splat half comes
+    ///   from renders of the capture views carried in the bundle, and away from
+    ///   those views there is no splat to show. The panel says so rather than
+    ///   fading to black or reusing a neighbouring view's pixels.
+    ///
+    /// See `docs/USER_GUIDE.md` "Blend panel".
     fn blend_panel(&mut self, ui: &mut egui::Ui) {
         if !self.has_blend {
             return;
@@ -357,16 +376,21 @@ impl ViewerApp {
             ui.label("no gate head in these weights: the gated blend is unavailable");
         }
         let splat_views = self.renderer.splat_views();
-        let where_from = if has_splat {
-            "yes".to_owned()
+        let source = if self.renderer.has_live_splat() {
+            let detail = self
+                .renderer
+                .live_splat()
+                .map_or_else(String::new, |s| format!(" ({} Gaussians)", s.num_splats()));
+            format!("yes — rendered LIVE at this pose from blend.splat_ply{detail}")
+        } else if has_splat {
+            "yes — a precomputed render of this capture view".to_owned()
         } else if !self.controller.is_pinned() {
-            "no — you have flown off the capture views".to_owned()
+            "no — you have flown off the capture views, and no ply is loaded".to_owned()
         } else {
-            "no — this view has no stored render".to_owned()
+            "no — this view has no stored render, and no ply is loaded".to_owned()
         };
         ui.label(format!(
-            "splat at this pose: {where_from} ({} of {} views carry one; \
-             the live path removes the limit)",
+            "splat at this pose: {source}  [{} of {} views carry a precomputed render]",
             splat_views.len(),
             self.views.len()
         ));

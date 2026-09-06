@@ -65,7 +65,9 @@ Related docs: docs/GEOMETRY.md (frames, up vector), docs/TRIPS_REFERENCE.md
                     index), name, width, height, fx, fy, cx, cy,
                     R (9 floats, row-major world-to-camera),
                     t (3 floats), distortion (8 floats, Saiga order).
-    blend           OPTIONAL, present only on a hybrid (design A) run
+    blend           OPTIONAL: on a hybrid (design A) run, and on any run whose
+                    point source is a Gaussian PLY (then only `splat_ply` is
+                    meaningful -- `channels` is empty and there are no renders)
                     (`BlendInfo`): gate (bool -- whether the weights carry the
                     gate head), gate_channel (int, always 3), gate_scale
                     (float), splat_ply (str, "" if none), splat_renders (str
@@ -307,22 +309,30 @@ class BundleParams:
 class BlendInfo:
     """The `blend:` block of `bundle.json`: everything a viewer needs to mix.
 
-    Present only on a bundle exported from a run trained with the blend gate
-    (`hybrid.gate.enabled`). A viewer that does not understand it ignores the
-    key; a bundle without it is byte-for-byte the document every previous
-    bundle was, which is why `BUNDLE_FORMAT` does **not** change.
+    Written on a hybrid (design A) run, gate or not, and -- since the viewer
+    grew a live splat path -- on any run whose point source is a Gaussian PLY,
+    where the only meaningful field is `splat_ply` (`channels` is empty, so
+    `block_channels() == 0` and a reader's `C + G` check is unchanged). A viewer
+    that does not understand the block ignores the key; a bundle without it is
+    byte-for-byte the document every previous bundle was, which is why
+    `BUNDLE_FORMAT` does **not** change.
 
     Attributes:
-        gate: whether `weights.safetensors` carries the gate head. Always True
-            here (the block is not written otherwise), but explicit so the
-            document is readable on its own.
+        gate: whether `weights.safetensors` carries the gate head, i.e. whether
+            its U-Net has a fourth output channel. False on a hybrid run trained
+            without `hybrid.gate`, and on a plain Gaussian-seeded run. The
+            exporter writes the `gate` safetensors key only when this is True:
+            `brush_unet::weights` refuses a file whose metadata and
+            `out_channels` disagree.
         gate_channel: which U-Net output channel is the gate logit (3).
         gate_scale: the run's own default scale; the viewer's slider starts here.
         splat_ply: absolute path to the Gaussian PLY the splat half came from,
             or "" if the run recorded none. This is what the **live** splat path
-            (rendering the PLY in the viewer through Brush's `brush-render`)
-            will open; it is carried now so a bundle exported today is already
-            complete when that lands.
+            opens: `trips-viewer` loads it once through Brush's `brush-render`
+            and rasterises it at whatever pose the camera is at, which is what
+            makes splat / gated / mix / split work away from the capture views.
+            Taken from `hybrid.ply_path` on a design-A run, and otherwise from
+            the run's own `point_source` when that is a Gaussian PLY.
         splat_renders: filename of the precomputed render archive
             (`BUNDLE_SPLAT_FILENAME`), or "" when none were written.
         splat_views: array positions into `views` that have a precomputed
@@ -687,8 +697,13 @@ def write_bundle(source: BundleSource, out_dir: str | Path) -> Path:
     metadata.update(source.metadata or {})
     blend = source.blend
     if blend is not None:
-        metadata["gate"] = "1"
-        metadata["gate_scale"] = str(float(blend.gate_scale))
+        # Only on a run that really has the head. `brush_unet::weights` REFUSES a
+        # file whose metadata says gate=1 while `out_channels` is 3 ("metadata
+        # says gate=... but out_channels=..."), and a `blend` block is written
+        # for any design-A run and for any gaussian-seeded run, gate or not.
+        if blend.gate:
+            metadata["gate"] = "1"
+            metadata["gate_scale"] = str(float(blend.gate_scale))
         metadata["splat_ply"] = blend.splat_ply
     export(
         source.net,
@@ -1116,6 +1131,38 @@ def native_splat_renders(
     return out, scale
 
 
+def gaussian_ply_path(source: Any) -> str:
+    """The Gaussian `.ply` a `PointSourceConfig` reads, or `""`.
+
+    The viewer's live splat path renders this file at whatever pose the camera
+    is at, so recording it is what lets the Blend panel work away from the
+    capture views. A run seeded from a Gaussian PLY (`point_source.type ==
+    "gaussian"`) has one even when it is not a hybrid run at all -- that is the
+    common case for Karekare, where every TRIPS run starts from
+    `kklid_20000.ply`.
+
+    Args:
+        source: a `trippy.train.config.PointSourceConfig`, or None.
+
+    Returns:
+        The path as a string, or `""` when this source reads no PLY. A
+        `type == "union"` source reports its FIRST Gaussian child, depth first:
+        a union's other members are COLMAP/monodepth points that no splat
+        renderer can draw.
+    """
+    if source is None:
+        return ""
+    kind = str(getattr(source, "type", "") or "")
+    if kind == "gaussian":
+        return str(getattr(source, "path", "") or "")
+    if kind == "union":
+        for child in getattr(source, "sources", None) or []:
+            found = gaussian_ply_path(child)
+            if found:
+                return found
+    return ""
+
+
 def native_blend(trainer: Any, views: list[BundleView], default_position: int) -> tuple[
     BlendInfo | None, dict[int, dict[str, np.ndarray]]
 ]:
@@ -1129,13 +1176,43 @@ def native_blend(trainer: Any, views: list[BundleView], default_position: int) -
     that is the bug this fixes, and the Blend panel's splat half is the same
     pixels, for free.
 
+    Also written, in a minimal form carrying nothing but `splat_ply`, for a
+    plain run whose `point_source` is a Gaussian PLY -- which is every Karekare
+    run, all of them seeded from `kklid_20000.ply`. That block has `channels ==
+    []`, so `block_channels() == 0` and the network's input width is unchanged;
+    its only job is to tell the viewer which PLY to render live.
+
     None -- and therefore no "blend" key in `bundle.json` and no `splat.npz` --
-    on a non-hybrid run. That is the whole backwards-compatibility story:
-    nothing about an existing bundle changes.
+    on a run that is neither hybrid nor Gaussian-seeded (a COLMAP-sparse or
+    monodepth point source, or a TRIPS checkpoint import). That is the whole
+    backwards-compatibility story: nothing about such a bundle changes.
     """
     cfg_hybrid = getattr(trainer.cfg, "hybrid", None)
+    source_ply = gaussian_ply_path(getattr(trainer.cfg, "point_source", None))
     if cfg_hybrid is None or not cfg_hybrid.enabled:
-        return None, {}
+        if not source_ply:
+            return None, {}
+        # A plain (non-hybrid) run seeded from a Gaussian PLY. It has no gate,
+        # no Gaussian input block and no precomputed renders -- `channels` is
+        # empty, so `block_channels() == 0` and the viewer's `C + G` check is
+        # `C == in_channels`, i.e. exactly what it was without the block. What
+        # this DOES carry is `splat_ply`, which is all the live splat path needs
+        # to offer splat / mix / split on a run that never trained a hybrid.
+        return (
+            BlendInfo(
+                gate=False,
+                gate_channel=HYBRID_A_GATE_CHANNEL_INDEX,
+                gate_scale=HYBRID_A_GATE_SCALE_DEFAULT,
+                splat_ply=source_ply,
+                splat_renders="",
+                splat_views=[],
+                splat_scale=1.0,
+                mask_by_alpha=False,
+                channels=[],
+                feature_channels=int(trainer.cfg.feature_channels),
+            ),
+            {},
+        )
     positions = splat_view_positions(views, default_position, BUNDLE_SPLAT_MAX_VIEWS)
     renders, scale = native_splat_renders(trainer, views, positions)
     return (
@@ -1143,7 +1220,10 @@ def native_blend(trainer: Any, views: list[BundleView], default_position: int) -
             gate=bool(cfg_hybrid.gate_enabled),
             gate_channel=HYBRID_A_GATE_CHANNEL_INDEX,
             gate_scale=float(getattr(trainer, "gate_scale", cfg_hybrid.gate_scale)),
-            splat_ply=str(cfg_hybrid.ply_path or ""),
+            # The hybrid block's own PLY, falling back to the point source's:
+            # a design-A run that conditions on a splat trained elsewhere records
+            # `hybrid.ply_path`, but one that only *seeds* from a PLY does not.
+            splat_ply=str(cfg_hybrid.ply_path or "") or source_ply,
             splat_renders=BUNDLE_SPLAT_FILENAME if renders else "",
             splat_views=sorted(renders),
             splat_scale=scale,

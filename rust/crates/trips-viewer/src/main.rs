@@ -61,12 +61,20 @@ Options:
                        you have moved off it)
   --free               open in free-fly mode instead of orbit
 
-Blend panel (hybrid bundles with a `blend` block only; see docs/USER_GUIDE.md):
+Blend panel (any bundle with a `blend` block -- a hybrid run, or any run seeded
+from a Gaussian .ply; see docs/USER_GUIDE.md):
   --blend-mode <m>     trips | splat | gated | mix | split (default trips)
   --gate-scale <f>     0..2 multiplier on the trained gate, for `gated`
                        (0 = TRIPS, 1 = as trained, 2 = pushed to the splat)
   --mix <f>            0 = splat, 1 = TRIPS, for `mix`
   --split <f>          fraction of the width where `split` changes over
+  --splat-ply <p>      render THIS .ply live instead of the one bundle.json
+                       names (`blend.splat_ply`)
+  --no-live-splat      do not open the ply at all: fall back to the bundle's
+                       precomputed capture-view renders, as before v0.6.0
+  --splat-subsample <n> keep every n-th Gaussian while parsing (a stride, so it
+                       also shrinks the parser's allocation -- the only lever
+                       that helps peak memory on a multi-GB ply)
 
 Headless (no window; used by the acceptance check and the perf table):
   --screenshot <o.png> render one frame to a PNG and exit
@@ -75,6 +83,11 @@ Headless (no window; used by the acceptance check and the perf table):
                        prove that moving the camera reaches the renderer
   --frames <n>         warm-up frames before the screenshot / benchmark (default 2)
   --bench <n>          time <n> frames and print ms + fps, then exit
+  --render-size <WxH>  render at exactly this size instead of the view's own
+                       size times --scale (so any bundle can be measured at
+                       1080p, whatever its capture resolution)
+  --splat-bench <n>    time <n> LIVE SPLAT renders on their own -- no pyramid,
+                       no U-Net -- and print the median ms, then exit
 
 Keys:
   left-drag  orbit (or look, in free mode)   right/middle-drag  pan
@@ -136,6 +149,94 @@ struct Args {
     free: bool,
     /// The Blend panel's starting state.
     blend: Blend,
+    /// How to get the live Gaussian splat, if at all.
+    splat: SplatArgs,
+    /// `--render-size WxH`: an explicit headless render resolution.
+    render_size: Option<(usize, usize)>,
+    /// `--splat-bench <n>`: time the splat render alone.
+    splat_bench: Option<usize>,
+}
+
+/// Parse `1920x1080`.
+fn parse_size(text: &str) -> Result<(usize, usize), String> {
+    let (w, h) = text
+        .split_once(['x', 'X'])
+        .ok_or_else(|| format!("--render-size {text:?}: expected WxH, e.g. 1920x1080"))?;
+    let width: usize = w.trim().parse().map_err(|e| format!("--render-size width: {e}"))?;
+    let height: usize = h.trim().parse().map_err(|e| format!("--render-size height: {e}"))?;
+    if width == 0 || height == 0 {
+        return Err(format!("--render-size {text:?}: both sides must be > 0"));
+    }
+    Ok((width, height))
+}
+
+/// The live-splat flags. Kept together so `run_headless` and the window take
+/// the same three decisions through the same code.
+#[derive(Clone, Debug, Default)]
+struct SplatArgs {
+    /// `--splat-ply`, which overrides `bundle.json`'s `blend.splat_ply`.
+    ply: Option<PathBuf>,
+    /// `--no-live-splat`: keep the pre-v0.6.0 precomputed-only behaviour.
+    disabled: bool,
+    /// `--splat-subsample <n>`.
+    subsample: Option<u32>,
+}
+
+/// Open the bundle's Gaussian `.ply` and hand it to `renderer`, printing what
+/// happened.
+///
+/// Never fatal. A bundle with no `blend.splat_ply`, a `--no-live-splat` run, or
+/// a ply that will not open all leave the renderer on the precomputed path,
+/// which is exactly the behaviour every bundle had before this existed. The
+/// only difference is a line on stderr saying which of those it was.
+///
+/// # Arguments
+/// - `renderer`: already built on the device the window (or the headless run)
+///   uses.
+/// - `dir`: the bundle directory, so a relative `splat_ply` resolves against it.
+/// - `blend`: the bundle's `blend` block, or `None`.
+/// - `args`: the three flags.
+fn attach_live_splat(
+    renderer: &mut Renderer,
+    dir: &std::path::Path,
+    blend: Option<&crate::bundle::BlendManifest>,
+    args: &SplatArgs,
+) {
+    if args.disabled {
+        eprintln!("--no-live-splat: the Blend panel uses the precomputed capture-view renders");
+        return;
+    }
+    let named = args.ply.clone().or_else(|| {
+        blend
+            .map(|b| b.splat_ply.trim())
+            .filter(|p| !p.is_empty())
+            .map(PathBuf::from)
+    });
+    let Some(named) = named else {
+        return;
+    };
+    // A bundle written on this machine records an absolute path; a bundle
+    // someone moved may not, so a relative one is read next to `bundle.json`.
+    let path = if named.is_absolute() {
+        named
+    } else {
+        dir.join(named)
+    };
+    eprintln!("loading splat {} ...", path.display());
+    let started = std::time::Instant::now();
+    match renderer.load_live_splat(&path, args.subsample) {
+        Ok(splat) => eprintln!(
+            "splat loaded: {} Gaussians, SH degree {}, {:.0} ms",
+            splat.num_splats(),
+            splat.sh_degree(),
+            splat.load_ms()
+        ),
+        Err(e) => eprintln!(
+            "splat NOT loaded after {:.0} ms ({e}); the Blend panel falls back to the \
+             bundle's precomputed capture-view renders",
+            started.elapsed().as_secs_f64() * 1e3
+        ),
+    }
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -151,6 +252,9 @@ fn parse_args() -> Result<Args, String> {
         camera_yaw_deg: None,
         free: false,
         blend: Blend::default(),
+        splat: SplatArgs::default(),
+        render_size: None,
+        splat_bench: None,
     };
     let mut argv = std::env::args().skip(1);
     while let Some(flag) = argv.next() {
@@ -203,6 +307,20 @@ fn parse_args() -> Result<Args, String> {
             }
             "--mix" => args.blend.mix = value()?.parse().map_err(|e| format!("--mix: {e}"))?,
             "--split" => args.blend.split = value()?.parse().map_err(|e| format!("--split: {e}"))?,
+            "--render-size" => args.render_size = Some(parse_size(&value()?)?),
+            "--splat-bench" => {
+                args.splat_bench =
+                    Some(value()?.parse().map_err(|e| format!("--splat-bench: {e}"))?);
+            }
+            "--splat-ply" => args.splat.ply = Some(PathBuf::from(value()?)),
+            "--no-live-splat" => args.splat.disabled = true,
+            "--splat-subsample" => {
+                args.splat.subsample = Some(
+                    value()?
+                        .parse()
+                        .map_err(|e| format!("--splat-subsample: {e}"))?,
+                );
+            }
             "--free" => args.free = true,
             "--frames" => args.warmup = value()?.parse().map_err(|e| format!("--frames: {e}"))?,
             "--bench" => args.bench = Some(value()?.parse().map_err(|e| format!("--bench: {e}"))?),
@@ -249,10 +367,17 @@ fn run_headless(args: &Args, bundle: Bundle) -> Result<(), String> {
     });
     let frame_index = view.index;
     let camera_view = view.clone();
-    let mut renderer = Renderer::new(bundle, device)?;
+    let bundle_dir = bundle.dir.clone();
+    let blend_manifest = bundle.manifest.blend.clone();
+    let mut renderer = Renderer::new(bundle, device.clone())?;
+    attach_live_splat(&mut renderer, &bundle_dir, blend_manifest.as_ref(), &args.splat);
     let scale = args.settings.render_scale.clamp(0.1, 1.0);
-    let width = ((camera_view.width as f32 * scale).round() as usize).max(16);
-    let height = ((camera_view.height as f32 * scale).round() as usize).max(16);
+    // `--render-size` wins over `--scale`: measuring a 1080p frame must not
+    // depend on the capture happening to be 1080p.
+    let (width, height) = args.render_size.unwrap_or((
+        ((camera_view.width as f32 * scale).round() as usize).max(16),
+        ((camera_view.height as f32 * scale).round() as usize).max(16),
+    ));
     let mut controller = crate::camera::Controller::new(&views, home, up);
     if args.free {
         controller.set_mode(crate::camera::Mode::Free);
@@ -353,6 +478,53 @@ fn run_headless(args: &Args, bundle: Bundle) -> Result<(), String> {
         );
     }
 
+    if let Some(count) = args.splat_bench {
+        // The splat render ON ITS OWN: no pyramid, no U-Net, no compositing --
+        // the number the perf table wants, and the one a whole-frame `--bench`
+        // cannot separate out.
+        let Some(splat) = renderer.live_splat() else {
+            return Err(
+                "--splat-bench needs a live splat; this bundle names no `blend.splat_ply` \
+                 (or --no-live-splat was passed)"
+                    .to_owned(),
+            );
+        };
+        // One untimed render pays for shader compilation and pool growth, and
+        // reports how much of the splat this camera can actually see -- see
+        // `LiveSplat::render_counting`.
+        let (_warm, (visible, intersections)) = block_on(splat.render_counting(&camera))?;
+        block_on(brush_pyramid::gpu::sync(&device))?;
+        if visible == 0 {
+            eprintln!(
+                "WARNING: 0 of {} Gaussians are visible from this camera. The ply and the \
+                 bundle are probably from different reconstructions, and the timing below \
+                 measures the frustum cull, not the rasteriser.",
+                splat.num_splats()
+            );
+        }
+        let mut samples = Vec::with_capacity(count.max(1));
+        for _ in 0..count.max(1) {
+            let start = std::time::Instant::now();
+            let _image = block_on(splat.render(&camera))?;
+            // Drain the queue: without it every sample would time a submission,
+            // not a render, and the median would be meaningless.
+            block_on(brush_pyramid::gpu::sync(&device))?;
+            samples.push(start.elapsed().as_secs_f64() * 1e3);
+        }
+        samples.sort_by(f64::total_cmp);
+        let median = samples[samples.len() / 2];
+        println!(
+            "SPLAT-BENCH {width}x{height} {} Gaussians, SH degree {}: median over {} renders \
+             {median:.2} ms ({:.1} fps); {visible} visible, {intersections} tile \
+             intersections; load {:.0} ms",
+            splat.num_splats(),
+            splat.sh_degree(),
+            samples.len(),
+            1000.0 / median,
+            splat.load_ms(),
+        );
+    }
+
     if let Some(out) = &args.screenshot {
         let (data, channels, height, width) =
             block_on(renderer.render_to_host(&camera, frame_index, &args.settings, args.blend))?;
@@ -386,7 +558,10 @@ fn run() -> Result<(), String> {
     let args = parse_args()?;
     // `--profile` prints per-stage numbers and must not open a window: a
     // headless queue job has no display, and an earlier version hung there.
-    let headless = args.screenshot.is_some() || args.bench.is_some() || args.settings.profile;
+    let headless = args.screenshot.is_some()
+        || args.bench.is_some()
+        || args.splat_bench.is_some()
+        || args.settings.profile;
     let dir = resolve_bundle(args.bundle.clone(), headless)?;
     let bundle = Bundle::load(&dir)?;
     eprintln!(
@@ -419,6 +594,7 @@ fn run() -> Result<(), String> {
     let title = format!("TRIPS — {}", bundle.manifest.name);
     let mode = args.mode;
     let blend_state = args.blend;
+    let splat_args = args.splat.clone();
     let navigation = if args.free {
         crate::camera::Mode::Free
     } else {
@@ -436,7 +612,7 @@ fn run() -> Result<(), String> {
         &title,
         options,
         Box::new(move |cc| {
-            let mut app = app::ViewerApp::new(cc, bundle, settings)
+            let mut app = app::ViewerApp::new(cc, bundle, settings, &splat_args)
                 .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
             app.set_mode(mode);
             app.set_navigation(navigation);

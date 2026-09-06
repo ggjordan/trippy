@@ -168,8 +168,10 @@ or with no argument at all, and it opens a folder picker.
 
 ## The Blend panel: splat vs TRIPS, with a slider
 
-Only appears on a **hybrid** scene trained with the blend gate. On every other scene the
-viewer looks exactly as it always has.
+Appears on any scene whose bundle names a Gaussian `.ply` — every **hybrid** run, and every
+plain run seeded from a splat (which on Karekare is all of them: they all start from
+`kklid_20000.ply`). On a scene built from COLMAP points or monodepth there is no splat to
+mix in and the viewer looks exactly as it always has.
 
 A hybrid run draws the scene from two things at once: your Gaussian splat, and TRIPS's point
 cloud. Until now, how much of any pixel came from which was buried in the network's weights.
@@ -193,30 +195,60 @@ Two sliders:
 - **mix** (manual mix only), **0 = splat, 1 = TRIPS**. This one ignores what the network
   learned and just crossfades.
 
-### The honest limitation, and what is coming
+### The splat is rendered live, wherever you fly
 
-Right now the splat half comes from **precomputed renders of the capture views**, carried
-inside the bundle (a `splat.npz` next to `bundle.json`: a dozen views, downscaled to 512 px
-on the long edge). So:
+When the viewer opens a bundle it also opens the Gaussian `.ply` that bundle names
+(`blend.splat_ply`) and keeps it on the graphics card. Every frame, Brush's own Gaussian
+renderer draws it **from wherever your camera is**, and the Blend panel mixes that with the
+TRIPS frame. So every mode works everywhere: fly off the capture path, look backwards, go
+somewhere no photograph was ever taken — the splat follows.
 
-- On a capture view that has one — press `N`/`P` to step between them, or use "jump to view" —
-  every mode works.
-- The moment you fly off a capture view, there is no splat for *that pose*. The panel greys out
-  the modes that need one and says so. **It will not fade to black and it will not reuse the
-  view you just left**, because a stored render is a picture of the Gaussians taken from that
-  view's camera — showing it at your new pose would be showing a photograph of somewhere else.
-  (The training code refuses the same substitution, for the same reason.) Press `R` or `N`/`P`
-  to sit back on a capture view.
+You will see two lines about it:
 
-The panel tells you how many of the scene's views carry a render.
+```
+loading splat /Users/.../kklid_20000.ply ...
+splat loaded: 8912345 Gaussians, SH degree 3, 41000 ms
+```
 
-**Coming next: live splat rendering.** The bundle already records the path to the Gaussian
-`.ply` the splat half came from. The follow-up wires Brush's own Gaussian renderer
-(`brush-render`, in the `rust/brush-trips` submodule) into the viewer so the splat is rendered
-at *your* pose, wherever you fly — at which point the cap of a dozen views and the greying-out
-both disappear. The plumbing it needs (the shared wgpu device, the Burn tensor bridge into
-egui's render pass, the patched shader stack) is already in place and working; what is left is
-the camera conversion and a packed-RGBA8 branch in the blit shader.
+Loading is the slow part, once, when the scene opens: a 2 GB `.ply` takes tens of seconds.
+Rendering it after that is a per-frame cost like anything else. The panel's bottom line says
+which you are looking at — `rendered LIVE at this pose` or `a precomputed render of this
+capture view`.
+
+**If the `.ply` cannot be opened** (it was moved, or the bundle came from another machine) the
+viewer says so on stderr, keeps working, and falls back to what it did before: **precomputed
+renders of the capture views**, carried inside the bundle as a `splat.npz` (a dozen views,
+downscaled to 512 px on the long edge). In that state:
+
+- on a capture view that has one — press `N`/`P` to step between them — every mode works;
+- the moment you fly off one, there is no splat for *that pose*. The panel greys out the modes
+  that need one and says so. **It will not fade to black and it will not reuse the view you
+  just left**, because a stored render is a picture of the Gaussians taken from that view's
+  camera — showing it at your new pose would be showing a photograph of somewhere else.
+
+`--splat-ply <path>` points the viewer at a different `.ply` than the bundle names.
+`--no-live-splat` turns the live path off and gives you exactly the older behaviour.
+`--splat-subsample <n>` keeps every n-th Gaussian, which is the lever to reach for if a very
+large `.ply` will not fit.
+
+### What the two halves have in common, and what they do not
+
+- **Exposure.** Both halves are in *display* space when they are mixed. The TRIPS frame has
+  already been through the tone mapper (exposure, white balance, vignette, response curve); the
+  splat's colours were fitted against the photographs directly. Neither is converted, so what
+  you see is a straight crossfade between two pictures graded the same way. If a scene's TRIPS
+  half looks brighter or flatter than its splat half, that is the tone mapper's grade, and `X`
+  cycles it.
+- **Lens distortion.** The TRIPS half applies the capture's lens distortion; the splat half is
+  rendered as a plain pinhole, because the two renderers parameterise distortion differently.
+  On a scene with strong distortion the two can disagree by a few pixels at the very corners.
+- **The gate is still a capture-view opinion, on a hybrid scene.** A hybrid network is *fed* the
+  Gaussian render as input, and that input still comes from the bundle's precomputed views — the
+  live splat feeds the blend, not the network. So off a capture view the TRIPS half (and the
+  gate `g` it produces) is the network's "no Gaussian information here" answer, which is what it
+  was trained to fall back to. `splat only`, `manual mix` and `split screen` are unaffected, and
+  so is every non-hybrid scene. `docs/LIMITATIONS.md` has the reason (there is no per-pixel depth
+  out of either renderer to fill the block's depth channel with).
 
 ### From the command line
 
@@ -225,6 +257,9 @@ Useful for making two frames to compare side by side:
 ```
 rust/target/release/trips-viewer <bundle> --blend-mode mix --mix 0 --screenshot splat.png
 rust/target/release/trips-viewer <bundle> --blend-mode mix --mix 1 --screenshot trips.png
+# ... and the same two from a pose no camera stood at, which is the whole point:
+rust/target/release/trips-viewer <bundle> --camera-yaw-deg 20 --blend-mode mix --mix 0 \
+    --screenshot splat-off-path.png
 rust/target/release/trips-viewer <bundle> --blend-mode gated --gate-scale 2 --screenshot pushed.png
 rust/target/release/trips-viewer <bundle> --blend-mode split --split 0.5 --screenshot split.png
 ```

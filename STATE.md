@@ -3,6 +3,26 @@
 Last updated: 2026-09-06 (fix/viewer-kk session; previous: web-perf)
 
 ## Done
+- **feat/live-splat (2026-09-07): the Gaussian splat is rendered LIVE in the viewer, at any pose.**
+  `bundle.json`'s `blend.splat_ply` is loaded once into `brush_render::Splats` on the viewer's own
+  device (`trips-viewer/src/splat.rs`, `brush-serde` for the ply, `brush-render` for the raster,
+  both path deps into the untouched submodule, `cfg`-gated off wasm) and rasterised at every
+  frame's camera, so `splat`/`gated`/`mix`/`split` work everywhere instead of only on the dozen
+  capture views `splat.npz` carried. **The camera-convention finding: there is no axis flip** --
+  trippy and Brush share `+X` right / `+Y` down / `+Z` forward, so the conversion is
+  `rotation = R^T`, `position = -R^T t`, `fov = focal_to_fov(focal, pixels)`,
+  `center_uv = (cx/W, cy/H)`, and the `R^T` is free (row-major `R` read column-major by glam).
+  Pinned by a CPU test projecting five points through both cameras with each library's own code.
+  **`blit.wgsl` needed no change**: `TextureMode::Float` gives `[H,W,4]` f32 which slices into the
+  planar `[1,3,H,W]` the tone mapper already produces. Proof without a window
+  (`scripts/viewer_splat_check.sh`, synthetic bundle, camera yawed 20 deg off a capture view):
+  mix 0 vs mix 1 = **58.126/255, 100% of pixels changed**, control with `--no-live-splat` = **0.000**.
+  Horse regression: the pre-change binary and the new one write a **byte-identical** frame
+  (max|a-b| 0.0). Also: `export-bundle` now records `splat_ply` for **any** Gaussian-seeded run
+  (every Karekare run), not just hybrids; two pre-existing bugs fixed on the way (`trips-web` did
+  not compile after the Blend panel changed `Renderer::render`'s signature; a gate-less hybrid
+  export wrote `gate = "1"` next to `out_channels = 3`, which `brush_unet::weights` refuses).
+  Perf job `trippy-live-splat-perf-1` (prio 12) queued for the ms numbers.
 - **fix/viewer-kk (2026-09-06): the white Karekare frame was an untrained per-image exposure, not a viewer bug.** `Trainer._initial_exposure` encoded "no EXIF" as "EV 0" *before* subtracting the scene mean, so an EXIF-less photo got a relative EV of -5.870477 on kk-coherent = a **58.5x** tone-mapper gain, which clips the response LUT flat to `LUT(1) = (0.888, 0.875, 0.863)`. Ten of 219 images have no EXIF; six are held out (their exposure never gets a gradient) and one of those six was view 0, the view the bundle opened at. Proof: the run's own six worst held-out PSNRs (6.19-6.92 dB) are exactly those six views. Job `trippy-viewer-kk-1` (rc 0) settled it numerically -- **the viewer matches trippy's Python reference at 85.78 dB on the BROKEN bundle**, which rules out f16, the response LUT, the background and the feature layout in one measurement. **View 0 vs its own photograph: 6.20 -> 14.92 dB** (its neighbour is 15.49); the unaffected views are byte-identical before and after; **horse parity unchanged at 82.68470 dB**. Four fixes (the trainer half is `feat/eval-calib`'s implementation, kept on rebase -- same bug found independently from two directions): trainer (no EXIF -> gain 1), exporter (`trusted_exposures` substitutes the scene median beyond 2 stops, recorded in the bundle metadata), `default_view` moves off an untrustworthy view (full2: 0 -> 26 `IMG_3735`), and the viewer picks its own exposure off a capture pose (`X`, `--exposure`). Plus navigation 4x faster with a 50x scroll ceiling. Re-delivered: `full2-broadcast-viewer-v2`, `trips-kk-full1-viewer-v2`, `trips-mac-viewer-horse-v3`. New tool: `trippy bundle-parity` + `scripts/viewer_parity_check.sh` (numbers only, safe on private scenes).
 - **feat/web-perf (2026-09-06): the browser viewer was 27x slower because of the LINKER, not the renderer.** `wasm-ld` wrapped every export in a `.command_export` shim that re-runs the whole `.init_array`; `cubecl-ir` -> `pliron` makes one such run cost ~110 us, and `wasm-bindgen` resolves `__externref_table_alloc` by export name, so every `JsValue` `wgpu` built for a bind group paid it -- ~2,500 constructor runs a frame, 275 ms of a 297 ms frame. `trips-web/build.rs` now links with `--export=__wasm_call_ctors`; `web/trips.js` runs them once and refuses without the export. **Chrome 1440x810: `raw level-0` 3.32 -> 75.9 fps, `network` 1.09 -> 17.7 fps, readback PSNR 62.04 -> 104.54 dB.** Safari re-diagnosed: "Expected 'f16'" was never about f16 -- Safari 26.6.2 has no WebGPU subgroups in any form, so `brush-sort`'s four radix kernels cannot compile; the page now refuses with the exact kernels and builtins, checked on `adapter.features`, not the user agent. Launcher `trips-web-viewer-horse` re-delivered.
 - Spec + plan grilled and approved 2026-09-05.
