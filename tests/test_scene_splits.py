@@ -2,8 +2,11 @@
 
 Module: tests.test_scene_splits
 Invariants under test: `modulo_split` is a pure function of the sorted name
-    list (order-independent input, deterministic output), and
-    `split_with_forced_heldout` always pins the forced names into heldout.
+    list (order-independent input, deterministic output);
+    `split_with_forced_heldout` pins the forced names into heldout in the
+    default "all" mode, and in "alternate" mode holds out every other
+    forced name while forcing the rest INTO train (they can never leak back
+    into heldout via the modulo stride).
 Related docs: docs/SPEC.md v0.1.0 milestone ("train/held-out split");
     trippy.constants.SHADE_FRAMES_KK.
 """
@@ -70,3 +73,50 @@ def test_split_with_forced_heldout_ignores_absent_names() -> None:
     train, heldout = splits.split_with_forced_heldout(names, forced, k=2, offset=0)
     assert sorted(train + heldout) == sorted(names)
     assert "not_present.jpg" not in train and "not_present.jpg" not in heldout
+
+
+# --- forced hold-out protocols ("all" vs "alternate", trippy.constants.FORCED_HELDOUT_MODES) ---
+
+
+def test_partition_forced_all_holds_every_forced_frame_out() -> None:
+    heldout, train = splits.partition_forced(SHADE_FRAMES_KK, mode="all")
+    assert heldout == sorted(SHADE_FRAMES_KK)
+    assert train == []
+
+
+def test_partition_forced_alternate_splits_the_shade_frames_in_half() -> None:
+    heldout, train = splits.partition_forced(SHADE_FRAMES_KK, mode="alternate")
+    assert heldout == ["IMG_3828.jpg", "IMG_3830.jpg", "IMG_3832.jpg"]
+    assert train == ["IMG_3829.jpg", "IMG_3831.jpg", "IMG_3833.jpg"]
+    assert sorted(heldout + train) == sorted(SHADE_FRAMES_KK)
+
+
+def test_partition_forced_alternate_offset_flips_the_parity() -> None:
+    heldout, train = splits.partition_forced(SHADE_FRAMES_KK, mode="alternate", alternate_offset=1)
+    assert heldout == ["IMG_3829.jpg", "IMG_3831.jpg", "IMG_3833.jpg"]
+    assert train == ["IMG_3828.jpg", "IMG_3830.jpg", "IMG_3832.jpg"]
+
+
+def test_partition_forced_rejects_an_unknown_mode() -> None:
+    with pytest.raises(ValueError):
+        splits.partition_forced(SHADE_FRAMES_KK, mode="every-other-one")
+
+
+def test_split_with_forced_heldout_alternate_trains_half_the_shade_frames() -> None:
+    names = [f"IMG_{i}.jpg" for i in range(3800, 3860)]
+    train, heldout = splits.split_with_forced_heldout(names, SHADE_FRAMES_KK, k=8, mode="alternate")
+
+    assert sorted(train + heldout) == sorted(names)
+    assert set(train).isdisjoint(heldout)
+    assert set(heldout) & set(SHADE_FRAMES_KK) == {"IMG_3828.jpg", "IMG_3830.jpg", "IMG_3832.jpg"}
+    # The trained shade frames are pulled OUT of the modulo stride, so none of them can be
+    # held out by accident -- the point of the protocol is that the shade region is observed.
+    assert {"IMG_3829.jpg", "IMG_3831.jpg", "IMG_3833.jpg"} <= set(train)
+
+
+def test_split_with_forced_heldout_defaults_to_the_all_protocol() -> None:
+    names = [f"IMG_{i}.jpg" for i in range(3800, 3860)]
+    default_split = splits.split_with_forced_heldout(names, SHADE_FRAMES_KK, k=8)
+    explicit_split = splits.split_with_forced_heldout(names, SHADE_FRAMES_KK, k=8, mode="all")
+    assert default_split == explicit_split
+    assert set(SHADE_FRAMES_KK) <= set(default_split[1])

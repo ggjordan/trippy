@@ -66,6 +66,8 @@ def evaluate_checkpoint(
     checkpoint_path: str | Path,
     images: list[str] | None = None,
     device: str | None = None,
+    calibrate: bool | None = None,
+    calibrate_white_balance: bool | None = None,
 ) -> dict:
     """Evaluate a checkpoint on `images` (default: its own held-out split).
 
@@ -74,10 +76,21 @@ def evaluate_checkpoint(
         images: image names to evaluate (must exist in the checkpoint's
             scene); None uses the checkpoint's own held-out split.
         device: forwarded to `build_trainer_from_checkpoint`.
+        calibrate: fit each held-out image's own exposure (test-time
+            photometric calibration, `Trainer.calibrate_frame`) and report
+            the calibrated metrics *alongside* the strict ones. None keeps
+            the checkpoint's own `cfg.eval_calibrate_camera` (False for
+            every run so far). This still does no training and never
+            writes back to the checkpoint -- the fitted scalars are local
+            to the call.
+        calibrate_white_balance: fit red/blue white balance too (green is
+            pinned, as in training). None keeps the checkpoint's config.
 
     Returns:
-        The `Trainer.evaluate()` metrics dict -- including the "per_image",
-        "shade", and "other" held-out split (see `Trainer.evaluate`) -- also
+        The `Trainer.evaluate()` metrics dict -- including the "per_image"
+        exposure diagnostics, the "shade"/"other" held-out split, and (with
+        `calibrate`) "shade_calibrated"/"other_calibrated" (see
+        `Trainer.evaluate`) -- also
         written to `<run_dir>/eval_manual_<timestamp>/metrics.json` +
         `sheet.jpg` (a distinct directory from any mid-training/`--report`
         eval, named by wall-clock time rather than epoch, so repeated manual
@@ -88,8 +101,10 @@ def evaluate_checkpoint(
         split existed, without retraining it.
     """
     trainer = build_trainer_from_checkpoint(checkpoint_path, device=device)
+    if calibrate_white_balance is not None:
+        trainer.cfg.eval_calibrate_white_balance = bool(calibrate_white_balance)
     eval_dirname = TRAIN_EVAL_MANUAL_DIRNAME_FMT.format(ts=time.strftime("%Y%m%d-%H%M%S"))
-    return trainer.evaluate(names=images, eval_dirname=eval_dirname)
+    return trainer.evaluate(names=images, eval_dirname=eval_dirname, calibrate=calibrate)
 
 
 def render_offpath(

@@ -1678,3 +1678,44 @@ device-side count (indirect dispatch) so `render_inner` never stalls. That is a
 - 2026-09-06T13:50Z EXP-0003 full2-broadcast final (300 ep, 55.8k steps, 3.2 h): held-out all 15.02/0.423/0.468; shade (6 frames) 8.49/0.302/0.689; other 16.47/0.450/0.419; shade dark mass 36.9% (baseline 19.9%); dolly coverage 0.195. VERDICT so far: plain TRIPS from Gaussian centres is worse than the Gaussians in the shade. Leaderboard refreshed and delivered. full1-broadcast backfilled: shade 7.55 dB.
 - 2026-09-06T01:49:46Z EXP-0007 first run was bogus: scenes/hunua/clips/clip5923/sparse/0 holds a 2-image stub; the real model is clip5923_best (371 registered). Run dir + its review links removed; requeued as full-trips-2.
 - 2026-09-06T01:49:46Z submitted job trippy-full-trips-2 prio 70: trippy train --config experiments/EXP-0007-hunua/config.yaml --report --max-minutes 240
+- 2026-09-06T02:01:12Z submitted job trippy-eval-calib-1 prio 15: bash -c cd /Users/nzbirdranch/trippy/.worktrees/eval-calib && PYTHONPATH=. TRIPPY_OUTPUT=/Users/nzbirdranch/trippy/output /Users/nzbirdranch/trippy/.venv/bin/python -m trippy.cli eval --checkpoint output/runs/EXP-0003-kk-trips-train/full2-broadcast/checkpoints/checkpoint_latest.pt --device mps --calibrate
+- 2026-09-06T02:04:23Z submitted job trippy-full3-alt prio 70: trippy train --config experiments/EXP-0003-kk-trips-train/config_full3_alt.yaml --report --max-minutes 240
+
+- 2026-09-06T02:10Z **How much of the Karekare shade verdict is a measurement artefact? (feat/eval-calib, CPU analysis + two queued jobs)**
+  Question: full2-broadcast reported held-out shade 8.49 dB vs Gaussians 14.94. Two suspects: (1) held-out
+  images' per-image exposure is never trained, only EXIF-initialised; (2) all six consecutive shade frames
+  are held out, so the shade region has no photo in training at all.
+  **Suspect (1) is real and worse than suspected — it is a bug, not just a protocol quirk.** Four of the
+  six shade frames (IMG_3829/3831/3832/3833) have no EXIF ExposureTime/ISO in the scene cache.
+  `Trainer._initial_exposure` fell back to absolute `EV=0` and then subtracted the 5.87 EV scene mean, so
+  those frames rendered through a **58.5x gain** for all 300 epochs, and being held out their exposure was
+  never trained back. Numbers, computed CPU-side from the existing `metrics.jsonl` per-image rows plus the
+  cache's EXIF (no re-render, no imagery opened): the six held-out frames with missing EXIF average
+  **6.55 dB** whether or not they are shade frames (IMG_3703 6.19 and IMG_3896 6.92 are non-shade); shade
+  frames WITH EXIF score 12.45 and 12.29; other frames with EXIF average 17.26. So the reported split
+  (all 15.02 / shade 8.49 / other 16.47) becomes, on EXIF-valid frames only, **all 16.90 / shade 12.37 /
+  other 17.26**. Verdict: roughly half the reported shade gap is an exposure artefact, and a real ~4.9 dB
+  shade deficit remains. Fixed: missing-EXIF images now initialise at the scene mean (gain 1.0).
+  **Suspect (2) is compounded by an unfair baseline.** `kkc_15000` was trained with Brush's
+  `--eval-split-every 10` (~/Splats/research/kk-coherent.md:61-67): of the six shade frames only IMG_3829
+  was held out, so five (including the dolly anchor IMG_3830) were Gaussian TRAINING views, as were 27 of
+  the 33 frames in trippy's held-out split. The 8.49-vs-14.94 comparison is therefore novel-view vs
+  training-set reconstruction. Recorded plainly in experiments/EXP-0003-kk-trips-train/README.md and
+  docs/EXPERIMENTS.md; the baseline numbers stand as measured, with the caveat attached.
+  Precedent for the fix: TRIPS ships `optimize_eval_camera` (a per-epoch EvalRefine gradient pass over the
+  TEST crops that steps the camera/pose optimisers with texture+network frozen, src/apps/train.cpp:591-596,
+  693-697) and `interpolate_eval_settings` (copy a test frame's exposure/WB from its neighbouring train
+  frames, NeuralCamera.cpp:481-520). Both default false there and in the released horse checkpoint.
+  trippy's `eval_calibrate_camera` / `trippy eval --calibrate` is the first of those cut down to exposure
+  (+optional WB): points, poses, U-Net, vignette and response LUT frozen; the fitted scalar never written
+  back; both numbers always reported. Default OFF.
+  Jobs: `trippy-eval-calib-1` (prio 15, before/after on full2-broadcast) and `trippy-full3-alt` (prio 70,
+  the `forced_heldout_mode: alternate` protocol, 300 ep, --max-minutes 240) — both queued behind the
+  running full2-trips training; numbers to be appended here when they land.
+  Artifacts: output/runs/EXP-0003-kk-trips-train/full2-broadcast/eval_manual_*/metrics.json (per-image
+  brightness/gain diagnostics) once eval-calib-1 completes.
+  **Queue note:** both jobs sit behind `full2-trips` (prio 70, started 13:44, `--max-minutes 330`,
+  running at ~4 min/epoch), so eval-calib-1 starts around 19:30. Both job scripts `cd` into
+  `.worktrees/eval-calib` and run with `PYTHONPATH` pointing there (the feature only exists on
+  `feat/eval-calib`), so **the worktree must survive until both have run**, or they must be
+  resubmitted from main after the merge.

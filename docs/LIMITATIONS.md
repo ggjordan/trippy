@@ -267,6 +267,21 @@ prediction was divided by ~70 before the response LUT. Measured on `checkpoint_e
 +0.113, after exposure +0.0012, after the LUT +0.0116 against a target mean of 0.457 -- a black frame.
 `lr_exposure = 5e-4` moves the value by 4e-3 in a whole epoch, so training cannot climb out of it.
 
+**Fixed (2026-09-06, feat/eval-calib) — the same exposure init, one level down: a frame with no EXIF
+started at a 58.5x gain.** The fix above centres the EVs on the scene mean, but `Trainer._initial_exposure`
+still fell back to an *absolute* `EV = 0` for an image whose cached EXIF has no ExposureTime/ISO. After
+subtracting kk-coherent's 5.87 EV mean, that frame is initialised at -5.87 EV, i.e. `2 ** 5.87 = 58.5x`
+brighter. For a *training* frame the optimiser eventually pulls it back; for a **held-out** frame nothing
+ever does, because only sampled training frames get an exposure gradient. 10 of kk-coherent's 219 images
+have no EXIF and 6 of them are in the held-out split; all six scored 6.19-6.92 dB in EXP-0003
+full2-broadcast, shade and non-shade alike, against 17.26 dB for the non-shade frames with EXIF. Missing
+EXIF now initialises at the scene mean (relative 0, gain 1.0). **Known remaining limitation:** a held-out
+frame's exposure is still never trained, so even a correct EXIF value is only an estimate of the camera's
+actual response; `trippy eval --calibrate` measures how much that is worth per frame (docs/EXPERIMENTS.md
+"Test-time camera calibration"), and TRIPS's own `interpolate_eval_settings` (copy the exposure of the
+neighbouring train frames, `NeuralCamera.cpp:481-520`) is a not-yet-ported alternative that would fix it
+without touching the held-out photo at all.
+
 **Fixed — the eval PSNR was 4.771 dB too low.** `Trainer.evaluate` computed
 `((pred - target)**2 * mask).sum() / mask.sum()` with `pred` (1, 3, H, W) and `mask` (1, 1, H, W): a
 3-channel error sum over a 1-channel mask sum, i.e. exactly `3x` the MSE and `10*log10(3) = 4.771 dB` off

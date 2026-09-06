@@ -14,6 +14,11 @@ rust/**/target/
 # Build outputs
 build/
 output/
+# ...including an `output` SYMLINK: a worktree has no output/ of its own, but a queued job that
+# runs from the worktree (gpu_submit.sh cds there) resolves a config's relative `run_dir:
+# output/runs/...` against it, so agents symlink it to $TRIPPY_OUTPUT. `output/` alone does not
+# match a symlink.
+output
 
 # Third-party / upstream code
 third_party/

@@ -89,6 +89,86 @@ synthetic scene so the CPU suite catches it in seconds.
 
 Target: v0.2.0 acceptance requires PSNR within 1.5 dB of the best plain Gaussian on non-shade frames.
 
+### Forced hold-out protocols: `forced_heldout_mode: all | alternate`
+
+The six shade frames (`IMG_3828`-`IMG_3833`, `trippy.constants.SHADE_FRAMES_KK`) are consecutive, so
+*how* they are held out decides which question the shade PSNR answers. `TrainConfig.forced_heldout_mode`
+picks the protocol (`trippy.scene.splits.partition_forced`):
+
+| mode | shade frames in training | the question it answers |
+|---|---|---|
+| `all` (default) | none | **Novel view of an unobserved region.** The network has never seen a photograph of the shade; whatever it draws there is invented. |
+| `alternate` | `IMG_3829/3831/3833` (offset 0 holds out `IMG_3828/3830/3832`) | **Interpolation inside an observed region.** The shade is photographed three times; the score is for three unseen viewpoints between them. |
+
+Neither is "the right one" -- they are different experiments, and a run should say which it used.
+`all` is the harder, more honest test of the project's actual goal (walking into a region the camera
+never stood in). `alternate` is the protocol that makes the Gaussian baseline comparable, because:
+
+**The Gaussian baseline never held the shade out.** `kkc_15000.ply` was trained with Brush's
+`--eval-split-every 10` (`~/Splats/research/kk-coherent.md:61-67`), which holds out every 10th name of the
+219 registered images -- 22 views. Of the six shade frames only `IMG_3829.jpg` was held out; the other
+five, including the dolly anchor `IMG_3830.jpg`, were **training views**. Of the 33 frames in trippy's own
+held-out split, 27 were `kkc_15000` training views. So the "Gaussians 15.53 dB all / 14.94 dB shade"
+baseline rows are largely *training-set reconstruction* numbers being compared against genuine held-out
+numbers. In the shade specifically the comparison is 5-of-6 unfair to TRIPS, and any README or leaderboard
+row quoting it must say so. (Recomputing the baseline on a fair split would mean retraining the Gaussians
+with trippy's split -- not done; the numbers stand as measured, with this caveat attached.)
+
+### Test-time camera calibration (`eval_calibrate_camera` / `trippy eval --calibrate`)
+
+A held-out image's row of `NeuralCamera.exposures_values` is **never trained** -- only sampled training
+frames get gradients -- so a held-out frame renders through whatever EXIF initialisation it happened to
+get (`Trainer._initial_exposure`). Exposure is a property of the camera that took the photo, not of the
+reconstruction, so a wrong one costs many dB that have nothing to do with geometry.
+
+TRIPS has the same problem and ships two opt-in answers, both **off** in `configs/train_normalnet.ini:48-49`
+and in the released horse checkpoint (`third_party/zenodo/tt_checkpoints/checkpoint_horse/params.ini:53-54`):
+
+- `optimize_eval_camera` -- a per-epoch "EvalRefine" gradient pass over the **test** crops that steps the
+  camera and pose optimisers with texture/network frozen (`src/apps/train.cpp:591-596, 693-697`;
+  `NeuralScene.cpp:1473-1503`, which skips `texture_optimizer` but always steps
+  `camera_adam_optimizer`, i.e. exposure, white balance, response and vignette).
+- `interpolate_eval_settings` -- copy each test frame's exposure/WB from its two neighbouring train frames
+  (`NeuralCamera.cpp:481-520`, called from `TestEpoch`, `train.cpp:1604-1611`). The two are mutually
+  exclusive (`SAIGA_ASSERT` at `train.cpp:1606`).
+
+trippy's `eval_calibrate_camera` is `optimize_eval_camera` cut down to the photometric scalars:
+per held-out image, `Trainer.calibrate_frame` fits **only** that image's exposure (and, with
+`eval_calibrate_white_balance` / `--calibrate-wb`, its red/blue white balance -- green stays pinned as in
+training) with `eval_calibrate_steps` (200) Adam steps at `eval_calibrate_lr` (0.05) on masked L1 against
+that image's own photo. The points, poses, U-Net, vignette and response LUT are frozen; the fitted scalar
+lives in a local tensor and is never written back into the module or the checkpoint
+(`NeuralCamera.forward_with`). Adam is warm-started at `-log2(best_global_gain)` because it moves an
+exposure by only ~`lr` per step and a broken frame can start 5.87 EV away.
+
+Rules for reporting it:
+
+- **Default off.** Every training-time eval is the strict protocol; `trippy eval --checkpoint ... --calibrate`
+  turns it on for a diagnostic re-run, which reports both numbers side by side (`psnr_mean` and
+  `psnr_mean_calibrated`, `shade` and `shade_calibrated`).
+- A calibrated PSNR **uses the held-out photo** and is therefore not a novel-view number. It answers one
+  question: how much of the gap is photometric. Quote it as "calibrated", never as the run's PSNR.
+- The fit minimises L1, not MSE, so on a frame whose exposure was already right the calibrated PSNR can
+  come out a few tenths of a dB *below* the strict one. That is expected, not a bug.
+- **The Gaussian baseline cannot be calibrated**: raw Gaussians have no per-image exposure model at all.
+  Its shade PSNR is what it is. The leaderboard's calibrated column is blank for it, on purpose.
+
+### Per-image exposure diagnostics
+
+`Trainer.evaluate` now records, for every evaluated image and at no extra render cost, the numbers that
+separate an exposure artefact from a structural failure:
+
+| key | meaning |
+|---|---|
+| `exposure_ev` / `exposure_gain` | the per-image EV this render actually used, and `2**-EV`, the gain it applied |
+| `pred_mean` / `target_mean` | mean brightness of the prediction and of the photo |
+| `brightness_ratio` | `target_mean / pred_mean` -- a pure gain error shows up here directly |
+| `gain_best` | the closed-form least-squares global gain, `sum(p*t)/sum(p*p)` (`trippy.train.trainer.best_global_gain`) |
+| `psnr_gain` | PSNR after applying `gain_best` -- the best any single global brightness factor can do, no training involved |
+
+`trippy eval` prints them as a markdown table. A frame where `psnr_gain` is many dB above `psnr` is being
+scored on its exposure; a frame where they are equal has a structural problem.
+
 ### Extent gate
 
 Prevents scene sprawl. Compute the bounding box of the trained point set:
@@ -470,7 +550,9 @@ fresh `<run_dir>/eval_manual_<timestamp>/` directory (never collides with a mid-
 `eval_ep<NNNN>/`) and appends an `{"eval": true, ...}` row to the run's own `metrics.jsonl` -- including the
 `shade`/`other` split above -- so `trippy leaderboard` picks up a real "held-out shade" number for a
 checkpoint that finished training before that split existed, with no retraining required. Omitting
-`--images` evaluates the checkpoint's own held-out split. `trippy.train.eval.render_offpath` renders
+`--images` evaluates the checkpoint's own held-out split. `--calibrate` (plus optional `--calibrate-wb`)
+adds the test-time photometric calibration described above -- the strict numbers are still computed and
+printed, with the calibrated ones next to them, and a per-image diagnostics table underneath. `trippy.train.eval.render_offpath` renders
 honesty triplets (no ground truth) at arbitrary poses from a JSON file; the dolly/off-path camera-path
 generators below use the richer `trippy.render.candidate.render_candidate` pipeline instead (per-frame
 raw/net/coverage/honesty PNGs, videos, a summary honesty sheet, and `metrics.json`), not this JSON-file API.
@@ -688,6 +770,18 @@ eval --checkpoint <run_dir>/checkpoints/checkpoint_latest.pt` against an existin
 backfill the split without retraining (it appends a fresh eval row `trippy leaderboard` then picks
 up). The two fixed baseline rows below always carry a real shade-only PSNR/SSIM/LPIPS split from
 their own source experiment's per-bucket eval, independent of any trippy-native run.
+
+**Held-out shade PSNR (calibrated)** is an *optional* column: it appears only once some run has a
+calibrated eval (`trippy eval --checkpoint ... --calibrate`, whose `shade_calibrated` split lands in
+`report.json`'s `heldout_split` or in the last `metrics.jsonl` eval row). With no such run the table is
+byte-identical to the one before this column existed (`trippy.render.leaderboard.leaderboard_headers` /
+`row_cells`). It is a diagnostic, not a ranking number -- see "Test-time camera calibration" above -- and
+the Gaussian baseline's cell is permanently `n/a` because raw Gaussians have no per-image exposure model
+to calibrate. Do not sort on it.
+
+**The Gaussian baseline row is not a like-for-like comparison in the shade.** `kkc_15000` was trained on
+five of the six shade frames (see "Forced hold-out protocols" above); its 14.94 dB shade number is mostly
+a training-set reconstruction score, while every trippy run's shade number is a genuine held-out score.
 
 Two fixed baseline rows are always included (not scanned -- neither is a trippy-native training
 run with its own `metrics.jsonl`), sourced verbatim from their own experiment READMEs:

@@ -164,7 +164,7 @@ def test_evaluate_shade_split_empty_when_no_forced_heldout_matches(tmp_path: Pat
     # SHADE_FRAMES_KK -- "shade" degrades to an empty (not fabricated) group.
     trainer = _build_trainer(tmp_path)
     metrics = trainer.evaluate()
-    assert metrics["shade"] == {"n": 0, "psnr": None, "ssim": None, "lpips": None}
+    assert metrics["shade"] == {"n": 0, "names": [], "psnr": None, "ssim": None, "lpips": None}
     assert metrics["other"]["n"] == metrics["n_images"]
 
 
