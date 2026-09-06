@@ -25,6 +25,7 @@ from pathlib import Path
 import torch
 
 from trippy.constants import TRAIN_EVAL_MANUAL_DIRNAME_FMT
+from trippy.hybrid import gate as gate_mod
 from trippy.hybrid.gsrender_live import gaussian_provider_for
 from trippy.render.sheets import colorize, save_png, side_by_side
 from trippy.train import checkpoint_io
@@ -32,7 +33,9 @@ from trippy.train.config import TrainConfig
 from trippy.train.trainer import Trainer
 
 
-def build_trainer_from_checkpoint(checkpoint_path: str | Path, device: str | None = None) -> Trainer:
+def build_trainer_from_checkpoint(
+    checkpoint_path: str | Path, device: str | None = None, gate_scale: float | None = None
+) -> Trainer:
     """Rebuild a Trainer (dataset, point source, net, camera) from a checkpoint's own config.
 
     Args:
@@ -40,6 +43,12 @@ def build_trainer_from_checkpoint(checkpoint_path: str | Path, device: str | Non
         device: override the checkpoint's own `cfg.device` (e.g. force
             "cpu" to inspect an `mps`-trained checkpoint on a laptop);
             None keeps the checkpoint's original device.
+        gate_scale: override the blend gate's post-training scale
+            (`trippy.hybrid.gate`): 0 = pure TRIPS, 1 = the mix training
+            chose, 2 = pushed all the way to the splat. None keeps the
+            checkpoint's own `hybrid.gate_scale`; ignored (with no error) on
+            a checkpoint trained without the gate, so a caller may always
+            pass it.
 
     Returns:
         A `Trainer` with the checkpoint's trained state loaded (weights,
@@ -59,6 +68,8 @@ def build_trainer_from_checkpoint(checkpoint_path: str | Path, device: str | Non
         trainer.gaussian_provider = gaussian_provider_for(
             cfg.hybrid, trainer.hybrid, device=str(trainer.device)
         )
+    if gate_scale is not None and trainer.gate_enabled:
+        trainer.gate_scale = gate_mod.clamp_scale(gate_scale)
     return trainer
 
 
@@ -69,6 +80,7 @@ def evaluate_checkpoint(
     calibrate: bool | None = None,
     calibrate_white_balance: bool | None = None,
     exposure_mode: str | None = None,
+    gate_scale: float | None = None,
 ) -> dict:
     """Evaluate a checkpoint on `images` (default: its own held-out split).
 
@@ -92,6 +104,10 @@ def evaluate_checkpoint(
             checkpoint's own `cfg.eval_exposure_mode` ("neighbours" for any
             checkpoint saved by a config that didn't set it explicitly --
             see `trippy.train.config.TrainConfig.eval_exposure_mode`).
+        gate_scale: forwarded to `build_trainer_from_checkpoint` -- re-score
+            the same checkpoint at a different splat-vs-TRIPS mix without
+            retraining. The gate map itself is unchanged (it is what the
+            network learned); only how much of it is applied changes.
 
     Returns:
         The `Trainer.evaluate()` metrics dict -- including the "per_image"
@@ -108,7 +124,7 @@ def evaluate_checkpoint(
         shade split for a checkpoint that finished training before this
         split existed, without retraining it.
     """
-    trainer = build_trainer_from_checkpoint(checkpoint_path, device=device)
+    trainer = build_trainer_from_checkpoint(checkpoint_path, device=device, gate_scale=gate_scale)
     if calibrate_white_balance is not None:
         trainer.cfg.eval_calibrate_white_balance = bool(calibrate_white_balance)
     eval_dirname = TRAIN_EVAL_MANUAL_DIRNAME_FMT.format(ts=time.strftime("%Y%m%d-%H%M%S"))

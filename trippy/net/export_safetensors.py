@@ -49,7 +49,7 @@ tensors (C = in_channels, F = filters, O = out_channels, L = num_layers,
     camera.white_balance        (M, 3)        -- only if enable_white_balance
     camera.vignette_params      (3,)          -- only if enable_vignette
     camera.vignette_center      (2,)          -- only if enable_vignette
-    camera.response             (O, P)        -- only if enable_response
+    camera.response             (RGB=3, P)    -- only if enable_response
 """
 
 from __future__ import annotations
@@ -62,6 +62,11 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from trippy.constants import (
+    HYBRID_A_GATE_CHANNEL_INDEX,
+    HYBRID_A_GATE_SCALE_DEFAULT,
+    NET_DEFAULT_NUM_OUTPUT_CHANNELS,
+)
 from trippy.net.camera_model import NeuralCamera
 from trippy.net.unet import MultiScaleUnet2dDecOnlySmallFixed
 
@@ -183,10 +188,25 @@ def camera_tensors(camera: NeuralCamera) -> dict[str, np.ndarray]:
 
 
 def build_metadata(
-    unet: MultiScaleUnet2dDecOnlySmallFixed, camera: NeuralCamera | None
+    unet: MultiScaleUnet2dDecOnlySmallFixed,
+    camera: NeuralCamera | None,
+    gate: bool | None = None,
+    gate_scale: float = HYBRID_A_GATE_SCALE_DEFAULT,
 ) -> dict[str, str]:
-    """The `__metadata__` block; see the module docstring's KEY schema."""
+    """The `__metadata__` block; see the module docstring's KEY schema.
+
+    Args:
+        unet: the network being exported.
+        camera: its tone mapper, or None.
+        gate: whether the extra output channel is the blend gate. None infers
+            it from the channel count (`out_channels > 3`), which is what makes
+            an existing three-channel checkpoint export exactly the metadata it
+            exported before the gate existed.
+        gate_scale: the run's own default `hybrid.gate_scale`; only meaningful
+            when the gate is present.
+    """
     cfg = unet.config
+    has_gate = (cfg.num_output_channels > NET_DEFAULT_NUM_OUTPUT_CHANNELS) if gate is None else bool(gate)
     meta = {
         "format": EXPORT_FORMAT,
         "num_layers": str(cfg.num_layers),
@@ -199,6 +219,15 @@ def build_metadata(
         "last_act": cfg.last_act,
         "has_camera": "0",
     }
+    if has_gate:
+        # Written ONLY when the gate is present, so a three-channel export is
+        # byte-for-byte the file it was before the gate existed (the committed
+        # Rust parity fixture is compared byte for byte -- see
+        # tests/test_net_export_safetensors.py). An absent "gate" key therefore
+        # means "no gate", which is exactly how `brush_unet::weights` reads it.
+        meta["gate"] = "1"
+        meta["gate_channel"] = str(HYBRID_A_GATE_CHANNEL_INDEX)
+        meta["gate_scale"] = str(float(gate_scale))
     if camera is None:
         return meta
     ccfg = camera.config
@@ -231,6 +260,8 @@ def export(
     camera: NeuralCamera | None,
     path: str | Path,
     extra_metadata: Mapping[str, str] | None = None,
+    gate: bool | None = None,
+    gate_scale: float = HYBRID_A_GATE_SCALE_DEFAULT,
 ) -> Path:
     """Write `unet` (+ optional `camera`) to `path` as safetensors.
 
@@ -240,6 +271,9 @@ def export(
         path: destination `.safetensors` file.
         extra_metadata: additional string->string entries merged into
             `__metadata__` (e.g. the source checkpoint path).
+        gate, gate_scale: forwarded to `build_metadata` -- see there. The
+            defaults infer the gate from the network's own channel count, so a
+            caller that knows nothing about the gate exports correctly.
 
     Returns:
         The path written.
@@ -247,7 +281,7 @@ def export(
     tensors = unet_tensors(unet)
     if camera is not None:
         tensors.update(camera_tensors(camera))
-    metadata = build_metadata(unet, camera)
+    metadata = build_metadata(unet, camera, gate=gate, gate_scale=gate_scale)
     if extra_metadata:
         metadata.update({str(k): str(v) for k, v in extra_metadata.items()})
     return write_safetensors(tensors, path, metadata)

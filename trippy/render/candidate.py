@@ -47,6 +47,7 @@ import torch
 from trippy.constants import (
     CANDIDATE_COVERAGE_FILENAME,
     CANDIDATE_FRAMES_DIRNAME,
+    CANDIDATE_GATE_FILENAME,
     CANDIDATE_HONESTY_FRAME_FILENAME,
     CANDIDATE_HONESTY_MAX_SHEET_FRAMES,
     CANDIDATE_HONESTY_SHEET_FILENAME,
@@ -60,6 +61,7 @@ from trippy.constants import (
     DOLLY_COVERAGE_STOP_THRESHOLD,
     VIDEO_DEFAULT_FPS,
 )
+from trippy.hybrid import gate as gate_mod
 from trippy.net.camera_model import default_uv_grid
 from trippy.raster.pyramid import render_pyramid
 from trippy.render.dolly import CameraPose, dolly_stop_index
@@ -77,13 +79,21 @@ def _render_layers(
     t: torch.Tensor,
     image_hw: tuple[int, int],
     image_name: str | None = None,
-) -> tuple[torch.Tensor, list[torch.Tensor], dict]:
+) -> tuple[torch.Tensor, list[torch.Tensor], dict, torch.Tensor | None]:
     """Pyramid render + U-Net, before tone-mapping (see module docstring).
 
     Mirrors `Trainer._render` (trippy/train/trainer.py) exactly, built only
     from `Trainer`'s public attributes -- including hybrid design A's
     `gaussian_for_pose`/`hybrid.attach` pair, which is skipped entirely on a
     non-hybrid checkpoint (`trainer.hybrid is None`).
+
+    Returns:
+        `(net_out, layers, aux, gaussian)`. The Gaussian block is returned
+        rather than discarded because the blend gate has to mix the *same*
+        pixels the network was shown -- re-rendering it here would let the two
+        drift apart at exactly the poses (dolly/off-path) where a live render is
+        least reproducible. None on a non-hybrid checkpoint, and also whenever
+        no renderer could supply a block for this pose.
     """
     layers, aux = render_pyramid(
         trainer.point_params.xyz,
@@ -99,11 +109,12 @@ def _render_layers(
         bg=trainer.background,
     )
     inputs = [layer.unsqueeze(0) for layer in layers]
+    gaussian: torch.Tensor | None = None
     if trainer.hybrid is not None:
         gaussian = trainer.gaussian_for_pose(image_name, K, R, t, image_hw)
         inputs = trainer.hybrid.attach(inputs, gaussian)
     net_out = trainer.net(inputs)
-    return net_out, layers, aux
+    return net_out, layers, aux, gaussian
 
 
 def _fallback_tone_map(trainer: Trainer, net_out: torch.Tensor) -> torch.Tensor:
@@ -181,6 +192,7 @@ def render_candidate(
     stop_at_low_coverage: bool = False,
     dolly_stop_threshold: float = DOLLY_COVERAGE_STOP_THRESHOLD,
     gaussian_provider: Callable[..., torch.Tensor | None] | None = None,
+    gate_scale: float | None = None,
 ) -> dict:
     """Render `poses` through a checkpoint and write every honesty artifact.
 
@@ -225,6 +237,11 @@ def render_candidate(
             never a valid substitute -- see
             `trippy.hybrid.gsrender_live.gaussian_provider_for`. Ignored
             entirely on a non-hybrid checkpoint.
+        gate_scale: blend-gate override (`trippy.hybrid.gate`): 0 renders the
+            pure TRIPS path, 1 the mix the run was trained to, 2 pushes
+            everything the gate leaned towards the splat all the way there.
+            None keeps the checkpoint's own `hybrid.gate_scale`. Ignored on a
+            checkpoint trained without the gate.
 
     Returns:
         The metrics dict also written to `<out_dir>/metrics.json`:
@@ -241,6 +258,8 @@ def render_candidate(
     trainer.camera.eval()
     if gaussian_provider is not None:
         trainer.gaussian_provider = gaussian_provider
+    if gate_scale is not None:
+        trainer.gate_scale = gate_mod.clamp_scale(gate_scale)
 
     out_dir = Path(out_dir)
     frames_dir = out_dir / CANDIDATE_FRAMES_DIRNAME
@@ -251,6 +270,7 @@ def render_candidate(
     sheet_images: list[np.ndarray] = []
     sheet_labels: list[str] = []
     frame_metrics: list[dict] = []
+    gate_rows: list[dict] = []
 
     with torch.no_grad():
         for pose in poses:
@@ -259,8 +279,12 @@ def render_candidate(
             t = torch.tensor(np.asarray(pose.t, dtype=np.float32), device=trainer.device)
             image_hw = (int(pose.image_hw[0]), int(pose.image_hw[1]))
 
-            net_out, layers, aux = _render_layers(trainer, K, R, t, image_hw, pose.image_name)
-            pred = _tone_map_for_pose(trainer, net_out, pose.image_name)
+            net_out, layers, aux, gaussian = _render_layers(
+                trainer, K, R, t, image_hw, pose.image_name
+            )
+            net_rgb, gate = trainer.split_net_output(net_out)
+            pred = _tone_map_for_pose(trainer, net_rgb, pose.image_name)
+            pred, gate = trainer.apply_gate(pred, gate, gaussian)
 
             raw01 = layers[0][:3].clamp(0.0, 1.0).permute(1, 2, 0).cpu().numpy()
             net01 = pred[0].clamp(0.0, 1.0).permute(1, 2, 0).cpu().numpy()
@@ -277,6 +301,12 @@ def render_candidate(
             save_png(frame_dir / CANDIDATE_RAW_FILENAME, raw_u8)
             save_png(frame_dir / CANDIDATE_NET_FILENAME, net_u8)
             save_png(frame_dir / CANDIDATE_COVERAGE_FILENAME, coverage_color)
+            if gate is not None:
+                # A from-scratch heatmap of the mix at this pose (0 = TRIPS, 1 = splat) --
+                # no photographed pixels, so it is safe for an agent to open (AGENTS.md
+                # Sec. 6). It sits next to `coverage.png` because the two answer the same
+                # kind of question: what is this pixel actually made of.
+                save_png(frame_dir / CANDIDATE_GATE_FILENAME, gate_mod.gate_heatmap(gate))
             honesty = side_by_side(
                 [raw_u8, net_outlined_u8, coverage_color],
                 ["raw L0", f"network (outline: coverage<{coverage_threshold:g})", "coverage"],
@@ -297,6 +327,11 @@ def render_candidate(
                     "coverage_mean_center": cov_stats["mean_center"],
                 }
             )
+            if gate is not None:
+                row = gate_mod.gate_stats(gate)
+                row["splat_present"] = bool(gaussian is not None)
+                frame_metrics[-1]["gate"] = row
+                gate_rows.append(row)
 
     metrics: dict = {
         "checkpoint": str(checkpoint_path),
@@ -307,6 +342,15 @@ def render_candidate(
         ),
         "frames": frame_metrics,
     }
+    if gate_rows:
+        metrics["gate"] = {
+            **gate_mod.merge_gate_stats(gate_rows),
+            "gate_scale": trainer.gate_scale,
+            # Poses with no splat at all (no live renderer, or a pose the renderer
+            # declined) are rendered TRIPS-only whatever the gate says. Counting them is
+            # the difference between "the gate chose TRIPS" and "there was no choice".
+            "n_frames_without_splat": sum(1 for r in gate_rows if not r["splat_present"]),
+        }
 
     if stop_at_low_coverage and frame_metrics:
         stop_index = dolly_stop_index(

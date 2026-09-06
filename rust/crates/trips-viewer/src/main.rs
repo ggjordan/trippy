@@ -29,7 +29,7 @@ mod blit;
 // render pipeline for wasm32. These imports are what keeps every `crate::bundle`
 // / `crate::camera` / `crate::renderer` path below (and in `app.rs`/`blit.rs`)
 // resolving unchanged.
-use trips_viewer::{bundle, camera, renderer};
+use trips_viewer::{blend, bundle, camera, renderer};
 
 use std::path::PathBuf;
 
@@ -37,6 +37,7 @@ use brush_pyramid::gpu::{block_on, WgpuDevice};
 use brush_pyramid::png;
 
 use crate::bundle::Bundle;
+use crate::blend::{Blend, BlendMode};
 use crate::renderer::{ExposureMode, Renderer, Settings, ViewMode};
 
 const USAGE: &str = "\
@@ -60,6 +61,13 @@ Options:
                        you have moved off it)
   --free               open in free-fly mode instead of orbit
 
+Blend panel (hybrid bundles with a `blend` block only; see docs/USER_GUIDE.md):
+  --blend-mode <m>     trips | splat | gated | mix | split (default trips)
+  --gate-scale <f>     0..2 multiplier on the trained gate, for `gated`
+                       (0 = TRIPS, 1 = as trained, 2 = pushed to the splat)
+  --mix <f>            0 = splat, 1 = TRIPS, for `mix`
+  --split <f>          fraction of the width where `split` changes over
+
 Headless (no window; used by the acceptance check and the perf table):
   --screenshot <o.png> render one frame to a PNG and exit
   --camera-yaw-deg <d> yaw the camera off the chosen view by <d> degrees first;
@@ -74,6 +82,7 @@ Keys:
   scroll     zoom in orbit mode, fly speed in free mode
   F          orbit <-> free      R  back to the view it opened at
   N / P      next / previous capture view
+  B          cycle the blend mode (hybrid bundles)
   V          cycle network / raw level-0 / coverage
   X          cycle the exposure the tone mapper applies
   - / =      render scale        TAB  hide the panel
@@ -125,6 +134,8 @@ struct Args {
     camera_yaw_deg: Option<f32>,
     /// Open in free-fly rather than the default orbit mode.
     free: bool,
+    /// The Blend panel's starting state.
+    blend: Blend,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -139,6 +150,7 @@ fn parse_args() -> Result<Args, String> {
         bench: None,
         camera_yaw_deg: None,
         free: false,
+        blend: Blend::default(),
     };
     let mut argv = std::env::args().skip(1);
     while let Some(flag) = argv.next() {
@@ -184,6 +196,13 @@ fn parse_args() -> Result<Args, String> {
                 args.camera_yaw_deg =
                     Some(value()?.parse().map_err(|e| format!("--camera-yaw-deg: {e}"))?);
             }
+            "--blend-mode" => args.blend.mode = BlendMode::parse(&value()?)?,
+            "--gate-scale" => {
+                args.blend.gate_scale =
+                    value()?.parse().map_err(|e| format!("--gate-scale: {e}"))?;
+            }
+            "--mix" => args.blend.mix = value()?.parse().map_err(|e| format!("--mix: {e}"))?,
+            "--split" => args.blend.split = value()?.parse().map_err(|e| format!("--split: {e}"))?,
             "--free" => args.free = true,
             "--frames" => args.warmup = value()?.parse().map_err(|e| format!("--frames: {e}"))?,
             "--bench" => args.bench = Some(value()?.parse().map_err(|e| format!("--bench: {e}"))?),
@@ -275,7 +294,7 @@ fn run_headless(args: &Args, bundle: Bundle) -> Result<(), String> {
     // Warm-up frames pay for shader compilation and buffer-pool growth, which
     // is not a viewer's steady state.
     for _ in 0..args.warmup.max(1) {
-        block_on(renderer.render(&camera, frame_index, args.mode, &args.settings))?;
+        block_on(renderer.render(&camera, frame_index, args.mode, &args.settings, args.blend))?;
     }
 
     if args.settings.profile {
@@ -284,6 +303,7 @@ fn run_headless(args: &Args, bundle: Bundle) -> Result<(), String> {
             frame_index,
             args.mode,
             &args.settings,
+            args.blend,
         ))?;
         if let Some(s) = frame.stats.stages {
             println!(
@@ -312,7 +332,7 @@ fn run_headless(args: &Args, bundle: Bundle) -> Result<(), String> {
         profile.profile = false;
         for _ in 0..count.max(1) {
             let start = std::time::Instant::now();
-            let frame = block_on(renderer.render(&camera, frame_index, args.mode, &profile))?;
+            let frame = block_on(renderer.render(&camera, frame_index, args.mode, &profile, args.blend))?;
             // Draining the queue is the honest end-of-frame barrier, and moves
             // no data -- unlike a readback, which would charge the frame for
             // 24 MB of transfer the window never pays.
@@ -335,7 +355,7 @@ fn run_headless(args: &Args, bundle: Bundle) -> Result<(), String> {
 
     if let Some(out) = &args.screenshot {
         let (data, channels, height, width) =
-            block_on(renderer.render_to_host(&camera, frame_index, &args.settings))?;
+            block_on(renderer.render_to_host(&camera, frame_index, &args.settings, args.blend))?;
         let pixels = png::feature_to_rgb8(&data, channels, height, width, 1.0)?;
         png::write_rgb8(out, &pixels, width, height)?;
         eprintln!("wrote {}", out.display());
@@ -398,6 +418,7 @@ fn run() -> Result<(), String> {
     settings.render_scale = settings.render_scale.clamp(0.1, 1.0);
     let title = format!("TRIPS — {}", bundle.manifest.name);
     let mode = args.mode;
+    let blend_state = args.blend;
     let navigation = if args.free {
         crate::camera::Mode::Free
     } else {
@@ -419,6 +440,12 @@ fn run() -> Result<(), String> {
                 .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
             app.set_mode(mode);
             app.set_navigation(navigation);
+            if blend_state != Blend::default() {
+                // Only override the bundle's own starting state when a flag asked
+                // for something else, so a plain launch still opens on the frame
+                // the run's metrics describe.
+                app.set_blend(blend_state);
+            }
             Ok(Box::new(app))
         }),
     )

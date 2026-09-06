@@ -72,6 +72,8 @@ from trippy.constants import (
     TRAIN_CHECKPOINT_FILENAME_FMT,
     TRAIN_CHECKPOINT_LATEST_FILENAME,
     TRAIN_EVAL_DIRNAME_FMT,
+    TRAIN_EVAL_GATE_DIRNAME,
+    TRAIN_EVAL_GATE_FILENAME_FMT,
     TRAIN_EVAL_METRICS_FILENAME,
     TRAIN_EVAL_SHEET_JPEG_FILENAME,
     TRAIN_EVAL_SHEET_JPEG_QUALITY,
@@ -82,6 +84,7 @@ from trippy.constants import (
     TRAIN_PSNR_EPS,
 )
 from trippy.geom import xform_b
+from trippy.hybrid import gate as gate_mod
 from trippy.hybrid.gaussian_input import GaussianInputs
 from trippy.net.camera_model import NeuralCamera, interpolate_from_train_neighbours
 from trippy.net.losses import LossWeights, TripsLoss, _LazyLPIPS, l1_loss, mse_loss, ssim
@@ -306,7 +309,27 @@ class Trainer:
         # provider here, and `trippy.render.candidate.render_candidate` can override it.
         self.gaussian_provider: Callable[..., torch.Tensor | None] | None = None
 
-        network_cfg = NetworkConfig(num_input_channels=cfg.net_input_channels, num_layers=cfg.layers)
+        # The blend gate (trippy.hybrid.gate). `gate_scale` is a *runtime* attribute, not a
+        # config read, because it is the one knob a caller is meant to turn after training:
+        # `trippy eval --gate-scale` / `candidate-report --gate-scale` and the viewer's Blend
+        # panel all set it on the built Trainer. It starts at the checkpoint's own recorded
+        # `hybrid.gate_scale`, so doing nothing reproduces the run's own default mix.
+        self.gate_enabled: bool = cfg.hybrid.gate_enabled
+        self.gate_scale: float = gate_mod.clamp_scale(cfg.hybrid.gate_scale)
+        if self.gate_enabled:
+            self._log(
+                f"hybrid blend gate: on (+1 net output channel, gate_scale={self.gate_scale}, "
+                f"gate_prior target={cfg.hybrid.gate_prior.target} weight={cfg.hybrid.gate_prior.weight})"
+            )
+
+        # `net_output_channels` is 3 + the blend gate's own channel (trippy.hybrid.gate);
+        # with the gate off it is 3, i.e. `NetworkConfig`'s own default, so a gate-off run
+        # builds exactly the network it built before the gate existed.
+        network_cfg = NetworkConfig(
+            num_input_channels=cfg.net_input_channels,
+            num_output_channels=cfg.net_output_channels,
+            num_layers=cfg.layers,
+        )
         self.net = MultiScaleUnet2dDecOnlySmallFixed(network_cfg).to(self.device)
 
         first_item = self.dataset[0]
@@ -538,6 +561,73 @@ class Trainer:
         frame_index_t = torch.tensor([frame_index], device=self.device, dtype=torch.long)
         return self.camera(net_out, frame_index_t)
 
+    # --- the blend gate (trippy.hybrid.gate) ---
+
+    def split_net_output(self, net_out: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """`(rgb, gate)` for this run: `(net_out, None)` when the gate is off.
+
+        Public because `trippy.render.candidate` renders through the same
+        network without going via `train_step`/`evaluate`, and both halves must
+        split the output the same way or the two would disagree about which
+        channel is colour.
+        """
+        return gate_mod.split_output(net_out, self.gate_enabled)
+
+    def apply_gate(
+        self,
+        pred: torch.Tensor,
+        gate: torch.Tensor | None,
+        gaussian: torch.Tensor | None,
+        scale: float | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Blend the tone-mapped prediction towards the splat: `g*splat + (1-g)*trips`.
+
+        Args:
+            pred: `(1, 3, H', W')` tone-mapped network output (display space).
+            gate: `(1, 1, H, W)` gate in [0, 1] from `split_net_output`, or None
+                (gate off) -- then this is a no-op returning `(pred, None)`.
+            gaussian: the `(G, H, W)` Gaussian block this render was given, or
+                None. **None means no blend**: a frame with no render triple, a
+                crop ablation 1 dropped, or a pose with no live renderer has no
+                splat evidence at all, and mixing in its all-zero stand-in would
+                paint black holes and claim splat support that does not exist
+                (see `trippy.hybrid.gate`).
+            scale: `gate_scale` override; None uses `self.gate_scale`.
+
+        Returns:
+            `(pred, gate)` -- `pred` blended (or unchanged when there is nothing
+            to blend with), and the gate map centre-cropped to `pred`'s own size
+            so the two are pixel-aligned for logging and heatmaps. The returned
+            gate is the RAW trained gate, not the scaled one: the scale is a
+            viewing knob, and the number worth recording is what the network
+            learned.
+        """
+        if gate is None:
+            return pred, None
+        gate = _center_crop_like(gate, pred.shape[-2], pred.shape[-1])
+        splat_rgb = gate_mod.splat_rgb_from_block(gaussian, self.cfg.hybrid)
+        if splat_rgb is None:
+            return pred, gate
+        splat_rgb = _center_crop_like(splat_rgb, pred.shape[-2], pred.shape[-1])
+        effective = self.gate_scale if scale is None else scale
+        return gate_mod.blend(splat_rgb, pred, gate, effective), gate
+
+    def _decode(
+        self,
+        net_out: torch.Tensor,
+        frame_index: int,
+        gaussian: torch.Tensor | None,
+        scale: float | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """`net_out` -> the displayed image: split off the gate, tone-map rgb, blend.
+
+        The one place the three steps are composed, so `train_step`, `evaluate`
+        and `render_at_pose` cannot drift apart.
+        """
+        rgb, gate = self.split_net_output(net_out)
+        pred = self._tone_map(rgb, frame_index)
+        return self.apply_gate(pred, gate, gaussian, scale=scale)
+
     def gaussian_for_pose(
         self,
         name: str | None,
@@ -606,7 +696,12 @@ class Trainer:
         """
         gaussian = self.gaussian_for_pose(image_name, K, R, t, image_hw)
         net_out, layers, aux = self._render(K, R, t, image_hw, gaussian=gaussian)
-        pred = self._tone_map(net_out, frame_index)
+        pred, gate = self._decode(net_out, frame_index, gaussian)
+        if gate is not None:
+            # The gate map travels with the render it explains: `trippy.render.candidate`
+            # writes it out as a heatmap next to the frame, and it must be the gate of
+            # THIS pose, not of whatever was rendered last.
+            aux["gate"] = gate
         return pred, layers, aux
 
     def _sample_zoom(self) -> float:
@@ -690,7 +785,9 @@ class Trainer:
         net_out, _layers, _aux = self._render(
             cropped["K"], R, t, (self.cfg.crop, self.cfg.crop), gaussian=gaussian
         )
-        pred = self._tone_map(net_out, frame_index)
+        # Training always blends at `gate_scale = 1`: the scale is a post-training viewing
+        # knob, and training through it would make the learned gate a function of the knob.
+        pred, gate = self._decode(net_out, frame_index, gaussian, scale=1.0)
 
         target = _center_crop_like(target, pred.shape[-2], pred.shape[-1])
         mask = _center_crop_like(mask, pred.shape[-2], pred.shape[-1])
@@ -698,7 +795,17 @@ class Trainer:
         image_loss = self.loss_fn(pred, target, mask)
         extent_penalty = self._extent_penalty()
         camera_reg = self.camera.regularizer()
-        total = image_loss + self.cfg.extent_penalty_weight * extent_penalty + camera_reg
+        # Optional mean-gate prior (`hybrid.gate_prior.weight` > 0; off by default). It is
+        # added to the SAME total the image losses feed, so the gate is shaped by one
+        # objective rather than fitted separately.
+        gate_prior = (
+            gate_mod.gate_prior_loss(
+                gate, self.cfg.hybrid.gate_prior.target, self.cfg.hybrid.gate_prior.weight
+            )
+            if gate is not None
+            else torch.zeros((), device=self.device)
+        )
+        total = image_loss + self.cfg.extent_penalty_weight * extent_penalty + camera_reg + gate_prior
 
         self.optimizer.zero_grad(set_to_none=True)
         total.backward()
@@ -725,6 +832,11 @@ class Trainer:
         if self.hybrid is not None:
             record["gaussian_dropped"] = bool(dropped)
             record["gaussian_present"] = bool(gaussian is not None)
+        if gate is not None:
+            # Per-step, so `metrics.jsonl` shows the mix drifting over a run without
+            # waiting for the next eval.
+            record["gate_mean"] = float(gate.detach().mean().item())
+            record["gate_prior"] = float(gate_prior.detach().item())
         self._append_metrics(record)
         return record
 
@@ -1016,8 +1128,21 @@ class Trainer:
             the number a caller should treat as "the" held-out PSNR under
             this feature -- see `trippy.constants` "eval_exposure_mode").
 
+            On a blend-gate run (`hybrid.gate.enabled`), also: a top-level
+            "gate" block (mean/min/max/percentiles of the per-pixel splat
+            weight across these frames, plus the `gate_scale` they were
+            rendered at and the prior's settings), and per image "gate" (the
+            RAW trained gate), "gate_effective" (after `gate_scale` -- what
+            was actually displayed; the two are equal at scale 1) and
+            "gate_splat_present". None of these keys exist on a gate-less
+            run. See `trippy.hybrid.gate`.
+
             Also writes `<run_dir>/<eval_dirname>/metrics.json` (the full
-            dict above) and, for up to `cfg.eval_max_images` images
+            dict above), on a gate run one
+            `<eval_dirname>/gate/<stem>.gate.png` heatmap per frame (drawn
+            from the gate values alone, so it holds no photographed pixels
+            and is safe to open -- AGENTS.md Sec. 6), and, for up to
+            `cfg.eval_max_images` images
             (forced-held-out shade frames first), `sheet.jpg` (JPEG quality
             `TRAIN_EVAL_SHEET_JPEG_QUALITY`, not PNG -- see module-level
             `_save_eval_sheet_jpeg`): photo | render | raw level-0 |
@@ -1043,6 +1168,10 @@ class Trainer:
 
         forced = set(self.cfg.forced_heldout)
         sheet_names = sorted(names, key=lambda n: (n not in forced, n))[: self.cfg.eval_max_images]
+        # Resolved up front (it used to be resolved just before the write) because the gate
+        # heatmaps are written per frame, inside the loop, into a subdirectory of it.
+        eval_dirname = eval_dirname if eval_dirname is not None else TRAIN_EVAL_DIRNAME_FMT.format(epoch=epoch)
+        eval_dir = self.run_dir / eval_dirname
 
         psnr_vals: list[float] = []
         ssim_vals: list[float] = []
@@ -1054,6 +1183,7 @@ class Trainer:
         per_image: dict[str, dict] = {}
         sheet_images: list[np.ndarray] = []
         sheet_labels: list[str] = []
+        gate_stats_rows: list[dict] = []
 
         with torch.no_grad():
             for name in names:
@@ -1080,7 +1210,12 @@ class Trainer:
                 net_out, layers, aux = self._render(
                     item["K"], R, t, (height, width), gaussian=gaussian
                 )
-                pred = self._tone_map(net_out, frame_index)
+                # `net_rgb` is the 3-channel colour output: everything downstream that
+                # tone-maps, calibrates or overrides an exposure works on it, so the gate
+                # channel never reaches a code path that assumes rgb.
+                net_rgb, gate = self.split_net_output(net_out)
+                pred = self._tone_map(net_rgb, frame_index)
+                pred, gate = self.apply_gate(pred, gate, gaussian)
 
                 target_c = _center_crop_like(target, pred.shape[-2], pred.shape[-1])
                 mask_c = _center_crop_like(mask, pred.shape[-2], pred.shape[-1])
@@ -1127,6 +1262,23 @@ class Trainer:
                     # on a masked run; 0.0 on an unmasked one).
                     "mask_excluded_frac": float(1.0 - mask_c.mean().item()),
                 }
+                if gate is not None:
+                    # Two summaries per frame: the RAW trained gate (what the network
+                    # learned) and the EFFECTIVE one after `gate_scale` (what was actually
+                    # displayed). They are equal at the default scale of 1, and a reader
+                    # who only ever sees one of them would be misled the moment they are not.
+                    row_stats = gate_mod.gate_stats(gate)
+                    per_image[name]["gate"] = row_stats
+                    per_image[name]["gate_effective"] = gate_mod.gate_stats(
+                        gate_mod.effective_gate(gate, self.gate_scale)
+                    )
+                    per_image[name]["gate_splat_present"] = bool(gaussian is not None)
+                    gate_stats_rows.append(row_stats)
+                    gate_dir = eval_dir / TRAIN_EVAL_GATE_DIRNAME
+                    gate_dir.mkdir(parents=True, exist_ok=True)
+                    Image.fromarray(gate_mod.gate_heatmap(gate)).save(
+                        gate_dir / TRAIN_EVAL_GATE_FILENAME_FMT.format(stem=Path(name).stem)
+                    )
 
                 # Headline "_eval" numbers (docs/EXPERIMENTS.md "Test-time camera
                 # calibration"): a training-set name always uses its own (never-overridden)
@@ -1141,8 +1293,9 @@ class Trainer:
                 cal_info: dict | None = None
                 if calibrate or row_mode == "calibrate":
                     with torch.enable_grad():
-                        pred_cal, cal_info = self.calibrate_frame(net_out, target_c, frame_index, mask=mask_c)
+                        pred_cal, cal_info = self.calibrate_frame(net_rgb, target_c, frame_index, mask=mask_c)
                     pred_cal = _center_crop_like(pred_cal, pred.shape[-2], pred.shape[-1])
+                    pred_cal, _ = self.apply_gate(pred_cal, gate, gaussian)
 
                 if calibrate:
                     psnr_cal = _psnr(pred_cal, target_c, mask_c)
@@ -1166,9 +1319,13 @@ class Trainer:
                     exposure_override, wb_override = self._interpolated_camera_override(frame_index)
                     frame_index_t = torch.tensor([frame_index], device=self.device, dtype=torch.long)
                     eval_pred = self.camera.forward_with(
-                        net_out, frame_index_t, exposure=exposure_override, white_balance=wb_override
+                        net_rgb, frame_index_t, exposure=exposure_override, white_balance=wb_override
                     )
                     eval_pred = _center_crop_like(eval_pred, pred.shape[-2], pred.shape[-1])
+                    # The alternative exposure changes the TRIPS half only; the splat half
+                    # is already display-referred, so the gate is re-applied on top rather
+                    # than the blend being redone from scratch.
+                    eval_pred, _ = self.apply_gate(eval_pred, gate, gaussian)
                 else:  # "calibrate"
                     eval_pred = pred_cal
 
@@ -1200,6 +1357,14 @@ class Trainer:
                     pred_np = pred[0].clamp(0.0, 1.0).permute(1, 2, 0).cpu().numpy()
                     sheet_images += [photo_np, pred_np, raw, coverage_rgb]
                     sheet_labels += [f"{name} photo", "render", "raw L0", "coverage"]
+                    if gate is not None:
+                        # A fifth column on a 4-column sheet would misalign every row, so
+                        # the gate replaces the (already per-frame) coverage panel's
+                        # neighbour only when it exists: 4 columns stay 4 columns by
+                        # dropping "raw L0" -- which is still written per frame by the
+                        # candidate report -- in favour of the mix map this run is about.
+                        sheet_images[-2] = gate_mod.gate_heatmap(gate).astype(np.float32) / 255.0
+                        sheet_labels[-2] = f"gate (0=TRIPS, 1=splat, x{self.gate_scale:g})"
 
         shade_names, other_names = _shade_and_other(names, self.cfg.forced_heldout)
 
@@ -1234,13 +1399,21 @@ class Trainer:
             # the same experiment are never compared without the difference being visible.
             "masks": self.mask_stats(),
         }
+        if gate_stats_rows:
+            # The number Jordan actually asked for: how much of this eval came from the
+            # splat rather than from TRIPS, per eval and per frame.
+            metrics["gate"] = {
+                **gate_mod.merge_gate_stats(gate_stats_rows),
+                "gate_scale": self.gate_scale,
+                "gate_prior_target": self.cfg.hybrid.gate_prior.target,
+                "gate_prior_weight": self.cfg.hybrid.gate_prior.weight,
+                "heatmaps": TRAIN_EVAL_GATE_DIRNAME,
+            }
         if calibrate:
             metrics["psnr_mean_calibrated"] = float(np.mean(psnr_cal_vals)) if psnr_cal_vals else 0.0
             metrics["shade_calibrated"] = _aggregate_group(shade_names, per_image, suffix="_calibrated")
             metrics["other_calibrated"] = _aggregate_group(other_names, per_image, suffix="_calibrated")
 
-        eval_dirname = eval_dirname if eval_dirname is not None else TRAIN_EVAL_DIRNAME_FMT.format(epoch=epoch)
-        eval_dir = self.run_dir / eval_dirname
         eval_dir.mkdir(parents=True, exist_ok=True)
         (eval_dir / TRAIN_EVAL_METRICS_FILENAME).write_text(json.dumps(metrics, indent=2))
         if sheet_images:
@@ -1252,7 +1425,18 @@ class Trainer:
             self._best_epoch = epoch
 
         self._append_metrics({"eval": True, **{k: v for k, v in metrics.items() if k != "names"}})
-        self._log(f"epoch {epoch}: eval psnr={metrics['psnr_mean']:.3f} ssim={metrics['ssim_mean']:.4f}")
+        gate_note = ""
+        if metrics.get("gate"):
+            g = metrics["gate"]
+            pcts = g.get("percentiles", {})
+            gate_note = (
+                f" gate_mean={g['mean']:.3f} (p5={pcts.get('p5', 0.0):.3f}"
+                f" p50={pcts.get('p50', 0.0):.3f} p95={pcts.get('p95', 0.0):.3f},"
+                f" scale={g['gate_scale']:g})"
+            )
+        self._log(
+            f"epoch {epoch}: eval psnr={metrics['psnr_mean']:.3f} ssim={metrics['ssim_mean']:.4f}{gate_note}"
+        )
         return metrics
 
     # --- point removal (trippy.train.prune) ---

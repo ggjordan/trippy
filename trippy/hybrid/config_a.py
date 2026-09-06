@@ -35,6 +35,11 @@ from trippy.constants import (
     HYBRID_A_CHANNEL_WIDTHS,
     HYBRID_A_DEFAULT_DROPOUT_P,
     HYBRID_A_DEFAULT_MASK_BY_ALPHA,
+    HYBRID_A_GATE_PRIOR_DEFAULT_TARGET,
+    HYBRID_A_GATE_PRIOR_DEFAULT_WEIGHT,
+    HYBRID_A_GATE_SCALE_DEFAULT,
+    HYBRID_A_GATE_SCALE_MAX,
+    HYBRID_A_GATE_SCALE_MIN,
     HYBRID_A_MODES,
     HYBRID_C_GSRENDER_MAX_HW,
     HYBRID_C_GSRENDER_MIN_OPACITY,
@@ -55,6 +60,51 @@ def gaussian_channel_count(channels: list[str] | tuple[str, ...]) -> int:
         `["rgb", "alpha", "depth"]`, 4 for `["rgb", "alpha"]`.
     """
     return sum(HYBRID_A_CHANNEL_WIDTHS[group] for group in channels)
+
+
+@dataclass
+class GateConfig:
+    """The `hybrid.gate:` block: the explicit splat-vs-TRIPS blend weight.
+
+    `enabled: false` (the default) is a hard no-op -- the U-Net keeps its three
+    output channels and no blend is ever computed, so every queued run and every
+    existing hybrid checkpoint is bit-identical to a build without the gate. See
+    `trippy.hybrid.gate` for the maths and why the blend happens after the tone
+    mapper.
+
+    Attributes:
+        enabled: master switch for the extra output channel and the blend.
+    """
+
+    enabled: bool = False
+
+
+@dataclass
+class GatePriorConfig:
+    """The `hybrid.gate_prior:` block: an optional pull on the gate's MEAN.
+
+    Off by default (`weight = 0`). When on, `weight * (mean(g) - target) ** 2` is
+    added to every training step's loss. It constrains the average only -- the
+    per-pixel map, which is the whole point of the gate, is left to the image
+    losses. Use it to ask "what does this scene look like if it has to lean 20%
+    on the splat?", never to decide the answer.
+
+    Attributes:
+        target: the mean gate to pull towards, in [0, 1] (1 = all splat).
+        weight: penalty weight; <= 0 disables the term entirely.
+    """
+
+    target: float = HYBRID_A_GATE_PRIOR_DEFAULT_TARGET
+    weight: float = HYBRID_A_GATE_PRIOR_DEFAULT_WEIGHT
+
+    def __post_init__(self) -> None:
+        if not 0.0 <= self.target <= 1.0:
+            raise ValueError(f"hybrid.gate_prior.target must be in [0, 1], got {self.target}")
+
+    @property
+    def active(self) -> bool:
+        """True when the term actually contributes to the loss."""
+        return self.weight > 0.0
 
 
 @dataclass
@@ -95,6 +145,17 @@ class HybridConfig:
         gsrender_max_hw, gsrender_min_opacity: forwarded to `gsrender.render`
             for live renders; defaults match design C's, so a live render
             and a precomputed one are produced by the same call.
+        gate: the blend gate (`GateConfig`); `enabled: false` by default and a
+            hard no-op then. Requires `enabled` and `"rgb" in channels`.
+        gate_prior: optional mean-gate regulariser (`GatePriorConfig`); off by
+            default (`weight: 0`).
+        gate_scale: the post-training knob, in
+            `[HYBRID_A_GATE_SCALE_MIN, HYBRID_A_GATE_SCALE_MAX]`. Multiplies the
+            trained gate at eval/render time (the product is clamped back into
+            [0, 1]): 0 = pure TRIPS, 1 = as trained, 2 = push towards the splat.
+            Recorded in the checkpoint so a run's default mix is reproducible;
+            `trippy eval --gate-scale` / `candidate-report --gate-scale` and the
+            viewer's Blend panel override it per call.
     """
 
     enabled: bool = False
@@ -109,8 +170,18 @@ class HybridConfig:
     gsrender_tools_dir: str = ""
     gsrender_max_hw: int = HYBRID_C_GSRENDER_MAX_HW
     gsrender_min_opacity: float = HYBRID_C_GSRENDER_MIN_OPACITY
+    gate: GateConfig = field(default_factory=GateConfig)
+    gate_prior: GatePriorConfig = field(default_factory=GatePriorConfig)
+    gate_scale: float = HYBRID_A_GATE_SCALE_DEFAULT
 
     def __post_init__(self) -> None:
+        # YAML round-trip: `TrainConfig.from_dict` hands nested blocks over as plain
+        # dicts (and `to_dict`/`asdict` turns them back into dicts), so rebuild the
+        # dataclasses here exactly as `TrainConfig.__post_init__` does for `hybrid:`.
+        if isinstance(self.gate, dict):
+            self.gate = GateConfig(**self.gate)
+        if isinstance(self.gate_prior, dict):
+            self.gate_prior = GatePriorConfig(**self.gate_prior)
         unknown = [g for g in self.channels if g not in HYBRID_A_CHANNEL_WIDTHS]
         if unknown:
             raise ValueError(
@@ -135,11 +206,35 @@ class HybridConfig:
             raise ValueError(f"hybrid.depth_scale must be positive, got {self.depth_scale}")
         if self.enabled and not self.renders_dir:
             raise ValueError("hybrid.enabled is true but hybrid.renders_dir is empty")
+        if not HYBRID_A_GATE_SCALE_MIN <= self.gate_scale <= HYBRID_A_GATE_SCALE_MAX:
+            raise ValueError(
+                f"hybrid.gate_scale must be in [{HYBRID_A_GATE_SCALE_MIN}, "
+                f"{HYBRID_A_GATE_SCALE_MAX}], got {self.gate_scale}"
+            )
+        if self.gate.enabled:
+            # The gate blends *towards* the Gaussian colour, so there has to be one.
+            if not self.enabled:
+                raise ValueError("hybrid.gate.enabled needs hybrid.enabled")
+            if "rgb" not in self.channels:
+                raise ValueError(
+                    "hybrid.gate.enabled needs 'rgb' in hybrid.channels: the gate blends "
+                    f"towards the Gaussian colour and this run has channels={self.channels}"
+                )
 
     @property
     def num_channels(self) -> int:
         """Width of the Gaussian block appended to every U-Net input level."""
         return gaussian_channel_count(self.channels)
+
+    @property
+    def gate_enabled(self) -> bool:
+        """True when the network carries the extra gate output channel.
+
+        The single predicate every consumer asks. It is deliberately an AND with
+        `enabled`: a `gate: {enabled: true}` on a non-hybrid run is refused at
+        construction, so this can never be true without a Gaussian block to blend.
+        """
+        return bool(self.enabled and self.gate.enabled)
 
     @property
     def wants_depth(self) -> bool:

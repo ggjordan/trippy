@@ -878,6 +878,54 @@ HYBRID_A_DEPTH_SCALE_FALLBACK = HYBRID_C_DEPTH_NORM_SCALE
 # but enough to make an eval pass over the held-out split effectively free.
 HYBRID_A_RENDER_CACHE_FRAMES = 16
 
+# --- hybrid design A, the BLEND GATE (trippy.hybrid.gate) ---------------------
+# The gate makes the splat-vs-TRIPS mix an explicit, inspectable, adjustable quantity
+# instead of an implicit consequence of the U-Net's weights. With `hybrid.gate.enabled`
+# the network grows ONE extra output channel; its sigmoid is a per-pixel weight `g`, and
+# the displayed image is `g * splat_rgb + (1 - g) * trips_rgb` (both sides in
+# display-referred space -- see trippy.hybrid.gate for why the blend is applied AFTER
+# the tone mapper, not before).
+
+# Width of the gate head: one channel appended AFTER the three colour channels, so
+# `net_out[:, :3]` is byte-for-byte the pre-gate network output and channel index 3 is
+# the gate logit. Keeping the colour channels first is what lets the tone mapper, the
+# calibration fit and every honesty artifact stay unchanged.
+HYBRID_A_GATE_CHANNELS = 1
+
+# Index of the gate logit inside the U-Net's output (== NET_DEFAULT_NUM_OUTPUT_CHANNELS).
+HYBRID_A_GATE_CHANNEL_INDEX = NET_DEFAULT_NUM_OUTPUT_CHANNELS
+
+# `hybrid.gate_scale` bounds. The scale is a POST-TRAINING knob: the trained gate is
+# multiplied by it and the product clamped back into [0, 1], so 0 is "pure TRIPS",
+# 1 is "what training chose" and 2 is "push everything the gate leaned towards the splat
+# all the way to the splat". Values outside the range are clamped rather than rejected so
+# a viewer slider can never crash a render.
+HYBRID_A_GATE_SCALE_MIN = 0.0
+HYBRID_A_GATE_SCALE_MAX = 2.0
+HYBRID_A_GATE_SCALE_DEFAULT = 1.0
+
+# `hybrid.gate_prior` defaults. weight = 0 is OFF (the default): the gate is then shaped
+# only by the image losses. A non-zero weight adds `weight * (mean(g) - target) ** 2` to
+# every training step, which pulls the run's AVERAGE reliance on the splat towards
+# `target` without constraining any individual pixel -- the point being to probe "how
+# much splat does this scene actually want?" rather than to dictate it.
+HYBRID_A_GATE_PRIOR_DEFAULT_TARGET = 0.5
+HYBRID_A_GATE_PRIOR_DEFAULT_WEIGHT = 0.0
+
+# Percentiles of the per-eval gate map recorded in metrics.json / report.json. A mean
+# alone cannot distinguish "half the frame is splat" from "the whole frame is a 50/50
+# mush", and that distinction is the entire question this feature exists to answer.
+HYBRID_A_GATE_PERCENTILES = (1.0, 5.0, 25.0, 50.0, 75.0, 95.0, 99.0)
+
+# Filenames under a run's eval directory. The heatmap is rendered FROM SCRATCH out of the
+# gate values only (trippy.render.sheets.colorize) -- it contains no photographed pixels,
+# so an agent may open it (AGENTS.md Sec. 6 "Allowed to view").
+TRAIN_EVAL_GATE_DIRNAME = "gate"
+TRAIN_EVAL_GATE_FILENAME_FMT = "{stem}.gate.png"
+
+# Per-frame gate heatmap written next to the other candidate-report artifacts.
+CANDIDATE_GATE_FILENAME = "gate.png"
+
 # EXP-0005's measured held-out PSNR for the RAW Gaussian render (kkc_15000.ply) against the
 # photo, on kk-coherent's modulo-8 held-out split: the "plain Gaussians" baseline any hybrid
 # must beat. `all` = 33 frames, `shade` = the 6 SHADE_FRAMES_KK frames.

@@ -2,6 +2,91 @@
 All notable changes to trippy. Format: Keep a Changelog. Versions: semver tags `vX.Y.Z`. Every push also gets a `build-NNNN` tag.
 
 ## [Unreleased]
+### Added
+- **The blend gate: the splat-vs-TRIPS mix is now an explicit, measurable, adjustable tensor
+  (`hybrid.gate`, off by default).** Hybrid design A feeds the Gaussian render into the U-Net as
+  *input*, so how much of a finished pixel came from the splat and how much from the TRIPS
+  points was buried in the weights -- unmeasurable, unshowable, unadjustable after training. The
+  network now grows **one extra output channel** whose sigmoid is a per-pixel weight `g`, and the
+  displayed image is `g * splat_rgb + (1 - g) * trips_rgb`. Trained end to end by the ordinary
+  image losses; nothing supervises `g` directly. `trippy/hybrid/gate.py`.
+  - The blend is applied **after** the tone mapper, because both operands are only commensurable
+    in display-referred space (the splat is a finished render of a 3DGS already fitted to these
+    photos) -- and because that makes both extremes exact: `gate_scale 0` returns the TRIPS path
+    bit for bit and a saturated gate returns the splat bit for bit. Both are asserted as
+    equalities in `tests/test_hybrid_gate_math.py` / `tests/test_hybrid_gate_trainer.py`.
+  - **A missing splat is never blended.** A frame with no render, a crop `dropout_gaussian_p`
+    dropped, a pose with no live renderer: the gate is computed and logged, and not applied.
+    Blending its all-zero stand-in would paint black holes and claim splat support that is not
+    there.
+  - **`hybrid.gate_scale` (0..2, default 1)** re-weights the trained gate at eval/render time --
+    0 pure TRIPS, 1 as trained, 2 pushed to the splat. Exposed as `trippy eval --gate-scale` and
+    `trippy candidate-report --gate-scale`, recorded in the checkpoint, and a viewer slider.
+    Training always blends at 1.0: the scale is a viewing knob, and training through it would
+    make the learned gate a function of the knob.
+  - **`hybrid.gate_prior` (`target`, `weight`; off by default)** adds
+    `weight * (mean(g) - target)^2` to the step loss -- a *mean* prior, so it asks how much of a
+    scene wants to be splat without flattening the per-pixel map the feature exists to expose.
+  - **Measured everywhere a number already is**: `gate_mean`/`gate_prior` per training step;
+    a `gate` block (mean/min/max/percentiles + `gate_scale`) per eval and per candidate report,
+    with raw and post-scale summaries per image; a `gate` key in `report.json` and a section in
+    the run README. Plus **a from-scratch gate heatmap PNG with every eval**
+    (`eval_ep*/gate/<stem>.gate.png`) and per candidate frame (`frames/<pose>/gate.png`) --
+    no photographed pixels, so they are in AGENTS.md's "allowed to view" list.
+- **Viewer: a Blend panel** (`rust/crates/trips-viewer`, `B` to cycle). TRIPS only / splat only /
+  gated blend / manual mix / split screen at the same pose, with a `gate_scale` slider (0..2) and
+  a global mix slider (0 = splat, 1 = TRIPS). Composed as Burn tensor ops into the *same* planar
+  buffer the network already produced, so `blit.wgsl`, its uniform block and `--screenshot` are
+  all unchanged -- which means a screenshot measures the picture on screen. Headless flags
+  `--blend-mode`, `--gate-scale`, `--mix`, `--split`.
+  - **Shipped with precomputed splat renders, not live ones.** The bundle carries a `splat.npz`
+    of the capture views' Gaussian blocks (12 views, downscaled to 512 px on the long edge);
+    the moment the camera leaves one of those views the panel greys out the splat modes and says
+    so, rather than fading to black or reusing the view you just left — a stored render is a
+    picture of the Gaussians from *that* view's camera, and showing it at another pose would be
+    showing somewhere else (training refuses the same substitution). The bundle also records the
+    source `.ply`
+    path, which is what the follow-up (Brush's `brush-render` at the viewer's own pose) will
+    open. See docs/USER_GUIDE.md "The Blend panel".
+- **Export**: `weights.safetensors` gains `gate`/`gate_channel`/`gate_scale` metadata **only when
+  the gate is on**, so a gate-less export stays byte-identical to the file it was (including the
+  committed Rust parity fixture). The gate adds **no new tensor** -- it is extra rows of
+  `unet.final.weight`/`.bias` -- so `brush_unet::weights`' "no unknown tensor" schema rule is
+  untouched. `bundle.json` gains an optional `blend` block and `splat.npz`; `trippy-bundle-1`
+  does **not** change version, because both are additive and every previous bundle still loads.
+- **Rust `brush-unet` accepts the extra output channel**: `out_channels` of 3 or 4 and nothing
+  else, the metadata flag cross-checked against the channel count, the gate refused on any
+  channel but 3, and the `camera.response` LUT pinned to 3 rows (the gate is never tone-mapped).
+  `Unet::split_gate` and `brush_unet::blend_gate` are the Rust twins of
+  `trippy.hybrid.gate.split_output` / `.blend`. Nine new CPU schema tests
+  (`tests/gate_schema_cpu.rs`) build the four-channel file byte by byte from the safetensors
+  container rules, independently of the Python writer.
+- `experiments/EXP-0011-karekare-v2/config_hybrid_gate.yaml`: `config_hybrid.yaml` with the gate
+  on and nothing else changed, queued as `kkv2-7-hybrid-gate`.
+### Fixed
+- **A hybrid (design A) checkpoint's bundle could never be rendered — by the viewer or by
+  `trippy bundle-parity`.** A design-A network's `in_channels` is `feature_channels + G`
+  (9 on the kkv2 hybrids), but a bundle carried only the `C = 4` point features, so the first
+  `forward` failed with "inputs[0] has 4 channels, expected num_input_channels=9". Every hybrid
+  bundle exported so far is affected. `bundle.json`'s new `blend` block and `splat.npz` carry the
+  Gaussian block itself (rgb + alpha + normalised depth, per capture view), and both the Rust
+  renderer and the Python reference now concatenate it onto every pyramid level exactly as
+  `GaussianInputs.attach` does in training — honouring `mode: all_levels` vs `concat_level0`, and
+  feeding honest zeros (design A's own "no Gaussian information here" state) at a view with no
+  stored block. `Renderer::new` now refuses a channel-count mismatch up front, with both numbers,
+  instead of failing mid-frame. **Re-export any hybrid bundle to open it.**
+  - Caveat, stated because it is a real compromise: the stored block is downscaled to 512 px on
+    the long edge, so a hybrid bundle rendered at 1080p upsamples it on the way into the network
+    and the frame is *close to*, not identical with, the run's own eval frame. The live splat
+    path removes this too.
+- **The Burn tone mapper panicked on a four-channel network.** `camera.response` was sized
+  `[out_channels, P]`, so a blend-gate bundle reshaped a `[3, P]` LUT to `[1, 4*P]` and aborted at
+  load. The LUT is RGB-only — the gate channel is never tone-mapped — and is now read through
+  `get_shaped`, so a future disagreement is a message rather than a panic. Found by the GPU
+  acceptance job, pinned by three new CPU tests.
+### Changed
+- `scripts/gpu_submit.sh` accepts priorities **40-59** (trippy manages the queue from
+  2026-09-07: 40 target-scene runs, 45 hybrids, 50 other), alongside the existing 10-19 and 70.
 
 ## [v0.5.0] - 2026-09-07
 ### Milestone note

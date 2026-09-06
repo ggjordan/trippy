@@ -45,6 +45,7 @@ def write_fake_render(
     width: int = IMG_WIDTH,
     rgb: np.ndarray | None = None,
     seed: int = 0,
+    alpha: np.ndarray | float | None = None,
 ) -> dict[str, Path]:
     """Write one synthetic render triple in `render_splat_views`' exact layout.
 
@@ -55,6 +56,10 @@ def write_fake_render(
         rgb: (H, W, 3) float in [0, 1] to use as the render's colour; None
             generates a deterministic gradient/noise mix from `seed`.
         seed: RNG seed for the generated channels.
+        alpha: (H, W) float in [0, 1], or a scalar broadcast over the frame;
+            None generates a random coverage map. A test that needs "the splat
+            covers this pixel completely" (the blend gate's saturated extreme,
+            tests/test_hybrid_gate_trainer.py) passes 1.0 here.
 
     Returns:
         `{"rgb": png path, "depth": npy path, "alpha": npy path}`.
@@ -64,7 +69,9 @@ def write_fake_render(
     if rgb is None:
         ramp = np.linspace(0.0, 1.0, width, dtype=np.float32)[None, :, None]
         rgb = np.clip(ramp + rng.normal(0.0, 0.1, (height, width, 3)).astype(np.float32), 0.0, 1.0)
-    alpha = np.clip(rng.uniform(0.2, 1.0, (height, width)).astype(np.float32), 0.0, 1.0)
+    if alpha is None:
+        alpha = rng.uniform(0.2, 1.0, (height, width))
+    alpha = np.clip(np.broadcast_to(np.asarray(alpha, dtype=np.float32), (height, width)), 0.0, 1.0)
     depth = rng.uniform(FAKE_DEPTH_MIN, FAKE_DEPTH_MAX, (height, width)).astype(np.float32)
 
     paths = {
@@ -84,6 +91,7 @@ def write_fake_renders(
     scene_root: Path | None = None,
     height: int = IMG_HEIGHT,
     width: int = IMG_WIDTH,
+    alpha: np.ndarray | float | None = None,
 ) -> Path:
     """Write a render triple for every name in `names`.
 
@@ -97,12 +105,22 @@ def write_fake_renders(
             photo_path = Path(scene_root) / "images" / name
             with PILImage.open(photo_path) as img:
                 rgb = np.asarray(img.convert("RGB"), dtype=np.float32) / 255.0
-        write_fake_render(renders_dir, Path(name).stem, height=height, width=width, rgb=rgb, seed=i)
+        write_fake_render(
+            renders_dir, Path(name).stem, height=height, width=width, rgb=rgb, seed=i, alpha=alpha
+        )
     return renders_dir
 
 
-def hybrid_train_config(tmp_path: Path, **hybrid_overrides: Any) -> tuple[TrainConfig, list[str]]:
+def hybrid_train_config(
+    tmp_path: Path, render_alpha: np.ndarray | float | None = None, **hybrid_overrides: Any
+) -> tuple[TrainConfig, list[str]]:
     """A tiny CPU `TrainConfig` with hybrid design A enabled and fake renders on disk.
+
+    Args:
+        tmp_path: pytest tmp dir the scene, renders and run dir are built under.
+        render_alpha: forwarded to `write_fake_renders` -- pass 1.0 for
+            fully-covered renders (see `write_fake_render`).
+        hybrid_overrides: merged into the `hybrid:` block.
 
     Returns:
         `(cfg, names)` -- `names` is the synthetic scene's image list, all of
@@ -112,7 +130,7 @@ def hybrid_train_config(tmp_path: Path, **hybrid_overrides: Any) -> tuple[TrainC
     ply_path = build_synthetic_ply(tmp_path, point_set)
     names = sorted(p.name for p in (scene_root / "images").iterdir())
     renders_dir = tmp_path / "renders"
-    write_fake_renders(renders_dir, names, scene_root=scene_root)
+    write_fake_renders(renders_dir, names, scene_root=scene_root, alpha=render_alpha)
 
     hybrid = {"enabled": True, "renders_dir": str(renders_dir), "dropout_gaussian_p": 0.0}
     hybrid.update(hybrid_overrides)

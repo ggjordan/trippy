@@ -755,9 +755,13 @@ output/runs/<exp>/<run>/
 ├── eval_ep0000/
 │   ├── metrics.json               ({"epoch", "n_images", "psnr_mean", "ssim_mean", "lpips_mean", "names",
 │   │                                "per_image": {name: {"psnr", "ssim", "lpips"}}, "shade", "other"})
-│   └── sheet.jpg                  (honesty sheet: photo | render | raw L0 | coverage, up to
-│                                    cfg.eval_max_images rows, default 6; JPEG q85, not PNG --
-│                                    a quick progress check, unlike candidate-report's PNGs below)
+│   ├── sheet.jpg                  (honesty sheet: photo | render | raw L0 | coverage, up to
+│   │                                cfg.eval_max_images rows, default 6; JPEG q85, not PNG --
+│   │                                a quick progress check, unlike candidate-report's PNGs below.
+│   │                                On a blend-gate run the "raw L0" column becomes the gate map)
+│   └── gate/<stem>.gate.png       (ONLY on a blend-gate run: the per-pixel splat weight as a
+│                                    from-scratch heatmap, fixed [0,1] ramp. No photographed
+│                                    pixels, so this one is safe for anyone to open)
 ├── eval_ep0010/
 │   └── ...
 ├── eval_manual_<timestamp>/      (from a standalone `trippy eval --checkpoint`, see below)
@@ -1312,6 +1316,146 @@ not a fabricated render.
 Recorded as `HYBRID_A_BASELINE_*` in `trippy/constants.py`. The plain-TRIPS row is the 40-epoch
 number; the fair comparison is EXP-0009 against EXP-0003's 300-epoch `full2-trips`, whose
 config EXP-0009 copies verbatim outside its `hybrid:` block.
+
+### The blend gate: making the splat-vs-TRIPS mix explicit (`hybrid.gate`)
+
+Everything above feeds the Gaussian render into the U-Net as **input**, so how much of a
+finished pixel came from the splat and how much from the TRIPS points is a property of the
+weights: unmeasurable, unshowable, and unadjustable after training. The blend gate fixes all
+three. The network grows **one extra output channel**; its sigmoid is a per-pixel weight
+`g` in [0, 1], and the displayed image is
+
+```
+final = g * splat_rgb + (1 - g) * trips_rgb
+```
+
+with `trips_rgb` the tone-mapped 3-channel network output and `splat_rgb` the alpha-masked
+Gaussian render at the same pixel. `g` is trained end to end by the ordinary image losses --
+nothing supervises it directly. Implementation: `trippy/hybrid/gate.py`.
+
+**Gate off is a hard no-op.** `hybrid.gate.enabled` defaults to false; the network then has its
+original three output channels, no blend is computed, no `gate` key appears in any metrics or
+weight file, and every queued run and existing checkpoint behaves exactly as before.
+
+#### Where the blend happens, and why it matters
+
+**After the tone mapper, not before.** The two operands have to live in the same space or the
+mix is meaningless, and they are only commensurable in display-referred space: `splat_rgb` comes
+out of gsrender as a finished [0, 1] render of a 3DGS that was itself fitted to these photos, so
+its exposure is already applied. Blending pre-tone-map would push the splat through a second
+exposure and response curve it was never missing. It also makes both extremes *exact* rather
+than approximate, which is what the CPU tests assert:
+
+- `gate_scale = 0` returns the TRIPS path bit for bit.
+- a `gate_scale` large enough to saturate returns the splat bit for bit, wherever alpha is 1.
+
+Colour channels stay first (`net_out[:, :3]`), so the tone mapper, `Trainer.calibrate_frame`,
+every honesty artifact and the Rust blit shader are untouched.
+
+**No splat means no blend.** A frame with no render triple, a crop that `dropout_gaussian_p`
+dropped, and a pose with no live renderer all present as "no Gaussian block". The gate is still
+computed and logged there, but it is **not applied**: blending against the all-zero stand-in
+would paint black holes and would claim splat support that does not exist. Where the splat
+exists but is uncovered (alpha ~ 0) the network can learn `g -> 0` from the alpha channel it is
+fed -- a learned decision, not a fabricated one.
+
+#### `gate_scale`: turning the mix up and down after training
+
+`hybrid.gate_scale` (default 1.0, range [0, 2]) multiplies the trained gate and the product is
+clamped back into [0, 1]:
+
+| scale | what you see |
+|---|---|
+| 0 | pure TRIPS -- exactly the run's own network output |
+| 1 | the mix training chose |
+| 2 | every pixel whose trained gate was >= 0.5 pushed all the way to the splat |
+
+It is a **viewing** knob, never a training one: `train_step` always blends at 1.0, because
+training through the knob would make the learned gate a function of the knob. It is recorded in
+the checkpoint (so a run's default mix is reproducible) and overridden per call by
+`trippy eval --gate-scale`, `trippy candidate-report --gate-scale`, and the viewer's Blend panel.
+
+#### `gate_prior`: an optional pull on the mean gate
+
+`hybrid.gate_prior` (`target`, `weight`; **off by default**, `weight: 0`) adds
+`weight * (mean(g) - target) ** 2` to every training step's loss. A *mean* prior, not a
+per-pixel one, on purpose: the question it exists to ask is "how much of this scene wants to be
+splat overall?", and a per-pixel penalty would flatten the map the whole feature exists to
+expose. Use it to probe, not to decide.
+
+#### What gets measured, and where to look
+
+The gate is the point of the feature, so it is written down everywhere a number already is:
+
+- **Per training step** (`metrics.jsonl`): `gate_mean`, `gate_prior`.
+- **Per eval** (`eval_ep*/metrics.json`): a top-level `gate` block with mean, min, max and
+  percentiles (p1/p5/p25/p50/p75/p95/p99) across the held-out frames, plus `gate_scale` and the
+  prior's settings. Per image: `gate` (the **raw** trained gate) and `gate_effective` (after
+  `gate_scale` -- what was actually displayed), and `gate_splat_present`.
+- **Per eval, as pictures**: `eval_ep*/gate/<stem>.gate.png`, a from-scratch colour-ramp heatmap
+  of the gate over the frame with a fixed [0, 1] range, so one frame's colours mean the same as
+  another's. **These contain no photographed pixels** and are therefore in AGENTS.md Sec. 6's
+  "allowed to view" list -- an agent may and should open them. The per-epoch contact sheet also
+  swaps its "raw L0" column for the gate map on a gate run.
+- **Per candidate-report frame**: `frames/<pose>/gate.png` and a `gate` block in `metrics.json`,
+  including `n_frames_without_splat` -- the difference between "the gate chose TRIPS" and "there
+  was no splat to choose".
+- **In `report/report.json`**: a `gate` key with the held-out and dolly blocks, and a matching
+  section in the run README.
+
+A gate mean is **not a quality number** and must not be read as one. "17.9 dB with 80% of the
+pixels from the splat" and "17.9 dB with 5%" are very different results, and that is exactly
+what this makes visible.
+
+#### What a run is looking for
+
+Three outcomes are interesting, in order:
+
+1. The gate is a **structured map** rather than a constant -- the two renderers are genuinely
+   complementary, which is the whole thesis of design A.
+2. The gate is near 0 in the shade -- TRIPS is carrying the big tree and the splat is not.
+3. The gate is near 1 in the shade -- the splat is, and TRIPS is not.
+
+A constant map either way says the mix is not where the win is, and the next move is
+`gate_prior` at 0.2/0.8 to see what the scene gives up.
+
+#### Bundles: why a hybrid one needs the Gaussian block
+
+A design-A network's `in_channels` is `feature_channels + G`. Until this landed a bundle carried
+only the `C` point features, so **no hybrid checkpoint's bundle could be rendered at all** --
+the viewer and `trippy bundle-parity` both died at the first forward with "inputs[0] has 4
+channels, expected num_input_channels=9". `bundle.json`'s `blend` block and `splat.npz` fix that
+by carrying the block itself (rgb + alpha + normalised depth per capture view, in the run's own
+`channels` order and normalisation), and both renderers concatenate it onto every pyramid level
+exactly as `GaussianInputs.attach` does, honouring `mode`. A view with no stored block gets
+zeros -- design A's own state, which `dropout_gaussian_p` trained the network to render through.
+
+The block is downscaled to `BUNDLE_SPLAT_MAX_DIM` (512 px on the long edge) for at most
+`BUNDLE_SPLAT_MAX_VIEWS` (12) views, so a bundle stays a bundle rather than a second copy of the
+dataset. That is a real compromise and worth saying out loud: a hybrid bundle rendered at 1080p
+upsamples the block on its way into the network, so its frame is *close to*, not identical with,
+the run's own eval frame. The live splat path removes both the cap and the downscale.
+
+#### The wire format
+
+The gate adds **no new tensor**: it is extra rows of `unet.final.weight` / `unet.final.bias`,
+which the existing `(O, F, 1, 1)` / `(O,)` shapes already describe with `O = out_channels = 4`.
+`trippy export-bundle` writes `gate`/`gate_channel`/`gate_scale` into the safetensors
+`__metadata__` **only when the gate is on**, so a gate-less export stays byte-identical to the
+file it was before this existed (including the committed Rust parity fixture). `bundle.json`
+gains an optional `blend` block and a `splat.npz`; `trippy-bundle-1` does **not** change
+version, because both are additive and every previous bundle still loads.
+
+The Rust reader (`rust/crates/brush-unet`) accepts `out_channels` of 3 or 4 and nothing else,
+cross-checks the metadata flag against the channel count, and refuses a gate on any channel but
+3. `brush_unet::blend_gate` is the Rust twin of `trippy.hybrid.gate.blend`.
+
+#### Runs
+
+| Run | Config | What it asks |
+|---|---|---|
+| `kkv2-5-hybrid` | `experiments/EXP-0011-karekare-v2/config_hybrid.yaml` | does design A beat plain TRIPS on the target scene? (gate off) |
+| `kkv2-7-hybrid-gate` | `experiments/EXP-0011-karekare-v2/config_hybrid_gate.yaml` | the same run with the gate on -- one variable, and a gate map to read |
 
 ## Distillation (design B)
 

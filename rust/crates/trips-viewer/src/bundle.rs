@@ -25,6 +25,7 @@
 //! Related docs: `docs/USER_GUIDE.md`; `docs/GEOMETRY.md`;
 //!     `docs/decisions/ADR-0006-viewer-integration.md`.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use brush_pyramid::params::PyramidParams;
@@ -121,6 +122,13 @@ pub struct Manifest {
     /// Scene up vector in world coordinates, for the orbit controls.
     #[serde(default = "default_up")]
     pub up: [f32; 3],
+    /// The blend gate + precomputed splat renders, when this bundle was
+    /// exported from a run trained with one.
+    ///
+    /// `#[serde(default)]`, so every bundle written before the gate existed
+    /// still parses -- which is why [`BUNDLE_FORMAT`] does not change.
+    #[serde(default)]
+    pub blend: Option<BlendManifest>,
     /// Index **into `views`** (not a dataset image index) the viewer opens at.
     #[serde(default)]
     pub default_view: usize,
@@ -144,6 +152,289 @@ pub struct Bundle {
     pub points: PointSet,
     /// The U-Net + tone-mapper weights.
     pub weights: Weights,
+    /// Precomputed Gaussian-splat renders, keyed by **dataset image index**
+    /// (the same number [`BundleView::index`] carries and the tone mapper uses
+    /// as its frame index), so the renderer can look one up from the frame it
+    /// is drawing without consulting the manifest.
+    ///
+    /// Empty on any bundle without a `blend` block, and also on one whose
+    /// `splat.npz` could not be read -- the Blend panel then says so rather
+    /// than the scene refusing to open.
+    pub splats: HashMap<usize, SplatImage>,
+}
+
+/// The `blend` block of `bundle.json` (see `trippy.render.bundle.BlendInfo`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct BlendManifest {
+    /// Whether `weights.safetensors` carries the gate head.
+    #[serde(default)]
+    pub gate: bool,
+    /// Output channel of the gate logit; always [`brush_unet::GATE_CHANNEL`].
+    #[serde(default = "default_gate_channel")]
+    pub gate_channel: usize,
+    /// The run's own default gate scale; the Blend panel's slider starts here.
+    #[serde(default = "default_gate_scale")]
+    pub gate_scale: f32,
+    /// Absolute path of the Gaussian PLY the splat half came from, or "".
+    ///
+    /// **Not yet read.** It is what the live splat path will open (Brush's
+    /// `brush-render`, rendering the PLY at the viewer's own pose); until that
+    /// lands the viewer shows the precomputed renders below and says so. See
+    /// `docs/USER_GUIDE.md` "Blend panel".
+    #[serde(default)]
+    pub splat_ply: String,
+    /// File name of the precomputed render archive, or "" when none.
+    #[serde(default)]
+    pub splat_renders: String,
+    /// Array positions into `views` that have a precomputed render.
+    #[serde(default)]
+    pub splat_views: Vec<usize>,
+    /// Fraction of each view's own size the stored render was scaled to.
+    #[serde(default = "default_splat_scale")]
+    pub splat_scale: f32,
+    /// Whether the stored rgb is already alpha-masked.
+    #[serde(default)]
+    pub mask_by_alpha: bool,
+    /// The Gaussian block's channel groups, in `HYBRID_A_CHANNEL_ORDER`
+    /// (`rgb`, `alpha`, `depth`), exactly as the network was trained with.
+    /// Their total width is `G` and the U-Net's `in_channels` is `C + G`.
+    #[serde(default)]
+    pub channels: Vec<String>,
+    /// `"all_levels"` or `"concat_level0"`: how the block reaches the pyramid's
+    /// levels. Pooling it to every level on a `concat_level0` run would feed the
+    /// network something it was never trained on.
+    #[serde(default = "default_block_mode")]
+    pub mode: String,
+    /// `C`, the TRIPS feature width, so `C + G` can be checked against the
+    /// weight file's own `in_channels`.
+    #[serde(default)]
+    pub feature_channels: usize,
+}
+
+impl BlendManifest {
+    /// `G`: the Gaussian block's total width in channels.
+    #[must_use]
+    pub fn block_channels(&self) -> usize {
+        self.channels.iter().map(|g| group_width(g)).sum()
+    }
+
+    /// True when the block is pooled onto every pyramid level.
+    #[must_use]
+    pub fn all_levels(&self) -> bool {
+        self.mode != "concat_level0"
+    }
+}
+
+/// Channel width of one `HYBRID_A_CHANNEL_ORDER` group (0 for an unknown one).
+fn group_width(group: &str) -> usize {
+    match group {
+        "rgb" => 3,
+        "alpha" | "depth" => 1,
+        _ => 0,
+    }
+}
+
+fn default_block_mode() -> String {
+    "all_levels".to_owned()
+}
+
+fn default_gate_channel() -> usize {
+    brush_unet::GATE_CHANNEL
+}
+
+const fn default_gate_scale() -> f32 {
+    1.0
+}
+
+const fn default_splat_scale() -> f32 {
+    1.0
+}
+
+/// One view's precomputed Gaussian block, on the host.
+///
+/// Every plane is stored **planar CHW** because that is the layout the network's
+/// own output and its pyramid inputs use, so nothing here needs a transpose.
+/// This is both halves of the feature at once: `rgb` is the Blend panel's splat
+/// image, and the whole block is what the design-A U-Net's extra input channels
+/// are fed (see [`BlendManifest`] -- without it a hybrid bundle cannot render).
+#[derive(Debug, Clone, Default)]
+pub struct SplatImage {
+    /// `3 * height * width` values in [0, 1], planar, ALREADY alpha-masked when
+    /// the manifest says so. Empty when the run's block has no `rgb` group.
+    pub rgb: Vec<f32>,
+    /// `height * width` coverage values in [0, 1]; empty when not stored.
+    pub alpha: Vec<f32>,
+    /// `height * width` NORMALISED depths (already divided by the run's
+    /// `depth_scale`); empty when not stored.
+    pub depth: Vec<f32>,
+    /// Rows.
+    pub height: usize,
+    /// Columns.
+    pub width: usize,
+}
+
+impl SplatImage {
+    /// The splat colour the blend mixes towards: `rgb`, alpha-applied.
+    ///
+    /// Mirrors `trippy.hybrid.gate.splat_rgb_from_block`: when the block's rgb
+    /// is already masked this is `rgb` verbatim, otherwise alpha is applied
+    /// here, so the gate always mixes in "the splat where the splat exists"
+    /// regardless of the run's `mask_by_alpha` ablation.
+    #[must_use]
+    pub fn masked_rgb(&self, mask_by_alpha: bool) -> Vec<f32> {
+        if mask_by_alpha || self.alpha.is_empty() || self.rgb.is_empty() {
+            return self.rgb.clone();
+        }
+        let pixels = self.height * self.width;
+        let mut out = self.rgb.clone();
+        for c in 0..3 {
+            for i in 0..pixels {
+                out[c * pixels + i] *= self.alpha[i];
+            }
+        }
+        out
+    }
+
+    /// The whole `(G, height, width)` block, planar, in `channels` order,
+    /// resampled to `(h, w)`.
+    ///
+    /// The Rust twin of `trippy.hybrid.gaussian_input.block_from_arrays` +
+    /// `resample_to`: same group order, same normalisation, so the network sees
+    /// what it was trained on. A group with no stored plane contributes zeros --
+    /// design A's own "no Gaussian information here" state, not a fabrication.
+    #[must_use]
+    pub fn block(&self, channels: &[String], mask_by_alpha: bool, h: usize, w: usize) -> Vec<f32> {
+        let mut out = Vec::new();
+        for group in channels {
+            match group.as_str() {
+                "rgb" => out.extend(self.resample_planes(&self.masked_rgb(mask_by_alpha), 3, h, w)),
+                "alpha" => out.extend(self.resample_planes(&self.alpha, 1, h, w)),
+                "depth" => out.extend(self.resample_planes(&self.depth, 1, h, w)),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// Nearest-neighbour resample of `planes` (planar, `count` of them) to `(h, w)`.
+    ///
+    /// An empty `planes` gives zeros, which is exactly how the trainer represents
+    /// "no Gaussian information at this pixel".
+    fn resample_planes(&self, planes: &[f32], count: usize, h: usize, w: usize) -> Vec<f32> {
+        if planes.is_empty() {
+            return vec![0.0; count * h * w];
+        }
+        if h == self.height && w == self.width {
+            return planes.to_vec();
+        }
+        let mut out = vec![0.0f32; count * h * w];
+        for c in 0..count {
+            let src = c * self.height * self.width;
+            let dst = c * h * w;
+            for y in 0..h {
+                let sy = (y * self.height) / h;
+                for x in 0..w {
+                    let sx = (x * self.width) / w;
+                    out[dst + y * w + x] = planes[src + sy * self.width + sx];
+                }
+            }
+        }
+        out
+    }
+    /// Nearest-neighbour resample to `(height, width)`, planar CHW throughout.
+    ///
+    /// Nearest, not bilinear, on purpose: the stored render is already a
+    /// downscale of the run's own resolution ([`BlendManifest::splat_scale`]),
+    /// and the panel's job is to show *where* the splat and TRIPS disagree.
+    /// Inventing intermediate colours on the way back up would soften exactly
+    /// the edges that answer that question.
+    #[must_use]
+    pub fn resampled(&self, height: usize, width: usize) -> Vec<f32> {
+        self.resample_planes(&self.rgb, 3, height, width)
+    }
+}
+
+/// Decode `splat.npz` into `{dataset index: SplatImage}`.
+///
+/// The archive holds, per array position `p` in [`BlendManifest::splat_views`]:
+/// `view_<p>` (H, W, 3) uint8 rgb, `alpha_<p>` (H, W) uint8, and `depth_<p>`
+/// (H, W) **float32** -- the last one f32 rather than u8 because the normalised
+/// depth is unbounded and the network was trained on it directly. Only the
+/// groups [`BlendManifest::channels`] lists are present.
+///
+/// A member that is missing or mis-shaped is skipped, not fatal: a partial
+/// archive should grey out those views' Blend controls (and feed the network
+/// zeros in those channels, which is design A's own honest "no Gaussian
+/// information here" state), not refuse the scene.
+///
+/// # Errors
+/// Returns `Err` only when the archive itself cannot be parsed.
+pub fn decode_splats(
+    bytes: &[u8],
+    blend: &BlendManifest,
+    views: &[BundleView],
+    origin: &str,
+) -> Result<HashMap<usize, SplatImage>, String> {
+    let archive = brush_pyramid::npz::read_npz_bytes(bytes)
+        .map_err(|e| format!("{origin}: {e}"))?;
+    let mut out = HashMap::new();
+    for &position in &blend.splat_views {
+        let Some(view) = views.get(position) else {
+            continue;
+        };
+        let mut image = SplatImage::default();
+
+        // rgb: (H, W, 3) uint8 -> planar (3, H, W) in [0, 1]. It also fixes the
+        // block's (H, W) for every other plane.
+        if let Some(array) = archive.get(&format!("view_{position}")) {
+            if array.shape.len() == 3 && array.shape[2] == 3 {
+                let (height, width) = (array.shape[0], array.shape[1]);
+                if let Ok(values) = array.to_f32() {
+                    if values.len() == height * width * 3 {
+                        let mut rgb = vec![0.0f32; values.len()];
+                        for c in 0..3 {
+                            let plane = c * height * width;
+                            for i in 0..height * width {
+                                rgb[plane + i] = values[i * 3 + c] / 255.0;
+                            }
+                        }
+                        image.rgb = rgb;
+                        image.height = height;
+                        image.width = width;
+                    }
+                }
+            }
+        }
+        if image.height == 0 || image.width == 0 {
+            continue;
+        }
+
+        // alpha: uint8 -> [0, 1]. depth: already f32 and already normalised, so
+        // it is taken verbatim -- scaling it here would be a second division by
+        // `depth_scale`.
+        let pixels = image.height * image.width;
+        for (name, scale, target) in [
+            (format!("alpha_{position}"), 1.0 / 255.0, 0usize),
+            (format!("depth_{position}"), 1.0, 1usize),
+        ] {
+            let Some(array) = archive.get(&name) else { continue };
+            if array.shape != vec![image.height, image.width] {
+                continue;
+            }
+            let Ok(values) = array.to_f32() else { continue };
+            if values.len() != pixels {
+                continue;
+            }
+            let plane: Vec<f32> = values.iter().map(|v| v * scale).collect();
+            if target == 0 {
+                image.alpha = plane;
+            } else {
+                image.depth = plane;
+            }
+        }
+        out.insert(view.index, image);
+    }
+    Ok(out)
 }
 
 impl Bundle {
@@ -166,7 +457,21 @@ impl Bundle {
             .map_err(|e| format!("{}: {e}", dir.join(&manifest.points).display()))?;
         let weight_bytes = std::fs::read(dir.join(&manifest.weights))
             .map_err(|e| format!("{}: {e}", dir.join(&manifest.weights).display()))?;
-        Self::from_parts(dir.to_path_buf(), manifest, &points_bytes, &weight_bytes, &origin)
+        // The splat archive is OPTIONAL in the strongest sense: an unreadable or
+        // absent one greys out the Blend panel and leaves everything else working.
+        let splat_bytes = manifest
+            .blend
+            .as_ref()
+            .filter(|b| !b.splat_renders.is_empty())
+            .and_then(|b| std::fs::read(dir.join(&b.splat_renders)).ok());
+        Self::from_parts_with_splats(
+            dir.to_path_buf(),
+            manifest,
+            &points_bytes,
+            &weight_bytes,
+            splat_bytes.as_deref(),
+            &origin,
+        )
     }
 
     /// Parse and validate `bundle.json`, without touching the files it names.
@@ -222,6 +527,29 @@ impl Bundle {
         weight_bytes: &[u8],
         origin: &str,
     ) -> Result<Self, String> {
+        Self::from_parts_with_splats(dir, manifest, points_bytes, weight_bytes, None, origin)
+    }
+
+    /// [`Self::from_parts`], plus the optional precomputed splat archive.
+    ///
+    /// Separate entry point rather than a changed signature so `trips-web`
+    /// (which fetches exactly the files the manifest names) keeps compiling
+    /// unchanged and can opt in to the Blend panel by fetching one more.
+    ///
+    /// # Arguments
+    /// - `splat_bytes`: the whole `splat.npz`, or `None`.
+    ///
+    /// # Errors
+    /// As [`Self::from_parts`]. A `splat_bytes` that fails to decode is
+    /// **not** an error: it leaves `splats` empty.
+    pub fn from_parts_with_splats(
+        dir: PathBuf,
+        manifest: Manifest,
+        points_bytes: &[u8],
+        weight_bytes: &[u8],
+        splat_bytes: Option<&[u8]>,
+        origin: &str,
+    ) -> Result<Self, String> {
         let points = PointSet::from_npz_bytes(points_bytes, &manifest.points)?;
         if points.num_channels != manifest.num_channels {
             return Err(format!(
@@ -238,11 +566,19 @@ impl Bundle {
         }
         let weights = Weights::from_bytes(weight_bytes)?;
 
+        let splats = match (&manifest.blend, splat_bytes) {
+            (Some(blend), Some(bytes)) => {
+                decode_splats(bytes, blend, &manifest.views, origin).unwrap_or_default()
+            }
+            _ => HashMap::new(),
+        };
+
         Ok(Self {
             dir,
             manifest,
             points,
             weights,
+            splats,
         })
     }
 
@@ -592,6 +928,155 @@ mod tests {
               ]
             }}"#
         )
+    }
+
+    /// `manifest_json` plus a `blend` block, as a gate run exports it.
+    fn manifest_json_with_blend() -> String {
+        let base = manifest_json(BUNDLE_FORMAT);
+        let blend = r#""blend": {
+              "gate": true, "gate_channel": 3, "gate_scale": 1.5,
+              "splat_ply": "/tmp/kklid.ply", "splat_renders": "splat.npz",
+              "splat_views": [0, 1], "splat_scale": 0.5, "mask_by_alpha": true
+            }, "up":"#;
+        base.replacen(r#""up":"#, blend, 1)
+    }
+
+    /// Load a REAL bundle directory named by `TRIPPY_TEST_BUNDLE`, if one is set.
+    ///
+    /// Skipped (and passing) when the variable is absent, because no bundle may
+    /// be committed to this public repo -- but `scripts/test.sh` can be pointed
+    /// at a freshly exported synthetic one, and the blend-panel GPU check does
+    /// exactly that. This is the only test that reads a whole bundle off disk,
+    /// so it is the one that would catch a Python-writer / Rust-reader
+    /// disagreement about `splat.npz` before a GPU job pays for it.
+    #[test]
+    fn a_real_bundle_on_disk_loads_with_its_splats() {
+        let Some(dir) = std::env::var("TRIPPY_TEST_BUNDLE").ok().filter(|d| !d.is_empty())
+        else {
+            return;
+        };
+        let bundle = Bundle::load(Path::new(&dir)).unwrap_or_else(|e| panic!("{e}"));
+        let Some(blend) = bundle.manifest.blend.as_ref() else {
+            assert!(bundle.splats.is_empty(), "no blend block, so no splats");
+            return;
+        };
+        assert_eq!(blend.gate_channel, brush_unet::GATE_CHANNEL);
+        assert_eq!(
+            blend.gate,
+            bundle.weights.unet.has_gate(),
+            "the manifest and the weights disagree about the gate head"
+        );
+        // The bug this whole block exists to fix: a design-A network takes
+        // `C + G` input channels, so a bundle without a wide enough block cannot
+        // run its own U-Net at all.
+        assert_eq!(
+            bundle.manifest.num_channels + blend.block_channels(),
+            bundle.weights.unet.in_channels,
+            "C + G must equal the weights' in_channels"
+        );
+        assert_eq!(blend.feature_channels, bundle.manifest.num_channels);
+        assert!(!blend.channels.is_empty());
+        assert_eq!(
+            bundle.splats.len(),
+            blend.splat_views.len(),
+            "every view the manifest lists must decode out of splat.npz"
+        );
+        for &position in &blend.splat_views {
+            let view = &bundle.manifest.views[position];
+            let image = bundle
+                .splats
+                .get(&view.index)
+                .unwrap_or_else(|| panic!("no splat for view {}", view.index));
+            assert_eq!(image.rgb.len(), 3 * image.height * image.width);
+            assert!(image.rgb.iter().all(|v| (0.0..=1.0).contains(v)));
+            // The reassembled block is exactly as wide as the manifest promises,
+            // at whatever size a pyramid level asks for.
+            let block = image.block(&blend.channels, blend.mask_by_alpha, 7, 5);
+            assert_eq!(block.len(), blend.block_channels() * 7 * 5);
+            assert!(block.iter().all(|v| v.is_finite()));
+            // The stored render is the view's own size times `splat_scale`.
+            let expected_w = (view.width as f32 * blend.splat_scale).round() as usize;
+            assert!(
+                image.width.abs_diff(expected_w) <= 1,
+                "view {} stored at {} px, expected ~{expected_w}",
+                view.index,
+                image.width
+            );
+        }
+    }
+
+    #[test]
+    fn a_bundle_without_a_blend_block_parses_exactly_as_before() {
+        // The whole backwards-compatibility claim: `blend` is optional, and the
+        // format tag does not change, so every bundle already on disk still opens.
+        let m: Manifest = serde_json::from_str(&manifest_json(BUNDLE_FORMAT)).expect("parse");
+        assert!(m.blend.is_none());
+    }
+
+    #[test]
+    fn the_blend_block_parses_every_field() {
+        let m: Manifest = serde_json::from_str(&manifest_json_with_blend()).expect("parse");
+        let blend = m.blend.expect("blend block");
+        assert!(blend.gate);
+        assert_eq!(blend.gate_channel, brush_unet::GATE_CHANNEL);
+        assert_eq!(blend.gate_scale, 1.5);
+        assert_eq!(blend.splat_ply, "/tmp/kklid.ply");
+        assert_eq!(blend.splat_renders, "splat.npz");
+        assert_eq!(blend.splat_views, vec![0, 1]);
+        assert_eq!(blend.splat_scale, 0.5);
+        assert!(blend.mask_by_alpha);
+    }
+
+    #[test]
+    fn a_blend_block_missing_optional_fields_falls_back_to_the_documented_defaults() {
+        let base = manifest_json(BUNDLE_FORMAT);
+        let text = base.replacen(r#""up":"#, r#""blend": {"gate": true}, "up":"#, 1);
+        let m: Manifest = serde_json::from_str(&text).expect("parse");
+        let blend = m.blend.expect("blend block");
+        assert_eq!(blend.gate_channel, brush_unet::GATE_CHANNEL);
+        assert_eq!(blend.gate_scale, 1.0);
+        assert_eq!(blend.splat_scale, 1.0);
+        assert!(blend.splat_views.is_empty());
+        assert!(blend.splat_renders.is_empty());
+    }
+
+    #[test]
+    fn a_splat_image_resamples_planar_and_nearest() {
+        // 2x2 red/green/blue planes, upscaled to 4x4: every source pixel becomes a
+        // 2x2 block, and no new colour appears anywhere.
+        let mut rgb = Vec::new();
+        for c in 0..3 {
+            for i in 0..4 {
+                rgb.push((c * 4 + i) as f32 / 12.0);
+            }
+        }
+        let image = SplatImage {
+            rgb,
+            height: 2,
+            width: 2,
+            ..SplatImage::default()
+        };
+        let out = image.resampled(4, 4);
+        assert_eq!(out.len(), 3 * 16);
+        for c in 0..3 {
+            for y in 0..4 {
+                for x in 0..4 {
+                    let expected = image.rgb[c * 4 + (y / 2) * 2 + (x / 2)];
+                    assert_eq!(out[c * 16 + y * 4 + x], expected, "c{c} y{y} x{x}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn resampling_to_the_same_size_is_the_identity() {
+        let image = SplatImage {
+            rgb: (0..12).map(|i| i as f32).collect(),
+            height: 2,
+            width: 2,
+            ..SplatImage::default()
+        };
+        assert_eq!(image.resampled(2, 2), image.rgb);
     }
 
     #[test]

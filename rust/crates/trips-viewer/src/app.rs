@@ -32,6 +32,7 @@ use brush_pyramid::gpu::block_on;
 use eframe::egui;
 
 use crate::blit::{BlitCallback, BlitResources};
+use crate::blend::{Blend, BlendMode, GATE_SCALE_MAX, GATE_SCALE_MIN};
 use crate::bundle::Bundle;
 use crate::camera::{Controller, Mode};
 use crate::renderer::{ExposureMode, Renderer, Settings, ViewMode, MANUAL_EXPOSURE_LIMIT};
@@ -68,6 +69,11 @@ pub struct ViewerApp {
     last_frame: Option<std::time::Instant>,
     last_stats: Option<crate::renderer::FrameStats>,
     error: Option<String>,
+    /// The Blend panel's state (splat vs TRIPS).
+    blend: Blend,
+    /// Whether this bundle carries a `blend` block at all. False hides the
+    /// panel entirely, so a non-hybrid scene's UI is exactly what it was.
+    has_blend: bool,
 }
 
 impl ViewerApp {
@@ -115,6 +121,17 @@ impl ViewerApp {
         // on the horse bundle is 12 990 units across because of the far-field
         // environment sphere -- the 1948 u/s fly speed Jordan was given.
         let home = bundle.home_view_position();
+        // The Blend panel starts at the run's own recorded gate_scale but in
+        // TRIPS-only mode -- see `Blend::for_bundle` for why the first frame is
+        // deliberately the one the run's metrics describe.
+        let blend = Blend::for_bundle(
+            bundle
+                .manifest
+                .blend
+                .as_ref()
+                .map_or(1.0, |b| b.gate_scale),
+        );
+        let has_blend = bundle.manifest.blend.is_some();
 
         let renderer = Renderer::new(bundle, burn_device)?;
         let controller = Controller::new(&views, home, up);
@@ -136,7 +153,14 @@ impl ViewerApp {
             last_frame: None,
             last_stats: None,
             error: None,
+            blend,
+            has_blend,
         })
+    }
+
+    /// Set the initial blend state (from `--blend-mode` / `--gate-scale` / `--mix`).
+    pub fn set_blend(&mut self, blend: Blend) {
+        self.blend = blend;
     }
 
     /// Set the initial view mode (from `--mode`).
@@ -236,6 +260,9 @@ impl ViewerApp {
             if i.key_pressed(egui::Key::P) {
                 self.controller.step_view(&self.views, -1);
             }
+            if i.key_pressed(egui::Key::B) {
+                self.blend.mode = self.blend.mode.next();
+            }
 
             let axis = |positive: egui::Key, negative: egui::Key| -> f32 {
                 f32::from(i.key_down(positive)) - f32::from(i.key_down(negative))
@@ -261,6 +288,88 @@ impl ViewerApp {
             .unwrap_or(SCALE_STEPS.len() - 1) as i32;
         let next = (current + direction).clamp(0, SCALE_STEPS.len() as i32 - 1) as usize;
         self.settings.render_scale = SCALE_STEPS[next];
+    }
+
+    /// The Blend panel: how much of the frame is splat and how much is TRIPS.
+    ///
+    /// Drawn only for a bundle exported from a run trained with the blend gate
+    /// (`bundle.json`'s `blend` block); on every other scene this is a no-op and
+    /// the overlay is unchanged.
+    ///
+    /// The controls deliberately state what they cannot do. The splat half comes
+    /// from **precomputed renders of the capture views** carried in the bundle,
+    /// so away from those views there is no splat to show and the panel says so
+    /// rather than fading to black or reusing a neighbouring view's pixels. The
+    /// live path -- rendering `blend.splat_ply` at the viewer's own pose through
+    /// Brush's `brush-render` -- is the follow-up (`docs/USER_GUIDE.md`).
+    fn blend_panel(&mut self, ui: &mut egui::Ui) {
+        if !self.has_blend {
+            return;
+        }
+        ui.separator();
+        ui.label("Blend (B): splat vs TRIPS");
+
+        let frame_index = self.controller.reference().index;
+        let has_splat = self.renderer.has_splat(frame_index);
+        let has_gate = self.renderer.has_gate();
+
+        ui.horizontal(|ui| {
+            for mode in [
+                BlendMode::Trips,
+                BlendMode::Splat,
+                BlendMode::Gated,
+                BlendMode::Mix,
+                BlendMode::Split,
+            ] {
+                let usable = (!mode.needs_splat() || has_splat) && (!mode.needs_gate() || has_gate);
+                ui.add_enabled_ui(usable, |ui| {
+                    ui.selectable_value(&mut self.blend.mode, mode, mode.label());
+                });
+            }
+        });
+
+        if self.blend.mode.needs_gate() {
+            ui.add(
+                egui::Slider::new(&mut self.blend.gate_scale, GATE_SCALE_MIN..=GATE_SCALE_MAX)
+                    .text("gate scale (0 = TRIPS, 1 = as trained, 2 = splat)"),
+            );
+        }
+        if self.blend.mode == BlendMode::Mix {
+            ui.add(
+                egui::Slider::new(&mut self.blend.mix, 0.0..=1.0)
+                    .text("mix (0 = splat, 1 = TRIPS)"),
+            );
+        }
+        if self.blend.mode == BlendMode::Split {
+            ui.add(
+                egui::Slider::new(&mut self.blend.split, 0.0..=1.0)
+                    .text("split (splat left, TRIPS right)"),
+            );
+        }
+
+        // What the last frame ACTUALLY drew, which is not always what was asked.
+        if let Some(status) = self.last_stats.as_ref().and_then(|s| s.blend) {
+            if let Some(note) = status.note() {
+                ui.colored_label(egui::Color32::from_rgb(255, 200, 120), note);
+            }
+        }
+        if !has_gate {
+            ui.label("no gate head in these weights: the gated blend is unavailable");
+        }
+        let splat_views = self.renderer.splat_views();
+        let where_from = if has_splat {
+            "yes".to_owned()
+        } else if !self.controller.is_pinned() {
+            "no — you have flown off the capture views".to_owned()
+        } else {
+            "no — this view has no stored render".to_owned()
+        };
+        ui.label(format!(
+            "splat at this pose: {where_from} ({} of {} views carry one; \
+             the live path removes the limit)",
+            splat_views.len(),
+            self.views.len()
+        ));
     }
 
     /// The overlay: what is being shown, how fast, and the levers.
@@ -430,6 +539,8 @@ impl ViewerApp {
             );
         }
 
+        self.blend_panel(ui);
+
         ui.horizontal(|ui| {
             if ui.button("R: home").clicked() {
                 self.controller.reset(&self.views);
@@ -504,6 +615,7 @@ impl eframe::App for ViewerApp {
             frame_index,
             self.mode,
             &self.settings,
+            self.blend,
         )) {
             Ok(frame) => {
                 self.last_stats = Some(frame.stats);
