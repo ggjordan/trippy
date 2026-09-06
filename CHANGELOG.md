@@ -2,6 +2,8 @@
 All notable changes to trippy. Format: Keep a Changelog. Versions: semver tags `vX.Y.Z`. Every push also gets a `build-NNNN` tag.
 
 ## [Unreleased]
+### Milestone note
+- v0.5.0 = first Karekare candidate that beats the Gaussian baseline on held-out PSNR (17.75 all / 15.59 shade vs 15.53 / 14.94) with shade dark mass down to 24.1% (EXP-0010 arm B: TRIPS point removal + audit-aligned shade prune). Also: person masks, per-scene measured shade frames, viewer v3 exposure control, browser viewer 18 fps. The full-scene (karekare-v2) runs are queued.
 ### Added
 - Person masks (`masks_dir`, auto-discovered) in training loss and eval; EXP-0011 trains TRIPS on the full karekare-v2 scene (756 images, seeded from kklid_20000) masked and unmasked, plus removal and hybrid arms; shade frames measured per scene (93 big-tree frames; kk-coherent's six are a different spot).
 - Point removal (TRIPS rule + relative mode) and the audit-aligned shade-prune probe (EXP-0010).

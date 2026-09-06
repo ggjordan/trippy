@@ -1,0 +1,239 @@
+# EXP-0011 arm: config_removal.yaml + shade_prune on the MEASURED big-tree frames (93; the six
+# kk-coherent shade frames are a different place and are excluded from the region). Same caveat as
+# EXP-0010 arm B: shade_prune removes what the audit counts; quote its dark mass next to held-out
+# shade PSNR. Queued at prio 70 after kkv2-5.
+run_dir: /Users/nzbirdranch/trippy/output/runs/EXP-0011-karekare-v2/kkv2-6-shade-prune
+scene_root: /Users/nzbirdranch/Splats/scenes/karekare/karekare-v2
+masks_dir: ''
+use_masks: true
+width: 1008
+crop: 384
+mode: broadcast
+layers: 5
+epochs: 300
+train_factor: 1.0
+point_source:
+  type: gaussian
+  path: /Users/nzbirdranch/Splats/output/Training-Data/karekare/karekare-lid/kklid_20000.ply
+  min_opacity: 0.05
+  size_mode: knn
+heldout_k: 16
+eval_every: 20
+checkpoint_every: 20
+eval_max_images: 8
+eval_exposure_mode: neighbours
+forced_heldout:
+- IMG_3828.jpg
+- IMG_3829.jpg
+- IMG_3830.jpg
+- IMG_3831.jpg
+- IMG_3832.jpg
+- IMG_3833.jpg
+- IMG_4032.jpg
+- IMG_4033.jpg
+- IMG_4034.jpg
+- IMG_4035.jpg
+- IMG_4036.jpg
+- IMG_4037.jpg
+- IMG_4039.jpg
+- IMG_4040.jpg
+- IMG_4041.jpg
+- IMG_4057.jpg
+- IMG_4058.jpg
+- IMG_4059.jpg
+- IMG_4060.jpg
+- IMG_4061.jpg
+- IMG_4062.jpg
+- IMG_4083.jpg
+- IMG_4084.jpg
+- IMG_4085.jpg
+- IMG_4116.jpg
+- IMG_4117.jpg
+- IMG_4118.jpg
+- IMG_4260.jpg
+- IMG_4261.jpg
+- IMG_4264.jpg
+- IMG_4265.jpg
+- IMG_4266.jpg
+- IMG_4267.jpg
+- IMG_4269.jpg
+- IMG_4270.jpg
+- IMG_4271.jpg
+- IMG_4272.jpg
+- IMG_4273.jpg
+- IMG_4274.jpg
+- IMG_4280.jpg
+- IMG_4281.jpg
+- IMG_4282.jpg
+- IMG_4283.jpg
+- IMG_4284.jpg
+- IMG_4292.jpg
+- IMG_4293.jpg
+- IMG_4294.jpg
+- IMG_4295.jpg
+- IMG_4296.jpg
+- IMG_4297.jpg
+- IMG_4298.jpg
+- IMG_4299.jpg
+- IMG_4300.jpg
+- IMG_4301.jpg
+- IMG_4302.jpg
+- IMG_4303.jpg
+- IMG_4304.jpg
+- IMG_4305.jpg
+- IMG_4309.jpg
+- IMG_4310.jpg
+- IMG_4311.jpg
+- IMG_4312.jpg
+- IMG_4313.jpg
+- IMG_4319.jpg
+- IMG_4320.jpg
+- IMG_4321.jpg
+- IMG_5540.jpg
+- IMG_5541.jpg
+- IMG_5542.jpg
+- IMG_5543.jpg
+- IMG_5544.jpg
+- IMG_5545.jpg
+- IMG_5546.jpg
+- IMG_5547.jpg
+- IMG_5548.jpg
+- IMG_5549.jpg
+- IMG_5550.jpg
+- IMG_5551.jpg
+- IMG_5552.jpg
+- IMG_5557.jpg
+- IMG_5558.jpg
+- IMG_5559.jpg
+- IMG_5560.jpg
+- IMG_5561.jpg
+- IMG_5646.jpg
+- IMG_5647.jpg
+- IMG_5648.jpg
+- IMG_5649.jpg
+- IMG_5650.jpg
+- IMG_5651.jpg
+- IMG_5652.jpg
+- IMG_5653.jpg
+- IMG_5654.jpg
+- IMG_5655.jpg
+- IMG_5656.jpg
+- IMG_5657.jpg
+- IMG_5658.jpg
+- IMG_5659.jpg
+- IMG_5660.jpg
+forced_heldout_mode: alternate
+point_removal:
+  enabled: true
+  start_epoch: 100
+  every_epochs: 25
+  mode: relative
+  conf_threshold: 0.1
+  rel_factor: 0.3
+  min_points: 4000000
+shade_prune:
+  enabled: true
+  log_dark_mass: true
+  start_epoch: 100
+  every_epochs: 25
+  znear_frac: 0.05
+  zfar_frac: 0.5
+  lum_threshold: 0.25
+  conf_threshold: 0.5
+  min_points: 1000000
+  frames:
+  - IMG_4032.jpg
+  - IMG_4033.jpg
+  - IMG_4034.jpg
+  - IMG_4035.jpg
+  - IMG_4036.jpg
+  - IMG_4037.jpg
+  - IMG_4039.jpg
+  - IMG_4040.jpg
+  - IMG_4041.jpg
+  - IMG_4057.jpg
+  - IMG_4058.jpg
+  - IMG_4059.jpg
+  - IMG_4060.jpg
+  - IMG_4061.jpg
+  - IMG_4062.jpg
+  - IMG_4083.jpg
+  - IMG_4084.jpg
+  - IMG_4085.jpg
+  - IMG_4116.jpg
+  - IMG_4117.jpg
+  - IMG_4118.jpg
+  - IMG_4260.jpg
+  - IMG_4261.jpg
+  - IMG_4264.jpg
+  - IMG_4265.jpg
+  - IMG_4266.jpg
+  - IMG_4267.jpg
+  - IMG_4269.jpg
+  - IMG_4270.jpg
+  - IMG_4271.jpg
+  - IMG_4272.jpg
+  - IMG_4273.jpg
+  - IMG_4274.jpg
+  - IMG_4280.jpg
+  - IMG_4281.jpg
+  - IMG_4282.jpg
+  - IMG_4283.jpg
+  - IMG_4284.jpg
+  - IMG_4292.jpg
+  - IMG_4293.jpg
+  - IMG_4294.jpg
+  - IMG_4295.jpg
+  - IMG_4296.jpg
+  - IMG_4297.jpg
+  - IMG_4298.jpg
+  - IMG_4299.jpg
+  - IMG_4300.jpg
+  - IMG_4301.jpg
+  - IMG_4302.jpg
+  - IMG_4303.jpg
+  - IMG_4304.jpg
+  - IMG_4305.jpg
+  - IMG_4309.jpg
+  - IMG_4310.jpg
+  - IMG_4311.jpg
+  - IMG_4312.jpg
+  - IMG_4313.jpg
+  - IMG_4319.jpg
+  - IMG_4320.jpg
+  - IMG_4321.jpg
+  - IMG_5540.jpg
+  - IMG_5541.jpg
+  - IMG_5542.jpg
+  - IMG_5543.jpg
+  - IMG_5544.jpg
+  - IMG_5545.jpg
+  - IMG_5546.jpg
+  - IMG_5547.jpg
+  - IMG_5548.jpg
+  - IMG_5549.jpg
+  - IMG_5550.jpg
+  - IMG_5551.jpg
+  - IMG_5552.jpg
+  - IMG_5557.jpg
+  - IMG_5558.jpg
+  - IMG_5559.jpg
+  - IMG_5560.jpg
+  - IMG_5561.jpg
+  - IMG_5646.jpg
+  - IMG_5647.jpg
+  - IMG_5648.jpg
+  - IMG_5649.jpg
+  - IMG_5650.jpg
+  - IMG_5651.jpg
+  - IMG_5652.jpg
+  - IMG_5653.jpg
+  - IMG_5654.jpg
+  - IMG_5655.jpg
+  - IMG_5656.jpg
+  - IMG_5657.jpg
+  - IMG_5658.jpg
+  - IMG_5659.jpg
+  - IMG_5660.jpg
+device: mps
+seed: 0
