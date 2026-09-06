@@ -29,6 +29,10 @@ import yaml
 
 from trippy.constants import (
     DEFAULT_MIN_OPACITY,
+    EVAL_CALIBRATE_DEFAULT_LR,
+    EVAL_CALIBRATE_DEFAULT_STEPS,
+    FORCED_HELDOUT_MODE_ALL,
+    FORCED_HELDOUT_MODES,
     LOSS_DEFAULT_WEIGHT_L1,
     LOSS_DEFAULT_WEIGHT_LPIPS,
     LOSS_DEFAULT_WEIGHT_SSIM,
@@ -218,6 +222,20 @@ class TrainConfig:
     # --- split / eval (trippy.scene.splits) ---
     heldout_k: int = TRAIN_DEFAULT_HELDOUT_K
     forced_heldout: list[str] = field(default_factory=list)
+    # "all" (default, unchanged behaviour) holds every forced frame out; "alternate" holds out
+    # every other one and forces the rest into training. The two protocols answer different
+    # questions -- see trippy.scene.splits.partition_forced and docs/EXPERIMENTS.md
+    # "Forced hold-out protocols".
+    forced_heldout_mode: str = FORCED_HELDOUT_MODE_ALL
+    # Test-time photometric calibration at eval (trippy.constants "test-time photometric
+    # calibration"): fit ONLY this image's exposure (+ white balance when
+    # eval_calibrate_white_balance) against its own photo before scoring it. Default False:
+    # every training-time eval stays on the strict protocol; `trippy eval --calibrate` turns
+    # it on for a diagnostic re-run, which reports both numbers side by side.
+    eval_calibrate_camera: bool = False
+    eval_calibrate_white_balance: bool = False
+    eval_calibrate_steps: int = EVAL_CALIBRATE_DEFAULT_STEPS
+    eval_calibrate_lr: float = EVAL_CALIBRATE_DEFAULT_LR
     eval_every: int = TRAIN_DEFAULT_EVAL_EVERY
     checkpoint_every: int = TRAIN_DEFAULT_CHECKPOINT_EVERY
     eval_lpips: bool = True  # see trainer.py docstring: gated so CPU tests don't require a
@@ -267,6 +285,14 @@ class TrainConfig:
             raise ValueError(
                 f"pyramid_halving must be one of {RASTER_PYRAMID_HALVINGS}, got {self.pyramid_halving!r}"
             )
+        if self.forced_heldout_mode not in FORCED_HELDOUT_MODES:
+            raise ValueError(
+                f"forced_heldout_mode must be one of {FORCED_HELDOUT_MODES}, got {self.forced_heldout_mode!r}"
+            )
+        if self.eval_calibrate_steps < 0:
+            raise ValueError(f"eval_calibrate_steps must be >= 0, got {self.eval_calibrate_steps}")
+        if self.eval_calibrate_lr <= 0:
+            raise ValueError(f"eval_calibrate_lr must be positive, got {self.eval_calibrate_lr}")
         if self.eval_max_images <= 0:
             raise ValueError(f"eval_max_images must be positive, got {self.eval_max_images}")
         if self.checkpoint_keep_every <= 0:

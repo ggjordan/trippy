@@ -220,6 +220,22 @@ EXIF_TAG_EXIF_IFD_POINTER = 0x8769
 MODULO_SPLIT_DEFAULT_K = 8
 MODULO_SPLIT_DEFAULT_OFFSET = 0
 
+# How `split_with_forced_heldout` treats the forced (shade) frames -- the two protocols
+# answer different questions (docs/EXPERIMENTS.md "Forced hold-out protocols"):
+#   "all"       every forced frame is held out. The shade region then has NO photo in the
+#               training set at all, so its numbers measure novel view synthesis of an
+#               entirely unobserved region.
+#   "alternate" every other forced frame (by sorted name, starting at
+#               FORCED_HELDOUT_ALTERNATE_OFFSET) is held out and the rest are forced INTO
+#               training -- interpolation *inside* an observed region, which is the protocol
+#               the Gaussian baseline (trained on every frame) is implicitly measured under.
+FORCED_HELDOUT_MODE_ALL = "all"
+FORCED_HELDOUT_MODE_ALTERNATE = "alternate"
+FORCED_HELDOUT_MODES = (FORCED_HELDOUT_MODE_ALL, FORCED_HELDOUT_MODE_ALTERNATE)
+# Index parity (over the sorted forced list) that stays held out in "alternate" mode: 0 holds
+# out IMG_3828/3830/3832 and trains IMG_3829/3831/3833.
+FORCED_HELDOUT_ALTERNATE_OFFSET = 0
+
 # Six consecutive kk-coherent frames that pass through the shade region
 # under the trees (the project's core defect, see docs/SPEC.md "Context"
 # and docs/EXPERIMENTS.md's dolly camera note, which anchors on
@@ -660,6 +676,30 @@ TRAIN_LPIPS_METRIC_NET = "vgg"
 # Guards -10*log10(mse) against mse == 0 (a pred/target exact match, e.g. a degenerate
 # all-zero synthetic test image) producing +inf.
 TRAIN_PSNR_EPS = 1e-10
+
+# --- test-time photometric calibration at eval (trippy.train.trainer.Trainer.calibrate_frame) ---
+# A held-out image's per-image exposure/white balance is NEVER trained (only train frames'
+# rows of NeuralCamera.exposures_values get gradients), so a held-out frame renders through
+# whatever its EXIF initialisation happened to be. TRIPS has the same problem and ships two
+# opt-in answers, both off in configs/train_normalnet.ini:48-49 and in the released horse
+# checkpoint (third_party/zenodo/tt_checkpoints/checkpoint_horse/params.ini:53-54):
+#   optimize_eval_camera   an extra per-epoch "EvalRefine" gradient pass over the TEST crops
+#                          that steps the camera/pose optimisers with texture+network frozen
+#                          (src/apps/train.cpp:591-596, 693-697; NeuralScene.cpp:1473-1503).
+#   interpolate_eval_settings  copy each test frame's exposure/WB from its two neighbouring
+#                          train frames (NeuralCamera.cpp:481-520, train.cpp:1604-1611).
+# trippy's `eval_calibrate_camera` is the first of those two, cut down to the photometric
+# scalars only: exposure (and optionally white balance), fitted per image by Adam on L1
+# against that image's own photo, with the network, the points, the poses and the response
+# LUT all frozen, and the fitted value never written back into the module or the checkpoint.
+# Default OFF, so every training-time number stays the strict protocol.
+# Adam moves an exposure by at most ~lr per step, so steps*lr caps the total EV travel: 200 x
+# 0.05 = 10 EV of headroom. That matters because a kk-coherent frame with no EXIF starts 5.87
+# EV (58x) away from neutral -- a 60-step budget could not have reached it. The fit is over
+# 1-2 scalars on an already-rendered image, so the whole schedule costs far less than the
+# render it corrects.
+EVAL_CALIBRATE_DEFAULT_STEPS = 200
+EVAL_CALIBRATE_DEFAULT_LR = 0.05
 
 # --- hybrid/ : Design C, render->photo U-Net refinement (docs/PLAN-2026-09-05.md
 # "Hybrid (v0.3): (C) render->photo U-Net refinement on gsrender.py outputs first (cheap,

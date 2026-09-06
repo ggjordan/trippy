@@ -33,6 +33,13 @@ Invariants:
       `trippy eval --checkpoint` re-run against an existing checkpoint,
       which needs no retraining). A run whose report.json/metrics.jsonl
       both predate this split still degrades to "n/a", same as ever.
+    - The table's column list is *almost* fixed: `_HEADERS` plus one
+      optional "Held-out shade PSNR (calibrated)" column, appended by
+      `leaderboard_headers` only when some row carries a
+      `shade_calibrated` number (`trippy eval ... --calibrate`). With no
+      such run the output is byte-identical to the pre-calibration table,
+      which is why `row_cells` -- not `row["cells"]` -- is what callers
+      render.
     - `regenerate_and_deliver` never raises past `trippy.render.report.
       run_train_report`'s own end-of-run hook: a broken leaderboard
       rebuild (e.g. a corrupt run directory somewhere under `runs/`) must
@@ -121,6 +128,10 @@ _HEADERS = [
     "Wall time",
     "Viewer launcher",
 ]
+# Optional column, appended only when at least one scanned run has a calibrated shade number
+# (`trippy eval --checkpoint ... --calibrate`, Trainer.evaluate's "shade_calibrated"); a
+# leaderboard built before any such eval exists is byte-identical to the old one.
+_CALIBRATED_SHADE_HEADER = "Held-out shade PSNR (calibrated)"
 _FOOTNOTES = (
     (
         "Gaussian baseline dark-mass fraction: 19.9% (lum<0.25 opacity mass / mass in the shade "
@@ -133,6 +144,15 @@ _FOOTNOTES = (
         "\"n/a\" means neither exists yet for that run (it finished before the shade split was "
         "added); re-run `trippy eval --checkpoint <run>/checkpoints/checkpoint_latest.pt` to "
         "backfill it without retraining."
+    ),
+    (
+        f"\"{_CALIBRATED_SHADE_HEADER}\" appears only when some run has been re-evaluated with "
+        "`trippy eval --checkpoint ... --calibrate` (test-time photometric calibration: each "
+        "held-out image's own exposure fitted to its own photo, everything else frozen -- "
+        "TRIPS's own `optimize_eval_camera`, docs/EXPERIMENTS.md \"Test-time camera "
+        "calibration\"). It is a diagnostic, not the run's PSNR: the fixed Gaussian baseline "
+        "has no per-image exposure model at all, so it can never be calibrated and its shade "
+        "number stays as measured."
     ),
     (
         "Wall time is approximate: run-directory metrics.jsonl creation time to the report.json's "
@@ -337,6 +357,39 @@ def _heldout_shade(report: dict, last_eval: dict | None) -> dict | None:
     return None
 
 
+def _heldout_shade_calibrated(report: dict, last_eval: dict | None) -> float | None:
+    """The calibrated shade PSNR (`report.json`'s `heldout_split.shade_calibrated` first, else the last eval row's), or None.
+
+    Same source precedence as `_heldout_shade`. None whenever no calibrated eval has ever run
+    for this run -- which is the normal case, and makes the whole column disappear (see
+    `leaderboard_headers`).
+    """
+    split = report.get("heldout_split") if isinstance(report, dict) else None
+    shade = split.get("shade_calibrated") if isinstance(split, dict) else None
+    if isinstance(shade, dict) and shade.get("psnr") is not None:
+        return float(shade["psnr"])
+    if isinstance(last_eval, dict):
+        eval_shade = last_eval.get("shade_calibrated")
+        if isinstance(eval_shade, dict) and eval_shade.get("psnr") is not None:
+            return float(eval_shade["psnr"])
+    return None
+
+
+def leaderboard_headers(rows: list[dict[str, Any]]) -> list[str]:
+    """`_HEADERS`, plus the calibrated-shade column when any row carries one."""
+    if any(row.get("shade_calibrated") is not None for row in rows):
+        return [*_HEADERS, _CALIBRATED_SHADE_HEADER]
+    return list(_HEADERS)
+
+
+def row_cells(row: dict[str, Any], headers: list[str]) -> list[str]:
+    """`row["cells"]` padded/extended to match `headers` (the optional calibrated column last)."""
+    cells = list(row["cells"])
+    if len(headers) > len(_HEADERS):
+        cells.append(_fmt_num(row.get("shade_calibrated"), ".2f"))
+    return cells
+
+
 def _fmt_pct(value: float | None) -> str:
     return f"{value * 100:.1f}%" if value is not None else "n/a"
 
@@ -464,7 +517,13 @@ def build_run_row(run_dir: Path, experiments_root: Path) -> dict[str, Any]:
         viewer_launcher,
     ]
     psnr_all = held_out_all.get("psnr_mean") if held_out_all else None
-    return {"cells": cells, "dark_mass": dark_mass, "psnr_all": psnr_all, "is_baseline": False}
+    return {
+        "cells": cells,
+        "dark_mass": dark_mass,
+        "psnr_all": psnr_all,
+        "is_baseline": False,
+        "shade_calibrated": _heldout_shade_calibrated(report, summary["last_eval"]),
+    }
 
 
 def is_smoke_run(run_name: str) -> bool:
@@ -507,6 +566,9 @@ def _baseline_rows() -> list[dict[str, Any]]:
         "dark_mass": LEADERBOARD_BASELINE_GAUSSIAN_DARK_MASS,
         "psnr_all": LEADERBOARD_BASELINE_GAUSSIAN_PSNR_ALL,
         "is_baseline": True,
+        # Raw Gaussians have no per-image exposure model, so there is nothing to calibrate:
+        # this baseline's shade PSNR is what it is (see _FOOTNOTES and EXP-0003's README).
+        "shade_calibrated": None,
     }
     design_c = {
         "cells": [
@@ -539,6 +601,7 @@ def _baseline_rows() -> list[dict[str, Any]]:
         "dark_mass": None,
         "psnr_all": LEADERBOARD_BASELINE_DESIGN_C_PSNR_ALL,
         "is_baseline": True,
+        "shade_calibrated": None,
     }
     return [gaussian, design_c]
 
@@ -573,7 +636,12 @@ def build_leaderboard_rows(runs_root: Path | None = None, experiments_root: Path
 
 
 def rows_to_markdown(rows: list[dict[str, Any]]) -> str:
-    """The full markdown leaderboard: header, one row per run/baseline, footnotes."""
+    """The full markdown leaderboard: header, one row per run/baseline, footnotes.
+
+    The calibrated-shade column is included only when some row has one
+    (`leaderboard_headers`), so runs that predate test-time calibration are unaffected.
+    """
+    headers = leaderboard_headers(rows)
     lines = [
         "# TRIPS leaderboard",
         "",
@@ -584,11 +652,11 @@ def rows_to_markdown(rows: list[dict[str, Any]]) -> str:
             "of every `trippy train --report` run."
         ),
         "",
-        "| " + " | ".join(_HEADERS) + " |",
-        "|" + "---|" * len(_HEADERS),
+        "| " + " | ".join(headers) + " |",
+        "|" + "---|" * len(headers),
     ]
     for row in rows:
-        lines.append("| " + " | ".join(row["cells"]) + " |")
+        lines.append("| " + " | ".join(row_cells(row, headers)) + " |")
     lines.append("")
     for note in _FOOTNOTES:
         lines.append(f"- {note}")
@@ -715,7 +783,9 @@ def write_leaderboard(
     out_dir.mkdir(parents=True, exist_ok=True)
     markdown_path.write_text(rows_to_markdown(rows))
 
-    png_path = render_table_png(_HEADERS, rows, out_dir / LEADERBOARD_PNG_FILENAME, title="TRIPS leaderboard")
+    headers = leaderboard_headers(rows)
+    png_rows = [{**row, "cells": row_cells(row, headers)} for row in rows]
+    png_path = render_table_png(headers, png_rows, out_dir / LEADERBOARD_PNG_FILENAME, title="TRIPS leaderboard")
 
     return {"rows": rows, "markdown_path": markdown_path, "png_path": png_path}
 

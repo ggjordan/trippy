@@ -137,16 +137,25 @@ def _first_extent_record(extent_gate: dict | None) -> dict | None:
 def heldout_split(held_out_metrics: dict) -> dict:
     """`{"shade": {...}, "other": {...}}` from `Trainer.evaluate()`'s held-out split, or `{}` each.
 
+    Plus `"shade_calibrated"`/`"other_calibrated"` when the eval ran calibrated.
+
     `held_out_metrics` is `Trainer.evaluate()`'s own return value (see there for the "shade"/
     "other" shape: `{"n", "psnr", "ssim", "lpips"}`). Degrades to an empty dict per side -- not
     `None`, so `report.json`'s `heldout_split` key is always present and always a dict -- when
     `held_out_metrics` predates this split (an older report re-serialized, or `fit()` returning
     `{}` because a `max_minutes` budget expired before the first eval).
     """
-    return {
+    split = {
         "shade": held_out_metrics.get("shade") or {},
         "other": held_out_metrics.get("other") or {},
     }
+    # Only present when the eval that produced `held_out_metrics` ran with test-time
+    # photometric calibration (`Trainer.evaluate(calibrate=True)`); the leaderboard's
+    # calibrated column keys off exactly this absence (trippy.render.leaderboard).
+    for key in ("shade_calibrated", "other_calibrated"):
+        if held_out_metrics.get(key):
+            split[key] = held_out_metrics[key]
+    return split
 
 
 def extent_p99_max(extent_gate: dict | None) -> tuple[float, float] | None:

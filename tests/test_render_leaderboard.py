@@ -423,3 +423,74 @@ def test_regenerate_and_deliver_safely_never_raises(tmp_path: Path, monkeypatch:
     result = lb.regenerate_and_deliver_safely()
     assert result["status"] == "failed"
     assert "leaderboard exploded" in result["error"]
+
+
+# --- optional "Held-out shade PSNR (calibrated)" column (trippy eval --calibrate) ---
+
+
+def test_leaderboard_headers_omit_the_calibrated_column_when_no_run_has_one() -> None:
+    rows = lb.build_leaderboard_rows(Path("/nonexistent"), Path("/nonexistent"))
+    headers = lb.leaderboard_headers(rows)
+    assert headers == lb._HEADERS
+    assert lb._CALIBRATED_SHADE_HEADER not in headers
+    for row in rows:
+        assert len(lb.row_cells(row, headers)) == len(headers)
+
+
+def test_build_run_row_reads_calibrated_shade_from_report_json(tmp_path: Path) -> None:
+    report = dict(_REAL_SHAPED_TRAIN_REPORT)
+    report["heldout_split"] = {
+        "shade": {"n": 6, "psnr": 8.49, "ssim": 0.30, "lpips": 0.69},
+        "other": {"n": 27, "psnr": 16.47, "ssim": 0.45, "lpips": 0.42},
+        "shade_calibrated": {"n": 6, "psnr": 12.34, "ssim": 0.33, "lpips": 0.65},
+    }
+    run_dir = _train_report_run(tmp_path / "runs", "EXP-A", "run-cal", report, _TRAIN_REPORT_METRICS)
+
+    row = lb.build_run_row(run_dir, tmp_path / "no_experiments")
+    assert row["shade_calibrated"] == 12.34
+    headers = lb.leaderboard_headers([row])
+    assert headers[-1] == lb._CALIBRATED_SHADE_HEADER
+    assert lb.row_cells(row, headers)[-1] == "12.34"
+
+
+def test_build_run_row_falls_back_to_the_last_eval_row_for_the_calibrated_shade(tmp_path: Path) -> None:
+    metrics_rows = _TRAIN_REPORT_METRICS + [
+        {
+            "eval": True,
+            "epoch": 299,
+            "psnr_mean": 15.02,
+            "shade": {"n": 6, "psnr": 8.49},
+            "shade_calibrated": {"n": 6, "psnr": 11.11},
+        }
+    ]
+    run_dir = _train_report_run(
+        tmp_path / "runs", "EXP-A", "run-cal-fallback", _REAL_SHAPED_TRAIN_REPORT, metrics_rows
+    )
+    assert lb.build_run_row(run_dir, tmp_path / "no_experiments")["shade_calibrated"] == 11.11
+
+
+def test_build_run_row_calibrated_shade_is_none_without_a_calibrated_eval(tmp_path: Path) -> None:
+    run_dir = _train_report_run(
+        tmp_path / "runs", "EXP-A", "run-no-cal", _REAL_SHAPED_TRAIN_REPORT, _TRAIN_REPORT_METRICS
+    )
+    assert lb.build_run_row(run_dir, tmp_path / "no_experiments")["shade_calibrated"] is None
+
+
+def test_markdown_and_png_gain_exactly_one_column_when_a_calibrated_run_exists(tmp_path: Path) -> None:
+    report = dict(_REAL_SHAPED_TRAIN_REPORT)
+    report["heldout_split"] = {
+        "shade": {"n": 6, "psnr": 8.49},
+        "other": {"n": 27, "psnr": 16.47},
+        "shade_calibrated": {"n": 6, "psnr": 12.34},
+    }
+    _train_report_run(tmp_path / "runs", "EXP-A", "run-cal", report, _TRAIN_REPORT_METRICS)
+
+    result = lb.write_leaderboard(tmp_path / "out", tmp_path / "runs", tmp_path / "no_experiments")
+    markdown = result["markdown_path"].read_text()
+    header_line = next(line for line in markdown.splitlines() if line.startswith("| Run |"))
+    assert header_line.count("|") == len(lb._HEADERS) + 2
+    assert lb._CALIBRATED_SHADE_HEADER in header_line
+    # The Gaussian baseline has no exposure model, so its calibrated cell stays "n/a".
+    baseline_line = next(line for line in markdown.splitlines() if "Gaussians kkc_15000" in line)
+    assert baseline_line.rstrip().endswith("n/a |")
+    assert result["png_path"].read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"

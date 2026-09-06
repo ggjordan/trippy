@@ -307,8 +307,22 @@ def _cmd_eval(args: argparse.Namespace) -> int:
     evaluate_checkpoint`), so `trippy leaderboard` picks up the split for a
     checkpoint that finished training before the split existed -- no
     retraining needed.
+
+    `--calibrate` additionally fits each held-out image's own exposure
+    (`--calibrate-wb`: and its red/blue white balance) to its own photo
+    before scoring it, with everything else frozen, and prints the
+    calibrated numbers next to the strict ones -- TRIPS's own
+    `optimize_eval_camera`, cut down to the photometric scalars (see
+    `Trainer.calibrate_frame` for why that is legitimate and what it does
+    NOT prove). Either way, a per-image diagnostics table is printed last.
     """
-    metrics = evaluate_checkpoint(args.checkpoint, images=args.images, device=args.device)
+    metrics = evaluate_checkpoint(
+        args.checkpoint,
+        images=args.images,
+        device=args.device,
+        calibrate=True if args.calibrate else None,
+        calibrate_white_balance=True if args.calibrate_wb else None,
+    )
     shade, other = metrics.get("shade") or {}, metrics.get("other") or {}
     print(f"psnr_mean: {metrics['psnr_mean']}")
     print(f"ssim_mean: {metrics['ssim_mean']}")
@@ -316,7 +330,50 @@ def _cmd_eval(args: argparse.Namespace) -> int:
     print(f"n_images: {metrics['n_images']}")
     print(f"shade: n={shade.get('n')} psnr={shade.get('psnr')} ssim={shade.get('ssim')} lpips={shade.get('lpips')}")
     print(f"other: n={other.get('n')} psnr={other.get('psnr')} ssim={other.get('ssim')} lpips={other.get('lpips')}")
+    if metrics.get("calibrated"):
+        shade_c, other_c = metrics.get("shade_calibrated") or {}, metrics.get("other_calibrated") or {}
+        print(f"psnr_mean_calibrated: {metrics.get('psnr_mean_calibrated')}")
+        print(f"shade (calibrated): n={shade_c.get('n')} psnr={shade_c.get('psnr')} ssim={shade_c.get('ssim')}")
+        print(f"other (calibrated): n={other_c.get('n')} psnr={other_c.get('psnr')} ssim={other_c.get('ssim')}")
+    print(_per_image_diagnostics_table(metrics))
     return 0
+
+
+def _per_image_diagnostics_table(metrics: dict) -> str:
+    """Markdown per-image table: PSNR, brightness ratio, best-gain PSNR, calibrated PSNR.
+
+    Pure formatting over `Trainer.evaluate`'s "per_image" dict (docs/EXPERIMENTS.md
+    "Per-image exposure diagnostics"); columns whose values are all missing print as "n/a",
+    so an old metrics dict still renders.
+    """
+    per_image = metrics.get("per_image") or {}
+    shade = set((metrics.get("shade") or {}).get("names") or [])
+    header = (
+        "| image | group | PSNR | exposure gain | pred mean | photo mean | photo/pred | "
+        "best gain | PSNR@best gain | PSNR calibrated |"
+    )
+    lines = [header, "|" + "---|" * 10]
+    columns = [
+        ("psnr", ".2f"),
+        ("exposure_gain", ".3f"),
+        ("pred_mean", ".4f"),
+        ("target_mean", ".4f"),
+        ("brightness_ratio", ".3f"),
+        ("gain_best", ".3f"),
+        ("psnr_gain", ".2f"),
+        ("psnr_calibrated", ".2f"),
+    ]
+    for name in sorted(per_image):
+        row = per_image[name]
+        cells = [name, "shade" if name in shade else "other"]
+        cells += [_fmt_diagnostic(row.get(key), spec) for key, spec in columns]
+        lines.append("| " + " | ".join(cells) + " |")
+    return "\n".join(lines)
+
+
+def _fmt_diagnostic(value: object, spec: str) -> str:
+    """One diagnostics-table cell: formatted number, or "n/a" for a missing/non-numeric value."""
+    return format(value, spec) if isinstance(value, int | float) else "n/a"
 
 
 def _cmd_hybrid_c_train(args: argparse.Namespace) -> int:
@@ -970,6 +1027,21 @@ def build_parser() -> argparse.ArgumentParser:
     ev.add_argument("--checkpoint", required=True, help="checkpoint .pt path")
     ev.add_argument("--images", nargs="*", default=None, help="image names to evaluate (default: held-out split)")
     ev.add_argument("--device", choices=["cpu", "mps"], default=None, help="override the checkpoint's device")
+    ev.add_argument(
+        "--calibrate",
+        action="store_true",
+        help=(
+            "test-time photometric calibration: fit each held-out image's own exposure to its "
+            "own photo (a few dozen Adam steps, everything else frozen -- TRIPS's own "
+            "optimize_eval_camera, cut down to the photometric scalars) and report the "
+            "calibrated metrics next to the strict ones. Never writes back to the checkpoint."
+        ),
+    )
+    ev.add_argument(
+        "--calibrate-wb",
+        action="store_true",
+        help="with --calibrate, also fit red/blue white balance (green stays pinned, as in training)",
+    )
     ev.set_defaults(func=_cmd_eval)
 
     hybrid_c = sub.add_parser("hybrid-c", help="Design C: render->photo U-Net refinement")

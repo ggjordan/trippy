@@ -19,6 +19,9 @@ Invariants under test (each one would have failed, on CPU, in seconds,
        cannot clear.
     5. A non-finite gradient is zeroed before the optimizer step, so one
        degenerate fragment cannot permanently NaN a parameter.
+    6. An image with no usable EXIF initialises at the scene mean (gain
+       1.0), not at absolute EV 0 (which on kk-coherent meant a 58.5x
+       gain that a held-out frame never trains away).
 All fixtures are the synthetic scene from `tests/test_train_helpers.py`
 (never a real Splats scene); its photos now carry real EXIF so bug 1 is
 reachable from CPU tests at all.
@@ -28,6 +31,7 @@ Related docs: docs/TRIPS_REFERENCE.md Sec. 6 (exposure init),
 
 from __future__ import annotations
 
+import json
 import math
 from pathlib import Path
 
@@ -40,6 +44,7 @@ from test_train_helpers import (
     tiny_train_config,
 )
 
+from trippy.constants import SCENE_CACHE_META_FILENAME
 from trippy.net.losses import mse_loss
 from trippy.scene.dataset import crop as dataset_crop
 from trippy.train.trainer import Trainer, _center_crop_like
@@ -97,6 +102,37 @@ def test_initial_exposure_is_centred_on_the_scene_mean(tmp_path: Path) -> None:
     spread_expected = max(raw_ev) - min(raw_ev)
     spread_actual = float(exposures.max() - exposures.min())
     assert abs(spread_actual - spread_expected) < 1e-3
+
+
+def test_initial_exposure_of_an_image_without_exif_is_the_scene_mean(tmp_path: Path) -> None:
+    """A missing-EXIF image must start at gain 1.0, not `2 ** mean(EV)` (58.5x on kk-coherent).
+
+    The old fallback was an absolute `EV = 0`, which after subtracting the scene mean left the
+    frame at `-mean(EV)` -- and a held-out frame's exposure is never trained, so it stayed there
+    for the whole run (docs/LIMITATIONS.md "train/", experiments/EXP-0003-kk-trips-train/README.md
+    "The exposure artefact").
+    """
+    trainer = _build_trainer(tmp_path)
+    meta_path = trainer.dataset.cache_dir / SCENE_CACHE_META_FILENAME
+    meta = json.loads(meta_path.read_text())
+    stripped = trainer.dataset.names[0]
+    meta["images"][stripped].pop("exposure_time", None)
+    meta["images"][stripped].pop("iso", None)
+    meta_path.write_text(json.dumps(meta))
+
+    exposures = trainer._initial_exposure()
+    index = trainer.dataset.names.index(stripped)
+
+    known_ev = [math.log2(1.0 / t) + math.log2(EXIF_ISO / 100.0) for t in EXIF_EXPOSURE_TIMES]
+    assert min(known_ev) > 4.0, "fixture must have a large absolute EV or this test proves nothing"
+    # Exactly the scene mean -> relative 0 -> gain 1.0.
+    assert abs(float(exposures[index])) < 1e-5, (
+        f"missing-EXIF image initialised at {float(exposures[index]):+.3f} EV, i.e. a gain of "
+        f"{2 ** -float(exposures[index]):.1f}x"
+    )
+    # The remaining images keep their relative spread, now centred on the known-EV mean only.
+    others = [float(v) for i, v in enumerate(exposures) if i != index]
+    assert abs(sum(others) / len(others)) < 1e-4
 
 
 # --- 2. masked MSE / PSNR ------------------------------------------------

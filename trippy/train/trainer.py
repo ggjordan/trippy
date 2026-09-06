@@ -66,7 +66,7 @@ from trippy.constants import (
 from trippy.geom import xform_b
 from trippy.hybrid.gaussian_input import GaussianInputs
 from trippy.net.camera_model import NeuralCamera
-from trippy.net.losses import LossWeights, TripsLoss, _LazyLPIPS, mse_loss, ssim
+from trippy.net.losses import LossWeights, TripsLoss, _LazyLPIPS, l1_loss, mse_loss, ssim
 from trippy.net.unet import MultiScaleUnet2dDecOnlySmallFixed, NetworkConfig
 from trippy.raster.pyramid import render_pyramid
 from trippy.render.sheets import colorize, contact_sheet
@@ -109,6 +109,54 @@ def _save_eval_sheet_jpeg(path: Path, arr: np.ndarray, quality: int) -> Path:
     return path
 
 
+def best_global_gain(
+    pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor | None = None
+) -> float:
+    """The scalar `g` minimising `||g * pred - target||^2` -- a *diagnostic*, not a metric.
+
+    Closed form (least squares in one unknown):
+    `g = sum(pred * target) / sum(pred * pred)`. Applied to an already
+    tone-mapped prediction it answers exactly one question: how much of
+    this frame's error is a single global brightness factor (a mis-set
+    per-image exposure gain) rather than structure? A frame whose PSNR
+    jumps by many dB under `g` is being scored on its exposure, not on
+    its geometry. It never touches training and is never reported as the
+    run's PSNR (see `Trainer.evaluate`'s "psnr_gain" per-image key and
+    docs/EXPERIMENTS.md "Per-image exposure diagnostics").
+
+    Args:
+        pred, target: (B, C, H, W) tensors in the same space.
+        mask: (B, 1, H, W) validity mask (broadcast over channels), or None.
+
+    Returns:
+        `g` as a python float; 1.0 when `pred` is identically zero (no
+        gain can fix an all-black prediction, so report the no-op).
+    """
+    if mask is not None:
+        pred = pred * mask
+        target = target * mask
+    denom = float((pred * pred).sum().item())
+    if denom <= 0.0:
+        return 1.0
+    return float((pred * target).sum().item()) / denom
+
+
+def _psnr(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor | None = None) -> float:
+    """-10 log10(masked MSE), the single definition every number in this module uses."""
+    mse = mse_loss(pred, target, mask)
+    return float((-10.0 * torch.log10(mse + TRAIN_PSNR_EPS)).item())
+
+
+def _masked_mean_value(x: torch.Tensor, mask: torch.Tensor | None = None) -> float:
+    """Mean pixel value of `x` over `mask` (all channels), as a python float."""
+    if mask is None:
+        return float(x.mean().item())
+    total = float(mask.sum().item()) * x.shape[1]
+    if total <= 0.0:
+        return 0.0
+    return float((x * mask).sum().item()) / total
+
+
 def _shade_and_other(names: list[str], forced_heldout: list[str]) -> tuple[list[str], list[str]]:
     """Partition an already-held-out `names` list into shade frames vs other held-out frames.
 
@@ -129,19 +177,30 @@ def _shade_and_other(names: list[str], forced_heldout: list[str]) -> tuple[list[
     return shade, other
 
 
-def _aggregate_group(names: list[str], per_image: dict[str, dict]) -> dict:
+def _aggregate_group(names: list[str], per_image: dict[str, dict], suffix: str = "") -> dict:
     """`{"n", "psnr", "ssim", "lpips"}` -- mean over `names` from a per-image metrics dict.
 
     `psnr`/`ssim`/`lpips` are all `None` when `names` is empty (no images in this group, e.g. a
     scene with no `SHADE_FRAMES_KK` and no `forced_heldout`); `lpips` alone is also `None` when
     `cfg.eval_lpips` was False for the run that produced `per_image` (no per-image lpips values to
     average).
+
+    "names" is the group's own member list (so a consumer -- e.g. the `trippy eval`
+    diagnostics table -- can tell shade from other without re-deriving the split).
+
+    `suffix` selects which family of per-image keys to average: `""` reads
+    `psnr`/`ssim`/`lpips` (the strict, uncalibrated numbers), `"_calibrated"` reads
+    `psnr_calibrated`/... (present only when `Trainer.evaluate` ran with
+    `calibrate=True`). Missing keys average to `None` rather than raising, so an
+    older `per_image` dict aggregates fine.
     """
-    psnr_vals = [per_image[n]["psnr"] for n in names]
-    ssim_vals = [per_image[n]["ssim"] for n in names]
-    lpips_vals = [per_image[n]["lpips"] for n in names if per_image[n]["lpips"] is not None]
+    psnr_vals = [per_image[n].get(f"psnr{suffix}") for n in names]
+    psnr_vals = [v for v in psnr_vals if v is not None]
+    ssim_vals = [v for v in (per_image[n].get(f"ssim{suffix}") for n in names) if v is not None]
+    lpips_vals = [v for v in (per_image[n].get(f"lpips{suffix}") for n in names) if v is not None]
     return {
         "n": len(names),
+        "names": list(names),
         "psnr": float(np.mean(psnr_vals)) if psnr_vals else None,
         "ssim": float(np.mean(ssim_vals)) if ssim_vals else None,
         "lpips": float(np.mean(lpips_vals)) if lpips_vals else None,
@@ -181,7 +240,7 @@ class Trainer:
         )
         self._name_to_index = {name: i for i, name in enumerate(self.dataset.names)}
         self.train_names, self.heldout_names = splits.split_with_forced_heldout(
-            self.dataset.names, cfg.forced_heldout, k=cfg.heldout_k
+            self.dataset.names, cfg.forced_heldout, k=cfg.heldout_k, mode=cfg.forced_heldout_mode
         )
         if not self.train_names:
             raise ValueError("split produced an empty train set -- check heldout_k/forced_heldout vs dataset size")
@@ -298,22 +357,44 @@ class Trainer:
         amount of training at `lr_exposure=5e-4` can undo -- the bug that
         produced the 1.6 dB EXP-0003 smoke run (research/trips-metal.md,
         2026-09-06).
+
+        **Images with no usable EXIF get the scene mean (relative EV 0),
+        not absolute 0.** TRIPS's `colmap2adop` writes a literal `0` into
+        `exposure.txt` for a missing-EXIF image (`colmap2adop.cpp:32-36`),
+        which is harmless there because its scenes' `scene_exposure_value`
+        is itself 0. Here the scene mean is ~5.87 EV, so the old
+        `ev = 0.0` fallback produced a *relative* EV of -5.87, i.e. a gain
+        of `2 ** 5.87 = 58.5x` -- and a held-out frame's exposure is never
+        trained, so that 58x stuck for the whole run. On kk-coherent 10 of
+        219 images have no EXIF, 6 of them land in the held-out split, and
+        all 6 scored 6.2-6.9 dB in EXP-0003 full2-broadcast (vs 16.9 dB
+        mean over the 27 held-out frames that do have EXIF) -- see
+        `experiments/EXP-0003-kk-trips-train/README.md` "The exposure
+        artefact". Falling back to the mean makes a missing-EXIF image
+        start at gain 1, the neutral place `NeuralCamera`'s own zero-init
+        would put it.
         """
         meta = json.loads((self.dataset.cache_dir / SCENE_CACHE_META_FILENAME).read_text())["images"]
-        values = []
+        values: list[float | None] = []
         for name in self.dataset.names:
             info = meta.get(name, {})
             exposure_time = info.get("exposure_time")
             iso = info.get("iso")
             if exposure_time and exposure_time > 0 and iso and iso > 0:
-                ev = math.log2(1.0 / exposure_time) + math.log2(iso / 100.0)
+                values.append(math.log2(1.0 / exposure_time) + math.log2(iso / 100.0))
             else:
-                ev = 0.0
-            values.append(ev)
-        ev_tensor = torch.tensor(values, dtype=torch.float32)
-        if ev_tensor.numel() == 0:
-            return ev_tensor
-        return ev_tensor - ev_tensor.mean()
+                values.append(None)  # no usable EXIF -> scene mean, i.e. relative 0 (see docstring)
+        if not values:
+            return torch.zeros(0, dtype=torch.float32)
+        known = [v for v in values if v is not None]
+        mean = sum(known) / len(known) if known else 0.0
+        n_missing = len(values) - len(known)
+        if n_missing:
+            self._log(
+                f"exposure init: {n_missing}/{len(values)} images have no usable EXIF "
+                f"(ExposureTime/ISO); they start at the scene mean EV {mean:.3f}, i.e. gain 1.0"
+            )
+        return torch.tensor([mean if v is None else v for v in values], dtype=torch.float32) - mean
 
     def _apply_locks(self, epoch: int) -> None:
         """Freeze pose deltas / xyz+size during their respective lock periods (see module docstring)."""
@@ -589,11 +670,158 @@ class Trainer:
 
     # --- evaluation ---
 
+    def calibrate_frame(
+        self,
+        net_out: torch.Tensor,
+        target: torch.Tensor,
+        frame_index: int,
+        mask: torch.Tensor | None = None,
+        steps: int | None = None,
+        lr: float | None = None,
+        calibrate_white_balance: bool | None = None,
+    ) -> tuple[torch.Tensor, dict]:
+        """Fit ONLY this frame's exposure (+ optionally white balance) to its own photo.
+
+        Why this is legitimate, and what it is not:
+
+        - A held-out image's row of `NeuralCamera.exposures_values` never
+          receives a gradient during training (only sampled train frames
+          do), so at eval it still carries its EXIF initialisation. That
+          scalar is a property of the *camera that took the photo*, not of
+          the scene reconstruction, and getting it wrong costs PSNR that
+          has nothing to do with geometry or with the network.
+        - TRIPS ships exactly this knob: `optimize_eval_camera` runs a
+          per-epoch "EvalRefine" pass over the **test** crops that steps
+          the camera and pose optimisers with texture/network frozen
+          (`third_party/TRIPS/src/apps/train.cpp:591-596, 693-697`;
+          `NeuralScene.cpp:1473-1503`), and `interpolate_eval_settings`
+          instead copies a test frame's exposure/WB from its neighbouring
+          train frames (`NeuralCamera.cpp:481-520`). Both default to false
+          in `configs/train_normalnet.ini:48-49` and in the released
+          checkpoint, which is why trippy's own default is off too.
+        - trippy's version is strictly weaker than TRIPS's: only the
+          photometric scalars move. The point cloud, the poses, the U-Net,
+          the vignette and the response LUT are all untouched, nothing is
+          written back into this module (the fitted tensors are local, see
+          `NeuralCamera.forward_with`), and the number is always reported
+          *next to* the uncalibrated one, never instead of it.
+        - It does use the held-out photo, so a calibrated PSNR is not a
+          pure novel-view number. It answers one question only: how much
+          of the gap is photometric.
+
+        Args:
+            net_out: (1, 3, H, W) pre-tone-map network output for this frame.
+            target: (1, 3, H, W) ground-truth photo, same size.
+            frame_index: dataset index of the frame (selects the starting
+                exposure/WB row).
+            mask: (1, 1, H, W) validity mask, or None (all valid).
+            steps: Adam steps (default `cfg.eval_calibrate_steps`).
+            lr: Adam learning rate (default `cfg.eval_calibrate_lr`).
+            calibrate_white_balance: also fit the red/blue white-balance
+                gains (green is pinned to its reference, exactly as
+                `NeuralCamera.apply_constraints` does during training).
+                Default `cfg.eval_calibrate_white_balance`.
+
+        Returns:
+            `(pred, info)`: the tone-mapped prediction with the fitted
+            values applied, and `{"exposure_before", "exposure_after",
+            "exposure_delta_ev", "gain_before", "gain_after",
+            "white_balance", "exposure_warm_start", "steps", "l1_before",
+            "l1_after"}` -- `l1_before` is measured at the warm start, not
+            at the stored exposure.
+        """
+        steps = self.cfg.eval_calibrate_steps if steps is None else steps
+        lr = self.cfg.eval_calibrate_lr if lr is None else lr
+        if calibrate_white_balance is None:
+            calibrate_white_balance = self.cfg.eval_calibrate_white_balance
+
+        index_t = torch.tensor([frame_index], device=net_out.device, dtype=torch.long)
+        net_out = net_out.detach()
+        target = target.detach()
+
+        if self.camera.exposures_values is not None:
+            start = self.camera.exposures_values[index_t].detach().clone()
+        else:
+            start = torch.zeros(1, 1, 1, 1, device=net_out.device, dtype=net_out.dtype)
+
+        # Warm start: Adam moves an exposure by at most ~lr per step, so a frame that starts
+        # 5.87 EV (58x) off -- kk-coherent's missing-EXIF frames -- would need more steps than
+        # the budget. `best_global_gain` on the *uncalibrated* prediction says how much
+        # brighter/darker the output has to get; -log2(g) converts that into EV. It is exact
+        # only if the response LUT were linear, so it is a starting point, not the answer:
+        # Adam still runs from there.
+        with torch.no_grad():
+            pred0 = self.camera.forward_with(net_out, index_t)
+            gain0 = best_global_gain(pred0, target, mask)
+        if gain0 > 0.0:
+            start = start - math.log2(gain0)
+        exposure = start.clone().requires_grad_(True)
+        params = [exposure]
+
+        white_balance = None
+        wb_reference = None
+        if calibrate_white_balance:
+            if self.camera.white_balance_values is not None:
+                wb_start = self.camera.white_balance_values[index_t].detach().clone()
+            else:
+                wb_start = torch.ones(1, 3, 1, 1, device=net_out.device, dtype=net_out.dtype)
+            wb_reference = wb_start.clone()
+            white_balance = wb_start.clone().requires_grad_(True)
+            params.append(white_balance)
+
+        def _predict() -> torch.Tensor:
+            return self.camera.forward_with(
+                net_out, index_t, exposure=exposure, white_balance=white_balance
+            )
+
+        with torch.no_grad():
+            l1_before = float(l1_loss(_predict(), target, mask).item())
+
+        if steps > 0:
+            optimizer = torch.optim.Adam(params, lr=lr)
+            for _ in range(steps):
+                optimizer.zero_grad(set_to_none=True)
+                loss = l1_loss(_predict(), target, mask)
+                loss.backward()
+                optimizer.step()
+                if white_balance is not None and wb_reference is not None:
+                    # NeuralCamera.apply_constraints: green is pinned to its reference.
+                    with torch.no_grad():
+                        white_balance[:, 1:2] = wb_reference[:, 1:2]
+
+        with torch.no_grad():
+            pred = _predict()
+            l1_after = float(l1_loss(pred, target, mask).item())
+
+        before_ev = (
+            float(self.camera.exposures_values[index_t].detach().reshape(-1)[0].item())
+            if self.camera.exposures_values is not None
+            else 0.0
+        )
+        after_ev = float(exposure.detach().reshape(-1)[0].item())
+        info = {
+            "exposure_before": before_ev,
+            "exposure_after": after_ev,
+            "exposure_delta_ev": after_ev - before_ev,
+            "gain_before": float(2.0**-before_ev),
+            "gain_after": float(2.0**-after_ev),
+            "white_balance": (
+                [float(v) for v in white_balance.detach().reshape(-1)] if white_balance is not None else None
+            ),
+            "exposure_warm_start": float(start.reshape(-1)[0].item()),
+            "steps": int(steps),
+            "l1_before": l1_before,
+            "l1_after": l1_after,
+        }
+        return pred.detach(), info
+
+
     def evaluate(
         self,
         names: list[str] | None = None,
         epoch: int | None = None,
         eval_dirname: str | None = None,
+        calibrate: bool | None = None,
     ) -> dict:
         """Full-frame held-out evaluation: PSNR/SSIM(/LPIPS) + an honesty contact sheet.
 
@@ -608,6 +836,15 @@ class Trainer:
                 `eval_manual_<timestamp>` name instead, so a standalone
                 `trippy eval --checkpoint` re-run never collides with the
                 checkpoint's own epoch directory.
+            calibrate: also report *test-time photometrically calibrated*
+                metrics -- per image, this frame's exposure (and, with
+                `cfg.eval_calibrate_white_balance`, its red/blue white
+                balance) is fitted to its own photo by
+                `calibrate_frame` while everything else stays frozen.
+                Defaults to `cfg.eval_calibrate_camera` (False), so no
+                training-time eval changes. The strict numbers are always
+                computed and reported as well; the calibrated ones land in
+                separate keys and never overwrite them.
 
         Returns:
             {"epoch", "n_images", "psnr_mean", "ssim_mean", "lpips_mean"
@@ -616,7 +853,19 @@ class Trainer:
             image), "shade" and "other" (`{"n", "psnr", "ssim", "lpips"}`,
             the `_shade_and_other` split of `names` -- "shade" is
             `cfg.forced_heldout` when non-empty, else `SHADE_FRAMES_KK`,
-            intersected with `names`)}. Also writes
+            intersected with `names`)}. Every `per_image` entry also
+            carries the exposure diagnostics (no training, no extra
+            render): "pred_mean"/"target_mean"/"brightness_ratio" (mean
+            photo brightness over mean predicted brightness -- a mis-set
+            per-image gain shows up here directly), "gain_best" (the
+            closed-form global gain of `best_global_gain`) and "psnr_gain"
+            (PSNR after applying it), plus "exposure_ev"/"exposure_gain",
+            the per-image exposure this render actually used. With
+            `calibrate` on, "psnr_calibrated"/"ssim_calibrated"/
+            "lpips_calibrated"/"calibration" are added per image and
+            "psnr_mean_calibrated", "shade_calibrated" and
+            "other_calibrated" at the top level (`calibrated: false` and no
+            such keys otherwise). Also writes
             `<run_dir>/<eval_dirname>/metrics.json` (the full dict above)
             and, for up to `cfg.eval_max_images` images (forced-held-out
             shade frames first), `sheet.jpg` (JPEG quality
@@ -637,6 +886,7 @@ class Trainer:
         self.camera.eval()
         names = list(self.heldout_names) if names is None else list(names)
         epoch = self.epoch if epoch is None else epoch
+        calibrate = self.cfg.eval_calibrate_camera if calibrate is None else calibrate
 
         forced = set(self.cfg.forced_heldout)
         sheet_names = sorted(names, key=lambda n: (n not in forced, n))[: self.cfg.eval_max_images]
@@ -644,6 +894,7 @@ class Trainer:
         psnr_vals: list[float] = []
         ssim_vals: list[float] = []
         lpips_vals: list[float] = []
+        psnr_cal_vals: list[float] = []
         per_image: dict[str, dict] = {}
         sheet_images: list[np.ndarray] = []
         sheet_labels: list[str] = []
@@ -683,7 +934,51 @@ class Trainer:
                 ssim_vals.append(ssim_val)
                 if lpips_val is not None:
                     lpips_vals.append(lpips_val)
-                per_image[name] = {"psnr": psnr_val, "ssim": ssim_val, "lpips": lpips_val}
+
+                # Exposure diagnostics: free (no render, no training), always recorded --
+                # see `best_global_gain` and docs/EXPERIMENTS.md "Per-image exposure
+                # diagnostics".
+                pred_mean = _masked_mean_value(pred, mask_c)
+                target_mean = _masked_mean_value(target_c, mask_c)
+                gain_best = best_global_gain(pred, target_c, mask_c)
+                exposure_ev = (
+                    float(self.camera.exposures_values[frame_index].detach().reshape(-1)[0].item())
+                    if self.camera.exposures_values is not None
+                    else 0.0
+                )
+                per_image[name] = {
+                    "psnr": psnr_val,
+                    "ssim": ssim_val,
+                    "lpips": lpips_val,
+                    "pred_mean": pred_mean,
+                    "target_mean": target_mean,
+                    "brightness_ratio": (target_mean / pred_mean) if pred_mean > 0 else None,
+                    "gain_best": gain_best,
+                    "psnr_gain": _psnr(pred * gain_best, target_c, mask_c),
+                    "exposure_ev": exposure_ev,
+                    "exposure_gain": float(2.0**-exposure_ev),
+                }
+
+                if calibrate:
+                    with torch.enable_grad():
+                        pred_cal, cal_info = self.calibrate_frame(
+                            net_out, target_c, frame_index, mask=mask_c
+                        )
+                    pred_cal = _center_crop_like(pred_cal, pred.shape[-2], pred.shape[-1])
+                    psnr_cal = _psnr(pred_cal, target_c, mask_c)
+                    per_image[name].update(
+                        {
+                            "psnr_calibrated": psnr_cal,
+                            "ssim_calibrated": float(ssim(pred_cal, target_c, mask_c).item()),
+                            "lpips_calibrated": (
+                                float(self._eval_lpips(pred_cal, target_c, mask_c).item())
+                                if self._eval_lpips is not None
+                                else None
+                            ),
+                            "calibration": cal_info,
+                        }
+                    )
+                    psnr_cal_vals.append(psnr_cal)
 
                 if name in sheet_names:
                     raw = layers[0][:3].clamp(0.0, 1.0).permute(1, 2, 0).cpu().numpy()
@@ -706,7 +1001,12 @@ class Trainer:
             "per_image": per_image,
             "shade": _aggregate_group(shade_names, per_image),
             "other": _aggregate_group(other_names, per_image),
+            "calibrated": bool(calibrate),
         }
+        if calibrate:
+            metrics["psnr_mean_calibrated"] = float(np.mean(psnr_cal_vals)) if psnr_cal_vals else 0.0
+            metrics["shade_calibrated"] = _aggregate_group(shade_names, per_image, suffix="_calibrated")
+            metrics["other_calibrated"] = _aggregate_group(other_names, per_image, suffix="_calibrated")
 
         eval_dirname = eval_dirname if eval_dirname is not None else TRAIN_EVAL_DIRNAME_FMT.format(epoch=epoch)
         eval_dir = self.run_dir / eval_dirname

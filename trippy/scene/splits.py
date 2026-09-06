@@ -13,7 +13,13 @@ Related docs: docs/SPEC.md v0.1.0 milestone ("train/held-out split");
 
 from __future__ import annotations
 
-from trippy.constants import MODULO_SPLIT_DEFAULT_K, MODULO_SPLIT_DEFAULT_OFFSET
+from trippy.constants import (
+    FORCED_HELDOUT_ALTERNATE_OFFSET,
+    FORCED_HELDOUT_MODE_ALL,
+    FORCED_HELDOUT_MODES,
+    MODULO_SPLIT_DEFAULT_K,
+    MODULO_SPLIT_DEFAULT_OFFSET,
+)
 
 
 def modulo_split(
@@ -47,11 +53,54 @@ def modulo_split(
     return train, heldout
 
 
+def partition_forced(
+    forced: list[str],
+    mode: str = FORCED_HELDOUT_MODE_ALL,
+    alternate_offset: int = FORCED_HELDOUT_ALTERNATE_OFFSET,
+) -> tuple[list[str], list[str]]:
+    """Split the forced (shade) frames into (held out, forced into training) per `mode`.
+
+    The two modes answer different questions -- see
+    `trippy.constants.FORCED_HELDOUT_MODES` and docs/EXPERIMENTS.md
+    "Forced hold-out protocols":
+
+      - "all" (the strict protocol used by every EXP-0003 run so far):
+        every forced frame is held out, so the shade region has no photo
+        in training at all and its PSNR measures novel-view synthesis of
+        an unobserved region.
+      - "alternate": every other forced frame (sorted by name, keeping the
+        ones whose index parity equals `alternate_offset`) is held out and
+        the remainder are pushed into training -- interpolation inside an
+        observed region.
+
+    Args:
+        forced: forced-held-out names (order-independent; sorted here).
+        mode: one of `trippy.constants.FORCED_HELDOUT_MODES`.
+        alternate_offset: which index parity stays held out in
+            "alternate" mode (0 = the first, third, fifth ... name).
+
+    Returns:
+        `(heldout_forced, train_forced)`, both sorted, disjoint, covering
+        `forced`. `train_forced` is always empty in "all" mode.
+    """
+    if mode not in FORCED_HELDOUT_MODES:
+        raise ValueError(f"mode must be one of {FORCED_HELDOUT_MODES}, got {mode!r}")
+    ordered = sorted(set(forced))
+    if mode == FORCED_HELDOUT_MODE_ALL:
+        return ordered, []
+    parity = alternate_offset % 2
+    heldout = [n for i, n in enumerate(ordered) if i % 2 == parity]
+    train = [n for i, n in enumerate(ordered) if i % 2 != parity]
+    return heldout, train
+
+
 def split_with_forced_heldout(
     names: list[str],
     forced: list[str],
     k: int = MODULO_SPLIT_DEFAULT_K,
     offset: int = MODULO_SPLIT_DEFAULT_OFFSET,
+    mode: str = FORCED_HELDOUT_MODE_ALL,
+    alternate_offset: int = FORCED_HELDOUT_ALTERNATE_OFFSET,
 ) -> tuple[list[str], list[str]]:
     """Like `modulo_split`, but always holds out every name in `forced`.
 
@@ -62,18 +111,27 @@ def split_with_forced_heldout(
 
     Args:
         names: full image name set (order-independent).
-        forced: names that must end up in `heldout`. Entries not present in
-            `names` are ignored (so this is safe to call with a fixed
-            constant list across scenes that don't have those frames).
+        forced: names that must end up in `heldout` (in `mode="all"`).
+            Entries not present in `names` are ignored (so this is safe to
+            call with a fixed constant list across scenes that don't have
+            those frames).
         k, offset: passed to `modulo_split` for the remaining names.
+        mode, alternate_offset: passed to `partition_forced`. With
+            `mode="alternate"` only half the forced frames are held out and
+            the other half are forced into `train` (they are *removed* from
+            the modulo split, so they can never land in `heldout` by
+            accident) -- see `partition_forced` for why.
 
     Returns:
         (train_names, heldout_names), both sorted, disjoint, covering all
         of `names`, with every `name in forced` (that is also in `names`)
-        in `heldout`.
+        in `heldout` when `mode="all"`, and every other one of them in
+        `heldout` when `mode="alternate"`.
     """
     forced_set = set(forced) & set(names)
+    forced_heldout, forced_train = partition_forced(
+        sorted(forced_set), mode=mode, alternate_offset=alternate_offset
+    )
     remaining = [name for name in names if name not in forced_set]
     train, heldout = modulo_split(remaining, k=k, offset=offset)
-    heldout = sorted(heldout + list(forced_set))
-    return sorted(train), heldout
+    return sorted(train + forced_train), sorted(heldout + forced_heldout)

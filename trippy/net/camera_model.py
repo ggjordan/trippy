@@ -278,14 +278,53 @@ class NeuralCamera(nn.Module):
         parameters. uv: (B, 2, H, W) or None (built from `default_uv_grid`, broadcast over
         the batch); only read when `enable_vignette`.
         """
-        assert x.shape[1] == 3
-        if self.exposures_values is not None:
-            exposure = self.exposures_values[frame_index]
-            x = x * torch.exp2(-exposure)
+        return self.forward_with(x, frame_index, uv=uv)
 
-        if self.white_balance_values is not None:
-            wb = self.white_balance_values[frame_index]
-            x = wb * x
+    def forward_with(
+        self,
+        x: torch.Tensor,
+        frame_index: torch.Tensor,
+        exposure: torch.Tensor | None = None,
+        white_balance: torch.Tensor | None = None,
+        uv: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """`forward`, with this call's per-image exposure/white balance optionally overridden.
+
+        The overrides exist for *test-time photometric calibration*
+        (`trippy.train.trainer.Trainer.calibrate_frame`): they let a caller
+        differentiate the tone mapper with respect to a free exposure/WB
+        tensor **without mutating this module's parameters**, so a held-out
+        image's exposure can be fitted and then thrown away. TRIPS's own
+        equivalent (`optimize_eval_camera`, `src/apps/train.cpp:591-596,
+        693-697`) instead steps the real `camera_adam_optimizer` on the test
+        crops; keeping the fitted scalar out of the module here means an
+        eval can never silently leak into a checkpoint.
+
+        Args:
+            x: (B, 3, H, W) linear-ish rgb.
+            frame_index: (B,) long tensor indexing the per-image parameters;
+                still used for whichever of exposure/WB is not overridden.
+            exposure: (B, 1, 1, 1) EV_log2 override, applied as
+                `x * 2 ** -exposure`. When given it is used even if
+                `enable_exposure` is False (the module then has no exposure
+                parameter of its own to fall back to).
+            white_balance: (B, 3, 1, 1) multiplicative override, same rule.
+            uv: (B, 2, H, W) or None (built from `default_uv_grid`,
+                broadcast over the batch); only read when `enable_vignette`.
+
+        Returns:
+            (B, 3, H, W) display rgb.
+        """
+        assert x.shape[1] == 3
+        if exposure is not None:
+            x = x * torch.exp2(-exposure)
+        elif self.exposures_values is not None:
+            x = x * torch.exp2(-self.exposures_values[frame_index])
+
+        if white_balance is not None:
+            x = white_balance * x
+        elif self.white_balance_values is not None:
+            x = self.white_balance_values[frame_index] * x
 
         if self.vignette_net is not None:
             if uv is None:
