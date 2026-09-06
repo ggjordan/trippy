@@ -86,6 +86,28 @@ def test_point_params_provenance_is_buffer_not_parameter() -> None:
     np.testing.assert_array_equal(params.provenance.numpy(), ps.provenance)
 
 
+def test_point_params_init_conf_is_a_buffer_snapshot_of_conf0() -> None:
+    ps = _random_point_set(n=5)
+    params = PointParams(ps)
+    param_names = {name for name, _ in params.named_parameters()}
+    assert "init_conf" not in param_names
+    buffer_names = {name for name, _ in params.named_buffers()}
+    assert "init_conf" in buffer_names
+    np.testing.assert_allclose(params.init_conf.detach().numpy(), ps.conf0, atol=1e-3, rtol=1e-3)
+    np.testing.assert_allclose(params.init_conf.detach().numpy(), params.conf().detach().numpy(), atol=1e-3, rtol=1e-3)
+
+
+def test_point_params_init_conf_survives_training_moves() -> None:
+    """`init_conf` is frozen at construction: it must not track `raw_conf` after training moves it."""
+    ps = _random_point_set(n=5)
+    params = PointParams(ps)
+    before = params.init_conf.clone()
+    with torch.no_grad():
+        params.raw_conf += 5.0  # simulate a large optimiser step pushing confidence up
+    assert not torch.allclose(params.conf(), before, atol=1e-3)
+    torch.testing.assert_close(params.init_conf, before)
+
+
 def test_pose_params_zero_delta_is_identity() -> None:
     pose = PoseParams(3)
     R = torch.tensor([[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])

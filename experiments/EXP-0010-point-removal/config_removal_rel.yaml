@@ -1,0 +1,74 @@
+# EXP-0010 arm A': the RELATIVE analogue of arm A's point-removal rule.
+# Identical to config_removal.yaml (arm A, TRIPS's rule) except for two fields:
+# `point_removal.mode: relative` and `point_removal.rel_factor: 0.3`. Everything else --
+# recipe, schedule, conf_threshold -- is unchanged, so the only difference from arm A's
+# numbers is the confidence test itself (absolute cutoff vs. each point's own decline).
+#
+# Why this arm exists: arm A's conf_threshold (0.1) is not TRIPS's own number (0.3 code
+# default / 0.5 shipped) because trippy's confidence starts from the source PLY's opacity
+# (median 0.18 on kkc_15000) rather than TRIPS's uniform sigmoid(10*0.5) = 0.9933 -- see
+# config_removal.yaml's own header comment and docs/EXPERIMENTS.md "EXP-0010" for the
+# measured numbers. An absolute cutoff under trippy's init mostly measures where a point
+# STARTED, not what training did to it. `mode: relative` is the faithful analogue: a point
+# is removed once its confidence has fallen below `rel_factor` (0.3) times its OWN initial
+# value (`trippy.train.params.PointParams.init_conf`), which is what TRIPS's absolute
+# cutoff means for free under its own uniform init. `conf_threshold: 0.1` is kept as an
+# optional absolute floor (an independent OR trigger -- see
+# trippy.train.prune.confidence_drop_mask), so a point that starts (and stays) negligible
+# is still caught even though it can never fall by rel_factor from an already-tiny start.
+#
+# Run via: scripts/queue_training.sh experiments/EXP-0010-point-removal/config_removal_rel.yaml \
+#   --max-minutes 300      (never invoked directly -- see AGENTS.md "GPU and compute").
+#
+# run_dir is an ABSOLUTE path (not experiments/EXP-0010-point-removal/exp0010-removal's
+# relative form config_removal.yaml uses) because this run is queued from the
+# .worktrees/relative-removal git worktree: a relative run_dir would resolve inside the
+# worktree and be lost/hard to find once the worktree is removed (AGENTS.md Sec. 5 --
+# subagents always export TRIPPY_OUTPUT so artefacts never live inside a worktree; the same
+# reasoning applies to a config's own run_dir).
+
+scene_root: /Users/nzbirdranch/Splats/scenes/karekare/kk-coherent
+run_dir: /Users/nzbirdranch/trippy/output/runs/EXP-0010-point-removal/removal-rel
+
+width: 1008
+crop: 384
+mode: broadcast
+layers: 5
+epochs: 300
+train_factor: 1.0
+
+point_source:
+  type: gaussian
+  path: /Users/nzbirdranch/Splats/output/Training-Data/karekare/kk-coherent/kkc_15000.ply
+  min_opacity: 0.05
+  size_mode: knn
+
+forced_heldout:
+  - IMG_3828.jpg
+  - IMG_3829.jpg
+  - IMG_3830.jpg
+  - IMG_3831.jpg
+  - IMG_3832.jpg
+  - IMG_3833.jpg
+
+# The RELATIVE analogue of arm A's rule (see header comment above). Same schedule as arm A
+# (TRIPS's own ratios scaled to 300 epochs: 200/600 -> epoch 100, 50/600 -> every 25
+# epochs; eight passes: 100, 125, ..., 275).
+point_removal:
+  enabled: true
+  start_epoch: 100
+  every_epochs: 25
+  mode: relative
+  conf_threshold: 0.1
+  rel_factor: 0.3
+  min_points: 1000000
+
+# Measurement only (the default): every eval logs the point count and the shade audit's
+# in-region dark-mass fraction, computed in-process from the live parameters. Nothing in
+# this arm prunes on that number.
+shade_prune:
+  enabled: false
+  log_dark_mass: true
+
+device: mps
+seed: 0

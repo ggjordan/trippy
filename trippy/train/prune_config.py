@@ -9,7 +9,8 @@ Purpose: describe, in two YAML-round-trippable dataclasses, when and how a
     cheap. The numpy/torch machinery that consumes these lives in
     `trippy.train.prune`.
 Invariants:
-    - `PointRemovalConfig` is TRIPS's rule and nothing else: drop every
+    - `PointRemovalConfig` is TRIPS's rule, plus one trippy-native mode
+      switch. `mode: absolute` is TRIPS's rule and nothing else: drop every
       point whose *effective* confidence `sigmoid(10 * raw_conf)` is below
       `conf_threshold`, on epochs `start_epoch + i*every_epochs`
       (`src/apps/train.cpp:846-851` and `:533-538`,
@@ -17,6 +18,12 @@ Invariants:
       default, matching TRIPS's own shipped configs, which disable it by
       putting `start_removing_points_epoch = 2000` beyond
       `num_epochs = 600` (`configs/train_normalnet.ini:8,133`).
+      `mode: relative` is the faithful analogue for trippy's own confidence
+      init (see `trippy.constants` "POINT_REMOVAL_MODE_ABSOLUTE" comment
+      for the full "why"): drop a point once its confidence has fallen
+      below `rel_factor` times its OWN initial confidence
+      (`trippy.train.params.PointParams.init_conf`), optionally also below
+      an absolute floor (`conf_threshold`, when > 0).
     - `ShadePruneConfig` is NOT a TRIPS rule and never claims to be. It is
       an audit-aligned heuristic: it removes points that are inside the
       exact region `~/Splats/tools/depthprior_shade_audit.py` measures, are
@@ -46,7 +53,10 @@ from trippy.constants import (
     POINT_REMOVAL_DEFAULT_CONF_THRESHOLD,
     POINT_REMOVAL_DEFAULT_EVERY_EPOCHS,
     POINT_REMOVAL_DEFAULT_MIN_POINTS,
+    POINT_REMOVAL_DEFAULT_MODE,
+    POINT_REMOVAL_DEFAULT_REL_FACTOR,
     POINT_REMOVAL_DEFAULT_START_EPOCH,
+    POINT_REMOVAL_MODES,
     SHADE_FRAMES_KK,
     SHADE_PRUNE_DEFAULT_CONF_THRESHOLD,
     SHADE_PRUNE_DEFAULT_LUM_THRESHOLD,
@@ -74,11 +84,25 @@ class PointRemovalConfig:
         every_epochs: removal repeats on `start_epoch + i*every_epochs`
             (`point_removal_epoch_interval`, `Settings.h:406`; code default
             50). Must be >= 1.
-        conf_threshold: a point is removed when
+        mode: "absolute" (default, TRIPS's literal rule) or "relative"
+            (trippy's faithful analogue for its own confidence init -- see
+            `trippy.constants.POINT_REMOVAL_MODE_ABSOLUTE`).
+        conf_threshold: in `mode: absolute`, a point is removed when
             `sigmoid(10*raw_conf) < conf_threshold`
             (`src/apps/train.cpp:846-851`). TRIPS's code default is 0.3
             (`Settings.h:427`); its shipped config uses 0.500000119
-            (`train_normalnet.ini:134`).
+            (`train_normalnet.ini:134`). In `mode: relative`, this doubles
+            as an optional absolute floor (set to 0 to disable it): a point
+            below it is removed outright, in addition to the `rel_factor`
+            test below.
+        rel_factor: only read in `mode: relative`. A point is removed once
+            `sigmoid(10*raw_conf) < rel_factor * init_conf`, where
+            `init_conf` is that point's OWN confidence at construction
+            (`trippy.train.params.PointParams.init_conf`) -- i.e. once it
+            has lost `1 - rel_factor` of the confidence it started with.
+            Default 0.3, chosen to mirror `POINT_REMOVAL_DEFAULT_CONF_THRESHOLD`
+            (see `trippy.constants` for why that is the same number under a
+            different rule). Must be > 0.
         min_points: never let the cloud fall below this many points -- a
             trippy addition (TRIPS has no floor). When a pass would breach
             it, the `min_points` highest-confidence points are kept
@@ -88,7 +112,9 @@ class PointRemovalConfig:
     enabled: bool = False
     start_epoch: int = POINT_REMOVAL_DEFAULT_START_EPOCH
     every_epochs: int = POINT_REMOVAL_DEFAULT_EVERY_EPOCHS
+    mode: str = POINT_REMOVAL_DEFAULT_MODE
     conf_threshold: float = POINT_REMOVAL_DEFAULT_CONF_THRESHOLD
+    rel_factor: float = POINT_REMOVAL_DEFAULT_REL_FACTOR
     min_points: int = POINT_REMOVAL_DEFAULT_MIN_POINTS
 
     def __post_init__(self) -> None:
@@ -96,8 +122,12 @@ class PointRemovalConfig:
             raise ValueError(f"point_removal.every_epochs must be >= 1, got {self.every_epochs}")
         if self.start_epoch < 0:
             raise ValueError(f"point_removal.start_epoch must be >= 0, got {self.start_epoch}")
+        if self.mode not in POINT_REMOVAL_MODES:
+            raise ValueError(f"point_removal.mode must be one of {POINT_REMOVAL_MODES}, got {self.mode!r}")
         if not 0.0 <= self.conf_threshold <= 1.0:
             raise ValueError(f"point_removal.conf_threshold must be in [0, 1], got {self.conf_threshold}")
+        if self.rel_factor <= 0.0:
+            raise ValueError(f"point_removal.rel_factor must be > 0, got {self.rel_factor}")
         if self.min_points < 0:
             raise ValueError(f"point_removal.min_points must be >= 0, got {self.min_points}")
 
@@ -142,7 +172,15 @@ class ShadePruneConfig:
             "dark" (the script's `--thresholds` entry the leaderboard
             quotes, 0.25).
         conf_threshold: a point is pruned only if it is in-region AND dark
-            AND `sigmoid(10*raw_conf) < conf_threshold`.
+            AND the confidence test below fires. `mode: absolute` (default)
+            is `sigmoid(10*raw_conf) < conf_threshold`; `mode: relative`
+            adds the same test `PointRemovalConfig` uses (`rel_factor *
+            init_conf`, `conf_threshold` as an optional floor when > 0).
+        mode, rel_factor: the confidence-test knobs, identical in meaning
+            to `PointRemovalConfig.mode` / `.rel_factor` (see there and
+            `trippy.constants.POINT_REMOVAL_MODE_ABSOLUTE`) but independent
+            fields, so `shade_prune` can run a different confidence rule
+            from `point_removal` in the same config.
         start_epoch, every_epochs: same schedule shape as
             `PointRemovalConfig`, kept independent so a run can prune on a
             different cadence from TRIPS's own rule.
@@ -162,7 +200,9 @@ class ShadePruneConfig:
     znear_frac: float = SHADE_PRUNE_DEFAULT_ZNEAR_FRAC
     zfar_frac: float = SHADE_PRUNE_DEFAULT_ZFAR_FRAC
     lum_threshold: float = SHADE_PRUNE_DEFAULT_LUM_THRESHOLD
+    mode: str = POINT_REMOVAL_DEFAULT_MODE
     conf_threshold: float = SHADE_PRUNE_DEFAULT_CONF_THRESHOLD
+    rel_factor: float = POINT_REMOVAL_DEFAULT_REL_FACTOR
     start_epoch: int = POINT_REMOVAL_DEFAULT_START_EPOCH
     every_epochs: int = POINT_REMOVAL_DEFAULT_EVERY_EPOCHS
     min_points: int = SHADE_PRUNE_DEFAULT_MIN_POINTS
@@ -173,8 +213,12 @@ class ShadePruneConfig:
             raise ValueError(f"shade_prune.every_epochs must be >= 1, got {self.every_epochs}")
         if self.start_epoch < 0:
             raise ValueError(f"shade_prune.start_epoch must be >= 0, got {self.start_epoch}")
+        if self.mode not in POINT_REMOVAL_MODES:
+            raise ValueError(f"shade_prune.mode must be one of {POINT_REMOVAL_MODES}, got {self.mode!r}")
         if not 0.0 <= self.conf_threshold <= 1.0:
             raise ValueError(f"shade_prune.conf_threshold must be in [0, 1], got {self.conf_threshold}")
+        if self.rel_factor <= 0.0:
+            raise ValueError(f"shade_prune.rel_factor must be > 0, got {self.rel_factor}")
         if not 0.0 <= self.lum_threshold <= 1.0:
             raise ValueError(f"shade_prune.lum_threshold must be in [0, 1], got {self.lum_threshold}")
         if not 0.0 <= self.znear_frac < self.zfar_frac:

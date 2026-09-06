@@ -29,6 +29,20 @@ TRIPS's rule, as found in the source (third_party/TRIPS @ a59a65b6):
     sigmoid-x10) confidence, on a fixed epoch schedule. There is no
     gradient, opacity-mass, visibility or error term in it.
 
+trippy's `mode: relative` (`PointRemovalConfig.mode`,
+`confidence_drop_mask` below) is a faithful analogue of that same rule,
+not a port of anything in TRIPS: TRIPS's absolute cutoff only makes sense
+because TRIPS initialises every point's confidence identically
+(`sigmoid(10*0.5) = 0.9933`), so "below cutoff" means "training pushed
+this point down". trippy initialises confidence from the source PLY's own
+opacity (median 0.18 on kkc_15000), so the same absolute cutoff mostly
+measures where a point started. The relative mode instead thresholds each
+point against its OWN starting confidence
+(`trippy.train.params.PointParams.init_conf`), which is what an absolute
+cutoff means for free under TRIPS's uniform init. See
+`trippy.constants.POINT_REMOVAL_MODE_ABSOLUTE` for the full rationale and
+docs/EXPERIMENTS.md "EXP-0010" for the measured numbers that motivated it.
+
 TRIPS's point *adding* is deliberately NOT ported; see
 docs/EXPERIMENTS.md "EXP-0010" and `docs/TRIPS_REFERENCE.md` for the full
 finding. In one line: its default path shells out to a NeAT CT
@@ -67,6 +81,10 @@ from pathlib import Path
 import numpy as np
 
 from trippy.constants import (
+    POINT_REMOVAL_DEFAULT_MODE,
+    POINT_REMOVAL_DEFAULT_REL_FACTOR,
+    POINT_REMOVAL_MODE_ABSOLUTE,
+    POINT_REMOVAL_MODE_RELATIVE,
     REC709_LUMA_WEIGHTS,
     SHADE_DARK_MASS_KEY_FMT,
     SHADE_DARK_N_KEY_FMT,
@@ -327,23 +345,91 @@ def apply_min_points(keep: np.ndarray, conf: np.ndarray, min_points: int) -> np.
     return widened
 
 
-def removal_keep_mask(conf: np.ndarray, conf_threshold: float, min_points: int) -> np.ndarray:
-    """TRIPS's rule: keep every point whose effective confidence is NOT below the cutoff.
+def confidence_drop_mask(
+    conf: np.ndarray,
+    conf_threshold: float,
+    mode: str = POINT_REMOVAL_DEFAULT_MODE,
+    rel_factor: float = POINT_REMOVAL_DEFAULT_REL_FACTOR,
+    init_conf: np.ndarray | None = None,
+) -> np.ndarray:
+    """The confidence test shared by `removal_keep_mask` and `shade_prune_keep_mask`.
 
-    `train.cpp:846-851` selects `confidence_value_of_point < cutoff` for
-    removal, so the keep mask is the complement, `conf >= cutoff`. The
-    `min_points` floor is trippy's, applied afterwards.
+    `mode="absolute"` is TRIPS's literal rule (`train.cpp:846-851`): drop
+    when `conf < conf_threshold`. `mode="relative"` is trippy's faithful
+    analogue for its own confidence init (`trippy.constants
+    .POINT_REMOVAL_MODE_ABSOLUTE` has the full "why"): drop once a point's
+    confidence has fallen below `rel_factor` times its OWN initial
+    confidence, `conf < rel_factor * init_conf`. `conf_threshold` doubles
+    as an optional absolute floor in relative mode -- when > 0, a point is
+    ALSO dropped if it is below that floor outright (an independent OR
+    trigger, so a point that starts, and stays, negligible is still caught
+    even though it can never fall by `rel_factor` from an already-tiny
+    start). Passing `conf_threshold=0` in relative mode disables the floor
+    and leaves the relative test as the sole criterion.
 
     Args:
         conf: (N,) effective confidence, i.e. `sigmoid(10 * raw_conf)`.
-        conf_threshold: TRIPS's `removal_confidence_cutoff`.
+        conf_threshold: TRIPS's `removal_confidence_cutoff` in absolute
+            mode; an optional floor (0 disables it) in relative mode.
+        mode: "absolute" or "relative"
+            (`trippy.constants.POINT_REMOVAL_MODES`).
+        rel_factor: only read in relative mode; see above.
+        init_conf: (N,) each point's OWN confidence at construction
+            (`trippy.train.params.PointParams.init_conf`). Required in
+            relative mode, ignored in absolute mode.
+
+    Returns:
+        (N,) bool, True where the point should be dropped.
+
+    Raises:
+        ValueError: `mode` is not a known mode, or `mode="relative"` and
+            `init_conf` is None.
+    """
+    conf = np.asarray(conf, dtype=np.float64)
+    if mode == POINT_REMOVAL_MODE_RELATIVE:
+        if init_conf is None:
+            raise ValueError("confidence_drop_mask(mode='relative') requires init_conf")
+        init_conf = np.asarray(init_conf, dtype=np.float64)
+        drop = conf < (rel_factor * init_conf)
+        if conf_threshold > 0:
+            drop = drop | (conf < conf_threshold)
+        return drop
+    if mode != POINT_REMOVAL_MODE_ABSOLUTE:
+        raise ValueError(f"confidence_drop_mask: unknown mode {mode!r}")
+    return conf < conf_threshold
+
+
+def removal_keep_mask(
+    conf: np.ndarray,
+    conf_threshold: float,
+    min_points: int,
+    mode: str = POINT_REMOVAL_DEFAULT_MODE,
+    rel_factor: float = POINT_REMOVAL_DEFAULT_REL_FACTOR,
+    init_conf: np.ndarray | None = None,
+) -> np.ndarray:
+    """TRIPS's rule (or trippy's relative analogue): keep points the confidence test spares.
+
+    `train.cpp:846-851` selects `confidence_value_of_point < cutoff` for
+    removal (`mode="absolute"`, the default -- this is exactly TRIPS's
+    rule, unchanged). `mode="relative"` swaps in
+    `trippy.train.prune_config.PointRemovalConfig`'s faithful analogue; see
+    `confidence_drop_mask` for the exact test. The `min_points` floor is
+    trippy's, applied afterwards, in both modes.
+
+    Args:
+        conf: (N,) effective confidence, i.e. `sigmoid(10 * raw_conf)`.
+        conf_threshold: TRIPS's `removal_confidence_cutoff` (absolute), or
+            the optional floor (relative).
         min_points: floor on the surviving count (see `apply_min_points`).
+        mode: "absolute" (default) or "relative".
+        rel_factor: only read in relative mode.
+        init_conf: only read (and required) in relative mode.
 
     Returns:
         (N,) bool keep mask.
     """
     conf = np.asarray(conf, dtype=np.float64)
-    keep = conf >= conf_threshold
+    keep = ~confidence_drop_mask(conf, conf_threshold, mode, rel_factor, init_conf)
     return apply_min_points(keep, conf, min_points)
 
 
@@ -354,6 +440,9 @@ def shade_prune_keep_mask(
     lum_threshold: float,
     conf_threshold: float,
     min_points: int,
+    mode: str = POINT_REMOVAL_DEFAULT_MODE,
+    rel_factor: float = POINT_REMOVAL_DEFAULT_REL_FACTOR,
+    init_conf: np.ndarray | None = None,
 ) -> np.ndarray:
     """trippy's audit-aligned rule: drop in-region AND dark AND low-confidence points.
 
@@ -361,19 +450,26 @@ def shade_prune_keep_mask(
     heuristic aimed at a metric, not a claim that those points are wrong;
     a run using it must be reported next to its held-out shade PSNR (see
     `trippy.train.prune_config.ShadePruneConfig` and docs/EXPERIMENTS.md
-    "EXP-0010").
+    "EXP-0010"). The confidence leg of the AND is `confidence_drop_mask`,
+    so `mode`/`rel_factor`/`init_conf` mean exactly what they mean for
+    `removal_keep_mask` -- see there.
 
     Args:
         inside: (N,) bool, from `in_region`.
         lum: (N,) Rec.709 luminance of the base colour.
         conf: (N,) effective confidence.
         lum_threshold: "dark" cutoff.
-        conf_threshold: confidence cutoff.
+        conf_threshold: confidence cutoff (absolute) or optional floor
+            (relative).
         min_points: floor on the surviving count (see `apply_min_points`).
+        mode: "absolute" (default) or "relative".
+        rel_factor: only read in relative mode.
+        init_conf: only read (and required) in relative mode.
 
     Returns:
         (N,) bool keep mask.
     """
     conf = np.asarray(conf, dtype=np.float64)
-    drop = inside & (np.asarray(lum, dtype=np.float64) < lum_threshold) & (conf < conf_threshold)
+    conf_drop = confidence_drop_mask(conf, conf_threshold, mode, rel_factor, init_conf)
+    drop = inside & (np.asarray(lum, dtype=np.float64) < lum_threshold) & conf_drop
     return apply_min_points(~drop, conf, min_points)

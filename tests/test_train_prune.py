@@ -50,9 +50,10 @@ from test_train_helpers import (
     tiny_train_config,
 )
 
-from trippy.constants import SH_C0
+from trippy.constants import CONF_SIGMOID_SCALE, SH_C0
 from trippy.points.gaussian_ply import GaussianPlySource
 from trippy.train import prune
+from trippy.train.params import logit
 from trippy.train.prune_config import PointRemovalConfig, ShadePruneConfig
 from trippy.train.trainer import Trainer
 
@@ -223,6 +224,83 @@ def test_shade_prune_keep_mask_respects_min_points() -> None:
     assert keep.tolist() == [True, False, True, False]
 
 
+# --- relative mode: trippy's faithful analogue -------------------------------------
+
+
+def test_removal_keep_mask_relative_keeps_stayed_put_and_drops_fallen() -> None:
+    init_conf = np.array([0.5, 0.5, 0.9])
+    conf = np.array([0.5, 0.1, 0.9])  # index 0 unchanged, index 1 fell to 0.2x, index 2 unchanged
+    keep = prune.removal_keep_mask(
+        conf, conf_threshold=0.0, min_points=0, mode="relative", rel_factor=0.3, init_conf=init_conf
+    )
+    assert keep.tolist() == [True, False, True]
+
+
+def test_removal_keep_mask_relative_requires_init_conf() -> None:
+    with pytest.raises(ValueError, match="init_conf"):
+        prune.removal_keep_mask(np.array([0.5]), conf_threshold=0.0, min_points=0, mode="relative")
+
+
+def test_removal_keep_mask_rejects_unknown_mode() -> None:
+    with pytest.raises(ValueError, match="mode"):
+        prune.removal_keep_mask(np.array([0.5]), conf_threshold=0.3, min_points=0, mode="bogus")
+
+
+def test_removal_keep_mask_relative_floor_is_an_independent_drop_trigger() -> None:
+    # init_conf all 1.0, rel_factor 0.3 -> the relative floor sits at 0.3. Both points here
+    # pass the relative test (>= 0.3); an absolute floor above 0.3 must still catch point 1.
+    init_conf = np.array([1.0, 1.0])
+    conf = np.array([0.5, 0.35])
+    keep_no_floor = prune.removal_keep_mask(
+        conf, conf_threshold=0.0, min_points=0, mode="relative", rel_factor=0.3, init_conf=init_conf
+    )
+    assert keep_no_floor.tolist() == [True, True]
+    keep_with_floor = prune.removal_keep_mask(
+        conf, conf_threshold=0.4, min_points=0, mode="relative", rel_factor=0.3, init_conf=init_conf
+    )
+    assert keep_with_floor.tolist() == [True, False]
+
+
+def test_shade_prune_keep_mask_relative_mode() -> None:
+    inside = np.ones(3, dtype=bool)
+    lum = np.zeros(3)
+    init_conf = np.array([0.5, 0.5, 0.5])
+    conf = np.array([0.5, 0.1, 0.5])
+    keep = prune.shade_prune_keep_mask(
+        inside, lum, conf, 0.25, 0.0, min_points=0, mode="relative", rel_factor=0.3, init_conf=init_conf
+    )
+    assert keep.tolist() == [True, False, True]
+
+
+# --- config validation: mode / rel_factor -------------------------------------------
+
+
+def test_point_removal_config_rejects_unknown_mode() -> None:
+    with pytest.raises(ValueError, match="mode"):
+        PointRemovalConfig(mode="bogus")
+
+
+def test_point_removal_config_rejects_non_positive_rel_factor() -> None:
+    with pytest.raises(ValueError, match="rel_factor"):
+        PointRemovalConfig(rel_factor=0.0)
+
+
+def test_point_removal_config_defaults_to_absolute_mode() -> None:
+    cfg = PointRemovalConfig()
+    assert cfg.mode == "absolute"
+    assert cfg.rel_factor == pytest.approx(0.3)
+
+
+def test_shade_prune_config_rejects_unknown_mode() -> None:
+    with pytest.raises(ValueError, match="mode"):
+        ShadePruneConfig(mode="bogus")
+
+
+def test_shade_prune_config_rejects_non_positive_rel_factor() -> None:
+    with pytest.raises(ValueError, match="rel_factor"):
+        ShadePruneConfig(rel_factor=-1.0)
+
+
 # --- region definition ---------------------------------------------------------------
 
 
@@ -298,6 +376,7 @@ def test_apply_keep_mask_drops_points_and_keeps_adam_moments_aligned(tmp_path: P
 
     n_before = len(trainer.point_params)
     xyz_before = trainer.point_params.xyz.detach().clone()
+    init_conf_before = trainer.point_params.init_conf.detach().clone()
     moments_before = {
         attr: trainer.optimizer.state[getattr(trainer.point_params, attr)]["exp_avg"].detach().clone()
         for attr, _group in Trainer._POINT_PARAM_GROUPS
@@ -313,6 +392,10 @@ def test_apply_keep_mask_drops_points_and_keeps_adam_moments_aligned(tmp_path: P
     assert trainer.points_removed_total == n_removed
     assert torch.equal(trainer.point_params.xyz.detach(), xyz_before.index_select(0, index))
     assert trainer.point_params.provenance.shape[0] == int(keep.sum())
+    # init_conf is metadata, not optimizer state: it index-selects onto survivors exactly
+    # like provenance, so entry i still means "point i's confidence when it was created".
+    assert trainer.point_params.init_conf.shape[0] == int(keep.sum())
+    assert torch.equal(trainer.point_params.init_conf, init_conf_before.index_select(0, index))
 
     for attr, group in Trainer._POINT_PARAM_GROUPS:
         param = getattr(trainer.point_params, attr)
@@ -362,6 +445,51 @@ def test_maybe_prune_points_min_points_floor(tmp_path: Path) -> None:
     )
     trainer.maybe_prune_points(epoch=0)
     assert len(trainer.point_params) == 17
+
+
+def test_maybe_prune_points_relative_mode_uses_init_conf(tmp_path: Path) -> None:
+    """The trainer-level acceptance case: relative mode keeps a point whose confidence
+    stayed put and drops one that fell to 0.2x its own initial value -- using the SAME
+    initial value for every point (the trainer's per-point init_conf buffer), not a fixed
+    absolute cutoff.
+    """
+    trainer, _names = _trainer_with_observations(
+        tmp_path,
+        point_removal={
+            "enabled": True,
+            "start_epoch": 0,
+            "every_epochs": 1,
+            "mode": "relative",
+            "conf_threshold": 0.0,  # no absolute floor: the relative test alone decides
+            "rel_factor": 0.3,
+            "min_points": 0,
+        },
+    )
+    init_conf = trainer.point_params.init_conf.detach().clone()
+    xyz_before = trainer.point_params.xyz.detach().clone()
+
+    # Point 0: push its confidence down to 0.2x its own initial value (must be dropped).
+    # Every other point is left untouched, i.e. "stayed put" (must be kept).
+    with torch.no_grad():
+        target = (init_conf[0] * 0.2).clamp(min=1e-4)
+        trainer.point_params.raw_conf[0] = logit(target) / CONF_SIGMOID_SCALE
+
+    conf_before = trainer.point_params.conf().detach().numpy().astype(np.float64)
+    expected_keep = prune.removal_keep_mask(
+        conf_before,
+        conf_threshold=0.0,
+        min_points=0,
+        mode="relative",
+        rel_factor=0.3,
+        init_conf=init_conf.numpy().astype(np.float64),
+    )
+    assert not expected_keep[0], "the point that fell to 0.2x its init confidence must be dropped"
+    assert expected_keep[1:].all(), "points whose confidence stayed put must be kept"
+
+    result = trainer.maybe_prune_points(epoch=0)
+    assert result["point_removal"] == int((~expected_keep).sum())
+    index = torch.from_numpy(np.flatnonzero(expected_keep).astype(np.int64))
+    assert torch.equal(trainer.point_params.xyz, xyz_before.index_select(0, index))
 
 
 def test_shade_prune_only_touches_dark_in_region_points(tmp_path: Path) -> None:
@@ -447,6 +575,11 @@ def test_checkpoint_round_trips_after_a_removal(tmp_path: Path) -> None:
     assert len(fresh.point_params) == len(trainer.point_params)
     assert torch.allclose(fresh.point_params.xyz, trainer.point_params.xyz)
     assert torch.allclose(fresh.point_params.feat, trainer.point_params.feat)
+    # init_conf is a buffer: `_resize_point_params` placeholder-zeros it, and
+    # `load_state_dict` must then overwrite it with the checkpoint's real values (the same
+    # ones the removal-surviving points carried before saving), not leave it zeroed.
+    assert torch.allclose(fresh.point_params.init_conf, trainer.point_params.init_conf)
+    assert not torch.allclose(fresh.point_params.init_conf, torch.zeros_like(fresh.point_params.init_conf))
     assert fresh.points_removed_total == trainer.points_removed_total
     fresh.train_step()  # optimiser groups still line up with the resized params.
 

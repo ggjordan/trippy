@@ -600,7 +600,9 @@ point_removal:            # TRIPS's own rule, ported
   enabled: true
   start_epoch: 100        # TRIPS: start_removing_points_epoch (Settings.h:403, default 200)
   every_epochs: 25        # TRIPS: point_removal_epoch_interval (Settings.h:406, default 50)
+  mode: absolute          # "absolute" (TRIPS's rule) or "relative" (trippy's analogue, see below)
   conf_threshold: 0.1     # TRIPS: removal_confidence_cutoff (Settings.h:427 = 0.3; ini:134 = 0.5)
+  rel_factor: 0.3         # only read in mode: relative -- see below
   min_points: 1000000     # trippy addition; TRIPS has no floor
 
 shade_prune:              # trippy's audit-aligned heuristic -- NOT a TRIPS rule
@@ -610,7 +612,9 @@ shade_prune:              # trippy's audit-aligned heuristic -- NOT a TRIPS rule
   znear_frac: 0.05
   zfar_frac: 0.5
   lum_threshold: 0.25
+  mode: absolute          # same mode/rel_factor choice as point_removal, independent field
   conf_threshold: 0.5
+  rel_factor: 0.3
   start_epoch: 100
   every_epochs: 25
   min_points: 1000000
@@ -633,6 +637,22 @@ trippy initialises confidence from the source PLY's opacity, so on `kkc_15000` (
 0.05) **74% of points are already below 0.3 and 90% below 0.5 at epoch 0** -- TRIPS's own
 number would delete the scene on the first pass. Pick the cutoff against the source's opacity
 distribution, not against TRIPS's ini. See experiments/EXP-0010-point-removal/README.md.
+
+**`mode: relative` -- the faithful analogue, for trippy's own confidence init.** TRIPS's
+absolute cutoff (above) is only "faithful" because TRIPS's confidence starts identical for
+every point (`sigmoid(10*0.5) = 0.9933`), so "below cutoff" already means "training moved
+this point". Under trippy's own init, an absolute cutoff mostly measures where a point
+started. `mode: relative` fixes that by comparing each point's *current* confidence to its
+OWN value at construction: it is dropped once `sigmoid(10*raw_conf) < rel_factor * init_conf`
+(`trippy.train.params.PointParams.init_conf`, a buffer snapshotted once at `PointParams.
+__init__` and carried, index-selected, through every later removal pass and checkpoint
+round trip -- never touched by the optimiser). `conf_threshold` doubles as an optional
+absolute floor in this mode (an independent OR trigger; set it to `0` to disable and use the
+relative test alone) -- see `trippy.train.prune.confidence_drop_mask` and
+`trippy.constants.POINT_REMOVAL_MODE_ABSOLUTE` for the exact rule and full rationale. Same
+`mode`/`rel_factor` fields exist on `shade_prune`, independently, for its own confidence leg.
+`config_removal_rel.yaml` in EXP-0010 is `config_removal.yaml` with only `mode: relative` and
+`rel_factor: 0.3` changed, so the two runs isolate exactly this one choice.
 
 **Point adding is NOT ported.** TRIPS's default adder shells out to an external NeAT CT
 reconstruction binary; its in-tree grid-loss fallback (`NeuralScene.cpp:1330-1373`) is dead
