@@ -24,8 +24,8 @@ Last updated: 2026-09-06 (web-perf session, Orchestrator: Claude Fable 5.1)
 - Jordan set the goal (2026-09-05 ~22:50): finish all stages autonomously; anything needing Jordan goes in the review queue below.
 
 ## In flight
-- GPU queue (prio 70, self-reporting, in order): distill done; full-trips (EXP-0007 Hunua), full2-broadcast, full2-trips (EXP-0003), union-broadcast, union-trips (EXP-0006), hybrid-a-all-levels (EXP-0009). Each delivers a viewer launcher + dolly/honesty/ply + audit table on completion. Splats' prio-60 trainings keep arriving ahead of them (Jordan: no queue jump).
-- feat/shade-split (mid): per-image held-out metrics + shade/other split for the leaderboard; backfill eval of full1-broadcast queued.
+- GPU queue: full2-broadcast (EXP-0003, epoch ~240/300, plateau ~15.1 dB) -> self-report + leaderboard; then web-perf-parity (prio 12), shade-split-eval-1 (prio 15, backfills full1-broadcast's shade split), then prio-70: full-trips (Hunua clip5923), full2-trips, hybrid-a-all-levels, union-broadcast, union-trips.
+- No subagents running. Next merges happen when runs report.
 
 ## Next (in order)
 1. Merge scene-io + points; launch feat/raster (large/high: numpy reference + Metal blend_fwd + pyramid forward) and feat/net (mid/high: U-Net + tone mapper ports) once TRIPS_REFERENCE.md lands.
