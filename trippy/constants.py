@@ -795,6 +795,11 @@ TRAIN_CHECKPOINT_BEST_JSON_FILENAME = "best.json"
 TRAIN_LOG_FILENAME = "log.txt"
 TRAIN_METRICS_FILENAME = "metrics.jsonl"
 TRAIN_EVAL_DIRNAME_FMT = "eval_ep{epoch:04d}"
+# `trippy eval --checkpoint` (trippy.train.eval.evaluate_checkpoint) writes here instead of
+# `TRAIN_EVAL_DIRNAME_FMT` -- a standalone re-evaluation isn't tied to one epoch (it may run long
+# after training finished, against a checkpoint whose own epoch dir already exists), and a
+# timestamp keeps repeated manual re-evals from clobbering each other's output.
+TRAIN_EVAL_MANUAL_DIRNAME_FMT = "eval_manual_{ts}"
 TRAIN_EVAL_SHEET_FILENAME = "sheet.png"
 # JPEG replaces PNG for the per-epoch eval contact sheet only (task brief 2026-09-06,
 # "make eval image dumps lighter"): it is a quick progress-check artifact, not a pixel-exact

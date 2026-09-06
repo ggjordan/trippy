@@ -47,6 +47,7 @@ from torch import nn
 from trippy.config import load_settings, pick_device
 from trippy.constants import (
     SCENE_CACHE_META_FILENAME,
+    SHADE_FRAMES_KK,
     TRAIN_CHECKPOINT_BEST_FILENAME,
     TRAIN_CHECKPOINT_BEST_JSON_FILENAME,
     TRAIN_CHECKPOINT_DIRNAME,
@@ -106,6 +107,45 @@ def _save_eval_sheet_jpeg(path: Path, arr: np.ndarray, quality: int) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     Image.fromarray(arr, mode="RGB").save(path, format="JPEG", quality=quality)
     return path
+
+
+def _shade_and_other(names: list[str], forced_heldout: list[str]) -> tuple[list[str], list[str]]:
+    """Partition an already-held-out `names` list into shade frames vs other held-out frames.
+
+    Shade frames are `forced_heldout` (a config's own explicit "always hold these frames out"
+    list, `cfg.forced_heldout`) when non-empty, else `SHADE_FRAMES_KK` (the kk-coherent scene's
+    known shade region under the trees) -- intersected with `names` either way, so a scene with
+    neither yields an empty shade set rather than raising. This is *not*
+    `trippy.scene.splits.split_with_forced_heldout` -- that function partitions the *whole*
+    dataset into train/heldout; this one further partitions an already-held-out set of names
+    purely for reporting (docs/EXPERIMENTS.md "Leaderboard").
+
+    Returns:
+        `(shade_names, other_names)`, both in `names`'s own order, partitioning it exactly.
+    """
+    shade_set = (set(forced_heldout) if forced_heldout else set(SHADE_FRAMES_KK)) & set(names)
+    shade = [n for n in names if n in shade_set]
+    other = [n for n in names if n not in shade_set]
+    return shade, other
+
+
+def _aggregate_group(names: list[str], per_image: dict[str, dict]) -> dict:
+    """`{"n", "psnr", "ssim", "lpips"}` -- mean over `names` from a per-image metrics dict.
+
+    `psnr`/`ssim`/`lpips` are all `None` when `names` is empty (no images in this group, e.g. a
+    scene with no `SHADE_FRAMES_KK` and no `forced_heldout`); `lpips` alone is also `None` when
+    `cfg.eval_lpips` was False for the run that produced `per_image` (no per-image lpips values to
+    average).
+    """
+    psnr_vals = [per_image[n]["psnr"] for n in names]
+    ssim_vals = [per_image[n]["ssim"] for n in names]
+    lpips_vals = [per_image[n]["lpips"] for n in names if per_image[n]["lpips"] is not None]
+    return {
+        "n": len(names),
+        "psnr": float(np.mean(psnr_vals)) if psnr_vals else None,
+        "ssim": float(np.mean(ssim_vals)) if ssim_vals else None,
+        "lpips": float(np.mean(lpips_vals)) if lpips_vals else None,
+    }
 
 
 class Trainer:
@@ -549,26 +589,49 @@ class Trainer:
 
     # --- evaluation ---
 
-    def evaluate(self, names: list[str] | None = None, epoch: int | None = None) -> dict:
+    def evaluate(
+        self,
+        names: list[str] | None = None,
+        epoch: int | None = None,
+        eval_dirname: str | None = None,
+    ) -> dict:
         """Full-frame held-out evaluation: PSNR/SSIM(/LPIPS) + an honesty contact sheet.
 
         Args:
             names: image names to evaluate; defaults to `self.heldout_names`.
             epoch: label used for the output directory / metrics record;
                 defaults to `self.epoch`.
+            eval_dirname: output directory name under `run_dir`; defaults to
+                `TRAIN_EVAL_DIRNAME_FMT.format(epoch=epoch)` (what every
+                mid-training/`--report` eval has always used).
+                `trippy.train.eval.evaluate_checkpoint` passes a
+                `eval_manual_<timestamp>` name instead, so a standalone
+                `trippy eval --checkpoint` re-run never collides with the
+                checkpoint's own epoch directory.
 
         Returns:
             {"epoch", "n_images", "psnr_mean", "ssim_mean", "lpips_mean"
-            (None if `cfg.eval_lpips` is False), "names"}. Also writes
-            `<run_dir>/eval_ep<NNNN>/metrics.json` and, for up to
-            `cfg.eval_max_images` images (forced-held-out shade frames
-            first), `sheet.jpg` (JPEG quality `TRAIN_EVAL_SHEET_JPEG_QUALITY`,
-            not PNG -- see module-level `_save_eval_sheet_jpeg`): photo |
-            render | raw level-0 | coverage, one row per image (docs/
-            EXPERIMENTS.md "Mandatory honesty sheet"). Also updates
-            `self._best_epoch`/`self._best_psnr` when this eval's
-            `psnr_mean` beats every prior eval -- `save_checkpoint` reads
-            those to decide whether to write `checkpoint_best.pt`.
+            (None if `cfg.eval_lpips` is False), "names", "per_image"
+            (`{name: {"psnr", "ssim", "lpips"}}`, one entry per evaluated
+            image), "shade" and "other" (`{"n", "psnr", "ssim", "lpips"}`,
+            the `_shade_and_other` split of `names` -- "shade" is
+            `cfg.forced_heldout` when non-empty, else `SHADE_FRAMES_KK`,
+            intersected with `names`)}. Also writes
+            `<run_dir>/<eval_dirname>/metrics.json` (the full dict above)
+            and, for up to `cfg.eval_max_images` images (forced-held-out
+            shade frames first), `sheet.jpg` (JPEG quality
+            `TRAIN_EVAL_SHEET_JPEG_QUALITY`, not PNG -- see module-level
+            `_save_eval_sheet_jpeg`): photo | render | raw level-0 |
+            coverage, one row per image (docs/EXPERIMENTS.md "Mandatory
+            honesty sheet"). Also updates `self._best_epoch`/
+            `self._best_psnr` when this eval's `psnr_mean` beats every
+            prior eval -- `save_checkpoint` reads those to decide whether
+            to write `checkpoint_best.pt`. Always appends an `{"eval":
+            True, ...}` row (same shape, minus "names") to `metrics.jsonl`,
+            so `trippy.render.leaderboard` picks up the shade split from
+            the most recent call to this method, whether that call came
+            from mid-training, `--report`, or a standalone `trippy eval
+            --checkpoint`.
         """
         self.net.eval()
         self.camera.eval()
@@ -581,6 +644,7 @@ class Trainer:
         psnr_vals: list[float] = []
         ssim_vals: list[float] = []
         lpips_vals: list[float] = []
+        per_image: dict[str, dict] = {}
         sheet_images: list[np.ndarray] = []
         sheet_labels: list[str] = []
 
@@ -608,11 +672,18 @@ class Trainer:
                 # Dividing a 3-channel error sum by a 1-channel mask sum (what this used
                 # to do) inflates the MSE 3x and costs exactly 4.77 dB of reported PSNR.
                 mse = mse_loss(pred, target_c, mask_c)
-                psnr = -10.0 * torch.log10(mse + TRAIN_PSNR_EPS)
-                psnr_vals.append(float(psnr.item()))
-                ssim_vals.append(float(ssim(pred, target_c, mask_c).item()))
-                if self._eval_lpips is not None:
-                    lpips_vals.append(float(self._eval_lpips(pred, target_c, mask_c).item()))
+                psnr_val = float((-10.0 * torch.log10(mse + TRAIN_PSNR_EPS)).item())
+                ssim_val = float(ssim(pred, target_c, mask_c).item())
+                lpips_val = (
+                    float(self._eval_lpips(pred, target_c, mask_c).item())
+                    if self._eval_lpips is not None
+                    else None
+                )
+                psnr_vals.append(psnr_val)
+                ssim_vals.append(ssim_val)
+                if lpips_val is not None:
+                    lpips_vals.append(lpips_val)
+                per_image[name] = {"psnr": psnr_val, "ssim": ssim_val, "lpips": lpips_val}
 
                 if name in sheet_names:
                     raw = layers[0][:3].clamp(0.0, 1.0).permute(1, 2, 0).cpu().numpy()
@@ -623,6 +694,8 @@ class Trainer:
                     sheet_images += [photo_np, pred_np, raw, coverage_rgb]
                     sheet_labels += [f"{name} photo", "render", "raw L0", "coverage"]
 
+        shade_names, other_names = _shade_and_other(names, self.cfg.forced_heldout)
+
         metrics = {
             "epoch": epoch,
             "n_images": len(names),
@@ -630,9 +703,13 @@ class Trainer:
             "ssim_mean": float(np.mean(ssim_vals)) if ssim_vals else 0.0,
             "lpips_mean": float(np.mean(lpips_vals)) if lpips_vals else None,
             "names": names,
+            "per_image": per_image,
+            "shade": _aggregate_group(shade_names, per_image),
+            "other": _aggregate_group(other_names, per_image),
         }
 
-        eval_dir = self.run_dir / TRAIN_EVAL_DIRNAME_FMT.format(epoch=epoch)
+        eval_dirname = eval_dirname if eval_dirname is not None else TRAIN_EVAL_DIRNAME_FMT.format(epoch=epoch)
+        eval_dir = self.run_dir / eval_dirname
         eval_dir.mkdir(parents=True, exist_ok=True)
         (eval_dir / TRAIN_EVAL_METRICS_FILENAME).write_text(json.dumps(metrics, indent=2))
         if sheet_images:

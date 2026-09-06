@@ -424,11 +424,14 @@ output/runs/<exp>/<run>/
 │   ├── checkpoint_best.pt        (the epoch with the best held-out PSNR so far)
 │   └── best.json                 ({"epoch", "psnr"} for checkpoint_best.pt)
 ├── eval_ep0000/
-│   ├── metrics.json               ({"epoch", "n_images", "psnr_mean", "ssim_mean", "lpips_mean", "names"})
+│   ├── metrics.json               ({"epoch", "n_images", "psnr_mean", "ssim_mean", "lpips_mean", "names",
+│   │                                "per_image": {name: {"psnr", "ssim", "lpips"}}, "shade", "other"})
 │   └── sheet.jpg                  (honesty sheet: photo | render | raw L0 | coverage, up to
 │                                    cfg.eval_max_images rows, default 6; JPEG q85, not PNG --
 │                                    a quick progress check, unlike candidate-report's PNGs below)
 ├── eval_ep0010/
+│   └── ...
+├── eval_manual_<timestamp>/      (from a standalone `trippy eval --checkpoint`, see below)
 │   └── ...
 ├── export.ply                    (final trained point cloud, 3DGS-compatible)
 └── export.ply.provenance.npy     (per-point provenance sidecar)
@@ -449,7 +452,11 @@ still-writing job.
 `metrics.jsonl` is append-only and safe to `tail -f` during a run: per-step records have keys `step`,
 `epoch`, `image`, `zoom`, `loss`, `image_loss`, `extent_penalty`, `camera_reg`, `nonfinite_grads`
 (gradient entries zeroed before the optimizer step -- normally 0, see `docs/LIMITATIONS.md`); per-eval records have
-`eval: true` plus the same fields as that eval's `metrics.json` (minus `names`, to keep each line short).
+`eval: true` plus the same fields as that eval's `metrics.json` (minus `names`, to keep each line short) --
+including `per_image`, `shade`, and `other` (`{"n", "psnr", "ssim", "lpips"}` each): "shade" is
+`cfg.forced_heldout` when non-empty, else `SHADE_FRAMES_KK` (the kk-coherent scene's shade region),
+intersected with the images actually evaluated; "other" is every other evaluated image. This is the "held-out
+shade" leaderboard column's own data source -- see "Leaderboard" below.
 `log.txt` gets one human-readable line per checkpoint save, per eval, per pruned checkpoint
 (`"pruned <path> (retention policy)"`), and per new best (`"new best held-out psnr=... -> checkpoint_best.pt"`),
 plus a line when a `--max-minutes` budget cuts a run short.
@@ -458,7 +465,11 @@ plus a line when a `--max-minutes` budget cuts a run short.
 
 `trippy eval --checkpoint <run_dir>/checkpoints/checkpoint_latest.pt [--images IMG_3830.jpg ...]`
 (`trippy.train.eval.evaluate_checkpoint`) re-evaluates a checkpoint without re-training, rebuilding the
-exact dataset/point-source/split the checkpoint was trained with from its own saved config. Omitting
+exact dataset/point-source/split the checkpoint was trained with from its own saved config. It writes to a
+fresh `<run_dir>/eval_manual_<timestamp>/` directory (never collides with a mid-training/`--report` eval's own
+`eval_ep<NNNN>/`) and appends an `{"eval": true, ...}` row to the run's own `metrics.jsonl` -- including the
+`shade`/`other` split above -- so `trippy leaderboard` picks up a real "held-out shade" number for a
+checkpoint that finished training before that split existed, with no retraining required. Omitting
 `--images` evaluates the checkpoint's own held-out split. `trippy.train.eval.render_offpath` renders
 honesty triplets (no ground truth) at arbitrary poses from a JSON file; the dolly/off-path camera-path
 generators below use the richer `trippy.render.candidate.render_candidate` pipeline instead (per-frame
@@ -667,11 +678,16 @@ report.json's mtime -- no per-step timestamp is recorded, so this is a filesyste
 estimate, not instrumented), and the delivered Mac viewer launcher's filename (`n/a` for
 `candidate-report` runs, which never export a viewer bundle).
 
-**Held-out shade PSNR/SSIM/LPIPS is honestly "n/a" for every scanned run**: `Trainer.evaluate()`
-records one aggregate over the whole held-out split (forced-shade frames included), not a
-per-image breakdown, so there is no real number to show without fabricating one. Only the two
-fixed baseline rows below carry a real shade-only PSNR/SSIM/LPIPS split, because that split
-already exists in their own source experiment's per-bucket eval.
+**Held-out shade PSNR/SSIM/LPIPS**: `Trainer.evaluate()` records a per-image `shade`/`other` split
+(see "Standalone evaluation" above) -- `trippy.render.leaderboard.build_run_row` reads it from the
+run's own `report.json` (`heldout_split.shade`) first, else the last `metrics.jsonl` eval row's own
+`shade` key. A row still reads `n/a` when neither source has it, honestly: either the run predates
+this split (finished training before it was added) and hasn't been re-evaluated since, or the scene
+has neither `cfg.forced_heldout` nor any `SHADE_FRAMES_KK` frame in its held-out set. Run `trippy
+eval --checkpoint <run_dir>/checkpoints/checkpoint_latest.pt` against an existing checkpoint to
+backfill the split without retraining (it appends a fresh eval row `trippy leaderboard` then picks
+up). The two fixed baseline rows below always carry a real shade-only PSNR/SSIM/LPIPS split from
+their own source experiment's per-bucket eval, independent of any trippy-native run.
 
 Two fixed baseline rows are always included (not scanned -- neither is a trippy-native training
 run with its own `metrics.jsonl`), sourced verbatim from their own experiment READMEs:
@@ -701,7 +717,8 @@ under `runs/`) and only prints/records it.
 
 Tested on CPU against synthetic `runs/`/`experiments/` trees written directly under `tmp_path`
 (`tests/test_render_leaderboard.py`: both report.json layouts, missing/malformed fields, the sort
-order, the fixed baselines, markdown + PNG rendering; `tests/test_cli_leaderboard.py`: the
+order, the fixed baselines, markdown + PNG rendering, and the held-out shade column's own
+report-first/eval-row-fallback/`n/a` precedence; `tests/test_cli_leaderboard.py`: the
 `trippy leaderboard` subprocess end to end, `--deliver`'s dry-run safety, the `--out` default) --
 never a real scene, checkpoint, or PLY.
 

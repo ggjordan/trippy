@@ -31,10 +31,11 @@ worse than plain Gaussians in the shade, and as sharp everywhere else". A run na
 `(smoke)` was a queue-rehearsal run (a few epochs, proving the pipeline works), not a real result
 -- read it for "did the run complete", not for its numbers.
 
-One honest gap: the "held-out shade" PSNR/SSIM/LPIPS column is `n/a` for every real trippy run.
-The trainer only records one aggregate number over the whole held-out split (shade frames
-included), not a separate shade-only number, so there is nothing real to show there yet -- only
-the two fixed baseline rows (which come from a different, already-published experiment) have it.
+The "held-out shade" PSNR/SSIM/LPIPS column now fills in for real trippy runs too: the trainer
+records a separate shade-vs-other breakdown every time it evaluates (mid-training, `--report`, or a
+standalone re-eval). A row still reads `n/a` when the run finished training before this existed and
+hasn't been re-evaluated since -- ask for `trippy eval --checkpoint <run>/checkpoints/checkpoint_latest.pt`
+to be run against it (no retraining needed) and the next leaderboard rebuild will pick up the number.
 
 ## How to open a .command file
 

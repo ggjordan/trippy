@@ -212,6 +212,51 @@ def test_build_run_row_train_report_layout_matches_real_full1_broadcast_numbers(
     assert row["is_baseline"] is False
 
 
+def test_build_run_row_held_out_shade_reads_report_heldout_split_first(tmp_path: Path) -> None:
+    report = dict(_REAL_SHAPED_TRAIN_REPORT)
+    report["heldout_split"] = {
+        "shade": {"n": 6, "psnr": 12.5, "ssim": 0.30, "lpips": 0.60},
+        "other": {"n": 27, "psnr": 15.0, "ssim": 0.45, "lpips": 0.40},
+    }
+    # A stale eval row shows a different shade number -- report.json must win.
+    stale_metrics = _TRAIN_REPORT_METRICS + [
+        {"eval": True, "epoch": 39, "psnr_mean": 14.417, "shade": {"n": 6, "psnr": 1.0, "ssim": 0.1, "lpips": 0.1}}
+    ]
+    run_dir = _train_report_run(tmp_path / "runs", "EXP-A", "run-shade", report, stale_metrics)
+
+    row = lb.build_run_row(run_dir, tmp_path / "no_experiments")
+    assert row["cells"][7] == "12.50/0.300/0.600"
+
+
+def test_build_run_row_held_out_shade_falls_back_to_last_eval_row(tmp_path: Path) -> None:
+    # No heldout_split in report.json (an older report predating this feature) -- fall back to
+    # the last metrics.jsonl eval row's own "shade" key (written by a `trippy eval --checkpoint`
+    # re-run against the existing checkpoint).
+    metrics_rows = _TRAIN_REPORT_METRICS + [
+        {
+            "eval": True,
+            "epoch": 39,
+            "psnr_mean": 14.417,
+            "shade": {"n": 6, "psnr": 13.1, "ssim": 0.33, "lpips": 0.55},
+            "other": {"n": 27, "psnr": 14.9, "ssim": 0.40, "lpips": 0.45},
+        }
+    ]
+    run_dir = _train_report_run(
+        tmp_path / "runs", "EXP-A", "run-shade-fallback", _REAL_SHAPED_TRAIN_REPORT, metrics_rows
+    )
+
+    row = lb.build_run_row(run_dir, tmp_path / "no_experiments")
+    assert row["cells"][7] == "13.10/0.330/0.550"
+
+
+def test_build_run_row_held_out_shade_is_na_when_neither_source_has_it(tmp_path: Path) -> None:
+    run_dir = _train_report_run(
+        tmp_path / "runs", "EXP-A", "run-no-shade", _REAL_SHAPED_TRAIN_REPORT, _TRAIN_REPORT_METRICS
+    )
+    row = lb.build_run_row(run_dir, tmp_path / "no_experiments")
+    assert row["cells"][7] == "n/a"
+
+
 def test_build_run_row_candidate_report_layout_no_baseline_or_bundle(tmp_path: Path) -> None:
     # candidate-report's own report.json has no `held_out`/`epoch`/`bundle`/`deliveries` keys,
     # and its `audits` dict is flat (shade_audit/extent_gate directly, not nested under
