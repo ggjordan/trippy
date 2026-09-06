@@ -104,6 +104,24 @@ and any file modified within `--protect-seconds` (default
 still-running job just wrote is never raced. `--dry-run` prints exactly what
 would be deleted (and the total bytes that would free) without deleting
 anything.
+
+`apply-edits` and `edits <subcommand>` are the Python side of the viewer
+editor (docs/EDITOR.md, docs/decisions/ADR-0007-viewer-editing.md), so
+regions can be authored and published before the viewer's own UI exists.
+`edits shade-find`/`add-box`/`add-sphere`/`add-lid` append a `Region` to an
+`edits.json` file (created if missing) -- `shade-find` runs
+`trippy.edit.shade_finder` (built on `trippy.train.prune`'s exact audit
+functions) against a bundle's `points.npz` and a scene's shade frames;
+`add-box`/`add-sphere`/`add-lid` take the region's geometry straight from
+flags (`add-lid`'s defaults are the Karekare pool's already-fitted numbers,
+`~/Splats/tools/SURFACE_LID.md` Sec 3). `apply-edits --bundle <dir> --edits
+edits.json --out <dir>` (`trippy.edit.apply.apply_edits`) composes the
+edits' regions (`trippy.edit.weights`) against the bundle's TRIPS points,
+writes a filtered `points.npz` + `blend_weights.npy` + `edits_applied.json`
+into `--out`, and, when `bundle.json` names a `blend.splat_ply`, writes a
+filtered copy of that Gaussian PLY with the same regions' deleted splats
+removed (single-pass, header-preserving -- every original PLY property,
+including SH `f_rest_*`, survives). CPU-only; never touches MPS or Rust.
 """
 
 from __future__ import annotations
@@ -140,6 +158,14 @@ from trippy.constants import (
     DISTILL_MAX_JUMP_MULTIPLIER,
     DISTILL_SPARSE_DIRNAME,
     DOLLY_DEFAULT_POSE_NAME,
+    EDIT_JSON_FILENAME,
+    EDIT_KAREKARE_LID_BAND,
+    EDIT_KAREKARE_LID_CENTER,
+    EDIT_KAREKARE_LID_FALLOFF,
+    EDIT_KAREKARE_LID_HEIGHT,
+    EDIT_KAREKARE_LID_RADIUS,
+    EDIT_KAREKARE_LID_UP,
+    EDIT_REGION_OPS,
     EVAL_EXPOSURE_MODES,
     GIT_DESCRIBE_MATCH_PATTERN,
     MONODEPTH_DEFAULT_CONF0,
@@ -147,11 +173,18 @@ from trippy.constants import (
     MONODEPTH_DEFAULT_VOXEL,
     PARITY_DEFAULT_INDICES,
     PARITY_DEFAULT_NUM_LAYERS,
+    POINT_REMOVAL_DEFAULT_MODE,
+    POINT_REMOVAL_DEFAULT_REL_FACTOR,
+    POINT_REMOVAL_MODES,
     PRUNE_RUN_DEFAULT_PROTECT_SECONDS,
     RASTER_MODES,
     RASTER_NUM_LAYERS,
     RENDER_CACHE_SUBDIR,
     SHADE_FRAMES_KK,
+    SHADE_PRUNE_DEFAULT_CONF_THRESHOLD,
+    SHADE_PRUNE_DEFAULT_LUM_THRESHOLD,
+    SHADE_PRUNE_DEFAULT_ZFAR_FRAC,
+    SHADE_PRUNE_DEFAULT_ZNEAR_FRAC,
     SMOKE_MPS_TEST_TENSOR_LEN,
     TRAIN_CHECKPOINT_BEST_JSON_FILENAME,
     TRAIN_CHECKPOINT_DIRNAME,
@@ -762,6 +795,171 @@ def _cmd_bundle_parity(args: argparse.Namespace) -> int:
                     }
         report["views"].append(entry)
     print(json.dumps(report, indent=2))
+    return 0
+
+
+def _resolve_edits_path(edits_arg: str | None, bundle_dir: str | Path | None) -> Path:
+    """A bare filename (no path separators) resolves under `bundle_dir`; anything else is used as-is.
+
+    Mirrors `docs/EDITOR.md` Sec 1's "written next to bundle.json" default
+    while still accepting an explicit path elsewhere (EDITOR.md's own
+    `--edits <dir>/edits.json` example).
+    """
+    edits_path = Path(edits_arg or EDIT_JSON_FILENAME)
+    if bundle_dir is not None and not edits_path.is_absolute() and len(edits_path.parts) == 1:
+        edits_path = Path(bundle_dir) / edits_path
+    return edits_path
+
+
+def _load_or_create_edits(edits_path: Path, bundle_dir: str | None):
+    """Load an existing `edits.json`, or start a fresh one stamped with `bundle_dir`'s own format."""
+    from trippy.edit.model import EditDocument
+
+    if edits_path.exists():
+        return EditDocument.load(edits_path)
+    bundle_format = ""
+    if bundle_dir is not None:
+        bundle_json_path = Path(bundle_dir) / "bundle.json"
+        if bundle_json_path.exists():
+            bundle_format = json.loads(bundle_json_path.read_text()).get("format", "")
+    return EditDocument.new(bundle_format=bundle_format)
+
+
+def _cmd_apply_edits(args: argparse.Namespace) -> int:
+    """`trippy apply-edits --bundle <dir> [--edits edits.json] --out <dir>`: publish `edits.json`.
+
+    See `trippy.edit.apply.apply_edits` for what gets written; exit 2 (not
+    a traceback) on a missing edits file or a validation/geometry error, so
+    a malformed hand-edited `edits.json` reads as a normal CLI failure.
+    """
+    from trippy.edit.apply import apply_edits
+
+    bundle_dir = Path(args.bundle)
+    edits_path = _resolve_edits_path(args.edits, bundle_dir)
+    if not edits_path.exists():
+        print(f"trippy apply-edits: no edits file at {edits_path}", file=sys.stderr)
+        return 2
+    try:
+        summary = apply_edits(bundle_dir, edits_path, args.out)
+    except (ValueError, KeyError, FileNotFoundError) as exc:
+        print(f"trippy apply-edits: {exc}", file=sys.stderr)
+        return 2
+    print(json.dumps(summary, indent=2))
+    return 0
+
+
+def _cmd_edits_shade_find(args: argparse.Namespace) -> int:
+    """`trippy edits shade-find --bundle <dir> --scene <root> --frames a.jpg,b.jpg --out edits.json`."""
+    from trippy.edit.shade_finder import find_shade_pointset_in_bundle
+
+    frames = [name.strip() for name in args.frames.split(",") if name.strip()]
+    try:
+        region, summary = find_shade_pointset_in_bundle(
+            args.bundle,
+            args.scene,
+            frames,
+            znear_frac=args.znear_frac,
+            zfar_frac=args.zfar_frac,
+            lum_threshold=args.lum_threshold,
+            conf_threshold=args.conf_threshold,
+            mode=args.mode,
+            rel_factor=args.rel_factor,
+            name=args.name,
+        )
+    except (ValueError, FileNotFoundError) as exc:
+        print(f"trippy edits shade-find: {exc}", file=sys.stderr)
+        return 2
+
+    edits_path = Path(args.out)
+    edits = _load_or_create_edits(edits_path, args.bundle)
+    edits.add_region(region)
+    edits.save(edits_path)
+    print(json.dumps(summary, indent=2))
+    return 0
+
+
+def _cmd_edits_add_box(args: argparse.Namespace) -> int:
+    """`trippy edits add-box --edits edits.json --center x y z --half-extents hx hy hz [--quat w x y z]`."""
+    from trippy.edit.model import Region, new_region_id
+
+    edits_path = Path(args.edits)
+    try:
+        region = Region(
+            id=new_region_id(),
+            name=args.name,
+            kind="box",
+            params={"center": list(args.center), "half_extents": list(args.half_extents), "quat": list(args.quat)},
+            mix=args.mix,
+            op=args.op,
+        )
+    except ValueError as exc:
+        print(f"trippy edits add-box: {exc}", file=sys.stderr)
+        return 2
+    edits = _load_or_create_edits(edits_path, args.bundle)
+    edits.add_region(region)
+    edits.save(edits_path)
+    print(json.dumps(region.to_json(), indent=2))
+    return 0
+
+
+def _cmd_edits_add_sphere(args: argparse.Namespace) -> int:
+    """`trippy edits add-sphere --edits edits.json --center x y z --radius r`."""
+    from trippy.edit.model import Region, new_region_id
+
+    edits_path = Path(args.edits)
+    try:
+        region = Region(
+            id=new_region_id(),
+            name=args.name,
+            kind="sphere",
+            params={"center": list(args.center), "radius": args.radius},
+            mix=args.mix,
+            op=args.op,
+        )
+    except ValueError as exc:
+        print(f"trippy edits add-sphere: {exc}", file=sys.stderr)
+        return 2
+    edits = _load_or_create_edits(edits_path, args.bundle)
+    edits.add_region(region)
+    edits.save(edits_path)
+    print(json.dumps(region.to_json(), indent=2))
+    return 0
+
+
+def _cmd_edits_add_lid(args: argparse.Namespace) -> int:
+    """`trippy edits add-lid --edits edits.json [--up ... --height ... --center ... --radius ... --falloff ... --band ...]`.
+
+    Defaults are the Karekare pool's already-fitted, A/B-verified numbers
+    (`~/Splats/tools/SURFACE_LID.md` Sec 3) -- omit every geometry flag to
+    get that region exactly, per `docs/decisions/ADR-0007-viewer-editing.md`
+    Sec "2.".
+    """
+    from trippy.edit.model import Region, new_region_id
+
+    edits_path = Path(args.edits)
+    try:
+        region = Region(
+            id=new_region_id(),
+            name=args.name,
+            kind="lid",
+            params={
+                "up": list(args.up),
+                "height": args.height,
+                "center": list(args.center),
+                "radius": args.radius,
+                "falloff": args.falloff,
+                "band": args.band,
+            },
+            mix=args.mix,
+            op=args.op,
+        )
+    except ValueError as exc:
+        print(f"trippy edits add-lid: {exc}", file=sys.stderr)
+        return 2
+    edits = _load_or_create_edits(edits_path, args.bundle)
+    edits.add_region(region)
+    edits.save(edits_path)
+    print(json.dumps(region.to_json(), indent=2))
     return 0
 
 
@@ -1380,6 +1578,86 @@ def build_parser() -> argparse.ArgumentParser:
     )
     bundle_parity.add_argument("--device", choices=["cpu", "mps"], default=None, help="render device")
     bundle_parity.set_defaults(func=_cmd_bundle_parity)
+
+    apply_edits_p = sub.add_parser(
+        "apply-edits",
+        help="publish edits.json onto a bundle: delete points/Gaussians, write blend weights",
+    )
+    apply_edits_p.add_argument("--bundle", required=True, help="bundle directory (holds bundle.json + points.npz)")
+    apply_edits_p.add_argument(
+        "--edits",
+        default=None,
+        help="edits.json path, or a bare filename resolved under --bundle (default: edits.json)",
+    )
+    apply_edits_p.add_argument(
+        "--out",
+        required=True,
+        help="output directory (bundle.json + points.npz + blend_weights.npy + edits_applied.json"
+        "[, filtered splat ply]; may equal --bundle for an in-place publish)",
+    )
+    apply_edits_p.set_defaults(func=_cmd_apply_edits)
+
+    edits_cmd = sub.add_parser("edits", help="author edits.json regions from the command line")
+    edits_sub = edits_cmd.add_subparsers(dest="edits_command", required=True)
+
+    shade_find = edits_sub.add_parser(
+        "shade-find",
+        help="select dark, low-confidence points in the shade audit region as a pointset region",
+    )
+    shade_find.add_argument("--bundle", required=True, help="bundle directory (reads points.npz for xyz/feat/conf)")
+    shade_find.add_argument("--scene", required=True, help="scene root (resolves sparse/0 or sparse_txt)")
+    shade_find.add_argument("--frames", required=True, help="comma-separated shade-frame image filenames")
+    shade_find.add_argument("--znear-frac", type=float, default=SHADE_PRUNE_DEFAULT_ZNEAR_FRAC)
+    shade_find.add_argument("--zfar-frac", type=float, default=SHADE_PRUNE_DEFAULT_ZFAR_FRAC)
+    shade_find.add_argument("--lum-threshold", type=float, default=SHADE_PRUNE_DEFAULT_LUM_THRESHOLD)
+    shade_find.add_argument("--conf-threshold", type=float, default=SHADE_PRUNE_DEFAULT_CONF_THRESHOLD)
+    shade_find.add_argument("--mode", choices=POINT_REMOVAL_MODES, default=POINT_REMOVAL_DEFAULT_MODE)
+    shade_find.add_argument("--rel-factor", type=float, default=POINT_REMOVAL_DEFAULT_REL_FACTOR)
+    shade_find.add_argument("--name", default="shade cloud", help="region name")
+    shade_find.add_argument("--out", required=True, help="edits.json to update (created if missing)")
+    shade_find.set_defaults(func=_cmd_edits_shade_find)
+
+    add_box = edits_sub.add_parser("add-box", help="append an (optionally rotated) box region")
+    add_box.add_argument("--edits", required=True, help="edits.json to update (created if missing)")
+    add_box.add_argument("--bundle", default=None, help="bundle dir, to stamp bundle_format if edits.json is new")
+    add_box.add_argument("--center", type=float, nargs=3, required=True, metavar=("X", "Y", "Z"))
+    add_box.add_argument("--half-extents", type=float, nargs=3, required=True, metavar=("HX", "HY", "HZ"))
+    add_box.add_argument(
+        "--quat", type=float, nargs=4, default=[1.0, 0.0, 0.0, 0.0], metavar=("W", "X", "Y", "Z"),
+        help="orientation (w, x, y, z); default is axis-aligned",
+    )  # fmt: skip
+    add_box.add_argument("--name", default="box")
+    add_box.add_argument("--mix", type=float, default=1.0)
+    add_box.add_argument("--op", choices=EDIT_REGION_OPS, default="blend")
+    add_box.set_defaults(func=_cmd_edits_add_box)
+
+    add_sphere = edits_sub.add_parser("add-sphere", help="append a sphere region")
+    add_sphere.add_argument("--edits", required=True, help="edits.json to update (created if missing)")
+    add_sphere.add_argument("--bundle", default=None, help="bundle dir, to stamp bundle_format if edits.json is new")
+    add_sphere.add_argument("--center", type=float, nargs=3, required=True, metavar=("X", "Y", "Z"))
+    add_sphere.add_argument("--radius", type=float, required=True)
+    add_sphere.add_argument("--name", default="sphere")
+    add_sphere.add_argument("--mix", type=float, default=1.0)
+    add_sphere.add_argument("--op", choices=EDIT_REGION_OPS, default="blend")
+    add_sphere.set_defaults(func=_cmd_edits_add_sphere)
+
+    add_lid = edits_sub.add_parser(
+        "add-lid", help="append a lid region (defaults: the Karekare pool's fitted numbers)"
+    )
+    add_lid.add_argument("--edits", required=True, help="edits.json to update (created if missing)")
+    add_lid.add_argument("--bundle", default=None, help="bundle dir, to stamp bundle_format if edits.json is new")
+    add_lid.add_argument("--up", type=float, nargs=3, default=list(EDIT_KAREKARE_LID_UP), metavar=("UX", "UY", "UZ"))
+    add_lid.add_argument("--height", type=float, default=EDIT_KAREKARE_LID_HEIGHT)
+    add_lid.add_argument(
+        "--center", type=float, nargs=3, default=list(EDIT_KAREKARE_LID_CENTER), metavar=("X", "Y", "Z")
+    )
+    add_lid.add_argument("--radius", type=float, default=EDIT_KAREKARE_LID_RADIUS)
+    add_lid.add_argument("--falloff", type=float, default=EDIT_KAREKARE_LID_FALLOFF)
+    add_lid.add_argument("--band", type=float, default=EDIT_KAREKARE_LID_BAND)
+    add_lid.add_argument("--name", default="pool lid")
+    add_lid.add_argument("--mix", type=float, default=1.0)
+    add_lid.add_argument("--op", choices=EDIT_REGION_OPS, default="delete")
+    add_lid.set_defaults(func=_cmd_edits_add_lid)
 
     leaderboard = sub.add_parser(
         "leaderboard",

@@ -3,6 +3,34 @@ All notable changes to trippy. Format: Keep a Changelog. Versions: semver tags `
 
 ## [Unreleased]
 ### Added
+- **Viewer editor, Python side (`docs/EDITOR.md`, ADR-0007): `edits.json`, weight
+  composition, the shade-cloud finder, and `trippy apply-edits`, ahead of the Rust
+  viewer UI.** New `trippy/edit/` package: `model.py` (`Region` — box/sphere/lid/
+  pointset, `mix`/`op`/`enabled` — and `EditDocument`, an ordered region list plus
+  an append-only undo log with a cursor, plus vectorised numpy membership tests
+  incl. an oriented box and the lid's falloff/band ramp); `weights.py` (per-point
+  blend-weight composition: gate default, then `blend`/`delete`/`fade` regions in
+  paint order, with `delete` permanent against a later `blend`/`fade`);
+  `shade_finder.py` (the shade-cloud finder, built directly on `trippy.train.
+  prune`'s exact audit functions, returning a `pointset` region + a summary whose
+  `mass_fraction` matches the audit's own number to float precision); `apply.py`
+  (`trippy apply-edits`'s implementation, incl. a single-pass, header-preserving
+  Gaussian PLY filter that never loads a ~2 GB PLY twice).
+  - `box`'s schema is `center`/`half_extents`/`quat` (an oriented box), a
+    deliberate, documented deviation from `docs/EDITOR.md`'s original
+    axis-aligned-only `min`/`max`.
+  - New CLI: `trippy apply-edits --bundle <dir> [--edits edits.json] --out <dir>`
+    (deletes points/Gaussians, writes `blend_weights.npy` + `edits_applied.json` +
+    a filtered splat PLY when `bundle.json` names one) and `trippy edits
+    shade-find/add-box/add-sphere/add-lid` (author `edits.json` regions from the
+    command line; `add-lid` defaults to the Karekare pool's already-fitted
+    numbers, `~/Splats/tools/SURFACE_LID.md` Sec 3).
+  - 46 new CPU tests (`tests/test_edit_model.py`, `test_edit_weights.py`,
+    `test_edit_shade_finder.py`, `test_edit_apply.py`, `test_cli_edits.py`),
+    synthetic fixtures only. See `docs/EXPERIMENTS.md` "Edits" for the worked run
+    and the full list of what is/isn't implemented vs. `docs/EDITOR.md`'s
+    milestones (the Rust viewer render integration and selection-tool UI are not
+    part of this change).
 - **The blend gate: the splat-vs-TRIPS mix is now an explicit, measurable, adjustable tensor
   (`hybrid.gate`, off by default).** Hybrid design A feeds the Gaussian render into the U-Net as
   *input*, so how much of a finished pixel came from the splat and how much from the TRIPS
