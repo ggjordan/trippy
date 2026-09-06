@@ -27,7 +27,8 @@ Last updated: 2026-09-06 (fix/viewer-kk session; previous: web-perf)
 ## In flight
 - GPU queue (prio 70, filename order): exp0010-removal (running), exp0010-shade-prune, full2-trips-resume, full3-alt-bc, full3-alt, hybrid-a-all-levels-bc, hybrid-a-all-levels, kkv2-0-smoke, kkv2-1-full-masked, kkv2-2-full-unmasked, kkv2-3-removal, kkv2-4-render-1/2/3, kkv2-5-hybrid, removal-rel, union-broadcast, union-trips. Roughly two days of GPU. Each training self-delivers a viewer launcher + audit table.
 - Worktrees that MUST stay until their queued jobs finish (job scripts cd into them): .worktrees/karekare-v2 (kkv2-0..6 jobs), .worktrees/blend-gate (kkv2-7-hybrid-gate + blend-gate-viewer2/3). point-removal's jobs are done: remove it. Remove with scripts/worktree_rm.sh.
-- No subagents running.
+- feat/live-splat (large/high): brush-render inside trips-viewer so blend/split work at any pose.
+- feat/edits-model (mid/high): edits.json model, region maths, shade-cloud finder, `trippy apply-edits` (Python side of the editor, ADR-0007 E1/E2/E6).
 
 ## Next (in order)
 1. Merge scene-io + points; launch feat/raster (large/high: numpy reference + Metal blend_fwd + pyramid forward) and feat/net (mid/high: U-Net + tone mapper ports) once TRIPS_REFERENCE.md lands.
