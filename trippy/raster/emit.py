@@ -68,6 +68,12 @@ EMIT_MODES = RASTER_MODES
 PIXEL_CENTERS = RASTER_PIXEL_CENTERS
 PYRAMID_HALVINGS = RASTER_PYRAMID_HALVINGS
 
+# Emission implementations. Both compute the same Fragments bit-for-bit
+# (tests/test_raster_emit_impl.py); "vectorised" builds one (L, M, 4) block
+# over the culled points, "loop" is the original per-layer Python loop kept as
+# the readable reference and the A/B baseline for tools/profile_raster.py.
+EMIT_IMPLS = ("vectorised", "loop")
+
 # Continuous-coordinate offset subtracted before `floor` to find the 2x2
 # footprint's base pixel, per pixel-centre convention (RASTER_PIXEL_CENTERS).
 _CENTRE_SHIFT = {"half": 0.5, "integer": 0.0}
@@ -459,6 +465,7 @@ def emit_fragments(
     valid: Tensor | None = None,
     alpha_min: float = RASTER_ALPHA_MIN,
     pixel_center: str = "half",
+    impl: str = "vectorised",
 ) -> Fragments:
     """Emit bilinear fragments for every (point, layer) pair the point covers.
 
@@ -530,10 +537,54 @@ def emit_fragments(
             such floor; pass 0.0 for an exact port (every in-bounds corner
             then takes a slot in the 16-deep list, even at weight 0).
         pixel_center: "half" or "integer" (see PIXEL_CENTERS).
+        impl: which implementation runs. "vectorised" (default) handles
+            every layer in one (L, M, ...) block over the M culled points;
+            "loop" is the original per-layer Python loop. The two return
+            bit-identical Fragments -- same order, same values -- and are
+            checked against each other in tests/test_raster_emit_impl.py;
+            only their cost differs, and only really on MPS, where a tensor
+            shape the backend has not seen before costs several times a
+            repeat (docs/ARCHITECTURE.md "Emission cost"). "loop" is kept as
+            the readable statement of the rule and as the A/B baseline for
+            tools/profile_raster.py.
 
     Returns:
         Fragments (unsorted; ordering is by layer, then by input point index,
         then by footprint corner).
+    """
+    if mode not in EMIT_MODES:
+        raise ValueError(f"mode must be one of {EMIT_MODES}, got {mode!r}")
+    if pixel_center not in PIXEL_CENTERS:
+        raise ValueError(f"pixel_center must be one of {PIXEL_CENTERS}, got {pixel_center!r}")
+    if impl not in EMIT_IMPLS:
+        raise ValueError(f"impl must be one of {EMIT_IMPLS}, got {impl!r}")
+    args = (uv, depth, size_px, conf, grid, mode, valid, alpha_min, pixel_center)
+    if impl == "loop":
+        return _emit_fragments_loop(*args)
+    return _emit_fragments_vectorised(*args)
+
+
+def _emit_fragments_loop(
+    uv: Tensor,
+    depth: Tensor,
+    size_px: Tensor,
+    conf: Tensor,
+    grid: LayerGrid,
+    mode: str,
+    valid: Tensor | None,
+    alpha_min: float,
+    pixel_center: str,
+) -> Fragments:
+    """Original per-layer loop emission. See emit_fragments for the contract.
+
+    Kept because it is the readable statement of the layer rule and the
+    reference the vectorised path is checked against
+    (tests/test_raster_emit_impl.py). It is no longer the default: on MPS it
+    costs one `torch.nonzero`, six boolean-mask gathers and one
+    `bool(keep.any())` readback per layer, and in mode "trips" it evaluates
+    the four-corner gate -- and `layer_factor`, and `layer_bounds` inside it
+    -- over all N points at every layer instead of over the M points the cull
+    kept.
     """
     if mode not in EMIT_MODES:
         raise ValueError(f"mode must be one of {EMIT_MODES}, got {mode!r}")
@@ -646,6 +697,280 @@ def emit_fragments(
     )
 
 
+def _empty_fragments(dtype: torch.dtype, device: torch.device, grid: LayerGrid) -> Fragments:
+    """A zero-length Fragments on the given dtype/device (shared exit path)."""
+    empty_i = torch.zeros(0, dtype=torch.int64, device=device)
+    empty_f = torch.zeros(0, dtype=dtype, device=device)
+    return Fragments(
+        layer_pixel=empty_i,
+        layer=empty_i.clone(),
+        pixel=empty_i.clone(),
+        depth=empty_f,
+        point_id=empty_i.clone(),
+        alpha=empty_f.clone(),
+        grid=grid,
+    )
+
+
+def _layer_factor_grid(
+    size_px: Tensor,
+    lower: Tensor,
+    upper: Tensor,
+    layer: Tensor,
+    num_layers: int,
+) -> Tensor:
+    """`layer_factor` evaluated for every (point, layer) pair in one shot.
+
+    Bit-identical to `layer_factor(size_px, l, num_layers)` called once per
+    layer: the arithmetic on each element is the same expression applied to
+    the same values; only the broadcast shape differs. The size-dependent
+    terms are computed once on (M,) and broadcast over the layer axis, which
+    is the whole point -- the loop version recomputed `exp`, two `pow`s and a
+    divide L times over the same sizes.
+
+    Args:
+        size_px: (M,) float, projected point size in layer-0 pixels.
+        lower, upper: (M,) int64 from `layer_bounds(size_px, num_layers)`.
+        layer: (L, 1) int64, the layer indices to evaluate at.
+        num_layers: L.
+
+    Returns:
+        (L, M) float, same dtype/device as `size_px`.
+    """
+    m = int(size_px.shape[0])
+    one = torch.ones_like(size_px)
+
+    # Sub-pixel branch; exp() on a clamped size so unused lanes cannot overflow.
+    small = (1.0 - RASTER_SMALL_POINT_CUTOFF) * torch.exp(
+        torch.clamp(size_px, max=1.0) - 1.0
+    ) + RASTER_SMALL_POINT_CUTOFF
+
+    lo_pow = torch.pow(torch.full_like(size_px, 2.0), lower.to(size_px.dtype))
+    hi_pow = torch.pow(torch.full_like(size_px, 2.0), upper.to(size_px.dtype))
+    denom = hi_pow - lo_pow
+    denom_safe = torch.where(denom == 0, torch.ones_like(denom), denom)
+
+    lower_r = lower.reshape(1, m)
+    upper_r = upper.reshape(1, m)
+    one_r = one.reshape(1, m)
+    interp = ((size_px - lo_pow) / denom_safe).reshape(1, m)
+    interp = torch.where(lower_r == layer, 1.0 - interp, interp)
+    # Dead in practice (see layer_factor), kept for source fidelity.
+    interp = torch.where(lower_r == num_layers - 1, one_r, interp)
+    factor = torch.where(lower_r == upper_r, one_r, interp)
+    factor = torch.where(upper_r == 0, small.reshape(1, m), factor)
+    return torch.where(lower_r > layer, one_r, factor)
+
+
+def _emit_fragments_vectorised(
+    uv: Tensor,
+    depth: Tensor,
+    size_px: Tensor,
+    conf: Tensor,
+    grid: LayerGrid,
+    mode: str,
+    valid: Tensor | None,
+    alpha_min: float,
+    pixel_center: str,
+) -> Fragments:
+    """Layer-vectorised emission. Same contract and same output as the loop.
+
+    Three structural differences from `_emit_fragments_loop`, all of them
+    pure cost, not semantics (tests/test_raster_emit_impl.py asserts the two
+    return identical tensors):
+
+    1. **The number of distinct tensor shapes per render drops from ~5 to 1.**
+       This is the one that matters, and it is why mode "trips" cost 1.5x a
+       mode "broadcast" training step on MPS despite emitting 2.7x FEWER
+       fragments. The loop version's per-layer tensors are sized by how
+       many points that layer selected, and in modes "trips"/"trilinear" that
+       count differs per layer *and* moves every training step as the crop
+       moves; in mode "broadcast" all five layers select the same rows, so
+       one shape serves them all. MPS charges 6-9x for an elementwise kernel
+       on a shape it has not seen before (measured, tools/profile_raster.py
+       --shape-probe), so the two modes were paying very different amounts of
+       that tax: with the camera moving, mode "trips"'s rasteriser cost rose
+       56% over its own frozen-camera cost and "trilinear"'s 76%, while
+       "broadcast"'s rose 1%. Here there is one M for the whole render, and
+       the three modes finally rank by their fragment counts. See
+       docs/ARCHITECTURE.md "Emission cost".
+    2. The point set is compacted to the `valid` rows **once**, before
+       anything per-layer runs. The loop version evaluates mode "trips"'s
+       four-corner gate -- and `layer_factor`, and the `layer_bounds` inside
+       it -- over all N points at every layer, because it reads the gate off
+       the full-length `uv`; but `alive` starts at `valid`, so the gate can
+       only ever matter on rows the cull already kept.
+    3. Per layer the loop version issues one `torch.nonzero`, six
+       boolean-mask gathers (each an implicit `nonzero`) and one
+       `bool(keep.any())` readback -- 40 data-dependent operations for L=5,
+       every one of which drains the MPS command queue. Here there are 3,
+       and the fragment count is only read back once.
+
+    What is deliberately kept from the loop: the bilinear weights and the
+    alpha are evaluated **per emitted fragment**, not for all (L, M, 4)
+    candidates, so mode "trips" does not pay for the coarse layers a point
+    never writes. That is why emission runs in three passes -- geometry,
+    then alpha, then the alpha floor -- rather than one.
+
+    Layout note: every intermediate is (L, M) or (L, M, 4) with the layer
+    axis FIRST, so `torch.nonzero` enumerates fragments in exactly the loop's
+    order (layer, then input point index, then footprint corner). The
+    fragment order is load-bearing: the depth sort is stable, so ties would
+    otherwise composite in a different order.
+    """
+    num_layers = len(grid.shapes)
+    device = uv.device
+    dtype = uv.dtype
+    centre_shift = _CENTRE_SHIFT[pixel_center]
+
+    if valid is None:
+        point_id = torch.arange(uv.shape[0], dtype=torch.int64, device=device)
+    else:
+        point_id = torch.nonzero(valid, as_tuple=False).reshape(-1)
+    m = int(point_id.shape[0])
+    if m == 0:
+        return _empty_fragments(dtype, device, grid)
+
+    uv_v = uv.index_select(0, point_id)
+    size_v = size_px.index_select(0, point_id)
+    conf_v = conf.index_select(0, point_id)
+    depth_v = depth.index_select(0, point_id)
+
+    heights = [s[0] for s in grid.shapes]
+    widths = [s[1] for s in grid.shapes]
+    scale = torch.tensor(
+        [1.0 / float(1 << layer) for layer in range(num_layers)], dtype=dtype, device=device
+    ).reshape(num_layers, 1)
+    w_i = torch.tensor(widths, dtype=torch.int64, device=device)
+    h_i = torch.tensor(heights, dtype=torch.int64, device=device)
+    off_i = torch.tensor(grid.offsets, dtype=torch.int64, device=device)
+    layer_ids = torch.arange(num_layers, dtype=torch.int64, device=device).reshape(num_layers, 1)
+
+    # u and v are kept as separate (L, M) tensors rather than one (L, M, 2):
+    # every later use is per-axis, and a stride-2 slice of a big MPS tensor is
+    # materialised on every read.
+    centred_u = uv_v[:, 0].reshape(1, m) * scale - centre_shift
+    centred_v = uv_v[:, 1].reshape(1, m) * scale - centre_shift
+    base_u = torch.floor(centred_u)
+    base_v = torch.floor(centred_v)
+    frac_u = centred_u - base_u
+    frac_v = centred_v - base_v
+    base_ui = base_u.to(torch.int64)
+    base_vi = base_v.to(torch.int64)
+
+    selected: Tensor | None
+    factor: Tensor | None
+    if mode == "broadcast":
+        # Every layer, factor 1: neither `layer_bounds` nor `layer_factor` is
+        # reachable, so neither is computed.
+        selected = None
+        factor = None
+    else:
+        lower, upper = layer_bounds(size_v, num_layers)
+        if mode == "trips":
+            w_gate = torch.tensor(
+                [float(w - 2) for w in widths], dtype=dtype, device=device
+            ).reshape(num_layers, 1)
+            h_gate = torch.tensor(
+                [float(h - 2) for h in heights], dtype=dtype, device=device
+            ).reshape(num_layers, 1)
+            fits = (base_u >= 0.0) & (base_u <= w_gate) & (base_v >= 0.0) & (base_v <= h_gate)
+            # TRIPS `break`s out of its layer loop, so a failed gate suppresses
+            # every coarser layer too: alive[l] = fits[0] & ... & fits[l].
+            alive_rows = [fits[0]]
+            for layer in range(1, num_layers):
+                alive_rows.append(alive_rows[-1] & fits[layer])
+            selected = torch.stack(alive_rows, dim=0) & (upper.reshape(1, m) >= layer_ids)
+        else:  # "trilinear"
+            selected = (lower.reshape(1, m) <= layer_ids) & (layer_ids <= upper.reshape(1, m))
+        factor = _layer_factor_grid(size_v, lower, upper, layer_ids, num_layers)
+
+    # --- pass 1: geometry, which needs no bilinear weight ---
+    #
+    # `base + d < size` and `base + d >= 0` are, for integers, `base < size - d`
+    # and `base >= -d`; testing it that way keeps this in the (L, M) domain
+    # instead of materialising two (L, M, 2) int64 corner tensors.
+    w_l = w_i.reshape(num_layers, 1)
+    h_l = h_i.reshape(num_layers, 1)
+    ok_x = torch.stack(
+        [(base_ui >= 0) & (base_ui < w_l), (base_ui >= -1) & (base_ui < w_l - 1)], dim=-1
+    )
+    ok_y = torch.stack(
+        [(base_vi >= 0) & (base_vi < h_l), (base_vi >= -1) & (base_vi < h_l - 1)], dim=-1
+    )
+    # A no-op in mode "trips" (its `fits` gate already guarantees all four
+    # corners are inside), the drop rule everywhere else.
+    keep = (ok_y.unsqueeze(-1) & ok_x.unsqueeze(-2)).reshape(num_layers, m, 4)
+    if selected is not None:
+        keep = keep & selected.unsqueeze(-1)
+
+    # `as_tuple=False` on the 3-D mask hands back the (layer, point-row, corner)
+    # triple directly, so every offset below is multiply-add -- no integer
+    # division. `nonzero` enumerates row-major, i.e. layer, then point, then
+    # corner: exactly the loop implementation's fragment order.
+    nz = torch.nonzero(keep, as_tuple=False)
+    if int(nz.shape[0]) == 0:
+        return _empty_fragments(dtype, device, grid)
+    # Contiguous copies, not stride-3 views: each column is read several times
+    # below, and a strided read of a multi-million-element MPS tensor is
+    # materialised every time.
+    frag_layer = nz[:, 0].contiguous()
+    frag_row = nz[:, 1].contiguous()
+    corner = nz[:, 2].contiguous()
+
+    # --- pass 2: alpha, on the survivors only ---
+    #
+    # This is the loop implementation's one real economy and it is kept: the
+    # 2x2 weights are evaluated per *fragment*, never for the (L, M, 4) pairs
+    # the geometry already threw away. In mode "trips" that is ~3x fewer
+    # multiplies, because a point only writes layers 0..layer_higher.
+    dx = torch.tensor(_CORNER_DX, dtype=torch.int64, device=device)
+    dy = torch.tensor(_CORNER_DY, dtype=torch.int64, device=device)
+    corner_dx = dx.index_select(0, corner)
+    corner_dy = dy.index_select(0, corner)
+    lm = frag_layer * m + frag_row
+
+    frag_frac_u = frac_u.reshape(-1).index_select(0, lm)
+    frag_frac_v = frac_v.reshape(-1).index_select(0, lm)
+    # `1 - frac` for the near corner, `frac` for the far one -- the two columns
+    # of the loop version's `wx` / `wy`, picked per fragment.
+    weight_x = torch.where(corner_dx == 0, 1.0 - frag_frac_u, frag_frac_u)
+    weight_y = torch.where(corner_dy == 0, 1.0 - frag_frac_v, frag_frac_v)
+    # Multiplication order is `(beta * conf) * factor` exactly as in the loop:
+    # `beta` is `wy * wx`, not `wx * wy`, and float multiply is not associative.
+    alpha = weight_y * weight_x * conf_v.index_select(0, frag_row)
+    if factor is not None:
+        alpha = alpha * factor.reshape(-1).index_select(0, lm).to(dtype)
+    # (mode "broadcast"'s factor is exactly 1.0, and `x * 1.0 == x` for every
+    # float, so skipping that multiply changes no bit of the result.)
+
+    # --- pass 3: the alpha floor ---
+    surviving = torch.nonzero(alpha >= alpha_min, as_tuple=False).reshape(-1)
+    if int(surviving.shape[0]) == 0:
+        return _empty_fragments(dtype, device, grid)
+    if int(surviving.shape[0]) != int(alpha.shape[0]):
+        frag_layer = frag_layer.index_select(0, surviving)
+        frag_row = frag_row.index_select(0, surviving)
+        corner_dx = corner_dx.index_select(0, surviving)
+        corner_dy = corner_dy.index_select(0, surviving)
+        lm = lm.index_select(0, surviving)
+        alpha = alpha.index_select(0, surviving)
+
+    px = base_ui.reshape(-1).index_select(0, lm) + corner_dx
+    py = base_vi.reshape(-1).index_select(0, lm) + corner_dy
+    pixel = py * w_i.index_select(0, frag_layer) + px
+
+    return Fragments(
+        layer_pixel=pixel + off_i.index_select(0, frag_layer),
+        layer=frag_layer,
+        pixel=pixel,
+        depth=depth_v.index_select(0, frag_row),
+        point_id=point_id.index_select(0, frag_row),
+        alpha=alpha,
+        grid=grid,
+    )
+
+
 @dataclass
 class SortedFragments:
     """Fragments ordered by (layer, pixel, depth) plus their segment offsets.
@@ -695,6 +1020,7 @@ def build_sorted_fragments(
     sort_stable: bool = True,
     pose_delta: Tensor | None = None,
     pixel_center: str = "half",
+    emit_impl: str = "vectorised",
 ) -> SortedFragments:
     """Project -> cull -> emit -> sort -> segment, the whole pre-compositing pipeline.
 
@@ -717,6 +1043,8 @@ def build_sorted_fragments(
         pose_delta: optional (6,) SE(3) twist refining `(R, t)`; see
             apply_pose_delta. Differentiable.
         pixel_center: "half" or "integer" (see emit_fragments).
+        emit_impl: one of EMIT_IMPLS; "loop" selects the original per-layer
+            emission, which is bit-identical and slower (see emit_fragments).
 
     Returns:
         SortedFragments on the same device/dtype as the inputs.
@@ -733,8 +1061,17 @@ def build_sorted_fragments(
         valid=valid,
         alpha_min=alpha_min,
         pixel_center=pixel_center,
+        impl=emit_impl,
     )
-    perm = sort_fragments(frags.layer_pixel, frags.depth, method=sort_method, stable=sort_stable)
+    # `grid.total - 1` is emission's own hard bound on layer_pixel, so handing it
+    # to the sort removes the composite key's `.max().item()` synchronisation.
+    perm = sort_fragments(
+        frags.layer_pixel,
+        frags.depth,
+        method=sort_method,
+        stable=sort_stable,
+        max_layer_pixel=grid.total - 1,
+    )
     layer_pixel = frags.layer_pixel.index_select(0, perm)
     offsets = segment_offsets(layer_pixel, grid.total, method=segment_method)
     return SortedFragments(

@@ -1812,3 +1812,67 @@ the areas I want". Artefacts: `$SPLATS_ROOT/tools/gpu_queue/logs/trippy-viewer-k
 - 2026-09-06T05:16:01Z delivered trips-leaderboard: One table of every TRIPS run so far vs the Gaussian baseline: held-out PSNR, shade dark-mass, extent, coverage. Regenerated after every training. (/Users/nzbirdranch/trippy/output/leaderboard/leaderboard.png)
 
 - 2026-09-06T05:30Z eval-neighbours-full2 rc 0: neighbour-exposure eval (TRIPS interpolate_eval_settings port): full2-broadcast all 17.12/0.454/0.416, shade 15.27/0.395/0.502 (strict own-exposure 15.02/8.49); full1-broadcast all 15.60, shade 12.27. Gaussian baseline 15.53/14.94. Leaderboard regenerated + delivered.
+- 2026-09-06T03:12:56Z submitted job trippy-trips-perf-1 prio 12: python tools/profile_raster.py --device mps --crop 384 --repeat 5 --warmup 2 --micro --json /Users/nzbirdranch/trippy/output/profile/trips-perf-1.json
+- 2026-09-06T03:34:32Z submitted job trippy-trips-perf-2 prio 12: python tools/profile_raster.py --device mps --skip-stages --train-steps 20 --train-warmup 3 --train-impls vectorised,loop --train-configs experiments/EXP-0003-kk-trips-train/config_full2_trips.yaml,experiments/EXP-0003-kk-trips-train/config_full2_broadcast.yaml --json /Users/nzbirdranch/trippy/output/profile/trips-perf-2.json
+- 2026-09-06T03:36:19Z submitted job trippy-trips-perf-3 prio 12: bash -c python -m pytest -q -m gpu tests && python tools/profile_raster.py --device mps --crop 384 --repeat 5 --warmup 2 --micro --json /Users/nzbirdranch/trippy/output/profile/trips-perf-3.json
+
+- 2026-09-06T~04:00Z **Why does mode `trips` train ~7x slower per step than `broadcast` on MPS? (perf/trips-mode)**
+  Question: EXP-0003 full2-broadcast ran 300 epochs / 55.8k steps in 3.2 h (0.21 s/step); full2-trips, the
+  same config with `mode: trips`, ran 21 epochs in 94 min (~1.4 s/step) before it was stopped. Both write
+  into up to 5 layers per point, so the fragment counts should be comparable.
+  Harness: new `tools/profile_raster.py` — loads the run's real point set (kk-coherent `kkc_15000.ply`,
+  min_opacity 0.05, kNN sizes, 5,736,619 points, cached as .npz), takes one real 384-px K-adjusted crop,
+  and times project / cull / emit / sort / segment / blend-fwd / backward per stage with
+  `torch.mps.synchronize()` around each, for every (mode, emission implementation) pair, plus
+  micro-benchmarks of the individual torch ops and a *shape probe* (same op on a repeated shape vs on a
+  shape the process has never used).
+  **Three findings kill the obvious hypotheses.** (1) Mode `trips` emits **fewer** fragments than
+  `broadcast`, not more: 9.02M vs 24.61M from the same 1.43M culled points (6.3 vs 17.2 per point);
+  `trilinear` 7.87M. There is no fragment explosion. (2) On CPU, at the same real scale, `trips` is
+  *cheaper* than `broadcast` end to end (1.62 s vs 3.76 s for one crop's forward+backward), so the 10x is
+  MPS-only. (3) Point sizes did not drift during the run (`softplus(raw_size)` median 0.01226 at both
+  epoch 0 and epoch 20), so nothing grew into the coarse layers.
+  **Root cause: the number of distinct tensor shapes per render, not the amount of work.** MPS charges
+  ~8x for an elementwise kernel on a shape the process has not used before (3.19 ms vs 0.36 ms for
+  `floor(x * 0.5)` on 1.43M rows). The old `emit_fragments` looped over layers and sized each layer's
+  tensors by how many points that layer selected. In `broadcast` all five layers select the same rows, so
+  one shape serves the whole render; in `trips`/`trilinear` the five counts differ *and* move every step
+  as the crop moves. Measured as the gap between a frozen and a moving camera (rasteriser fwd+bwd, ms):
+  `broadcast` 118.5 -> 119.6 (+1%), `trips` 81.8 -> **127.3** (+56%), `trilinear` 71.9 -> **126.7**
+  (+76%). Two secondary costs came with the same loop: mode `trips`'s four-corner gate (and
+  `layer_factor`, and `layer_bounds` inside it) was evaluated over all 5.74M points at *every* layer
+  instead of over the 1.43M the cull kept, and each layer cost one `torch.nonzero`, six boolean-mask
+  gathers and one `keep.any()` readback — 40 queue drains per render at L=5.
+  **Fix (bit-identical, `tests/test_raster_emit_impl.py` asserts equal tensors in equal order):**
+  `emit_fragments(..., impl="vectorised")`, now the default — compact the culled points once, do all L
+  layers as one layer-major `(L, M, ...)` block, and compact with `torch.nonzero` (geometry, then alpha
+  on the survivors only, then the alpha floor). One data-dependent shape per render instead of five, and
+  3 readbacks instead of 40. `impl="loop"` keeps the original as the readable statement of the rule and
+  the A/B baseline. `sort_fragments` also gained `max_layer_pixel=` so `build_sorted_fragments` can hand
+  it `grid.total - 1` instead of paying a `.max().item()` sync.
+  **Results (job `trippy-trips-perf-3`, moving camera, rasteriser fwd+bwd, ms):** `broadcast`
+  119.6 -> **108.4**, `trips` 127.3 -> **79.6**, `trilinear` 126.7 -> **65.6**. The three modes now
+  rank by the work they do (7.87M < 9.02M < 24.61M fragments) instead of by how many shapes they
+  churn. Whole `Trainer.train_step` on the real EXP-0003 configs (job `trippy-trips-perf-2`, 20 timed
+  steps, median s): `trips` **0.164 -> 0.100**, `broadcast` **0.109 -> 0.090**; a `trips` step goes
+  from **1.50x** a `broadcast` step to **1.11x**. GPU parity: `pytest -m gpu tests` **74 passed, rc 0**
+  (job `trippy-trips-perf-3`); CPU suite 887 passed (the only 10 failures are
+  `test_web_build_script.py`, which needs the `rust/brush-trips` submodule this worktree does not have
+  -- they pass in the main checkout).
+  **Caveat on the original 10x.** Measured back to back on an otherwise idle GPU, the mode is worth
+  1.5x per step, not 7-10x. The `full2-trips` run that motivated this (13:45-15:19, ~1.4 s/step) shared
+  the machine with several heavy CPU jobs and ~10 GB of swap in use, while `full2-broadcast`
+  (0.21 s/step) had the machine largely to itself overnight. Most of the observed gap was contention.
+  Point sizes were checked and ruled out too: `softplus(raw_size)` median 0.01226 / p99 0.247 at both
+  epoch 0 and epoch 20, so nothing grew into the coarse layers during the run.
+  Also measured, and both confirm the current defaults: `segment_offsets(method="bincount")` costs
+  **81.6 ms** on MPS against **0.28 ms** for `"searchsorted"` at 196k layer-pixels; the `"composite"`
+  int64 argsort is **19.3 ms** at 24.6M fragments against **36.5 ms** for the `"two_pass"` fallback
+  (docs/LIMITATIONS.md updated — the int64 key was never the problem it was assumed to be).
+  Jobs: `trippy-trips-perf-1` (prio 12, **rc 0**) stage table + micro-benchmarks + shape probe;
+  `trippy-trips-perf-2` (prio 12, **rc 1**) whole-`train_step` bisection -- every measurement printed,
+  then the JSON writer hit an `UnboundLocalError` under `--skip-stages` (fixed; the numbers are in the
+  job log); `trippy-trips-perf-3` (prio 12, **rc 0**) `pytest -m gpu` parity + the stage table on the
+  final code. Artifacts: `output/profile/trips-perf-{1,3}.json`,
+  `output/profile/trips-perf-cpu-full{,2}.json`, and the three job logs under
+  `~/Splats/tools/gpu_queue/logs/`.
