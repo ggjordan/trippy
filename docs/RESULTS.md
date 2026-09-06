@@ -18,6 +18,7 @@ Last updated 2026-09-07 05:00. Open things in `~/Splats/output/Jordan-Review/` (
 | TRIPS from Gaussian centres, 300 epochs, broadcast | 17.12 | 15.27 | 36.9% |
 | + TRIPS point removal (EXP-0010 A) | 17.67 | 15.44 | 36.8% |
 | + audit-aligned shade prune (EXP-0010 B) — **walk this one** | **17.75** | **15.59** | **24.1%** |
+| Alternating shade hold-out (trained on 3 of the 6 shade frames; scored on the other 3) | 17.94 | 16.79 | 36.7% |
 
 - PSNR uses exposure borrowed from neighbouring training frames (TRIPS's own method; no held-out photo is used).
   The earlier 8.49 dB shade number was an exposure bug (10 photos without EXIF got a 58x gain).
