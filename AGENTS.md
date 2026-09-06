@@ -81,7 +81,7 @@ Subagents **never** run `git commit`, `git push`, `git merge`, `git tag`, or `gh
 ### GPU and compute
 - **Never** run GPU/MPS work directly; submit jobs via `scripts/gpu_submit.sh [--prio N|--train] [--wait] <name> -- <cmd>`.
 - Never call `gpu_lock.sh`. trippy's wrapper calls `$SPLATS_ROOT/tools/gpu_queue/submit.sh` (`SPLATS_ROOT` comes from `.env`).
-- Job priority: short jobs (prio 10–19), training jobs (prio 70, behind Splats' standard jobs at 60). Jordan can override.
+- Job priority: short jobs (prio 10–19). Trainings: prio 70 while Splats had work queued; from 2026-09-07 (Jordan: last Splats item done) trippy manages the queue: target-scene runs 40, hybrids 45, other trippy trainings 50. If Splats queues new work, ask Jordan before letting it fall behind ours.
 - One heavy CPU job at a time; check free memory (≥28 GB) before launching. The machine OOM'd on 2026-09-05.
 - Long-running CPU work: wrap in `nohup ... & disown` or use `scripts/cpu_heavy.sh`.
 
