@@ -415,26 +415,43 @@ Matches the "Run location" table above -- a training run writes everything under
 
 ```
 output/runs/<exp>/<run>/
-├── log.txt                       (one line per checkpoint/eval event -- see below)
+├── log.txt                       (one line per checkpoint/eval/prune event -- see below)
 ├── metrics.jsonl                 (one JSON object per train_step AND per evaluate() call)
 ├── checkpoints/
-│   ├── checkpoint_ep0000.pt
-│   ├── checkpoint_ep0010.pt
-│   └── checkpoint_latest.pt      (always the most recent, for --resume)
+│   ├── checkpoint_ep0000.pt      (kept: epoch 0 is always a checkpoint_keep_every multiple)
+│   ├── checkpoint_ep0100.pt      (kept: checkpoint_keep_every multiple, default 100)
+│   ├── checkpoint_latest.pt      (always the most recent, for --resume)
+│   ├── checkpoint_best.pt        (the epoch with the best held-out PSNR so far)
+│   └── best.json                 ({"epoch", "psnr"} for checkpoint_best.pt)
 ├── eval_ep0000/
 │   ├── metrics.json               ({"epoch", "n_images", "psnr_mean", "ssim_mean", "lpips_mean", "names"})
-│   └── sheet.png                  (honesty sheet: photo | render | raw L0 | coverage, up to 6 rows)
+│   └── sheet.jpg                  (honesty sheet: photo | render | raw L0 | coverage, up to
+│                                    cfg.eval_max_images rows, default 6; JPEG q85, not PNG --
+│                                    a quick progress check, unlike candidate-report's PNGs below)
 ├── eval_ep0010/
 │   └── ...
 ├── export.ply                    (final trained point cloud, 3DGS-compatible)
 └── export.ply.provenance.npy     (per-point provenance sidecar)
 ```
 
+**Checkpoint retention** (`trippy.train.retention`, added 2026-09-06 after disk hit 94%):
+`checkpoint_ep<NNNN>.pt` files not covered by any of the rules above (not the best epoch, not a
+`checkpoint_keep_every` multiple, not among the `checkpoint_keep_last` most recent epochs) are deleted
+immediately after each `save_checkpoint` call -- so a 300-epoch run at `checkpoint_every=10` keeps a
+handful of epoch files (~ep0000/ep0100/ep0200/ep0300 + whichever is best + the latest) instead of all
+~30. `checkpoint_latest.pt`/`checkpoint_best.pt` are separate files, never subject to this deletion.
+`trippy prune-run <run_dir> [--dry-run]` applies the identical policy to a run directory after the fact
+(a run trained before this policy existed, or one still in progress): it reads `checkpoints/best.json`
+for the best-epoch protection if present, never deletes `checkpoint_latest.pt` or the single newest
+epoch file, and skips anything modified within `--protect-seconds` (default 120s) so it cannot race a
+still-writing job.
+
 `metrics.jsonl` is append-only and safe to `tail -f` during a run: per-step records have keys `step`,
 `epoch`, `image`, `zoom`, `loss`, `image_loss`, `extent_penalty`, `camera_reg`, `nonfinite_grads`
 (gradient entries zeroed before the optimizer step -- normally 0, see `docs/LIMITATIONS.md`); per-eval records have
 `eval: true` plus the same fields as that eval's `metrics.json` (minus `names`, to keep each line short).
-`log.txt` gets one human-readable line per checkpoint save and per eval (`"epoch N: eval psnr=... ssim=..."`),
+`log.txt` gets one human-readable line per checkpoint save, per eval, per pruned checkpoint
+(`"pruned <path> (retention policy)"`), and per new best (`"new best held-out psnr=... -> checkpoint_best.pt"`),
 plus a line when a `--max-minutes` budget cuts a run short.
 
 ### Standalone evaluation

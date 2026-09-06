@@ -603,6 +603,18 @@ TRAIN_DEFAULT_HELDOUT_K = 8
 TRAIN_DEFAULT_EVAL_EVERY = 10
 TRAIN_DEFAULT_CHECKPOINT_EVERY = 10
 
+# Disk retention policy (task brief 2026-09-06, "disk at 94%, trainer keeps every
+# checkpoint"): a 300-epoch run at checkpoint_every=10 writes ~30 epoch files of ~800 MB
+# each. `Trainer.save_checkpoint` keeps checkpoint_latest.pt, checkpoint_best.pt, every
+# epoch that is a multiple of `checkpoint_keep_every`, and the `checkpoint_keep_last` most
+# recent epoch files, deleting the rest (see `trippy.train.retention`). 100 keeps a handful
+# of milestone checkpoints across a 300-epoch run (ep0100, ep0200, ep0300) without the full
+# ~24 GB/run cost; 1 keeps only the epoch just written (checkpoint_latest.pt is already a
+# duplicate of it, so keep_last=1 is not wasted -- it survives independently of whatever
+# `--resume` later overwrites `checkpoint_latest.pt` with).
+TRAIN_DEFAULT_CHECKPOINT_KEEP_EVERY = 100
+TRAIN_DEFAULT_CHECKPOINT_KEEP_LAST = 1
+
 TRAIN_DEFAULT_SEED = 0
 
 # docs/SPEC.md v0.2.0 acceptance / task brief: "up to 6 held-out images" per honesty/eval
@@ -774,12 +786,31 @@ HYBRID_A_BASELINE_TRIPS_PSNR_ALL = 14.42
 TRAIN_CHECKPOINT_DIRNAME = "checkpoints"
 TRAIN_CHECKPOINT_FILENAME_FMT = "checkpoint_ep{epoch:04d}.pt"
 TRAIN_CHECKPOINT_LATEST_FILENAME = "checkpoint_latest.pt"
+# Retention policy additions (trippy.train.retention): the best-held-out-PSNR-so-far
+# checkpoint is kept alongside checkpoint_latest.pt regardless of the keep_every/keep_last
+# thinning, plus a tiny sidecar recording which epoch/PSNR it is (so `trippy prune-run` and
+# a human `cat`-ing the file both know without loading the .pt).
+TRAIN_CHECKPOINT_BEST_FILENAME = "checkpoint_best.pt"
+TRAIN_CHECKPOINT_BEST_JSON_FILENAME = "best.json"
 TRAIN_LOG_FILENAME = "log.txt"
 TRAIN_METRICS_FILENAME = "metrics.jsonl"
 TRAIN_EVAL_DIRNAME_FMT = "eval_ep{epoch:04d}"
 TRAIN_EVAL_SHEET_FILENAME = "sheet.png"
+# JPEG replaces PNG for the per-epoch eval contact sheet only (task brief 2026-09-06,
+# "make eval image dumps lighter"): it is a quick progress-check artifact, not a pixel-exact
+# honesty artifact -- those (candidate-report's honesty_sheet.png/raw/net/coverage PNGs,
+# trippy.render.candidate) are unaffected and stay PNG. Quality 85 is a standard
+# "visually lossless for photographic content, ~4-5x smaller than PNG" choice; not tuned
+# per-scene.
+TRAIN_EVAL_SHEET_JPEG_FILENAME = "sheet.jpg"
+TRAIN_EVAL_SHEET_JPEG_QUALITY = 85
 TRAIN_EVAL_METRICS_FILENAME = "metrics.json"
 TRAIN_EXPORT_FILENAME = "export.ply"
+
+# `trippy prune-run`'s default "never delete a file this fresh" window: guards a checkpoint
+# written by a still-running training job against a concurrent prune pass racing it (task
+# brief: "must skip files modified in the last 2 minutes").
+PRUNE_RUN_DEFAULT_PROTECT_SECONDS = 120.0
 # --- scene/adop_io.py : ADOP scene directory + Saiga containers ---
 # Sources: third_party/TRIPS/src/lib/data/SceneData.{h,cpp} and the public MIT
 # Saiga tree at https://github.com/darglein/saiga @ ee7a4e6b658 (External/saiga/

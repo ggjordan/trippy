@@ -41,18 +41,21 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from PIL import Image
 from torch import nn
 
 from trippy.config import load_settings, pick_device
 from trippy.constants import (
     SCENE_CACHE_META_FILENAME,
+    TRAIN_CHECKPOINT_BEST_FILENAME,
+    TRAIN_CHECKPOINT_BEST_JSON_FILENAME,
     TRAIN_CHECKPOINT_DIRNAME,
     TRAIN_CHECKPOINT_FILENAME_FMT,
     TRAIN_CHECKPOINT_LATEST_FILENAME,
     TRAIN_EVAL_DIRNAME_FMT,
-    TRAIN_EVAL_MAX_SHEET_IMAGES,
     TRAIN_EVAL_METRICS_FILENAME,
-    TRAIN_EVAL_SHEET_FILENAME,
+    TRAIN_EVAL_SHEET_JPEG_FILENAME,
+    TRAIN_EVAL_SHEET_JPEG_QUALITY,
     TRAIN_EXPORT_FILENAME,
     TRAIN_LOG_FILENAME,
     TRAIN_LPIPS_METRIC_NET,
@@ -65,11 +68,11 @@ from trippy.net.camera_model import NeuralCamera
 from trippy.net.losses import LossWeights, TripsLoss, _LazyLPIPS, mse_loss, ssim
 from trippy.net.unet import MultiScaleUnet2dDecOnlySmallFixed, NetworkConfig
 from trippy.raster.pyramid import render_pyramid
-from trippy.render.sheets import colorize, contact_sheet, save_png
+from trippy.render.sheets import colorize, contact_sheet
 from trippy.scene import splits
 from trippy.scene.dataset import SceneDataset
 from trippy.scene.dataset import crop as dataset_crop
-from trippy.train import checkpoint_io, export
+from trippy.train import checkpoint_io, export, retention
 from trippy.train.config import TrainConfig
 from trippy.train.params import PointParams, PoseParams
 
@@ -86,6 +89,23 @@ def _center_crop_like(x: torch.Tensor, target_h: int, target_w: int) -> torch.Te
     dh = max(0, (h - target_h) // 2)
     dw = max(0, (w - target_w) // 2)
     return x[..., dh : dh + target_h, dw : dw + target_w]
+
+
+def _save_eval_sheet_jpeg(path: Path, arr: np.ndarray, quality: int) -> Path:
+    """Save a per-epoch eval contact sheet as JPEG rather than PNG.
+
+    `trippy.render.sheets.contact_sheet` already returns a uint8 (H, W, 3)
+    array, so this is a thin wrapper -- kept local to this module (rather
+    than added to `trippy.render.sheets`) because it is specific to the
+    eval-sheet disk-usage tradeoff (task brief 2026-09-06): a quick
+    per-epoch progress check tolerates lossy compression, unlike
+    `candidate-report`'s honesty/coverage PNGs (`trippy.render.candidate`),
+    which Jordan inspects pixel-for-pixel and which this function is never
+    used for.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(arr, mode="RGB").save(path, format="JPEG", quality=quality)
+    return path
 
 
 class Trainer:
@@ -205,6 +225,14 @@ class Trainer:
         self._rng = torch.Generator(device="cpu").manual_seed(cfg.seed)
         self.epoch = 0
         self.global_step = 0
+
+        # Checkpoint retention bookkeeping (trippy.train.retention): `_best_epoch`/
+        # `_best_psnr` track the best held-out PSNR seen by ANY `evaluate()` call, updated
+        # there; `save_checkpoint` only promotes a checkpoint to checkpoint_best.pt when it
+        # is saving the exact epoch that currently holds that record (see save_checkpoint's
+        # docstring for what happens when eval_every != checkpoint_every).
+        self._best_epoch: int | None = None
+        self._best_psnr: float = float("-inf")
 
     # --- construction helpers ---
 
@@ -533,10 +561,14 @@ class Trainer:
             {"epoch", "n_images", "psnr_mean", "ssim_mean", "lpips_mean"
             (None if `cfg.eval_lpips` is False), "names"}. Also writes
             `<run_dir>/eval_ep<NNNN>/metrics.json` and, for up to
-            `TRAIN_EVAL_MAX_SHEET_IMAGES` images (forced-held-out shade
-            frames first), `sheet.png`: photo | render | raw level-0 |
-            coverage, one row per image (docs/EXPERIMENTS.md "Mandatory
-            honesty sheet").
+            `cfg.eval_max_images` images (forced-held-out shade frames
+            first), `sheet.jpg` (JPEG quality `TRAIN_EVAL_SHEET_JPEG_QUALITY`,
+            not PNG -- see module-level `_save_eval_sheet_jpeg`): photo |
+            render | raw level-0 | coverage, one row per image (docs/
+            EXPERIMENTS.md "Mandatory honesty sheet"). Also updates
+            `self._best_epoch`/`self._best_psnr` when this eval's
+            `psnr_mean` beats every prior eval -- `save_checkpoint` reads
+            those to decide whether to write `checkpoint_best.pt`.
         """
         self.net.eval()
         self.camera.eval()
@@ -544,7 +576,7 @@ class Trainer:
         epoch = self.epoch if epoch is None else epoch
 
         forced = set(self.cfg.forced_heldout)
-        sheet_names = sorted(names, key=lambda n: (n not in forced, n))[:TRAIN_EVAL_MAX_SHEET_IMAGES]
+        sheet_names = sorted(names, key=lambda n: (n not in forced, n))[: self.cfg.eval_max_images]
 
         psnr_vals: list[float] = []
         ssim_vals: list[float] = []
@@ -605,7 +637,11 @@ class Trainer:
         (eval_dir / TRAIN_EVAL_METRICS_FILENAME).write_text(json.dumps(metrics, indent=2))
         if sheet_images:
             sheet = contact_sheet(sheet_images, sheet_labels, cols=4)
-            save_png(eval_dir / TRAIN_EVAL_SHEET_FILENAME, sheet)
+            _save_eval_sheet_jpeg(eval_dir / TRAIN_EVAL_SHEET_JPEG_FILENAME, sheet, TRAIN_EVAL_SHEET_JPEG_QUALITY)
+
+        if metrics["psnr_mean"] > self._best_psnr:
+            self._best_psnr = metrics["psnr_mean"]
+            self._best_epoch = epoch
 
         self._append_metrics({"eval": True, **{k: v for k, v in metrics.items() if k != "names"}})
         self._log(f"epoch {epoch}: eval psnr={metrics['psnr_mean']:.3f} ssim={metrics['ssim_mean']:.4f}")
@@ -614,7 +650,33 @@ class Trainer:
     # --- checkpointing / export ---
 
     def save_checkpoint(self, epoch: int | None = None) -> Path:
-        """Save a checkpoint for `epoch` (default `self.epoch`) and update the "latest" alias."""
+        """Save a checkpoint for `epoch`, update aliases, then apply the retention policy.
+
+        Always writes `checkpoint_ep<NNNN>.pt` and `checkpoint_latest.pt`
+        (unconditional, as before). Additionally:
+          - If `epoch` is currently the best-known held-out-PSNR epoch (see
+            `evaluate`'s `self._best_epoch` bookkeeping -- only set when this
+            exact epoch's eval happened to be the best seen so far; a
+            `save_checkpoint` call for an epoch `evaluate()` never scored,
+            e.g. a manual `save_checkpoint(epoch=3)` in a test, leaves
+            `checkpoint_best.pt`/`best.json` untouched), also writes
+            `checkpoint_best.pt` (a second full copy, not a rename/symlink --
+            symlinks don't survive `scripts/deliver.sh`/rsync-style copies
+            reliably) and `best.json` ({"epoch", "psnr"}).
+          - Deletes every other `checkpoint_ep<NNNN>.pt` in `checkpoint_dir`
+            the policy doesn't protect (`trippy.train.retention.
+            select_checkpoints_to_delete`, keeping `cfg.checkpoint_keep_every`
+            multiples, the `cfg.checkpoint_keep_last` most recent, and the
+            best epoch). `checkpoint_latest.pt`/`checkpoint_best.pt` are never
+            in that glob, so they are never candidates for deletion.
+
+        Args:
+            epoch: defaults to `self.epoch`.
+
+        Returns:
+            The `checkpoint_ep<NNNN>.pt` path just written (not
+            `checkpoint_latest.pt`/`checkpoint_best.pt`).
+        """
         epoch = self.epoch if epoch is None else epoch
         payload = {
             "epoch": epoch,
@@ -632,7 +694,36 @@ class Trainer:
         checkpoint_io.save_checkpoint(path, payload)
         checkpoint_io.save_checkpoint(self.checkpoint_dir / TRAIN_CHECKPOINT_LATEST_FILENAME, payload)
         self._log(f"epoch {epoch}: checkpoint saved to {path}")
+
+        if self._best_epoch == epoch:
+            checkpoint_io.save_checkpoint(self.checkpoint_dir / TRAIN_CHECKPOINT_BEST_FILENAME, payload)
+            best_json = {"epoch": epoch, "psnr": self._best_psnr}
+            (self.checkpoint_dir / TRAIN_CHECKPOINT_BEST_JSON_FILENAME).write_text(json.dumps(best_json, indent=2))
+            self._log(f"epoch {epoch}: new best held-out psnr={self._best_psnr:.3f} -> checkpoint_best.pt")
+
+        self._prune_checkpoints()
         return path
+
+    def _prune_checkpoints(self) -> None:
+        """Delete checkpoint_ep*.pt files the retention policy no longer wants (see save_checkpoint).
+
+        Runs with `protect_newer_than_s=0.0`: everything already on disk in
+        this same process is fair game the instant it stops being the
+        best/a keep_every multiple/within keep_last -- unlike `trippy
+        prune-run` (a separate, later process against a possibly
+        still-running job), there is no concurrent writer to race here.
+        """
+        existing = sorted(self.checkpoint_dir.glob("checkpoint_ep*.pt"))
+        to_delete = retention.select_checkpoints_to_delete(
+            existing,
+            best_epoch=self._best_epoch,
+            keep_every=self.cfg.checkpoint_keep_every,
+            keep_last=self.cfg.checkpoint_keep_last,
+            protect_newer_than_s=0.0,
+        )
+        for victim in to_delete:
+            victim.unlink(missing_ok=True)
+            self._log(f"pruned {victim} (retention policy)")
 
     def load_state(self, payload: dict) -> None:
         """Load a checkpoint payload (as produced by `save_checkpoint`) into this Trainer."""

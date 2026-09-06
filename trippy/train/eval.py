@@ -75,7 +75,7 @@ def evaluate_checkpoint(
 
     Returns:
         The `Trainer.evaluate()` metrics dict (also written to
-        `<run_dir>/eval_ep<NNNN>/metrics.json` + `sheet.png`, same as a
+        `<run_dir>/eval_ep<NNNN>/metrics.json` + `sheet.jpg`, same as a
         mid-training eval).
     """
     trainer = build_trainer_from_checkpoint(checkpoint_path, device=device)

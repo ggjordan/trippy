@@ -141,7 +141,7 @@ def test_evaluate_still_writes_the_honesty_sheet(tmp_path: Path) -> None:
     trainer.evaluate(epoch=0)
     eval_dir = trainer.run_dir / "eval_ep0000"
     assert (eval_dir / "metrics.json").exists()
-    assert (eval_dir / "sheet.png").exists()
+    assert (eval_dir / "sheet.jpg").exists()  # JPEG, not PNG -- see trainer._save_eval_sheet_jpeg
 
 
 # --- checkpointing ---
