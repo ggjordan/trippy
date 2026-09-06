@@ -1719,3 +1719,7 @@ device-side count (indirect dispatch) so `render_inner` never stalls. That is a
   `.worktrees/eval-calib` and run with `PYTHONPATH` pointing there (the feature only exists on
   `feat/eval-calib`), so **the worktree must survive until both have run**, or they must be
   resubmitted from main after the merge.
+- 2026-09-06T02:58:12Z submitted job trippy-full-trips-2-bc prio 70: trippy train --config experiments/EXP-0007-hunua/config_bc.yaml --report --max-minutes 240
+- 2026-09-06T02:58:12Z submitted job trippy-full3-alt-bc prio 70: trippy train --config experiments/EXP-0003-kk-trips-train/config_full3_alt_bc.yaml --report --max-minutes 240
+- 2026-09-06T02:58:12Z submitted job trippy-hybrid-a-all-levels-bc prio 70: trippy train --config experiments/EXP-0009-hybrid-a/config_bc.yaml --report --max-minutes 240
+- 2026-09-06T02:58:58Z Throughput decision: trips mode trains ~10x slower per step than broadcast on MPS (full2-trips: ~7 min/epoch vs 0.2 s/step broadcast). Dequeued the trips-mode variants of Hunua, full3-alt, hybrid-a and union; requeued them as broadcast (-bc run dirs) so results land tonight. full2-trips keeps running under its 330-min budget as the trips-mode data point. perf/trips-mode profiling launched.

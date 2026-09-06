@@ -24,8 +24,11 @@ Last updated: 2026-09-06 (web-perf session, Orchestrator: Claude Fable 5.1)
 - Jordan set the goal (2026-09-05 ~22:50): finish all stages autonomously; anything needing Jordan goes in the review queue below.
 
 ## In flight
-- GPU queue: full2-broadcast (EXP-0003, epoch ~240/300, plateau ~15.1 dB) -> self-report + leaderboard; then web-perf-parity (prio 12), shade-split-eval-1 (prio 15, backfills full1-broadcast's shade split), then prio-70: full-trips (Hunua clip5923), full2-trips, hybrid-a-all-levels, union-broadcast, union-trips.
-- No subagents running. Next merges happen when runs report.
+- GPU queue: full2-trips (running, trips mode, ~7 min/epoch -> will stop on its 330-min budget), then viewer-kk-1 (prio 12), eval-calib-1 (prio 15), then prio-70 broadcast runs: full-trips-2-bc (Hunua clip5923_best), full3-alt-bc (alternating shade hold-out), hybrid-a-all-levels-bc, union-broadcast. Trips-mode variants parked until perf/trips-mode lands.
+- fix/viewer-kk (large/high): Karekare viewer near-white frame (per-view exposure outliers) + 4x speed; re-deliver v2.
+- feat/eval-interp (mid): held-out exposure from neighbouring train frames as the default eval mode.
+- perf/trips-mode (large/high): why trips mode is 10x slower per step on MPS.
+- Worktree eval-calib must stay until its two queued jobs (eval-calib-1, full3-alt: dequeued) have run; only eval-calib-1 remains.
 
 ## Next (in order)
 1. Merge scene-io + points; launch feat/raster (large/high: numpy reference + Metal blend_fwd + pyramid forward) and feat/net (mid/high: U-Net + tone mapper ports) once TRIPS_REFERENCE.md lands.

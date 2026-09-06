@@ -1,0 +1,55 @@
+# EXP-0003 full3-alt: the ALTERNATING shade hold-out protocol (see this experiment's README,
+# "Two hold-out protocols" and docs/EXPERIMENTS.md "Forced hold-out protocols").
+#
+# Same scene, point source and schedule as config_full2_trips.yaml -- the ONE deliberate change
+# is `forced_heldout_mode: alternate`: IMG_3828/3830/3832 stay held out, IMG_3829/3831/3833 are
+# forced into training. full2 answers "can the network synthesise a shade region it has never
+# photographed?" (novel view of an unobserved region, 8.49 dB). This run answers "can it
+# interpolate inside a shade region it HAS photographed?" -- which is the question the Gaussian
+# baseline was implicitly measured on, since kkc_15000 was trained with Brush's
+# `--eval-split-every 10` and therefore saw 5 of the 6 shade frames (~/Splats/research/
+# kk-coherent.md:61-67). Only this protocol makes the two comparable in the shade.
+#
+# NOTE (confound, stated up front): this run also picks up the missing-EXIF exposure-init fix
+# (Trainer._initial_exposure -- frames with no EXIF now start at the scene mean instead of
+# 5.87 EV / 58x below it). full2-broadcast's held-out numbers were badly damaged by that bug,
+# so full3-alt differs from full2-trips in TWO ways, not one. The uncontaminated protocol
+# comparison is full3-alt vs a re-eval of full2-trips with `trippy eval --calibrate`.
+#
+# Run via: scripts/queue_training.sh experiments/EXP-0003-kk-trips-train/config_full3_alt.yaml \
+#            --max-minutes 240
+# (never invoked directly -- see AGENTS.md).
+
+scene_root: /Users/nzbirdranch/Splats/scenes/karekare/kk-coherent
+run_dir: output/runs/EXP-0003-kk-trips-train/full3-alt-bc
+
+width: 1008
+crop: 384
+# "trips": the 2-layer trilinear write rule (docs/TRIPS_REFERENCE.md Sec. 3), not `broadcast`.
+mode: broadcast  # trips mode measured ~10x slower per step on MPS (7 min/epoch); broadcast to get answers tonight
+layers: 5
+epochs: 300
+train_factor: 1.0
+
+point_source:
+  type: gaussian
+  path: /Users/nzbirdranch/Splats/output/Training-Data/karekare/kk-coherent/kkc_15000.ply
+  min_opacity: 0.05
+  # knn: mean 4-NN distance (TRIPS's own size init); Gaussian scales project sub-pixel at 1008.
+  size_mode: knn
+
+# The six shade frames under the trees. With forced_heldout_mode: alternate, the first, third
+# and fifth of them (IMG_3828/3830/3832) are held out and the other three are pulled OUT of the
+# modulo stride into training (trippy.scene.splits.partition_forced), so the shade region is
+# observed exactly three times and scored on three unseen views inside it.
+forced_heldout:
+  - IMG_3828.jpg
+  - IMG_3829.jpg
+  - IMG_3830.jpg
+  - IMG_3831.jpg
+  - IMG_3832.jpg
+  - IMG_3833.jpg
+forced_heldout_mode: alternate
+
+device: mps
+seed: 0
