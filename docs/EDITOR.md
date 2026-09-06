@@ -1,8 +1,25 @@
 # Editing: turning `trips-viewer` into an edit tool
 
-Status: architecture only (`docs/decisions/ADR-0007-viewer-editing.md`);
-no code exists yet. This document is the detailed spec the milestones in
-§6 implement, in order.
+Status: **Python side implemented** (`trippy/edit/`: `model.py`,
+`weights.py`, `shade_finder.py`, `apply.py`; `trippy apply-edits` and
+`trippy edits shade-find/add-box/add-sphere/add-lid` in `trippy/cli.py`;
+see `docs/EXPERIMENTS.md` "Edits" for the worked run and test list). The
+Rust viewer (§0/§2's render integration, §3's selection tools, §4's UI) is
+**not implemented** -- this document remains the spec for that work.
+Two implementation notes, both explained where they matter below:
+
+- **`box`'s schema is `center`/`half_extents`/`quat`** (an oriented box),
+  not this section's axis-aligned `min`/`max` -- a rotated box is testable
+  where an axis-aligned-only schema is not; identity `quat` recovers an
+  axis-aligned box exactly. See §1's `box` entry.
+- **The Python `lid` region kind is E3's hard-clip action already**
+  (`op="delete"`/`"fade"`, `trippy.edit.model.lid_membership`); its 3D
+  gizmo (drag the plane/radius in the viewer) is not built. See §1's `lid`
+  entry and §6's E3 row.
+
+`docs/decisions/ADR-0007-viewer-editing.md` is still accurate to the
+sections below; this document is the detailed spec the milestones in §6
+implement, in order.
 
 Jordan's request (2026-09-07 09:45, `STATE.md`): a per-region/per-object
 splat-vs-TRIPS mix, smart object selection with masks, the Karekare pool
@@ -95,9 +112,15 @@ ADR-0006-viewer-integration.md` "Performance levers are render parameters").
 
 `kind`-specific `params`:
 
-- `box`: `min: [x,y,z]`, `max: [x,y,z]`, world space, axis-aligned (an
-  oriented box is not in scope for E1 — see §6).
-- `sphere`: `center: [x,y,z]`, `radius: f32`.
+- `box`: **implemented as `center: [x,y,z]`, `half_extents: [x,y,z]`
+  (all > 0), `quat: [w,x,y,z]` (default identity)** — an ORIENTED box, not
+  the axis-aligned `min`/`max` this line originally specified. Identity
+  `quat` is exactly an axis-aligned box (`min = center - half_extents`,
+  `max = center + half_extents`); a non-identity `quat` is what a rotated
+  box needs and `min`/`max` cannot express (`trippy.edit.model.
+  box_membership`, `docs/EXPERIMENTS.md` "Edits").
+- `sphere`: `center: [x,y,z]`, `radius: f32`. Implemented,
+  `trippy.edit.model.sphere_membership`.
 - `brush`: a sparse voxel grid — `origin: [x,y,z]`, `cell_size: f32`,
   `cells: [[i,j,k], ...]` (occupied cell indices; a set, not a dense array,
   because a brushed region is typically a tiny fraction of the scene's
@@ -111,11 +134,20 @@ ADR-0006-viewer-integration.md` "Performance levers are render parameters").
   `radius = 2.5`, `falloff = 1.0`, `band = 0.05`) drop straight into a
   region with zero re-fitting. This is a **hard clip**, not the training
   regulariser — see §2's "the lid is not `surface.rs`'s lid" box.
+  **Implemented** (`trippy.edit.model.lid_membership`; `op="delete"`'s hard
+  membership is the literal "below the plane, inside the radius", ignoring
+  `falloff`/`band`; `op="blend"`/`"fade"`'s graded weight ramps by them —
+  see that function's docstring for the formula, mirrored across the plane
+  from `SURFACE_LID.md`'s own `band_i`/`region_i` shape). `trippy edits
+  add-lid` with no geometry flags seeds exactly the numbers above. The 3D
+  gizmo (drag the plane/radius in the viewer) is not built.
 - `pointset`: `point_ids: [u32, ...]` — indices into `points.npz`'s `xyz`
   array (the TRIPS point cloud's own row order, stable for the life of a
   bundle since nothing in the viewer re-sorts or re-indexes points after
   `Bundle::load`). This is what the shade-cloud finder, click-to-cluster and
-  the SAM-3 lift all produce.
+  the SAM-3 lift all produce. **Implemented for the shade-cloud finder**
+  (`trippy.edit.shade_finder.find_shade_pointset`, CLI: `trippy edits
+  shade-find`); click-to-cluster and SAM-3 lift are not built.
 
 **`op` semantics:**
 
@@ -399,6 +431,18 @@ trippy apply-edits --bundle <dir> [--edits <dir>/edits.json] \
                     --out <dir> [--target trips|distilled|both]
 ```
 
+**Implemented today** (`trippy/edit/apply.py`, E6): `trippy apply-edits
+--bundle <dir> [--edits edits.json] --out <dir>` — no `--target` flag yet.
+It always publishes the bundle's own TRIPS `points.npz` (filtered
+`points.npz` + `blend_weights.npy` + `edits_applied.json` + an updated
+`bundle.json` into `--out`) and, in the SAME run, filters `bundle.json`'s
+`blend.splat_ply` PLY if one is named — i.e. today's single target is "this
+bundle's TRIPS points and (if present) its already-associated Gaussian
+PLY", not a choice between the TRIPS export and a *distilled* splat. The
+`export.ply`/`Trainer._apply_keep_mask` wiring and the `trippy distill`
+edit-then-distil ordering below are **not implemented** — `--target` stays
+documented here as the target shape once they land.
+
 - **TRIPS `export.ply`**: `trippy.train.export.write_gaussian_ply` gains an
   optional keep-mask parameter, built from `edits.json`'s `delete`-op
   regions tested against the checkpoint's own live `xyz` — the identical
@@ -430,14 +474,14 @@ here changes `Trainer.fit`'s loop or `maybe_prune_points`'s schedule.
 
 ## 6. Milestones
 
-| # | Scope | Estimate | Acceptance |
-|---|---|---|---|
-| **E1** | Region data model (`edits.json` read/write), `box`/`sphere` region kinds, per-point weight compositing (§2's non-depth design) on the TRIPS side only, undo/redo, save/load surviving a bundle close+reopen | 1 wk | Draw a box or sphere region in the viewer, set `mix`, see the TRIPS render change inside it and nothing outside it; undo removes the region; closing and reopening the bundle restores it exactly (region list, mix values, undo history) |
-| **E2** | Shade-cloud finder: `trippy edit-prep` precompute + live threshold sliders + preview-highlight `ViewMode` + "select" → `pointset` region | 3 d | On a bundle whose scene has registered shade frames, the finder's default thresholds select a `pointset` region whose `dark_mass_fraction` (via `trippy.train.prune.dark_mass_stats` on the selected IDs) matches the audit's own number for that scene to float precision; deleting the region and re-running the audit shows the drop |
-| **E3** | `lid` region kind + 3D gizmo (plane/radius drag) + hard-clip delete semantics | 2 d | Loading the Karekare pool bundle with a `lid` region seeded from `SURFACE_LID.md`'s numbers removes the haze from every angle at every `mix`/exposure; dragging the radius ring changes the affected point count live |
-| **E4** | Click-to-cluster: ray cast + k-d tree + k-NN growth in world+colour space, radius slider | 3 d | Clicking a point-cloud cluster selects a `pointset` region that visibly matches the clicked object's extent, without needing a depth buffer |
-| **E5** | SAM 3 lift: photo segmentation, multi-view projection + majority vote, `pointset` region output | 2–3 wk | Segmenting an object in 2–3 registered views of the same scene produces one `pointset` region that, previewed, highlights that object and not its neighbours; runs entirely local (no image leaves the machine) |
-| **E6** | Publish path: `trippy apply-edits`, TRIPS `export.ply` mask wiring, distilled-splat publish order (edit-then-distil for pointset regions, geometry-reapply for box/sphere/lid) | 3 d | `trippy apply-edits --target both` on a bundle with a mix of region kinds produces a TRIPS PLY with the deleted points absent and, after a `trippy distill` run on the same edited bundle, a distilled PLY that also lacks them; a box/sphere/lid region re-applied directly to an already-distilled PLY (no re-distillation) also removes the matching geometry |
+| # | Scope | Estimate | Acceptance | Status |
+|---|---|---|---|---|
+| **E1** | Region data model (`edits.json` read/write), `box`/`sphere` region kinds, per-point weight compositing (§2's non-depth design) on the TRIPS side only, undo/redo, save/load surviving a bundle close+reopen | 1 wk | Draw a box or sphere region in the viewer, set `mix`, see the TRIPS render change inside it and nothing outside it; undo removes the region; closing and reopening the bundle restores it exactly (region list, mix values, undo history) | **Python side done** (`trippy/edit/model.py`, `weights.py`); the viewer draw/render half is not built. |
+| **E2** | Shade-cloud finder: `trippy edit-prep` precompute + live threshold sliders + preview-highlight `ViewMode` + "select" → `pointset` region | 3 d | On a bundle whose scene has registered shade frames, the finder's default thresholds select a `pointset` region whose `dark_mass_fraction` (via `trippy.train.prune.dark_mass_stats` on the selected IDs) matches the audit's own number for that scene to float precision; deleting the region and re-running the audit shows the drop | **CLI precompute+select done** (`trippy edits shade-find`, `trippy/edit/shade_finder.py`; acceptance verified on the synthetic scene, `docs/EXPERIMENTS.md` "Edits"); the live threshold sliders and preview-highlight `ViewMode` are not built. |
+| **E3** | `lid` region kind + 3D gizmo (plane/radius drag) + hard-clip delete semantics | 2 d | Loading the Karekare pool bundle with a `lid` region seeded from `SURFACE_LID.md`'s numbers removes the haze from every angle at every `mix`/exposure; dragging the radius ring changes the affected point count live | **Region kind + hard-clip semantics done** (`trippy.edit.model.lid_membership`, `trippy edits add-lid`); the 3D gizmo is not built. |
+| **E4** | Click-to-cluster: ray cast + k-d tree + k-NN growth in world+colour space, radius slider | 3 d | Clicking a point-cloud cluster selects a `pointset` region that visibly matches the clicked object's extent, without needing a depth buffer | Not started. |
+| **E5** | SAM 3 lift: photo segmentation, multi-view projection + majority vote, `pointset` region output | 2–3 wk | Segmenting an object in 2–3 registered views of the same scene produces one `pointset` region that, previewed, highlights that object and not its neighbours; runs entirely local (no image leaves the machine) | Not started. |
+| **E6** | Publish path: `trippy apply-edits`, TRIPS `export.ply` mask wiring, distilled-splat publish order (edit-then-distil for pointset regions, geometry-reapply for box/sphere/lid) | 3 d | `trippy apply-edits --target both` on a bundle with a mix of region kinds produces a TRIPS PLY with the deleted points absent and, after a `trippy distill` run on the same edited bundle, a distilled PLY that also lacks them; a box/sphere/lid region re-applied directly to an already-distilled PLY (no re-distillation) also removes the matching geometry | **`trippy apply-edits` done** for the TRIPS points + Gaussian PLY publish path (`trippy/edit/apply.py`) — no `--target` flag (TRIPS-only; a splat PLY named by `bundle.json` is filtered the same run), and no `export.ply`/`trippy distill` wiring yet. |
 
 E1 already includes undo/save per the brief; E2–E5 add tool-specific
 selection UI on top of the E1 data model and do not need to repeat undo/save

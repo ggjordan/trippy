@@ -1604,3 +1604,98 @@ once the trainer supports it (landing on `feat/karekare-v2`, not yet merged — 
 edited here). Per Jordan, masked runs are additive, not a replacement: existing unmasked runs
 stay queued, and `scripts/requeue_with_masks.sh` (prepared, not run) submits a masked *sibling*
 config/run per config given, leaving the original untouched.
+
+## Edits
+
+The Python side of the viewer editor (`docs/EDITOR.md`, `docs/decisions/
+ADR-0007-viewer-editing.md`), landed ahead of the Rust viewer UI so regions can
+be authored and published from the command line: `trippy/edit/model.py`
+(`Region`/`EditDocument` -- box/sphere/lid/pointset, ordered regions, an
+append-only undo log with a cursor, world-space membership tests),
+`trippy/edit/weights.py` (per-point blend-weight composition: gate default,
+then `blend`/`delete`/`fade` regions in paint order), `trippy/edit/
+shade_finder.py` (the shade-cloud finder, built directly on this doc's own
+"Shade audit" functions -- `trippy.train.prune.build_shade_region`/
+`in_region`/`luminance`/`confidence_drop_mask`/`dark_mass_stats` -- as a
+*selector* Jordan can delete/fade/blend/undo, not a silent training-time
+removal), and `trippy/edit/apply.py` (`trippy apply-edits`'s implementation).
+
+**`box`'s schema is `center`/`half_extents`/`quat` (an oriented box), not
+`docs/EDITOR.md` Sec 1's axis-aligned `min`/`max`** -- a deliberate,
+documented deviation (identity quat recovers an axis-aligned box exactly;
+`docs/EDITOR.md` and this module's own docstring both record the reason: an
+oriented box is testable with a rotated-box membership test, an
+axis-aligned-only schema is not).
+
+**The `lid` region kind is a hard clip, not `~/Splats/tools/SURFACE_LID.md`'s
+training-time opacity penalty** (read-only; see ADR-0007 Sec "2." for the
+full "same geometry, different action" argument). `op="delete"`'s hard
+membership is the literal "below the plane, inside the radius", ignoring
+`falloff`/`band` entirely; `op="blend"`/`"fade"`'s graded weight ramps by
+`falloff` (horizontal, beyond `radius`) and `band` (vertical, below the
+plane), mirroring the shape of `SURFACE_LID.md`'s `band_i`/`region_i` terms
+across the plane -- see `trippy.edit.model.lid_membership`'s docstring for
+the exact formula. `trippy edits add-lid` with no geometry flags seeds
+exactly the Karekare pool's already-fitted numbers (`SURFACE_LID.md` Sec 3):
+`up = (0.01290213, -0.95271846, -0.30358041)`, `height = -0.49`,
+`center = (-0.00683348, -0.74759695, 3.95994345)`, `radius = 2.5`,
+`falloff = 1.0`, `band = 0.05`.
+
+**Composition order** (`trippy.edit.weights.compose_point_weights`): start
+from the gate's default (1.0 = pure TRIPS when the bundle has no gate), then
+apply `edits.json`'s `order` in sequence -- `blend` sets the weight to `mix`
+where the region applies (last write wins across overlapping enabled
+regions), `fade` multiplies the running weight by `mix`, `delete` zeroes the
+weight and is **permanent**: a later `blend`/`fade` region covering the same
+points must never un-delete them (`docs/EDITOR.md` Sec 1 "Ordering and
+overlap"). `pointset` regions only apply to the TRIPS point cloud whose row
+order produced their `point_ids`; `compose_gaussian_weights` skips them
+entirely rather than guess an unrelated correspondence to a Gaussian PLY's
+own rows.
+
+**`trippy apply-edits --bundle <dir> [--edits edits.json] --out <dir>`**
+(`trippy.edit.apply.apply_edits`) composes `edits.json`'s regions against the
+bundle's `points.npz`, writes a filtered `points.npz` + `blend_weights.npy` +
+`edits_applied.json` + an updated `bundle.json` into `--out`, and, when
+`bundle.json` names a `blend.splat_ply`, writes a filtered copy of that
+Gaussian PLY with the same regions' deleted Gaussians removed. The PLY filter
+is a single `np.fromfile` read of the whole structured vertex array (the
+file's own `x`/`y`/`z` columns double as the geometry-test input), so a ~2 GB
+production PLY is loaded exactly once, and every original vertex property
+(including SH `f_rest_*`, whatever the exact list is) survives untouched in
+the kept rows -- a header-preserving structured copy, not a hardcoded
+3DGS-field list. `weights.safetensors`/`splat.npz` are never copied (`--out`
+may equal `--bundle` for an in-place publish).
+
+`trippy edits shade-find --bundle <dir> --scene <root> --frames a.jpg,b.jpg
+--out edits.json` and `trippy edits add-box/add-sphere/add-lid` append a
+region to an `edits.json` file (created if missing), so regions can be
+authored before the viewer's own Regions/Inspector panels exist. A worked
+run on a synthetic gate bundle (a box `delete` region over a cluster of
+Gaussians + TRIPS points, plus a `shade-find` region), `n=300` TRIPS points /
+`n=40` Gaussians:
+
+```json
+{
+  "points": {"n_in": 300, "n_deleted": 8, "n_kept": 292},
+  "splat_ply": {"n_in": 40, "n_deleted": 5, "n_kept": 35}
+}
+```
+
+Tests (`tests/test_edit_*.py`, `tests/test_cli_edits.py`, CPU, synthetic
+fixtures only): membership incl. a rotated box and the lid's falloff/band
+ramp; composition order (blend/fade/delete, last-write-wins, delete is
+permanent); the undo cursor (add/undo/redo, "edit after undo discards the
+redone future", save/load survives a bundle close+reopen); the shade finder
+equals an independent brute-force selection on
+`tests/test_train_prune.py`'s synthetic scene; `apply-edits` on a synthetic
+bundle removes the right points/Gaussians, writes weights, and the filtered
+PLY round-trips through `GaussianPlySource` with an unrelated extra vertex
+property preserved byte-for-byte; CLI exit codes (0 on success, 2 on a
+missing edits file / bad geometry / argparse usage error).
+
+**Splat-side weight compositing and the Rust viewer wiring are not done
+here** -- this task is the Python side only (`docs/EDITOR.md` E1/E2/E3/E6's
+data model, weights, shade finder, and publish path); `docs/EDITOR.md` Sec 7
+already flags splat-side per-Gaussian weight rendering as unproven/
+unscheduled, and this work does not change that.

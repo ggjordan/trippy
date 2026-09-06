@@ -1527,3 +1527,51 @@ LEADERBOARD_PNG_ROW_BG_ALT = (237, 240, 247)
 LEADERBOARD_PNG_BASELINE_ROW_BG = (255, 244, 224)  # tinted so fixed baselines read as "not scanned"
 LEADERBOARD_PNG_TEXT_COLOR = (25, 25, 30)
 LEADERBOARD_PNG_TITLE_COLOR = (20, 20, 24)
+
+# --- edit/ : viewer editor sidecar (docs/EDITOR.md, docs/decisions/ADR-0007-viewer-editing.md) ---
+
+# Wire format tag written into `edits.json`; bump on any breaking change (mirrors
+# trippy.render.bundle.BUNDLE_FORMAT's own convention). Never written into bundle.json
+# itself -- ADR-0007 "edits.json cannot touch bundle.json's schema, and does not need to".
+EDIT_FORMAT = "trippy-edits-1"
+# Filename `edits.json` lives under next to `bundle.json` in a bundle directory
+# (docs/EDITOR.md Sec 1) -- CLI defaults resolve a bare filename against `--bundle`.
+EDIT_JSON_FILENAME = "edits.json"
+
+# Region.kind / Region.op enums, docs/EDITOR.md Sec 1's schema table. `brush` (sparse
+# voxel grid, painted incrementally by a brush tool) is documented but explicitly out
+# of scope for E1 (docs/EDITOR.md Sec 1: "not one of E1's two shipped kinds") -- not
+# included here; adding it later is additive to this tuple, not a breaking change.
+EDIT_REGION_KINDS = ("box", "sphere", "lid", "pointset")
+EDIT_REGION_OPS = ("blend", "delete", "fade")
+
+# Hex digits of a fresh region id's suffix (`new_region_id()` -> "r-<hex>"), matching
+# docs/EDITOR.md Sec 1's own example ids ("r-3f9a", "r-8b21": 4 hex chars looked
+# arbitrary in the doc, so this uses a wider 8-char slice of a uuid4 for a lower
+# collision chance across a long editing session -- ids are compared as opaque
+# strings everywhere, so the exact width is not part of any wire contract).
+EDIT_REGION_ID_HEX_LEN = 8
+
+# The gate's own default per-point weight when a bundle carries no blend gate at all
+# (`trippy.hybrid.gate` not enabled): "1.0 = TRIPS when no gate" -- every point renders
+# as pure TRIPS output until a region overrides it. docs/EDITOR.md Sec 2 "untouched by
+# any region, w_edit is None and the pixel is whatever feat/blend-gate's own g *
+# gate_scale already decided" -- for a gate-less bundle that decision is "all TRIPS".
+EDIT_GATE_DEFAULT_WEIGHT = 1.0
+
+# Files `trippy apply-edits` writes into `--out` alongside the filtered `points.npz`
+# (trippy.render.bundle.BUNDLE_POINTS_FILENAME, reused unchanged so the output
+# directory stays a valid bundle -- docs/EDITOR.md Sec 5 "Publish").
+EDIT_BLEND_WEIGHTS_FILENAME = "blend_weights.npy"
+EDIT_APPLIED_JSON_FILENAME = "edits_applied.json"
+
+# The Karekare pool lid's already-fitted, A/B-verified numbers (`~/Splats/tools/
+# SURFACE_LID.md` Sec 3, read-only; ADR-0007 Sec "2."): the editor's `lid` region kind
+# reuses these verbatim as its CLI default / worked example, never re-fitted here.
+# `trippy edits add-lid` seeds a new lid region with these unless overridden.
+EDIT_KAREKARE_LID_UP = (0.01290213, -0.95271846, -0.30358041)
+EDIT_KAREKARE_LID_HEIGHT = -0.49
+EDIT_KAREKARE_LID_CENTER = (-0.00683348, -0.74759695, 3.95994345)
+EDIT_KAREKARE_LID_RADIUS = 2.5
+EDIT_KAREKARE_LID_FALLOFF = 1.0
+EDIT_KAREKARE_LID_BAND = 0.05
