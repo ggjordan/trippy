@@ -659,6 +659,32 @@ change here, since nothing in `trainer.py` inspects which backward path is activ
   can run. `fit()` runs the full epoch loop (locks, vgg start, eval/checkpoint cadence) with an optional
   `max_minutes` wall-clock budget so a queue job ends cleanly (checkpoint + export always written before
   returning).
+  **Point removal is the one thing that changes the shape of the trained state mid-run.**
+  `maybe_prune_points(epoch)` runs at the top of each epoch, before that epoch's steps -- the same
+  place TRIPS calls `AddAndRemovePoints` (`src/apps/train.cpp:670-674`) -- and hands
+  `_apply_keep_mask` a boolean mask from `trippy.train.prune`. That method rebuilds each per-point
+  `nn.Parameter` by `index_select` and **index-selects that parameter's Adam moments with it**, then
+  swaps the new object into both the module and its optimiser param group, so moment row `i` still
+  belongs to point `i`; it is trippy's equivalent of `NeuralScene::RemovePoints` +
+  `ShrinkTextureOptimizer` + `MyAdam::shrinkInternalState` (`NeuralScene.cpp:1375-1470,362-370`,
+  `MyAdam.cu:346-374`). `load_state` resizes the point parameters to the checkpoint's own count before
+  loading, so a post-removal checkpoint resumes and re-evaluates normally. `point_stats()` adds the
+  point count plus the shade audit's in-region dark-mass fraction to every eval record.
+- **`trippy/train/prune_config.py` + `trippy/train/prune.py`**: point removal, and the shade-audit
+  statistic computed in-process. `prune_config.py` holds two dataclasses (stdlib only, so
+  `train/config.py` stays cheap to import -- the same split `hybrid/config_a.py` uses):
+  `PointRemovalConfig` is **TRIPS's own rule**, ported -- drop every point whose effective
+  confidence `sigmoid(10*raw_conf)` is below `conf_threshold`, on epochs
+  `start_epoch + i*every_epochs` (`src/apps/train.cpp:846-851` and `:533-538`,
+  `src/lib/models/NeuralTexture.h:42`, `src/lib/data/Settings.h:403-406,427`) -- and
+  `ShadePruneConfig` is **trippy's own, deliberately audit-aligned heuristic**, which drops points
+  that are inside the shade audit's region AND dark AND low-confidence. Both default off.
+  `prune.py` is pure numpy and side-effect free: `build_shade_region`/`in_region`/`dark_mass_stats`
+  are a field-for-field port of `~/Splats/tools/depthprior_shade_audit.py` (verified to reproduce its
+  cached numbers on `kkc_15000` exactly), and the two `*_keep_mask` functions return boolean masks.
+  Nothing here touches the optimiser; the Trainer does. TRIPS's point *adding* is not ported and the
+  reason is written down in `prune.py`'s docstring and experiments/EXP-0010-point-removal/README.md
+  (the default path shells out to an external NeAT binary; the in-tree fallback is dead code).
 - **`trippy/train/eval.py`**: standalone, checkpoint-only evaluation -- `evaluate_checkpoint` rebuilds a
   `Trainer` from the checkpoint's own saved `cfg` (so dataset/point-source/split reconstruct identically)
   and loads the trained state, never re-training. `render_offpath` renders honesty triplets (raw | network

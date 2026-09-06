@@ -80,6 +80,7 @@ from trippy.constants import (
     TRAIN_VGG_START_FRAC,
 )
 from trippy.hybrid.config_a import HybridConfig
+from trippy.train.prune_config import PointRemovalConfig, ShadePruneConfig
 
 
 def steps_per_epoch(train_factor: float, n_train: int) -> int:
@@ -270,6 +271,17 @@ class TrainConfig:
     # `enabled: false` (the default) is a hard no-op -- see trippy.hybrid.config_a.
     hybrid: HybridConfig = field(default_factory=HybridConfig)
 
+    # --- point removal (trippy.train.prune / trippy.train.prune_config) ---
+    # `point_removal:` is TRIPS's own confidence rule, ported: drop every point whose
+    # sigmoid(10*raw_conf) is below `conf_threshold`, on epochs start + i*every
+    # (src/apps/train.cpp:846-851, :533-538). `shade_prune:` is trippy's own,
+    # deliberately audit-aligned heuristic (dark + low-confidence points inside the
+    # region depthprior_shade_audit.py measures). Both default to `enabled: false`,
+    # a hard no-op; `shade_prune.log_dark_mass` (default true) is measurement only
+    # and never changes the cloud.
+    point_removal: PointRemovalConfig = field(default_factory=PointRemovalConfig)
+    shade_prune: ShadePruneConfig = field(default_factory=ShadePruneConfig)
+
     # --- misc ---
     seed: int = TRAIN_DEFAULT_SEED
     device: str = "cpu"
@@ -280,6 +292,10 @@ class TrainConfig:
             self.point_source = PointSourceConfig(**self.point_source)
         if isinstance(self.hybrid, dict):
             self.hybrid = HybridConfig(**self.hybrid)
+        if isinstance(self.point_removal, dict):
+            self.point_removal = PointRemovalConfig(**self.point_removal)
+        if isinstance(self.shade_prune, dict):
+            self.shade_prune = ShadePruneConfig(**self.shade_prune)
         if self.crop <= 0:
             raise ValueError(f"crop must be positive, got {self.crop}")
         if self.width <= 0:

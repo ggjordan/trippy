@@ -1,0 +1,80 @@
+# EXP-0010 arm B: TRIPS's rule PLUS trippy's audit-aligned shade prune.
+# Identical to config_removal.yaml (this directory) except that `shade_prune:` is also
+# on, so the only difference between the two arms' numbers is the shade prune.
+#
+# READ THIS BEFORE QUOTING THIS RUN'S DARK-MASS NUMBER: `shade_prune` removes exactly
+# the points the shade audit counts. It is an audit-aligned heuristic, NOT a claim that
+# those points are wrong. Its dark-mass fraction therefore MUST be reported next to this
+# run's held-out shade PSNR: if that PSNR drops relative to arm A, the removed points
+# were carrying real signal and the metric improvement is an artefact. See
+# docs/EXPERIMENTS.md "EXP-0010" and experiments/EXP-0010-point-removal/README.md.
+#
+# Run via: scripts/queue_training.sh experiments/EXP-0010-point-removal/config_shade_prune.yaml \
+#   --max-minutes 300      (never invoked directly -- see AGENTS.md "GPU and compute").
+
+scene_root: /Users/nzbirdranch/Splats/scenes/karekare/kk-coherent
+run_dir: output/runs/EXP-0010-point-removal/exp0010-shade-prune
+
+width: 1008
+crop: 384
+mode: broadcast
+layers: 5
+epochs: 300
+train_factor: 1.0
+
+point_source:
+  type: gaussian
+  path: /Users/nzbirdranch/Splats/output/Training-Data/karekare/kk-coherent/kkc_15000.ply
+  min_opacity: 0.05
+  size_mode: knn
+
+forced_heldout:
+  - IMG_3828.jpg
+  - IMG_3829.jpg
+  - IMG_3830.jpg
+  - IMG_3831.jpg
+  - IMG_3832.jpg
+  - IMG_3833.jpg
+
+# TRIPS's rule, ported verbatim (src/apps/train.cpp:846-851 selects
+# confidence_value_of_point < removal_confidence_cutoff; NeuralTexture.h:42 defines that
+# confidence as sigmoid(10*confidence_raw)). The SCHEDULE is TRIPS's own ratios scaled to
+# 300 epochs: start_removing_points_epoch/num_epochs = 200/600 -> epoch 100, and
+# point_removal_epoch_interval/num_epochs = 50/600 -> every 25 epochs
+# (src/lib/data/Settings.h:403-406). Eight passes: 100, 125, ..., 275.
+#
+# The THRESHOLD is not TRIPS's, and this is the one honest deviation in this arm.
+# TRIPS initialises every confidence at sigmoid(10*0.5) = 0.9933, so its 0.3 (code
+# default) / 0.5 (shipped ini) cutoffs mean "training pushed this point down". trippy
+# initialises confidence from the source PLY's own opacity instead, whose median on
+# kkc_15000 (min_opacity 0.05) is 0.18 -- measured on a 400k sample: 74% of points are
+# already below 0.3 and 90% below 0.5 at epoch 0. Using TRIPS's own number here would
+# delete the scene on the first pass and measure nothing. 0.1 keeps the rule's shape (a
+# fixed cutoff on the same quantity) while cutting into the low-opacity tail only.
+point_removal:
+  enabled: true
+  start_epoch: 100
+  every_epochs: 25
+  conf_threshold: 0.1
+  min_points: 1000000
+
+# trippy's own rule (NOT TRIPS's): drop points that are inside the audit's region AND
+# dark by its Rec.709 test AND below a confidence cutoff. `frames`, `znear_frac`,
+# `zfar_frac` and `lum_threshold` are left at their defaults, which ARE
+# depthprior_shade_audit.py's own defaults (IMG_3828..IMG_3833, 0.05, 0.50, 0.25), so the
+# region pruned is the region measured, to the point. Same schedule as arm A's removal so
+# the two arms differ by one rule and nothing else. conf_threshold 0.5 is TRIPS's shipped
+# removal cutoff (train_normalnet.ini:134), applied here only to in-region dark points.
+shade_prune:
+  enabled: true
+  log_dark_mass: true
+  start_epoch: 100
+  every_epochs: 25
+  znear_frac: 0.05
+  zfar_frac: 0.5
+  lum_threshold: 0.25
+  conf_threshold: 0.5
+  min_points: 1000000
+
+device: mps
+seed: 0
