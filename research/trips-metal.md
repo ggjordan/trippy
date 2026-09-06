@@ -1745,3 +1745,4 @@ device-side count (indirect dispatch) so `render_inner` never stalls. That is a
   Artifacts: output/runs/EXP-0003-kk-trips-train/full2-broadcast/eval_manual_20260906-153040/
   metrics.json; leaderboard now shows a "Held-out shade PSNR (calibrated)" column (15.32 for
   full2-broadcast, n/a for the Gaussian baseline, which has no exposure model).
+- 2026-09-06T03:43:36Z delivered trips-leaderboard: One table of every TRIPS run so far vs the Gaussian baseline: held-out PSNR, shade dark-mass, extent, coverage. Regenerated after every training. (/Users/nzbirdranch/trippy/output/leaderboard/leaderboard.png)

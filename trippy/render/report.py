@@ -137,18 +137,30 @@ def _first_extent_record(extent_gate: dict | None) -> dict | None:
 def heldout_split(held_out_metrics: dict) -> dict:
     """`{"shade": {...}, "other": {...}}` from `Trainer.evaluate()`'s held-out split, or `{}` each.
 
-    Plus `"shade_calibrated"`/`"other_calibrated"` when the eval ran calibrated.
+    Plus `"shade_eval"`/`"other_eval"` (the neighbour-exposure headline split,
+    `trippy.constants.EVAL_EXPOSURE_MODES`) when present, and
+    `"shade_calibrated"`/`"other_calibrated"` when the eval ran calibrated.
 
     `held_out_metrics` is `Trainer.evaluate()`'s own return value (see there for the "shade"/
-    "other" shape: `{"n", "psnr", "ssim", "lpips"}`). Degrades to an empty dict per side -- not
+    "other" shape: `{"n", "psnr", "ssim", "lpips"}`, and the parallel "_eval"-suffixed shape
+    under the resolved `exposure_mode`). Degrades to an empty dict per side -- not
     `None`, so `report.json`'s `heldout_split` key is always present and always a dict -- when
     `held_out_metrics` predates this split (an older report re-serialized, or `fit()` returning
-    `{}` because a `max_minutes` budget expired before the first eval).
+    `{}` because a `max_minutes` budget expired before the first eval). `"shade_eval"`/
+    `"other_eval"` are omitted the same way (present only when the source dict has them) --
+    `trippy.render.leaderboard` falls back to the plain "shade"/"other" fields and marks the
+    cell "(own)" when they are absent, so an old report.json still renders.
     """
     split = {
         "shade": held_out_metrics.get("shade") or {},
         "other": held_out_metrics.get("other") or {},
     }
+    # The neighbour-exposure headline split (PR #32, `Trainer.evaluate`'s "_eval" fields) --
+    # always present on a current run (default `exposure_mode="neighbours"`), absent on a
+    # report.json written before this feature existed.
+    for key in ("shade_eval", "other_eval"):
+        if held_out_metrics.get(key):
+            split[key] = held_out_metrics[key]
     # Only present when the eval that produced `held_out_metrics` ran with test-time
     # photometric calibration (`Trainer.evaluate(calibrate=True)`); the leaderboard's
     # calibrated column keys off exactly this absence (trippy.render.leaderboard).
@@ -177,6 +189,36 @@ def _fmt_pct(value: float | None) -> str:
 # --- comparison table + summary line ---
 
 
+def _headline_heldout(held_out_metrics: dict) -> tuple[str, float | None, float | None, float | None, bool]:
+    """The neighbour-exposure headline PSNR/SSIM/LPIPS, a short label for it, and whether it fell back.
+
+    `Trainer.evaluate` always resolves an `exposure_mode` (default "neighbours",
+    `trippy.constants.EVAL_EXPOSURE_MODES`) and reports the headline number under
+    `"psnr_mean_eval"`/`"ssim_mean_eval"`/`"lpips_mean_eval"` alongside the strict, own-exposure
+    `"psnr_mean"`/`"ssim_mean"`/`"lpips_mean"` fields (docs/EXPERIMENTS.md "interpolate_eval_settings
+    ported"). A `held_out_metrics` dict from before this feature existed has only the strict
+    fields -- this falls back to those and says so, rather than reporting nothing.
+
+    Returns:
+        `(label_suffix, psnr, ssim, lpips, used_fallback)` -- `label_suffix` is
+        `" ({exposure_mode}-exposure)"` when the headline fields are present, else
+        `" (own -- pre eval-fields run)"` when falling back to the strict fields.
+    """
+    psnr_eval = held_out_metrics.get("psnr_mean_eval")
+    ssim_eval = held_out_metrics.get("ssim_mean_eval")
+    lpips_eval = held_out_metrics.get("lpips_mean_eval")
+    if psnr_eval is not None or ssim_eval is not None:
+        mode = held_out_metrics.get("exposure_mode") or "neighbours"
+        return f" ({mode}-exposure)", psnr_eval, ssim_eval, lpips_eval, False
+    return (
+        " (own -- pre eval-fields run)",
+        held_out_metrics.get("psnr_mean"),
+        held_out_metrics.get("ssim_mean"),
+        held_out_metrics.get("lpips_mean"),
+        True,
+    )
+
+
 def comparison_table_markdown(
     held_out_metrics: dict,
     candidate_audits: dict,
@@ -184,6 +226,14 @@ def comparison_table_markdown(
     dolly_metrics: dict,
 ) -> str:
     """Markdown table: held-out PSNR/SSIM/LPIPS, dark-mass fraction, extent p99/max, dolly coverage.
+
+    The held-out rows lead with the neighbour-exposure headline number (`_headline_heldout`,
+    docs/EXPERIMENTS.md "interpolate_eval_settings ported: eval_exposure_mode (default
+    neighbours)") -- the number the leaderboard also sorts and headlines on -- and keep the
+    strict, own-exposure numbers visible immediately below them as a secondary row so the two
+    are never confused. A `held_out_metrics` dict that predates the "_eval" fields (an older
+    report re-serialized) falls back to the strict numbers for the headline row too and says
+    so, rather than showing a duplicate/misleading pair.
 
     Args:
         held_out_metrics: `Trainer.evaluate`'s return value (candidate only
@@ -198,9 +248,10 @@ def comparison_table_markdown(
         that can't be computed reads "n/a", so the table still renders per
         this task's brief requirement 6).
     """
-    psnr = held_out_metrics.get("psnr_mean")
-    ssim = held_out_metrics.get("ssim_mean")
-    lpips = held_out_metrics.get("lpips_mean")
+    label_suffix, psnr, ssim, lpips, used_fallback = _headline_heldout(held_out_metrics)
+    strict_psnr = held_out_metrics.get("psnr_mean")
+    strict_ssim = held_out_metrics.get("ssim_mean")
+    strict_lpips = held_out_metrics.get("lpips_mean")
 
     candidate_dark = dark_mass_fraction(candidate_audits.get("shade_audit"))
     baseline_dark = dark_mass_fraction(baseline_audits.get("shade_audit"))
@@ -211,9 +262,24 @@ def comparison_table_markdown(
     dolly_coverage = dolly_mean_center_coverage(dolly_metrics)
 
     rows = [
-        ("Held-out PSNR (dB)", "n/a", _fmt(psnr)),
-        ("Held-out SSIM", "n/a", _fmt(ssim, ".4f")),
-        ("Held-out LPIPS", "n/a", _fmt(lpips, ".4f") if lpips is not None else "n/a"),
+        (f"Held-out PSNR (dB){label_suffix}", "n/a", _fmt(psnr)),
+        (f"Held-out SSIM{label_suffix}", "n/a", _fmt(ssim, ".4f")),
+        (f"Held-out LPIPS{label_suffix}", "n/a", _fmt(lpips, ".4f") if lpips is not None else "n/a"),
+    ]
+    # Secondary rows: the strict, own-exposure numbers, kept visible next to the headline --
+    # skipped when the headline already IS the strict number (an old report with no "_eval"
+    # fields), so that case shows one row per metric, not a redundant duplicate pair.
+    if not used_fallback:
+        rows += [
+            ("Held-out PSNR (dB) (strict, own exposure)", "n/a", _fmt(strict_psnr)),
+            ("Held-out SSIM (strict, own exposure)", "n/a", _fmt(strict_ssim, ".4f")),
+            (
+                "Held-out LPIPS (strict, own exposure)",
+                "n/a",
+                _fmt(strict_lpips, ".4f") if strict_lpips is not None else "n/a",
+            ),
+        ]
+    rows += [
         (
             "Shade dark-mass fraction (lum<0.25)",
             _fmt_pct(baseline_dark),
@@ -268,13 +334,20 @@ def summary_line(run_name: str, epoch: int, held_out_metrics: dict, candidate_au
     This is the exact text handed to `scripts/deliver.sh` as the delivery
     "why" (this task's brief: "an honest one-line summary containing the
     key numbers" -- PSNR, dark-mass fraction vs baseline, and epochs; no
-    "looks good").
+    "looks good"). The headline PSNR is the neighbour-exposure number
+    (`_headline_heldout`) with the strict, own-exposure number quoted alongside it -- a
+    `held_out_metrics` dict from before the "_eval" fields existed falls back to the strict
+    number for both and says so.
     """
-    psnr = held_out_metrics.get("psnr_mean")
+    label_suffix, psnr, _ssim, _lpips, used_fallback = _headline_heldout(held_out_metrics)
+    strict_psnr = held_out_metrics.get("psnr_mean")
     candidate_dark = dark_mass_fraction(candidate_audits.get("shade_audit"))
     baseline_dark = dark_mass_fraction(baseline_audits.get("shade_audit"))
+    psnr_clause = f"held-out PSNR {_fmt(psnr)} dB{label_suffix}"
+    if not used_fallback:
+        psnr_clause += f" (strict, own exposure: {_fmt(strict_psnr)} dB)"
     return (
-        f"trippy train report {run_name}: epoch {epoch}, held-out PSNR {_fmt(psnr)} dB, "
+        f"trippy train report {run_name}: epoch {epoch}, {psnr_clause}, "
         f"shade dark-mass {_fmt_pct(candidate_dark)} vs baseline {_fmt_pct(baseline_dark)}"
     )
 
