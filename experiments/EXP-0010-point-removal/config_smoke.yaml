@@ -1,0 +1,56 @@
+# EXP-0010 smoke variant: prove the MPS path for point removal end to end.
+# Small enough (max_points=200000, half width, 4 epochs) to finish in minutes; removal
+# fires EVERY epoch from epoch 1 so the job log shows the point count falling and the
+# in-region dark-mass fraction moving, which is the whole thing this smoke is for.
+#
+# Run via: scripts/gpu_submit.sh --prio 16 exp0010-removal-smoke -- \
+#   trippy train --config experiments/EXP-0010-point-removal/config_smoke.yaml --report
+# (never invoked directly -- see AGENTS.md "GPU and compute").
+
+scene_root: /Users/nzbirdranch/Splats/scenes/karekare/kk-coherent
+run_dir: output/runs/EXP-0010-point-removal/exp0010-removal-smoke
+
+width: 504
+crop: 256
+mode: broadcast
+layers: 5
+epochs: 4
+
+point_source:
+  type: gaussian
+  path: /Users/nzbirdranch/Splats/output/Training-Data/karekare/kk-coherent/kkc_15000.ply
+  min_opacity: 0.05
+  size_mode: knn
+  max_points: 200000
+
+forced_heldout:
+  - IMG_3828.jpg
+  - IMG_3829.jpg
+  - IMG_3830.jpg
+  - IMG_3831.jpg
+  - IMG_3832.jpg
+  - IMG_3833.jpg
+
+# TRIPS's rule (src/apps/train.cpp:846-851), fired every epoch so 4 epochs show 4 passes.
+# conf_threshold 0.1 is deliberately low: trippy initialises confidence from the source
+# PLY's own opacity (median 0.18 on kkc_15000), NOT from TRIPS's uniform sigmoid(10*0.5)
+# = 0.9933, so TRIPS's shipped 0.5 would delete ~90% of this cloud at the first pass.
+point_removal:
+  enabled: true
+  start_epoch: 1
+  every_epochs: 1
+  conf_threshold: 0.1
+  min_points: 50000
+
+# Also prune the audit's own region, so the smoke exercises both code paths on MPS.
+shade_prune:
+  enabled: true
+  start_epoch: 2
+  every_epochs: 2
+  conf_threshold: 0.5
+  min_points: 50000
+
+eval_every: 1
+checkpoint_every: 1
+device: mps
+seed: 0

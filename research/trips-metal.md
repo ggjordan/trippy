@@ -1880,3 +1880,69 @@ the areas I want". Artefacts: `$SPLATS_ROOT/tools/gpu_queue/logs/trippy-viewer-k
 - 2026-09-06T05:27:04Z submitted job trippy-hybrid-a-all-levels prio 70: trippy train --config experiments/EXP-0009-hybrid-a/config.yaml --report --max-minutes 300
 - 2026-09-06T05:27:04Z submitted job trippy-union-trips prio 70: trippy train --config experiments/EXP-0006-union/config_trips.yaml --report --max-minutes 300
 - 2026-09-06T05:27:04Z submitted job trippy-full3-alt prio 70: trippy train --config experiments/EXP-0003-kk-trips-train/config_full3_alt.yaml --report --max-minutes 300
+- 2026-09-06T05:46:21Z submitted job trippy-exp0010-removal-smoke prio 16: trippy train --config experiments/EXP-0010-point-removal/config_smoke.yaml --report
+- 2026-09-06T05:46:26Z submitted job trippy-exp0010-removal prio 70: trippy train --config experiments/EXP-0010-point-removal/config_removal.yaml --report --max-minutes 300
+- 2026-09-06T05:46:27Z submitted job trippy-exp0010-shade-prune prio 70: trippy train --config experiments/EXP-0010-point-removal/config_shade_prune.yaml --report --max-minutes 300
+- **2026-09-06 (feat/point-removal, EXP-0010): TRIPS's point removal ported; TRIPS's point ADDING is
+  not portable, and one of its two in-tree fallbacks is dead code.**
+  *Question:* nothing in trippy's trainer ever removed a point, so does TRIPS's own removal rule move
+  the shade audit's dark-mass fraction (36.9% for TRIPS-from-Gaussians vs 19.9% for the Gaussians it
+  started from, unchanged after 300 epochs)?
+  **TRIPS's rule, as found (third_party/TRIPS @ a59a65b6).** One threshold on one quantity, on a fixed
+  epoch schedule, with no gradient/visibility/error term: `train.cpp:846-851` removes
+  `confidence_value_of_point < removal_confidence_cutoff`, where that confidence is
+  `sigmoid((10 + narrowing) * confidence_raw)` (`NeuralTexture.h:42`, narrowing 0 in the shipped ini).
+  Cutoff 0.3 (`Settings.h:427`) / 0.500000119 (`train_normalnet.ini:134`); schedule
+  `start + i*interval` built at `train.cpp:533-538` with defaults 200/50 (`Settings.h:403-406`); called
+  once per epoch before the epoch's steps (`train.cpp:670-674`). Surgery: `NeuralScene::RemovePoints`
+  (`NeuralScene.cpp:1375-1470`) + `ShrinkTextureOptimizer` (`:362-370`) +
+  `MyAdam::shrinkInternalState` (`MyAdam.cu:346-374`), which index-selects the Adam moments onto the
+  survivors. **Both adding and removal are OFF in every shipped TRIPS config**
+  (`train_normalnet.ini:130-133`: first pass at epoch 2000 of a 600-epoch run).
+  **Point adding, parked with the reason written down.** The default path shells out to an external
+  NeAT CT-reconstruction binary on per-epoch loss images (`#ifdef COMPILE_WITH_VET`,
+  `NeuralScene.cpp:859-1000`) -- a separate codebase, not a rule. The in-tree grid-loss fallback
+  (`AddNewRandomPointsInValuefilledBB`, `NeuralScene.cpp:1330-1373`) is **dead code**: it scales the
+  number of points added by `t_cell_value`, and nothing in the shipped renderer ever writes that buffer
+  (`SetValueForCell`/`GetPointerForValueForCell`, `NeuralPointCloudCuda.h:201-203`, have zero callers),
+  so it always adds exactly zero; it also multiplies the random offsets by `cell_bb_min` instead of
+  adding it (the correct line is commented out below). The third path (`AddPointsViaPointGrowing`) is
+  duplicate-every-point densification, not an error-driven adder.
+  **Finding that changes how the rule must be configured here.** TRIPS initialises every confidence at
+  `sigmoid(10*0.5) = 0.9933`, so its 0.3/0.5 cutoffs mean "training pushed this point down". trippy
+  initialises confidence from the source PLY's opacity: measured on `kkc_15000` (min_opacity 0.05,
+  400k sample) the conf quantiles are p5 0.060 / p25 0.105 / **p50 0.179** / p75 0.311 / p90 0.499, so
+  **74% of points are already below TRIPS's 0.3 and 90% below its 0.5 at epoch 0**. Using TRIPS's own
+  number would delete the scene on the first pass. EXP-0010 uses `conf_threshold 0.1` with TRIPS's own
+  schedule ratios scaled to 300 epochs (200/600 -> epoch 100, 50/600 -> every 25).
+  **In-process audit statistic, verified exact.** `trippy.train.prune.dark_mass_stats` reproduces
+  `~/Splats/tools/depthprior_shade_audit.py` on `kkc_15000` to the digit -- `n_in_region` 1,633,974,
+  `mass_in_region` 336873.52631, `dark_mass_lum0.25` 67068.80576, **fraction 0.199092** (the 19.9%
+  baseline) -- and all six views' `d`/`nobs`/`znear`/`zfar`, while reading the binary `sparse/0` model
+  where the tool reads `sparse_txt`. Under a second for 7.36M points, so it runs at every eval and lands
+  in `metrics.jsonl` under `points.shade_region`.
+  **Smoke `trippy-exp0010-removal-smoke` (prio 16, MPS, rc 0)** -- 4 epochs, 200k points, width 504,
+  removal every epoch, one shade prune at epoch 2. Both rules run on MPS and the optimiser-state
+  surgery holds (training continues across every pass, export + self-report normal). Per-epoch
+  `points | cum. removed | dark fraction | held-out shade PSNR`:
+  `0: 200,000 | 0 | 0.1920 | 11.24` -> `1: 154,660 | 45,340 | 0.2023 | 10.74` ->
+  `2: 147,488 | 52,512 | 0.1042 | 10.75` -> `3: 146,528 | 53,472 | 0.1197 | 10.68`.
+  Three early readings, none of them a verdict on 4 epochs of a 200k subsample:
+  (a) **TRIPS's rule alone RAISED the dark fraction** (0.1920 -> 0.2023) while deleting 22.7% of the
+  cloud -- the confidence tail it removes is not preferentially dark, which is a first answer to the
+  question this experiment asks; (b) `shade_prune` moved it 0.2023 -> 0.1042 in one pass of 5,670
+  points, and it **drifted back to 0.1197 by the next epoch with no further prune** -- deleting the
+  measured mass does not stop it re-forming; (c) the PSNR cost sat with TRIPS's rule (shade 11.24 ->
+  10.74 dB across epoch 1) and **not** with the shade prune (10.740 -> 10.746 across it).
+  *Jobs:* `trippy-exp0010-removal-smoke` (prio 16, **rc 0**), `trippy-exp0010-removal` (arm A, TRIPS's
+  rule only, prio 70, running) and `trippy-exp0010-shade-prune` (arm B, + the audit-aligned prune,
+  prio 70, queued), both long arms `--max-minutes 300`. *Verdict:* pending the 300-epoch runs.
+  **Arm B's dark-mass number is only meaningful next to its held-out shade PSNR** -- it prunes exactly
+  what the audit counts, so a metric win with a PSNR drop means the removed points were carrying real
+  signal.
+  *Artifacts:* `experiments/EXP-0010-point-removal/`; smoke run + both long runs write to
+  `.worktrees/point-removal/output/runs/EXP-0010-point-removal/*/metrics.jsonl` (relative `run_dir`
+  from a worktree -- rescue with `scripts/worktree_rm.sh point-removal`, do NOT `rm -rf` the worktree
+  while the long jobs are running); smoke deliverable `output/deliver/exp0010-removal-smoke`.
+- 2026-09-06T05:51:38Z delivered exp0010-removal-smoke-viewer: trippy train report exp0010-removal-smoke: epoch 3, held-out PSNR 12.38 dB (neighbours-exposure) (strict, own exposure: 12.50 dB), shade dark-mass 12.0% vs baseline 19.9%; open in the free-navigation viewer; N/P step capture views (/Users/nzbirdranch/trippy/output/deliver/exp0010-removal-smoke/OPEN_TRIPS_MAC_exp0010-removal-smoke.command)
+- 2026-09-06T05:51:38Z delivered trips-leaderboard: One table of every TRIPS run so far vs the Gaussian baseline: held-out PSNR, shade dark-mass, extent, coverage. Regenerated after every training. (/Users/nzbirdranch/trippy/output/leaderboard/leaderboard.png)

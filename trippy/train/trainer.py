@@ -19,6 +19,14 @@ Invariants: every render call goes through `trippy.raster.pyramid.
     gaussian_input). It is strictly additive: with `hybrid.enabled` false
     `self.hybrid is None` and every code path below is the one that existed
     before design A, down to the `NetworkConfig` channel count.
+    Point removal (`cfg.point_removal`, TRIPS's own confidence rule; and
+    `cfg.shade_prune`, trippy's audit-aligned heuristic) is the one thing
+    here that changes the *shape* of the trained state mid-run: see
+    `_apply_keep_mask`, which index-selects every per-point parameter and
+    its Adam moments together so moment row i keeps belonging to point i,
+    and `load_state`, which resizes before loading so such a checkpoint can
+    be resumed and re-evaluated. Both default to disabled, in which case
+    the point count is fixed for the whole run exactly as before.
     Structure/camera "locking" (docs/TRIPS_REFERENCE.md Sec. 7) is
     implemented by toggling `requires_grad_` on the frozen parameters for
     the locked epoch range, not by zeroing an optimizer-group learning
@@ -72,9 +80,9 @@ from trippy.net.unet import MultiScaleUnet2dDecOnlySmallFixed, NetworkConfig
 from trippy.raster.pyramid import render_pyramid
 from trippy.render.sheets import colorize, contact_sheet
 from trippy.scene import splits
-from trippy.scene.dataset import SceneDataset
+from trippy.scene.dataset import SceneDataset, resolve_sparse_dir
 from trippy.scene.dataset import crop as dataset_crop
-from trippy.train import checkpoint_io, export, retention
+from trippy.train import checkpoint_io, export, prune, retention
 from trippy.train.config import TrainConfig
 from trippy.train.params import PointParams, PoseParams
 
@@ -331,6 +339,15 @@ class Trainer:
         self._rng = torch.Generator(device="cpu").manual_seed(cfg.seed)
         self.epoch = 0
         self.global_step = 0
+
+        # Point removal bookkeeping (trippy.train.prune). `_shade_views` is the audit
+        # region, built lazily from the COLMAP model the first time a prune pass or an
+        # eval needs it and memoised for the rest of the run (a full points3D parse);
+        # `_shade_region_error` records why it could not be built, so a scene whose
+        # shade frames are not registered logs a reason instead of raising.
+        self.points_removed_total = 0
+        self._shade_views: list[prune.ShadeView] | None = None
+        self._shade_region_error: str | None = None
 
         # Checkpoint retention bookkeeping (trippy.train.retention): `_best_epoch`/
         # `_best_psnr` track the best held-out PSNR seen by ANY `evaluate()` call, updated
@@ -1129,6 +1146,11 @@ class Trainer:
             "lpips_mean_eval": float(np.mean(lpips_eval_vals)) if lpips_eval_vals else None,
             "shade_eval": _aggregate_group(shade_names, per_image, suffix="_eval"),
             "other_eval": _aggregate_group(other_names, per_image, suffix="_eval"),
+            # Point count + the shade audit's dark-mass fraction, computed in-process
+            # from the current parameters (trippy.train.prune.dark_mass_stats), so a
+            # removal run's effect on the metric is visible per eval rather than only
+            # at export time. See `point_stats`.
+            "points": self.point_stats(),
         }
         if calibrate:
             metrics["psnr_mean_calibrated"] = float(np.mean(psnr_cal_vals)) if psnr_cal_vals else 0.0
@@ -1150,6 +1172,217 @@ class Trainer:
         self._append_metrics({"eval": True, **{k: v for k, v in metrics.items() if k != "names"}})
         self._log(f"epoch {epoch}: eval psnr={metrics['psnr_mean']:.3f} ssim={metrics['ssim_mean']:.4f}")
         return metrics
+
+    # --- point removal (trippy.train.prune) ---
+
+    #: PointParams attribute name -> the optimiser group (`self._group_index`) it lives in.
+    #: Every one of these is a per-point parameter whose first dimension is the point
+    #: count, so removing points means index-selecting all four *and* their Adam moments.
+    _POINT_PARAM_GROUPS = (("xyz", "points"), ("raw_size", "size"), ("raw_conf", "conf"), ("feat", "texture"))
+
+    def shade_views(self) -> list[prune.ShadeView] | None:
+        """The shade audit's region for this scene, built once and memoised.
+
+        Built from `cfg.shade_prune.scene_txt` when set, otherwise from the
+        run's own scene (`trippy.scene.dataset.resolve_sparse_dir`). Returns
+        None -- and records why in `self._shade_region_error` -- when the
+        model cannot be read or a configured shade frame is not registered
+        in it, which is the normal case for every scene except kk-coherent.
+        This never raises: measuring the audit statistic must not be able to
+        kill a training run.
+        """
+        if self._shade_views is not None or self._shade_region_error is not None:
+            return self._shade_views
+        cfg = self.cfg.shade_prune
+        try:
+            sparse_dir = Path(cfg.scene_txt) if cfg.scene_txt else resolve_sparse_dir(self.cfg.scene_root)
+            views = prune.build_shade_region(sparse_dir, cfg.frames, cfg.znear_frac, cfg.zfar_frac)
+        except (OSError, ValueError, KeyError) as exc:
+            self._shade_region_error = f"{type(exc).__name__}: {exc}"
+            self._log(f"shade region unavailable ({self._shade_region_error}); dark-mass logging disabled")
+            return None
+        self._shade_views = views
+        self._log(
+            "shade region built from "
+            + ", ".join(f"{v.name}(d={v.d:.2f}, z in [{v.znear:.2f},{v.zfar:.2f}], {v.nobs} obs)" for v in views)
+        )
+        return views
+
+    def _point_arrays(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """(xyz, rgb, conf) as float64 numpy, in exactly the form `export_ply` writes them.
+
+        `rgb` is `clip(feat[:, :3], 0, 1)` and `conf` is `sigmoid(10*raw_conf)`;
+        `trippy.train.export.write_gaussian_ply` writes `(rgb - 0.5)/SH_C0`
+        and `logit(conf)`, and `depthprior_shade_audit.py` inverts both --
+        so the statistic computed from these is the statistic that script
+        reports on the exported PLY, not an approximation of it.
+        """
+        with torch.no_grad():
+            xyz = self.point_params.xyz.detach().cpu().numpy().astype(np.float64)
+            rgb = np.clip(self.point_params.feat[:, :3].detach().cpu().numpy().astype(np.float64), 0.0, 1.0)
+            conf = self.point_params.conf().detach().cpu().numpy().astype(np.float64)
+        return xyz, rgb, conf
+
+    def point_stats(self) -> dict:
+        """Point count, points removed so far, and the in-region dark-mass fraction.
+
+        Logged into every `evaluate()` metrics record (and so into
+        `metrics.jsonl`) so the number Jordan's complaint is measured by is
+        visible *during* training rather than only after an export plus a
+        Splats-tool run. The `shade_region` sub-dict is
+        `trippy.train.prune.dark_mass_stats`'s output, or `{"error": ...}`
+        when the region could not be built, or absent entirely when
+        `cfg.shade_prune.log_dark_mass` is off.
+        """
+        stats: dict = {
+            "n_points": len(self.point_params),
+            "n_removed_total": self.points_removed_total,
+        }
+        if not self.cfg.shade_prune.log_dark_mass:
+            return stats
+        views = self.shade_views()
+        if views is None:
+            stats["shade_region"] = {"error": self._shade_region_error}
+            return stats
+        xyz, rgb, conf = self._point_arrays()
+        stats["shade_region"] = prune.dark_mass_stats(views, xyz, rgb, conf, self.cfg.shade_prune.lum_threshold)
+        return stats
+
+    def _apply_keep_mask(self, keep: np.ndarray, reason: str) -> int:
+        """Drop every point `keep` is False for, rebuilding params AND optimiser state.
+
+        This is trippy's equivalent of TRIPS's
+        `NeuralScene::RemovePoints` + `ShrinkTextureOptimizer`
+        (`src/lib/data/NeuralScene.cpp:1375-1470`,
+        `src/lib/models/MyAdam.cu:346-374`): every per-point parameter is
+        index-selected onto the survivors, and so are that parameter's Adam
+        first/second moments, so moment row `i` still belongs to point `i`
+        afterwards. TRIPS zeroes the gradients after the surgery
+        (`NeuralScene.cpp:1436-1447`); here the freshly built
+        `nn.Parameter`s simply have `grad is None`, which is the same thing
+        for the next `optimizer.step()`. The Adam `step` counter is a scalar
+        and is carried across unchanged (TRIPS keeps `param_steps` too, just
+        index-selected, since its counter is per element).
+
+        Args:
+            keep: (N,) bool array over the *current* point count.
+            reason: short tag for the run log (e.g. "point_removal").
+
+        Returns:
+            How many points were removed (0 when `keep` is all True, in
+            which case nothing is rebuilt at all).
+        """
+        n_before = len(self.point_params)
+        if keep.shape != (n_before,):
+            raise ValueError(f"keep mask must be ({n_before},), got {keep.shape}")
+        n_removed = int(n_before - keep.sum())
+        if n_removed <= 0:
+            return 0
+
+        index = torch.from_numpy(np.flatnonzero(keep).astype(np.int64)).to(self.device)
+        for attr, group_name in self._POINT_PARAM_GROUPS:
+            old_param = getattr(self.point_params, attr)
+            new_param = nn.Parameter(
+                old_param.detach().index_select(0, index).clone(), requires_grad=old_param.requires_grad
+            )
+            state = self.optimizer.state.pop(old_param, None)
+            if state is not None:
+                self.optimizer.state[new_param] = {
+                    key: (
+                        value.index_select(0, index.to(value.device)).clone()
+                        if torch.is_tensor(value) and value.shape == old_param.shape
+                        else value
+                    )
+                    for key, value in state.items()
+                }
+            group = self.optimizer.param_groups[self._group_index[group_name]]
+            group["params"] = [new_param if p is old_param else p for p in group["params"]]
+            setattr(self.point_params, attr, new_param)
+
+        self.point_params.provenance = self.point_params.provenance.index_select(0, index)
+        # bbox_min/bbox_max are deliberately NOT recomputed: the extent penalty is
+        # anchored to the *initial* cloud's bounding box (see `_extent_penalty`), and
+        # shrinking it after a prune would start penalising points that were always
+        # inside the scene.
+        self.points_removed_total += n_removed
+        self._log(
+            f"epoch {self.epoch}: {reason} removed {n_removed} points "
+            f"({n_before} -> {len(self.point_params)})"
+        )
+        return n_removed
+
+    def maybe_prune_points(self, epoch: int) -> dict:
+        """Run whichever point-removal rules fire at `epoch` (TRIPS's, then trippy's).
+
+        TRIPS runs its removal pass at the top of an epoch, before that
+        epoch's training steps (`src/apps/train.cpp:670-674`,
+        `AddAndRemovePoints(epoch_id)` inside `if (do_train && epoch_id > 0)`);
+        `fit()` calls this in the same place. When both rules fire in the
+        same epoch, TRIPS's runs first and trippy's `shade_prune` then sees
+        the already-thinned cloud.
+
+        Args:
+            epoch: the epoch about to run.
+
+        Returns:
+            `{"point_removal": n, "shade_prune": n}` for the rules that
+            fired (absent keys mean that rule did not fire). Empty when
+            neither did.
+        """
+        result: dict = {}
+        removal_cfg = self.cfg.point_removal
+        if removal_cfg.fires_at(epoch):
+            _xyz, _rgb, conf = self._point_arrays()
+            keep = prune.removal_keep_mask(conf, removal_cfg.conf_threshold, removal_cfg.min_points)
+            result["point_removal"] = self._apply_keep_mask(keep, "point_removal")
+
+        shade_cfg = self.cfg.shade_prune
+        if shade_cfg.fires_at(epoch):
+            views = self.shade_views()
+            if views is None:
+                self._log(f"epoch {epoch}: shade_prune skipped ({self._shade_region_error})")
+            else:
+                xyz, rgb, conf = self._point_arrays()
+                inside, _zfrac = prune.in_region(views, xyz)
+                inside &= np.isfinite(xyz).all(axis=1)
+                keep = prune.shade_prune_keep_mask(
+                    inside,
+                    prune.luminance(rgb),
+                    conf,
+                    shade_cfg.lum_threshold,
+                    shade_cfg.conf_threshold,
+                    shade_cfg.min_points,
+                )
+                result["shade_prune"] = self._apply_keep_mask(keep, "shade_prune")
+        return result
+
+    def _resize_point_params(self, n: int) -> None:
+        """Rebuild every per-point parameter/buffer at length `n`, keeping optimiser groups aligned.
+
+        Needed by `load_state`: a checkpoint written after a removal pass
+        holds fewer points than this Trainer's freshly built point source
+        does, so the parameters must be resized *before* `load_state_dict`
+        can fill them. Values are placeholders (the caller overwrites them
+        immediately); what matters is that the optimiser's param groups end
+        up pointing at the same objects the module now holds, in the same
+        order, so `optimizer.load_state_dict` maps its saved state onto them
+        by position.
+        """
+        if n == len(self.point_params):
+            return
+        for attr, group_name in self._POINT_PARAM_GROUPS:
+            old_param = getattr(self.point_params, attr)
+            shape = (n, *old_param.shape[1:])
+            new_param = nn.Parameter(
+                torch.zeros(shape, dtype=old_param.dtype, device=old_param.device),
+                requires_grad=old_param.requires_grad,
+            )
+            self.optimizer.state.pop(old_param, None)
+            group = self.optimizer.param_groups[self._group_index[group_name]]
+            group["params"] = [new_param if p is old_param else p for p in group["params"]]
+            setattr(self.point_params, attr, new_param)
+        provenance = self.point_params.provenance
+        self.point_params.provenance = torch.zeros(n, dtype=provenance.dtype, device=provenance.device)
 
     # --- checkpointing / export ---
 
@@ -1193,6 +1426,7 @@ class Trainer:
             "background": self.background.detach().cpu(),
             "optimizer": self.optimizer.state_dict(),
             "scheduler": self.scheduler.state_dict(),
+            "points_removed_total": self.points_removed_total,
         }
         path = self.checkpoint_dir / TRAIN_CHECKPOINT_FILENAME_FMT.format(epoch=epoch)
         checkpoint_io.save_checkpoint(path, payload)
@@ -1230,7 +1464,19 @@ class Trainer:
             self._log(f"pruned {victim} (retention policy)")
 
     def load_state(self, payload: dict) -> None:
-        """Load a checkpoint payload (as produced by `save_checkpoint`) into this Trainer."""
+        """Load a checkpoint payload (as produced by `save_checkpoint`) into this Trainer.
+
+        A checkpoint saved after a point-removal pass holds fewer points
+        than this Trainer's point source rebuilt at construction, so the
+        per-point parameters are resized to the checkpoint's own count
+        first (`_resize_point_params`) -- otherwise `load_state_dict` would
+        raise a size mismatch and no removal run could ever be resumed,
+        re-evaluated or reported.
+        """
+        checkpoint_n = int(payload["point_params"]["xyz"].shape[0])
+        if checkpoint_n != len(self.point_params):
+            self._log(f"checkpoint holds {checkpoint_n} points (source built {len(self.point_params)}); resizing")
+            self._resize_point_params(checkpoint_n)
         self.point_params.load_state_dict(payload["point_params"])
         self.pose_params.load_state_dict(payload["pose_params"])
         self.net.load_state_dict(payload["net"])
@@ -1243,6 +1489,7 @@ class Trainer:
             self.scheduler.load_state_dict(payload["scheduler"])
         self.epoch = int(payload.get("epoch", 0))
         self.global_step = int(payload.get("global_step", 0))
+        self.points_removed_total = int(payload.get("points_removed_total", 0))
 
     def resume(self, path: str | Path) -> None:
         """Load a checkpoint file and continue from its epoch."""
@@ -1307,6 +1554,7 @@ class Trainer:
             return max_minutes is not None and (time.monotonic() - start_time) / 60.0 >= max_minutes
 
         while self.epoch < self.cfg.epochs:
+            self.maybe_prune_points(self.epoch)
             self._apply_locks(self.epoch)
             self.loss_fn.weights.vgg = self.cfg.loss_vgg if self.epoch >= self.cfg.vgg_start_epoch else 0.0
 

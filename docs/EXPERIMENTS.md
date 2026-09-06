@@ -65,6 +65,30 @@ python ~/Splats/tools/depthprior_shade_audit.py \
 
 Output: opacity mass in shade region (lower is better; 0 = shade is transparent).
 
+The same statistic is also computed **in-process, from the live parameters**, at every
+`Trainer.evaluate` (`trippy.train.prune.dark_mass_stats`), and written into the eval's
+`metrics.json` / `metrics.jsonl` under a `points` key:
+
+```json
+"points": {
+  "n_points": 5738000, "n_removed_total": 0,
+  "shade_region": {"n_in_region": 1633974, "mass_in_region": 336873.5,
+                   "dark_mass_lum0.25": 67068.8, "dark_n_lum0.25": 286884,
+                   "dark_mass_fraction": 0.1991}
+}
+```
+
+so a removal run's effect on Jordan's complaint is visible per epoch rather than only after
+an export plus a Splats-tool run. It is a port, not an approximation: the region code copies
+`depthprior_shade_audit.py`'s `build_region`/`in_region` field for field, and the
+colour/opacity mapping is exact through `trippy.train.export` (the exporter writes
+`logit(conf)` and `(clip(feat[:,:3],0,1) - 0.5)/SH_C0`; the audit inverts both). Verified on
+`kkc_15000`: identical `n_in_region` (1,633,974), `mass_in_region` (336873.52631),
+`dark_mass_lum0.25` (67068.80576) and all six views' `d`/`nobs`/`znear`/`zfar` as the tool's
+own cached JSON, in under a second for 7.36M points. Turn it off per run with
+`shade_prune.log_dark_mass: false`; it degrades to an `{"error": ...}` field (never an
+exception) on any scene whose shade frames are not registered.
+
 ### Held-out PSNR and LPIPS
 
 After exporting the model to PLY, render with:
@@ -565,6 +589,74 @@ git worktree but its artefacts should land in the main checkout's `output/`).
 magnitude fewer crops than a TRIPS epoch (`batch_size=4 x inner_batch_size=4` crops per step, one step
 per image). Read "epoch" in a trippy run as "1/8 of a pass over the training images", and size smoke runs
 accordingly: the EXP-0003 2-epoch smoke run does 48 optimiser steps in total.
+
+### Point removal: `point_removal:` (TRIPS's rule) and `shade_prune:` (trippy's)
+
+Both blocks default to `enabled: false`, a hard no-op: with neither set, a run's point count
+is fixed from construction to export, exactly as before this existed.
+
+```yaml
+point_removal:            # TRIPS's own rule, ported
+  enabled: true
+  start_epoch: 100        # TRIPS: start_removing_points_epoch (Settings.h:403, default 200)
+  every_epochs: 25        # TRIPS: point_removal_epoch_interval (Settings.h:406, default 50)
+  conf_threshold: 0.1     # TRIPS: removal_confidence_cutoff (Settings.h:427 = 0.3; ini:134 = 0.5)
+  min_points: 1000000     # trippy addition; TRIPS has no floor
+
+shade_prune:              # trippy's audit-aligned heuristic -- NOT a TRIPS rule
+  enabled: true
+  log_dark_mass: true     # measurement only, on by default even when enabled is false
+  frames: [IMG_3828.jpg, ...]   # defaults to SHADE_FRAMES_KK
+  znear_frac: 0.05
+  zfar_frac: 0.5
+  lum_threshold: 0.25
+  conf_threshold: 0.5
+  start_epoch: 100
+  every_epochs: 25
+  min_points: 1000000
+  scene_txt: ""           # "" = the run's own scene model (resolve_sparse_dir)
+```
+
+**TRIPS's rule, verbatim.** Drop every point whose *effective* confidence
+`sigmoid(10 * raw_conf)` is below `conf_threshold`
+(`third_party/TRIPS/src/apps/train.cpp:846-851`, with the confidence defined at
+`src/lib/models/NeuralTexture.h:42` -- docs/TRIPS_REFERENCE.md Sec. 2), on epochs
+`start_epoch + i*every_epochs` (`train.cpp:533-538`, `Settings.h:403-406`), evaluated once
+per epoch before that epoch's training steps (`train.cpp:670-674`). No gradient, opacity-mass,
+visibility or error term enters it. TRIPS's shipped configs disable it outright
+(`configs/train_normalnet.ini:130-133`: first removal at epoch 2000 of a 600-epoch run), which
+is why trippy defaults it off too.
+
+**Threshold caveat, and it matters.** TRIPS initialises every confidence at
+`sigmoid(10*0.5) = 0.9933`, so its 0.3/0.5 cutoffs mean "training pushed this point down".
+trippy initialises confidence from the source PLY's opacity, so on `kkc_15000` (min_opacity
+0.05) **74% of points are already below 0.3 and 90% below 0.5 at epoch 0** -- TRIPS's own
+number would delete the scene on the first pass. Pick the cutoff against the source's opacity
+distribution, not against TRIPS's ini. See experiments/EXP-0010-point-removal/README.md.
+
+**Point adding is NOT ported.** TRIPS's default adder shells out to an external NeAT CT
+reconstruction binary; its in-tree grid-loss fallback (`NeuralScene.cpp:1330-1373`) is dead
+code -- it scales the number of added points by `t_cell_value`, which no shipped renderer
+kernel ever writes (`SetValueForCell`/`GetPointerForValueForCell`,
+`NeuralPointCloudCuda.h:201-203`, have zero callers), so it always adds zero. The full finding
+is in experiments/EXP-0010-point-removal/README.md; a trippy-native depth-driven adder is
+parked there as a future experiment rather than culled.
+
+**`shade_prune` is not TRIPS and is deliberately loaded.** It removes points that are inside
+the shade audit's own region AND dark by its own Rec.709 test AND below a confidence cutoff --
+i.e. it removes the thing the audit measures. Any run using it must report its dark-mass
+fraction *next to* its held-out shade PSNR: if that PSNR drops, the removed points were
+carrying real signal and the metric win is an artefact. It is a probe, not a fix.
+
+**Mechanics.** Removing points rebuilds every per-point parameter *and* index-selects its Adam
+moments onto the survivors, so moment row `i` still belongs to point `i`
+(`Trainer._apply_keep_mask`) -- trippy's equivalent of `NeuralScene::RemovePoints` +
+`ShrinkTextureOptimizer` + `MyAdam::shrinkInternalState`
+(`NeuralScene.cpp:1375-1470,362-370`, `MyAdam.cu:346-374`). A checkpoint written after a
+removal holds fewer points than the config's point source rebuilds, so `Trainer.load_state`
+resizes before loading; resume, `trippy eval --checkpoint` and `--report` all work unchanged.
+The extent penalty's bounding box is deliberately **not** recomputed after a prune (it is
+anchored to the initial cloud).
 
 ### Output layout
 

@@ -1124,6 +1124,65 @@ SHADE_AUDIT_DARK_MASS_LUM_KEY = "dark_mass_lum0.25"
 # under `$TRIPPY_OUTPUT/<this>/`.
 AUDIT_CACHE_SUBDIR = "audits"
 
+# --- train/prune.py : TRIPS point removal + trippy's audit-aligned shade prune ---
+# TRIPS's own rule, from source (third_party/TRIPS @ a59a65b6):
+#   src/apps/train.cpp:846-851  indices_to_remove =
+#       where(texture->confidence_value_of_point.squeeze() < removal_confidence_cutoff, 1, 0).nonzero()
+#   src/lib/models/NeuralTexture.h:42  confidence_value_of_point = sigmoid((10 + narrowing) * confidence_raw)
+#   src/lib/data/Settings.h:427  float removal_confidence_cutoff = 0.3   (code default)
+#   configs/train_normalnet.ini:134  removal_confidence_cutoff = 0.500000119  (shipped config)
+#   src/lib/data/Settings.h:403-406  start_removing_points_epoch = 200,
+#       point_removal_epoch_interval = 50   (code defaults; fires at
+#       e == start + i*interval, built in train.cpp:533-538)
+#   configs/train_normalnet.ini:130-133  start_adding_points_epoch = 2020,
+#       start_removing_points_epoch = 2000 with num_epochs = 600 (ini:8),
+#       i.e. BOTH are disabled in the shipped config.
+# trippy takes the *code* default as its own default cutoff (0.3) and the
+# shipped config's schedule ratios (200/600, 50/600) as the epoch defaults,
+# scaled by a config's own `epochs` in the EXP-0010 configs rather than here.
+POINT_REMOVAL_DEFAULT_CONF_THRESHOLD = 0.3
+POINT_REMOVAL_DEFAULT_START_EPOCH = 200
+POINT_REMOVAL_DEFAULT_EVERY_EPOCHS = 50
+
+# Not in TRIPS: a floor on the surviving point count. TRIPS has no such guard
+# (RemovePoints happily empties the cloud; NeuralScene.cpp:1375-1405's
+# keep-index loop even reads one past the end of `indices_vec` when the last
+# point is removed). trippy needs one because its confidence is initialised
+# from the *source PLY's opacity*, not from TRIPS's uniform sigmoid(10*0.5) =
+# 0.9933 -- measured on kkc_15000 (min_opacity 0.05, 400k sample): 74% of
+# points already sit below TRIPS's 0.3 cutoff at epoch 0 and 90% below the
+# shipped 0.5, so a mis-set threshold would delete the scene. See
+# docs/EXPERIMENTS.md "EXP-0010".
+POINT_REMOVAL_DEFAULT_MIN_POINTS = 1000
+
+# --- shade_prune: trippy-only, deliberately audit-aligned (NOT a TRIPS rule) ---
+# Region definition copied field-for-field from Splats'
+# tools/depthprior_shade_audit.py (`build_region`/`in_region`): per shade
+# frame, a point is in the region if it projects inside that frame's image
+# rectangle at camera-space depth in (znear_frac*d, zfar_frac*d), where d is
+# the median camera-space depth of that frame's own observed sparse points.
+# The region is the union over frames. Defaults below are that script's own
+# argparse defaults, so trippy's in-process statistic equals the audit's.
+SHADE_PRUNE_DEFAULT_ZNEAR_FRAC = 0.05
+SHADE_PRUNE_DEFAULT_ZFAR_FRAC = 0.50
+# `--thresholds` default is [0.15, 0.20, 0.25, 0.30]; 0.25 is the one
+# SHADE_AUDIT_DARK_MASS_LUM_KEY reads and the one the leaderboard quotes.
+SHADE_PRUNE_DEFAULT_LUM_THRESHOLD = 0.25
+# Rec.709 luminance weights, identical to depthprior_shade_audit.py's
+# `0.2126*R + 0.7152*G + 0.0722*B`.
+REC709_LUMA_WEIGHTS = (0.2126, 0.7152, 0.0722)
+# The confidence a dark, in-region point must be below to be pruned. Matches
+# configs/train_normalnet.ini:134's shipped removal cutoff, applied here to a
+# far smaller set of points (in-region AND dark) than TRIPS ever applies it to.
+SHADE_PRUNE_DEFAULT_CONF_THRESHOLD = 0.5
+SHADE_PRUNE_DEFAULT_MIN_POINTS = 1000
+
+# Key prefix for the in-process dark-mass statistic logged at every eval, so a
+# metrics.jsonl row lines up by name with `depthprior_shade_audit.py --json-out`
+# (which writes `dark_mass_lum<t>` / `dark_n_lum<t>` per threshold).
+SHADE_DARK_MASS_KEY_FMT = "dark_mass_lum{t}"
+SHADE_DARK_N_KEY_FMT = "dark_n_lum{t}"
+
 # --- cli.py : `trippy candidate-report` ---
 
 CANDIDATE_REPORT_DOLLY_DIRNAME = "dolly"

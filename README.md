@@ -26,6 +26,9 @@ Nobody human edits this code: LLM agents run the repo under the rules in `AGENTS
 
 ### What is here
 - The Python package `trippy/` (geometry, point sources, Metal rasteriser, U-Net, trainer, renderers).
+- TRIPS's own confidence-based point removal, ported (`point_removal:` in a training config), plus an
+  audit-aligned `shade_prune:` probe and an in-process reading of the shade audit's dark-mass fraction at
+  every eval. See `docs/EXPERIMENTS.md` "Point removal" and `experiments/EXP-0010-point-removal/`.
 - CPU-only tests under `tests/` (under 60 s); MPS tests are marked `gpu` and run only inside GPU-queue jobs.
 - Docs and decision records under `docs/`; the running experiment log in `research/`.
 - Later: the Brush fork under `rust/`.
