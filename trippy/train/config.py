@@ -31,6 +31,8 @@ from trippy.constants import (
     DEFAULT_MIN_OPACITY,
     EVAL_CALIBRATE_DEFAULT_LR,
     EVAL_CALIBRATE_DEFAULT_STEPS,
+    EVAL_EXPOSURE_MODE_DEFAULT,
+    EVAL_EXPOSURE_MODES,
     FORCED_HELDOUT_MODE_ALL,
     FORCED_HELDOUT_MODES,
     LOSS_DEFAULT_WEIGHT_L1,
@@ -236,6 +238,17 @@ class TrainConfig:
     eval_calibrate_white_balance: bool = False
     eval_calibrate_steps: int = EVAL_CALIBRATE_DEFAULT_STEPS
     eval_calibrate_lr: float = EVAL_CALIBRATE_DEFAULT_LR
+    # Which exposure/WB a HELD-OUT frame renders through for the "_eval"-suffixed fields in
+    # `Trainer.evaluate` (trippy.constants "eval_exposure_mode" for the full rationale and the
+    # TRIPS `interpolate_eval_settings` citation). Default "neighbours" fixes the held-out-
+    # exposure artefact (a never-trained per-image exposure costing dB that have nothing to do
+    # with reconstruction quality) without ever reading the held-out photo. The plain
+    # `psnr`/`ssim`/`lpips`/`psnr_mean`/`shade`/`other` fields are NOT affected by this
+    # setting -- they always use each frame's own raw exposure, exactly as before this field
+    # existed. "own" reproduces that same behaviour in the new `_eval` fields too (a no-op);
+    # "calibrate" promotes the existing `eval_calibrate_camera` per-image fit to be the `_eval`
+    # row's number instead of only a diagnostic side column.
+    eval_exposure_mode: str = EVAL_EXPOSURE_MODE_DEFAULT
     eval_every: int = TRAIN_DEFAULT_EVAL_EVERY
     checkpoint_every: int = TRAIN_DEFAULT_CHECKPOINT_EVERY
     eval_lpips: bool = True  # see trainer.py docstring: gated so CPU tests don't require a
@@ -293,6 +306,10 @@ class TrainConfig:
             raise ValueError(f"eval_calibrate_steps must be >= 0, got {self.eval_calibrate_steps}")
         if self.eval_calibrate_lr <= 0:
             raise ValueError(f"eval_calibrate_lr must be positive, got {self.eval_calibrate_lr}")
+        if self.eval_exposure_mode not in EVAL_EXPOSURE_MODES:
+            raise ValueError(
+                f"eval_exposure_mode must be one of {EVAL_EXPOSURE_MODES}, got {self.eval_exposure_mode!r}"
+            )
         if self.eval_max_images <= 0:
             raise ValueError(f"eval_max_images must be positive, got {self.eval_max_images}")
         if self.checkpoint_keep_every <= 0:

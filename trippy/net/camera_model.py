@@ -15,6 +15,11 @@ commit a59a65b6d9a8b1c14c73bc004cc9a8956f054c24):
     CameraResponseNetImpl          NeuralCamera.h:98-118, .cpp:64-176
     NeuralCameraImpl                NeuralCamera.h:120-161, .cpp:214-426
     NeuralCameraParams defaults    src/lib/data/Settings.h:110-141
+    InterpolateFromNeighbors        NeuralCamera.cpp:481-520 (called from TestEpoch when
+                                    interpolate_eval_settings is set, src/apps/train.cpp:1604-1611)
+                                    -- ported as `interpolate_from_train_neighbours` below,
+                                    used by `trippy.train.trainer.Trainer.evaluate`'s
+                                    `exposure_mode="neighbours"` (the default).
 
 Order of operations in NeuralCameraImpl::forward (NeuralCamera.cpp:258-390), all defaults
 per configs/train_normalnet.ini:190-198 (see trippy.constants for exact citations):
@@ -40,6 +45,7 @@ aspect-ratio correction only to channel 0 (NeuralCamera.cpp:33
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import torch
@@ -366,3 +372,108 @@ class NeuralCamera(nn.Module):
             )
             return torch.zeros((), device=device)
         return CAMERA_RESPONSE_SMOOTHNESS_OUTER_WEIGHT * self.camera_response.param_loss()
+
+
+def nearest_train_neighbour_distances(
+    is_train: Sequence[bool], index: int
+) -> tuple[int | None, int | None, int, int]:
+    """Walk backward/forward, circularly, from `index` to the nearest `True` entry.
+
+    Port of the index arithmetic in `NeuralCameraImpl::InterpolateFromNeighbors`
+    (`third_party/TRIPS/src/lib/models/NeuralCamera.cpp:481-520`): `index_before = (i-1) >= 0
+    ? i-1 : n-1` and `index_after = (i+1) < n ? i+1 : 0` -- i.e. the frame-index array wraps
+    around at both ends rather than clamping, exactly like a circular buffer over capture
+    order. This function generalises that single step to "walk until you hit a training
+    frame", which is what `interpolate_from_train_neighbours` below needs.
+
+    Args:
+        is_train: per-frame-index flag, True for a TRAINING frame, in dataset/capture order
+            (i.e. aligned with `NeuralCamera.exposures_values`'s own row order).
+        index: the frame index to search around (may itself be True or False; the search
+            always starts by stepping *away* from it, so `index` itself is never returned).
+
+    Returns:
+        `(prev_index, next_index, dist_prev, dist_next)`: the nearest training index walking
+        backward and forward respectively, and how many steps each took (>= 1). Either index
+        is `None` (with its distance equal to `len(is_train)`, i.e. "went all the way around
+        without finding one") when `is_train` has no `True` entry at all.
+    """
+    n = len(is_train)
+    if n == 0:
+        raise ValueError("is_train must be non-empty")
+
+    prev_index: int | None = None
+    prev_dist = n
+    j = index
+    for step in range(1, n + 1):
+        j = j - 1 if j - 1 >= 0 else n - 1
+        if is_train[j]:
+            prev_index, prev_dist = j, step
+            break
+
+    next_index: int | None = None
+    next_dist = n
+    j = index
+    for step in range(1, n + 1):
+        j = j + 1 if j + 1 < n else 0
+        if is_train[j]:
+            next_index, next_dist = j, step
+            break
+
+    return prev_index, next_index, prev_dist, next_dist
+
+
+def interpolate_from_train_neighbours(
+    values: torch.Tensor, is_train: Sequence[bool], index: int
+) -> torch.Tensor:
+    """`values[index]`'s replacement: linear interpolation between its nearest TRAIN neighbours.
+
+    Port of `NeuralCameraImpl::InterpolateFromNeighbors`
+    (`third_party/TRIPS/src/lib/models/NeuralCamera.cpp:481-520`, called from `TestEpoch` when
+    `interpolate_eval_settings` is set, `third_party/TRIPS/src/apps/train.cpp:1604-1611`).
+
+    What TRIPS actually does: for every non-training index `i` (`not_training_indices`), 10
+    Jacobi passes of `exp[i] = 0.5 * (exp[i-1] + exp[i+1])` (wrapping at the array ends), with
+    every non-training index updated *simultaneously* each pass from the *previous* pass's
+    values -- training rows are never themselves overwritten, so they act as fixed (Dirichlet)
+    boundary values. This is the standard Jacobi iteration for the 1-D discrete Laplace
+    equation on a path graph with those boundaries; its unique fixed point (the equation this
+    iteration is solving for) is exactly the **linear interpolation, by index distance,
+    between the two nearest fixed values on either side of any run of unknowns** -- a linear
+    function already equals the average of its neighbours everywhere, so it solves
+    `x_i = 0.5*(x_{i-1}+x_{i+1})` at every interior point, boundaries included by construction.
+
+    trippy computes that fixed point directly (closed form) instead of iterating 10 times:
+    for an isolated run of held-out frames it is mathematically identical to what TRIPS
+    converges toward, and unlike a fixed 10-pass budget it is exact regardless of how long the
+    run of held-out frames between two training frames is (TRIPS's own 10 passes only fully
+    converge for short runs; kk-coherent's 6-consecutive-frame shade region is short enough
+    that this makes no practical difference, but the closed form removes the dependency on
+    that being true). `docs/EXPERIMENTS.md` "Test-time camera calibration" records this
+    citation and rationale.
+
+    Args:
+        values: `(n, ...)` per-frame tensor (e.g. `NeuralCamera.exposures_values`, `(n, 1, 1,
+            1)`, or `white_balance_values`, `(n, 3, 1, 1)`), in the same frame-index order as
+            `is_train`.
+        is_train: per-frame-index flag, True for a TRAINING frame.
+        index: the (held-out) frame index to compute a replacement value for.
+
+    Returns:
+        A tensor shaped like `values[index]` (i.e. `values.shape[1:]`): the weighted average
+        of `values[prev_index]` and `values[next_index]` (weighted by inverse distance -- the
+        nearer training frame dominates), or `values[prev_index]` unweighted when both
+        neighbours resolve to the same single training frame. Falls back to `values.mean(dim=0)`
+        (the plain scene-mean over every frame currently in `values`) when `is_train` has no
+        `True` entry anywhere -- a degenerate case that cannot happen inside `Trainer` (its
+        `__init__` already requires a non-empty training split) but keeps this function total
+        for standalone testing/reuse.
+    """
+    prev_index, next_index, dist_prev, dist_next = nearest_train_neighbour_distances(is_train, index)
+    if prev_index is None:
+        return values.mean(dim=0)
+    if prev_index == next_index:
+        return values[prev_index]
+    weight_next = dist_prev / (dist_prev + dist_next)
+    weight_prev = 1.0 - weight_next
+    return weight_prev * values[prev_index] + weight_next * values[next_index]

@@ -278,9 +278,27 @@ full2-broadcast, shade and non-shade alike, against 17.26 dB for the non-shade f
 EXIF now initialises at the scene mean (relative 0, gain 1.0). **Known remaining limitation:** a held-out
 frame's exposure is still never trained, so even a correct EXIF value is only an estimate of the camera's
 actual response; `trippy eval --calibrate` measures how much that is worth per frame (docs/EXPERIMENTS.md
-"Test-time camera calibration"), and TRIPS's own `interpolate_eval_settings` (copy the exposure of the
-neighbouring train frames, `NeuralCamera.cpp:481-520`) is a not-yet-ported alternative that would fix it
-without touching the held-out photo at all.
+"Test-time camera calibration").
+
+**Fixed (2026-09-06, feat/eval-interp) — TRIPS's `interpolate_eval_settings` is now ported.** The above
+"known remaining limitation" is what produced the wrong 8.49 dB EXP-0003 shade number: a held-out shade
+frame's exposure was never trained, so it scored on whatever its EXIF/zero initialisation happened to be,
+not on the reconstruction. `trippy.net.camera_model.interpolate_from_train_neighbours` ports TRIPS's
+`NeuralCameraImpl::InterpolateFromNeighbors` (`NeuralCamera.cpp:481-520`, called from `TestEpoch` when
+`interpolate_eval_settings` is set, `train.cpp:1604-1611`): a held-out frame's exposure/white-balance is
+replaced with a value interpolated from its nearest TRAINING frames by dataset index (capture order),
+never reading the held-out photo. `Trainer.evaluate`'s new `exposure_mode` argument (config
+`eval_exposure_mode`, default `"neighbours"`) selects this; see docs/EXPERIMENTS.md "Test-time camera
+calibration" for the exact interpolation rule (closed-form linear interpolation, not TRIPS's own 10-pass
+Jacobi iteration -- they agree for an isolated run of held-out frames, see that section for why) and for
+an open design question this port left unresolved: the plain `psnr`/`ssim`/`lpips`/`psnr_mean`/`shade`/
+`other` fields deliberately still mean "own exposure" unconditionally (two existing tests --
+`tests/test_train_regression.py::test_evaluate_psnr_matches_an_independent_masked_psnr` and several in
+`tests/test_train_eval_calibrate.py` -- assert exactly that), so the "neighbours by default" fix lives in
+new parallel `_eval`-suffixed fields rather than overwriting the old ones. Nothing downstream
+(`trippy.render.leaderboard`, `trippy train --report`) has been repointed at the new fields yet -- they
+still read the unaffected `psnr_mean`/`shade`/`other` keys, so a leaderboard/report rebuild is needed
+before this fix is visible outside `trippy eval`'s own printout.
 
 **Fixed — the eval PSNR was 4.771 dB too low.** `Trainer.evaluate` computed
 `((pred - target)**2 * mask).sum() / mask.sum()` with `pred` (1, 3, H, W) and `mask` (1, 1, H, W): a

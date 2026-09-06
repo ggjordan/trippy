@@ -68,6 +68,7 @@ def evaluate_checkpoint(
     device: str | None = None,
     calibrate: bool | None = None,
     calibrate_white_balance: bool | None = None,
+    exposure_mode: str | None = None,
 ) -> dict:
     """Evaluate a checkpoint on `images` (default: its own held-out split).
 
@@ -85,11 +86,18 @@ def evaluate_checkpoint(
             to the call.
         calibrate_white_balance: fit red/blue white balance too (green is
             pinned, as in training). None keeps the checkpoint's config.
+        exposure_mode: which exposure/WB a held-out image's headline
+            "_eval" numbers use -- "own"/"neighbours"/"calibrate"
+            (`trippy.constants.EVAL_EXPOSURE_MODES`). None keeps the
+            checkpoint's own `cfg.eval_exposure_mode` ("neighbours" for any
+            checkpoint saved by a config that didn't set it explicitly --
+            see `trippy.train.config.TrainConfig.eval_exposure_mode`).
 
     Returns:
         The `Trainer.evaluate()` metrics dict -- including the "per_image"
-        exposure diagnostics, the "shade"/"other" held-out split, and (with
-        `calibrate`) "shade_calibrated"/"other_calibrated" (see
+        exposure diagnostics, the "shade"/"other" held-out split, the
+        `exposure_mode`-resolved "shade_eval"/"other_eval" headline numbers,
+        and (with `calibrate`) "shade_calibrated"/"other_calibrated" (see
         `Trainer.evaluate`) -- also
         written to `<run_dir>/eval_manual_<timestamp>/metrics.json` +
         `sheet.jpg` (a distinct directory from any mid-training/`--report`
@@ -104,7 +112,9 @@ def evaluate_checkpoint(
     if calibrate_white_balance is not None:
         trainer.cfg.eval_calibrate_white_balance = bool(calibrate_white_balance)
     eval_dirname = TRAIN_EVAL_MANUAL_DIRNAME_FMT.format(ts=time.strftime("%Y%m%d-%H%M%S"))
-    return trainer.evaluate(names=images, eval_dirname=eval_dirname, calibrate=calibrate)
+    return trainer.evaluate(
+        names=images, eval_dirname=eval_dirname, calibrate=calibrate, exposure_mode=exposure_mode
+    )
 
 
 def render_offpath(

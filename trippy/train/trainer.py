@@ -46,6 +46,7 @@ from torch import nn
 
 from trippy.config import load_settings, pick_device
 from trippy.constants import (
+    EVAL_EXPOSURE_MODES,
     SCENE_CACHE_META_FILENAME,
     SHADE_FRAMES_KK,
     TRAIN_CHECKPOINT_BEST_FILENAME,
@@ -65,7 +66,7 @@ from trippy.constants import (
 )
 from trippy.geom import xform_b
 from trippy.hybrid.gaussian_input import GaussianInputs
-from trippy.net.camera_model import NeuralCamera
+from trippy.net.camera_model import NeuralCamera, interpolate_from_train_neighbours
 from trippy.net.losses import LossWeights, TripsLoss, _LazyLPIPS, l1_loss, mse_loss, ssim
 from trippy.net.unet import MultiScaleUnet2dDecOnlySmallFixed, NetworkConfig
 from trippy.raster.pyramid import render_pyramid
@@ -244,6 +245,12 @@ class Trainer:
         )
         if not self.train_names:
             raise ValueError("split produced an empty train set -- check heldout_k/forced_heldout vs dataset size")
+        # For `exposure_mode="neighbours"` (trippy.net.camera_model.interpolate_from_train_neighbours):
+        # per-frame-index flag, True for a TRAINING frame, aligned with `self.dataset.names`'s own
+        # order (== `NeuralCamera.exposures_values`'s row order, since both are built from
+        # `len(self.dataset.names)`). Computed once -- the split never changes after __init__.
+        self._train_name_set = set(self.train_names)
+        self._is_train_frame = [name in self._train_name_set for name in self.dataset.names]
 
         point_source = cfg.point_source.to_source()
         point_set = point_source.build()
@@ -670,6 +677,36 @@ class Trainer:
 
     # --- evaluation ---
 
+    def _interpolated_camera_override(
+        self, frame_index: int
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Exposure/WB override for `frame_index`, interpolated from its nearest TRAIN neighbours.
+
+        `exposure_mode="neighbours"`'s own building block (`trippy.net.camera_model.
+        interpolate_from_train_neighbours`, porting `NeuralCameraImpl::InterpolateFromNeighbors`,
+        `NeuralCamera.cpp:481-520`): never reads `frame_index`'s own photo, only the current
+        (possibly still-initial, for a frame never sampled by `train_step`) rows of every
+        TRAINING frame. Read-only -- `.detach()`d inputs, nothing written back to the module,
+        same "never touches the checkpoint" contract as `calibrate_frame`.
+
+        Returns:
+            `(exposure_override, white_balance_override)`, each shaped like a single row of
+            the corresponding `NeuralCamera` parameter with a leading batch dim of 1 (ready for
+            `NeuralCamera.forward_with`'s `exposure`/`white_balance` kwargs), or `None` when
+            that parameter is disabled (`enable_exposure=False` / `enable_white_balance=False`).
+        """
+        exposure_override = None
+        if self.camera.exposures_values is not None:
+            exposure_override = interpolate_from_train_neighbours(
+                self.camera.exposures_values.detach(), self._is_train_frame, frame_index
+            ).unsqueeze(0)
+        white_balance_override = None
+        if self.camera.white_balance_values is not None:
+            white_balance_override = interpolate_from_train_neighbours(
+                self.camera.white_balance_values.detach(), self._is_train_frame, frame_index
+            ).unsqueeze(0)
+        return exposure_override, white_balance_override
+
     def calibrate_frame(
         self,
         net_out: torch.Tensor,
@@ -822,6 +859,7 @@ class Trainer:
         epoch: int | None = None,
         eval_dirname: str | None = None,
         calibrate: bool | None = None,
+        exposure_mode: str | None = None,
     ) -> dict:
         """Full-frame held-out evaluation: PSNR/SSIM(/LPIPS) + an honesty contact sheet.
 
@@ -844,7 +882,21 @@ class Trainer:
                 Defaults to `cfg.eval_calibrate_camera` (False), so no
                 training-time eval changes. The strict numbers are always
                 computed and reported as well; the calibrated ones land in
-                separate keys and never overwrite them.
+                separate keys and never overwrite them. Independent of
+                `exposure_mode` below (see that arg for how the two relate).
+            exposure_mode: which exposure/white-balance a HELD-OUT image's
+                "_eval"-suffixed numbers (below) are computed with --
+                `trippy.constants.EVAL_EXPOSURE_MODES`
+                ("own"/"neighbours"/"calibrate"). Defaults to
+                `cfg.eval_exposure_mode` ("neighbours"). A name that is one
+                of `self.train_names` always uses "own" regardless of this
+                setting (TRIPS's own `InterpolateFromNeighbors` is likewise
+                only ever called on `not_training_indices` --
+                `NeuralCamera.cpp:481-520`, `train.cpp:1604-1611`). This
+                setting never changes the plain `psnr`/`ssim`/`lpips`/
+                `psnr_mean`/`shade`/`other` fields below -- those always use
+                each frame's own raw, never-trained exposure, exactly as
+                before this feature existed.
 
         Returns:
             {"epoch", "n_images", "psnr_mean", "ssim_mean", "lpips_mean"
@@ -855,20 +907,36 @@ class Trainer:
             `cfg.forced_heldout` when non-empty, else `SHADE_FRAMES_KK`,
             intersected with `names`)}. Every `per_image` entry also
             carries the exposure diagnostics (no training, no extra
-            render): "pred_mean"/"target_mean"/"brightness_ratio" (mean
-            photo brightness over mean predicted brightness -- a mis-set
-            per-image gain shows up here directly), "gain_best" (the
-            closed-form global gain of `best_global_gain`) and "psnr_gain"
-            (PSNR after applying it), plus "exposure_ev"/"exposure_gain",
-            the per-image exposure this render actually used. With
-            `calibrate` on, "psnr_calibrated"/"ssim_calibrated"/
-            "lpips_calibrated"/"calibration" are added per image and
-            "psnr_mean_calibrated", "shade_calibrated" and
-            "other_calibrated" at the top level (`calibrated: false` and no
-            such keys otherwise). Also writes
-            `<run_dir>/<eval_dirname>/metrics.json` (the full dict above)
-            and, for up to `cfg.eval_max_images` images (forced-held-out
-            shade frames first), `sheet.jpg` (JPEG quality
+            render, always computed from each frame's own raw exposure
+            regardless of `exposure_mode`): "pred_mean"/"target_mean"/
+            "brightness_ratio" (mean photo brightness over mean predicted
+            brightness -- a mis-set per-image gain shows up here directly),
+            "gain_best" (the closed-form global gain of `best_global_gain`)
+            and "psnr_gain" (PSNR after applying it), plus "exposure_ev"/
+            "exposure_gain", the frame's own exposure (whether or not it
+            was used for this row's headline number). With `calibrate` on,
+            "psnr_calibrated"/"ssim_calibrated"/"lpips_calibrated"/
+            "calibration" are added per image and "psnr_mean_calibrated",
+            "shade_calibrated" and "other_calibrated" at the top level
+            (`calibrated: false` and no such keys otherwise).
+
+            "exposure_mode" (top level): the resolved mode this call used.
+            Per image, `exposure_mode`, `psnr_eval`, `ssim_eval`,
+            `lpips_eval` -- the headline number under this feature: for a
+            TRAINING-set name this is always identical to `psnr`/`ssim`/
+            `lpips` ("own"); for a held-out name it is computed under the
+            resolved `exposure_mode` ("own": identical to the plain fields;
+            "neighbours": `_interpolated_camera_override`'s exposure/WB;
+            "calibrate": `calibrate_frame`'s fit, reusing the same fit
+            `calibrate=True` above would have produced, computed at most
+            once per image either way). "psnr_mean_eval", "shade_eval" and
+            "other_eval" aggregate these at the top level, always (this is
+            the number a caller should treat as "the" held-out PSNR under
+            this feature -- see `trippy.constants` "eval_exposure_mode").
+
+            Also writes `<run_dir>/<eval_dirname>/metrics.json` (the full
+            dict above) and, for up to `cfg.eval_max_images` images
+            (forced-held-out shade frames first), `sheet.jpg` (JPEG quality
             `TRAIN_EVAL_SHEET_JPEG_QUALITY`, not PNG -- see module-level
             `_save_eval_sheet_jpeg`): photo | render | raw level-0 |
             coverage, one row per image (docs/EXPERIMENTS.md "Mandatory
@@ -887,6 +955,9 @@ class Trainer:
         names = list(self.heldout_names) if names is None else list(names)
         epoch = self.epoch if epoch is None else epoch
         calibrate = self.cfg.eval_calibrate_camera if calibrate is None else calibrate
+        exposure_mode = self.cfg.eval_exposure_mode if exposure_mode is None else exposure_mode
+        if exposure_mode not in EVAL_EXPOSURE_MODES:
+            raise ValueError(f"exposure_mode must be one of {EVAL_EXPOSURE_MODES}, got {exposure_mode!r}")
 
         forced = set(self.cfg.forced_heldout)
         sheet_names = sorted(names, key=lambda n: (n not in forced, n))[: self.cfg.eval_max_images]
@@ -895,6 +966,9 @@ class Trainer:
         ssim_vals: list[float] = []
         lpips_vals: list[float] = []
         psnr_cal_vals: list[float] = []
+        psnr_eval_vals: list[float] = []
+        ssim_eval_vals: list[float] = []
+        lpips_eval_vals: list[float] = []
         per_image: dict[str, dict] = {}
         sheet_images: list[np.ndarray] = []
         sheet_labels: list[str] = []
@@ -959,12 +1033,23 @@ class Trainer:
                     "exposure_gain": float(2.0**-exposure_ev),
                 }
 
-                if calibrate:
+                # Headline "_eval" numbers (docs/EXPERIMENTS.md "Test-time camera
+                # calibration"): a training-set name always uses its own (never-overridden)
+                # exposure, exactly like TRIPS's InterpolateFromNeighbors only ever touching
+                # `not_training_indices`; a held-out name uses the resolved `exposure_mode`.
+                row_mode = "own" if name in self._train_name_set else exposure_mode
+
+                # `calibrate_frame` is expensive (an Adam loop) -- run it at most once per
+                # image even when both the legacy `calibrate` side-column and
+                # `exposure_mode="calibrate"`'s headline number need it.
+                pred_cal: torch.Tensor | None = None
+                cal_info: dict | None = None
+                if calibrate or row_mode == "calibrate":
                     with torch.enable_grad():
-                        pred_cal, cal_info = self.calibrate_frame(
-                            net_out, target_c, frame_index, mask=mask_c
-                        )
+                        pred_cal, cal_info = self.calibrate_frame(net_out, target_c, frame_index, mask=mask_c)
                     pred_cal = _center_crop_like(pred_cal, pred.shape[-2], pred.shape[-1])
+
+                if calibrate:
                     psnr_cal = _psnr(pred_cal, target_c, mask_c)
                     per_image[name].update(
                         {
@@ -979,6 +1064,38 @@ class Trainer:
                         }
                     )
                     psnr_cal_vals.append(psnr_cal)
+
+                if row_mode == "own":
+                    eval_pred = pred
+                elif row_mode == "neighbours":
+                    exposure_override, wb_override = self._interpolated_camera_override(frame_index)
+                    frame_index_t = torch.tensor([frame_index], device=self.device, dtype=torch.long)
+                    eval_pred = self.camera.forward_with(
+                        net_out, frame_index_t, exposure=exposure_override, white_balance=wb_override
+                    )
+                    eval_pred = _center_crop_like(eval_pred, pred.shape[-2], pred.shape[-1])
+                else:  # "calibrate"
+                    eval_pred = pred_cal
+
+                psnr_eval = _psnr(eval_pred, target_c, mask_c)
+                ssim_eval = float(ssim(eval_pred, target_c, mask_c).item())
+                lpips_eval = (
+                    float(self._eval_lpips(eval_pred, target_c, mask_c).item())
+                    if self._eval_lpips is not None
+                    else None
+                )
+                per_image[name].update(
+                    {
+                        "exposure_mode": row_mode,
+                        "psnr_eval": psnr_eval,
+                        "ssim_eval": ssim_eval,
+                        "lpips_eval": lpips_eval,
+                    }
+                )
+                psnr_eval_vals.append(psnr_eval)
+                ssim_eval_vals.append(ssim_eval)
+                if lpips_eval is not None:
+                    lpips_eval_vals.append(lpips_eval)
 
                 if name in sheet_names:
                     raw = layers[0][:3].clamp(0.0, 1.0).permute(1, 2, 0).cpu().numpy()
@@ -1002,6 +1119,16 @@ class Trainer:
             "shade": _aggregate_group(shade_names, per_image),
             "other": _aggregate_group(other_names, per_image),
             "calibrated": bool(calibrate),
+            # Headline numbers under `exposure_mode` (trippy.constants "eval_exposure_mode"):
+            # always populated (unlike the "_calibrated" block below, which is opt-in) since
+            # "neighbours" is the resolved default -- see `evaluate`'s own docstring for how
+            # this relates to the plain psnr_mean/shade/other above.
+            "exposure_mode": exposure_mode,
+            "psnr_mean_eval": float(np.mean(psnr_eval_vals)) if psnr_eval_vals else 0.0,
+            "ssim_mean_eval": float(np.mean(ssim_eval_vals)) if ssim_eval_vals else 0.0,
+            "lpips_mean_eval": float(np.mean(lpips_eval_vals)) if lpips_eval_vals else None,
+            "shade_eval": _aggregate_group(shade_names, per_image, suffix="_eval"),
+            "other_eval": _aggregate_group(other_names, per_image, suffix="_eval"),
         }
         if calibrate:
             metrics["psnr_mean_calibrated"] = float(np.mean(psnr_cal_vals)) if psnr_cal_vals else 0.0
