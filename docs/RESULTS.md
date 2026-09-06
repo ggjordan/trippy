@@ -1,9 +1,9 @@
 # Results digest for Jordan (kept current by the Orchestrator; numbers in research/trips-metal.md)
 
-Last updated 2026-09-06 18:10. Open things in `~/Splats/output/Jordan-Review/` (`4-other/`, `2-open-in-brush/`).
+Last updated 2026-09-07 05:00. Open things in `~/Splats/output/Jordan-Review/` (`4-other/`, `2-open-in-brush/`).
 
 ## What to click first
-1. `4-other/full2-broadcast-viewer-v2.command` — the 300-epoch Karekare TRIPS model, free navigation.
+1. `4-other/exp0010-shade-prune-viewer.command` — best kk-coherent candidate so far (see table). Also `full2-broadcast-viewer-v2.command` for the un-pruned version.
    R = home view, N/P = step through the capture, V = network / raw points / coverage, X = exposure mode,
    scroll = faster. Walk toward the shade under the trees.
 2. `4-other/trips-leaderboard.png` — one table of every run vs the plain Gaussians.
@@ -15,7 +15,9 @@ Last updated 2026-09-06 18:10. Open things in `~/Splats/output/Jordan-Review/` (
 | | all held-out PSNR | shade frames PSNR | dark mass in the shade volume |
 |---|---|---|---|
 | Plain Gaussians (kkc_15000; trained on 5 of the 6 shade frames) | 15.53 | 14.94 | 19.9% |
-| TRIPS from Gaussian centres, 300 epochs, broadcast | **17.12** | **15.27** | 36.9% |
+| TRIPS from Gaussian centres, 300 epochs, broadcast | 17.12 | 15.27 | 36.9% |
+| + TRIPS point removal (EXP-0010 A) | 17.67 | 15.44 | 36.8% |
+| + audit-aligned shade prune (EXP-0010 B) — **walk this one** | **17.75** | **15.59** | **24.1%** |
 
 - PSNR uses exposure borrowed from neighbouring training frames (TRIPS's own method; no held-out photo is used).
   The earlier 8.49 dB shade number was an exposure bug (10 photos without EXIF got a 58x gain).

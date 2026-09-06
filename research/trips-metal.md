@@ -2019,3 +2019,5 @@ the areas I want". Artefacts: `$SPLATS_ROOT/tools/gpu_queue/logs/trippy-viewer-k
   until all eight jobs finish** -- the generated job files `cd` into it.
 
 - 2026-09-06T08:00Z EXP-0010 arm A (exp0010-removal) rc 0: 300 ep in ~3 h (36 s/epoch after the emission fix); held-out all 17.67 / shade 15.44 (neighbour exposure; strict 16.51); shade dark mass 36.8% vs 19.9% baseline: TRIPS's confidence-cutoff removal does not reduce dark mass. Viewer launcher delivered.
+
+- 2026-09-06T16:50Z EXP-0010 arm B (exp0010-shade-prune) rc 0: 300 ep; all 17.75 (strict 16.53), shade 15.59 (neighbour exposure); shade dark mass 24.1% vs 36.9% (arm A 36.8%) vs 19.9% Gaussians. First candidate that beats the Gaussian baseline on PSNR with dark mass approaching baseline. Viewer launcher delivered.
