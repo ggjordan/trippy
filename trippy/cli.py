@@ -90,6 +90,20 @@ them plus the fixed Gaussian/Design-C baselines
 "Leaderboard". CPU-only; `--deliver` also hands the PNG to `scripts/deliver.sh`
 under the fixed `trips-leaderboard` name (the same thing `train --report`
 already does automatically at the end of every run).
+
+`prune-run` applies `trippy.train.retention`'s checkpoint-retention policy to
+an existing run directory's `checkpoints/` (the same policy `Trainer.
+save_checkpoint` now applies automatically after every save) -- for a run
+that trained before this policy existed, or one that was never going to
+finish its own retention because it is still running. It only ever
+deletes `checkpoint_ep<NNNN>.pt` files matching that filename pattern:
+`checkpoint_latest.pt`/`checkpoint_best.pt` are never in its candidate list,
+the single newest epoch file is never deleted regardless of `--keep-last`,
+and any file modified within `--protect-seconds` (default
+`PRUNE_RUN_DEFAULT_PROTECT_SECONDS` = 120s) is skipped so a checkpoint a
+still-running job just wrote is never raced. `--dry-run` prints exactly what
+would be deleted (and the total bytes that would free) without deleting
+anything.
 """
 
 from __future__ import annotations
@@ -132,11 +146,16 @@ from trippy.constants import (
     MONODEPTH_DEFAULT_VOXEL,
     PARITY_DEFAULT_INDICES,
     PARITY_DEFAULT_NUM_LAYERS,
+    PRUNE_RUN_DEFAULT_PROTECT_SECONDS,
     RASTER_MODES,
     RASTER_NUM_LAYERS,
     RENDER_CACHE_SUBDIR,
     SHADE_FRAMES_KK,
     SMOKE_MPS_TEST_TENSOR_LEN,
+    TRAIN_CHECKPOINT_BEST_JSON_FILENAME,
+    TRAIN_CHECKPOINT_DIRNAME,
+    TRAIN_DEFAULT_CHECKPOINT_KEEP_EVERY,
+    TRAIN_DEFAULT_CHECKPOINT_KEEP_LAST,
     TRAIN_DEFAULT_MODE,
     TRAIN_EXPORT_FILENAME,
     TRAIN_REPORT_DIRNAME,
@@ -157,6 +176,7 @@ from trippy.render.bundle import export_bundle as write_export_bundle
 from trippy.render.candidate import render_candidate
 from trippy.render.dolly import shade_dolly_poses
 from trippy.render.offpath import offpath_poses
+from trippy.train import retention
 from trippy.train.config import PointSourceConfig, TrainConfig
 from trippy.train.eval import build_trainer_from_checkpoint, evaluate_checkpoint
 from trippy.train.trainer import Trainer
@@ -575,6 +595,82 @@ def _cmd_leaderboard(args: argparse.Namespace) -> int:
     print(f"trippy leaderboard: {len(result['rows'])} row(s) -> {result['markdown_path']}, {result['png_path']}")
     if "delivery" in result:
         print(f"trippy leaderboard: delivery {result['delivery']['status']}")
+    return 0
+
+
+def _cmd_prune_run(args: argparse.Namespace) -> int:
+    """`trippy prune-run <run_dir> [--dry-run]`: apply the retention policy to an existing run.
+
+    Reads `checkpoints/best.json` (if present -- older runs trained before
+    this feature won't have one) for the best-epoch protection, globs
+    `checkpoints/checkpoint_ep*.pt`, and defers the actual keep/delete
+    decision to `trippy.train.retention.select_checkpoints_to_delete` --
+    exactly the function `Trainer.save_checkpoint` itself calls, so this
+    command reproduces the same policy for a run that already finished (or
+    is still running) rather than re-implementing it.
+    """
+    run_dir = Path(args.run_dir)
+    checkpoint_dir = run_dir / TRAIN_CHECKPOINT_DIRNAME
+    if not checkpoint_dir.is_dir():
+        print(f"trippy prune-run: no {TRAIN_CHECKPOINT_DIRNAME}/ directory under {run_dir}", file=sys.stderr)
+        return 2
+
+    best_epoch = None
+    best_json_path = checkpoint_dir / TRAIN_CHECKPOINT_BEST_JSON_FILENAME
+    if best_json_path.exists():
+        try:
+            best_epoch = json.loads(best_json_path.read_text()).get("epoch")
+        except (json.JSONDecodeError, OSError) as exc:
+            print(f"trippy prune-run: could not read {best_json_path} ({exc}); continuing without it", file=sys.stderr)
+
+    all_epoch_paths = sorted(checkpoint_dir.glob("checkpoint_ep*.pt"))
+    epochs = [(p, retention.epoch_of(p)) for p in all_epoch_paths]
+    recognised = [(p, e) for p, e in epochs if e is not None]
+    if not recognised:
+        print(f"trippy prune-run: no checkpoint_ep*.pt files under {checkpoint_dir}; nothing to do")
+        return 0
+    newest_epoch = max(e for _, e in recognised)
+
+    to_delete = retention.select_checkpoints_to_delete(
+        [p for p, _ in recognised],
+        best_epoch=best_epoch,
+        keep_every=args.keep_every,
+        keep_last=args.keep_last,
+        protect_newer_than_s=args.protect_seconds,
+    )
+    # Hard safety net independent of --keep-last (task brief: "must NEVER touch ... the
+    # newest epoch file"): even a `--keep-last 0` misfire must not remove it.
+    to_delete = [p for p in to_delete if retention.epoch_of(p) != newest_epoch]
+
+    total_bytes = 0
+    for victim in to_delete:
+        try:
+            size = victim.stat().st_size
+        except FileNotFoundError:
+            continue
+        total_bytes += size
+        if args.dry_run:
+            print(f"would delete {victim} ({size} bytes)")
+        else:
+            victim.unlink(missing_ok=True)
+            print(f"deleted {victim} ({size} bytes)")
+
+    verb = "would free" if args.dry_run else "freed"
+    prefix = "DRY RUN: " if args.dry_run else ""
+    print(f"trippy prune-run: {prefix}{len(to_delete)} file(s), {verb} {total_bytes} bytes")
+    print(
+        "JSON:"
+        + json.dumps(
+            {
+                "run_dir": str(run_dir),
+                "dry_run": args.dry_run,
+                "best_epoch": best_epoch,
+                "newest_epoch": newest_epoch,
+                "deleted": [str(p) for p in to_delete],
+                "bytes_freed": total_bytes,
+            }
+        )
+    )
     return 0
 
 
@@ -1024,6 +1120,34 @@ def build_parser() -> argparse.ArgumentParser:
         help="also deliver the PNG via scripts/deliver.sh under the fixed 'trips-leaderboard' name",
     )
     leaderboard.set_defaults(func=_cmd_leaderboard)
+
+    prune_run = sub.add_parser(
+        "prune-run",
+        help="apply the checkpoint retention policy to an existing run directory's checkpoints/",
+    )
+    prune_run.add_argument("run_dir", help="run directory (the one containing checkpoints/)")
+    prune_run.add_argument(
+        "--dry-run", action="store_true", help="print what would be deleted (and bytes freed) without deleting"
+    )
+    prune_run.add_argument(
+        "--keep-every",
+        type=int,
+        default=TRAIN_DEFAULT_CHECKPOINT_KEEP_EVERY,
+        help="keep every Nth epoch checkpoint (default matches TrainConfig.checkpoint_keep_every)",
+    )
+    prune_run.add_argument(
+        "--keep-last",
+        type=int,
+        default=TRAIN_DEFAULT_CHECKPOINT_KEEP_LAST,
+        help="keep this many of the most recent epoch checkpoints (default matches TrainConfig.checkpoint_keep_last)",
+    )
+    prune_run.add_argument(
+        "--protect-seconds",
+        type=float,
+        default=PRUNE_RUN_DEFAULT_PROTECT_SECONDS,
+        help="never delete a file modified more recently than this many seconds ago (default 120s)",
+    )
+    prune_run.set_defaults(func=_cmd_prune_run)
 
     candidate_report = sub.add_parser(
         "candidate-report",

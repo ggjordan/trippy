@@ -38,6 +38,8 @@ from trippy.constants import (
     RASTER_PYRAMID_HALVINGS,
     TRAIN_DEFAULT_BACKGROUND,
     TRAIN_DEFAULT_CHECKPOINT_EVERY,
+    TRAIN_DEFAULT_CHECKPOINT_KEEP_EVERY,
+    TRAIN_DEFAULT_CHECKPOINT_KEEP_LAST,
     TRAIN_DEFAULT_CROP,
     TRAIN_DEFAULT_CROPS_PER_STEP,
     TRAIN_DEFAULT_EPOCHS,
@@ -62,6 +64,7 @@ from trippy.constants import (
     TRAIN_DEFAULT_WIDTH,
     TRAIN_DEFAULT_ZOOM_MAX,
     TRAIN_DEFAULT_ZOOM_MIN,
+    TRAIN_EVAL_MAX_SHEET_IMAGES,
     TRAIN_EXTENT_MARGIN_FRAC,
     TRAIN_EXTENT_PENALTY_WEIGHT_DEFAULT,
     TRAIN_LOCK_CAMERAS_FRAC,
@@ -219,6 +222,18 @@ class TrainConfig:
     checkpoint_every: int = TRAIN_DEFAULT_CHECKPOINT_EVERY
     eval_lpips: bool = True  # see trainer.py docstring: gated so CPU tests don't require a
     # network-reachable LPIPS/VGG backbone unless explicitly asked for.
+    # Rows in the per-epoch eval contact sheet (photo | render | raw L0 | coverage), forced
+    # held-out frames first -- was a hardcoded constant (TRAIN_EVAL_MAX_SHEET_IMAGES), now a
+    # config field so a run can widen/narrow it without a code change; default is unchanged
+    # behaviour (trippy.train.trainer.Trainer.evaluate).
+    eval_max_images: int = TRAIN_EVAL_MAX_SHEET_IMAGES
+
+    # --- checkpoint retention (trippy.train.retention; task brief 2026-09-06, disk at 94%) ---
+    # `Trainer.save_checkpoint` keeps checkpoint_latest.pt, checkpoint_best.pt (the best
+    # held-out PSNR so far), every epoch that is a multiple of `checkpoint_keep_every`, and
+    # the `checkpoint_keep_last` most recent epoch files, deleting the rest.
+    checkpoint_keep_every: int = TRAIN_DEFAULT_CHECKPOINT_KEEP_EVERY
+    checkpoint_keep_last: int = TRAIN_DEFAULT_CHECKPOINT_KEEP_LAST
 
     # --- hybrid: the Gaussian splat render as extra U-Net input channels (design A) ---
     # `enabled: false` (the default) is a hard no-op -- see trippy.hybrid.config_a.
@@ -252,6 +267,12 @@ class TrainConfig:
             raise ValueError(
                 f"pyramid_halving must be one of {RASTER_PYRAMID_HALVINGS}, got {self.pyramid_halving!r}"
             )
+        if self.eval_max_images <= 0:
+            raise ValueError(f"eval_max_images must be positive, got {self.eval_max_images}")
+        if self.checkpoint_keep_every <= 0:
+            raise ValueError(f"checkpoint_keep_every must be positive, got {self.checkpoint_keep_every}")
+        if self.checkpoint_keep_last < 0:
+            raise ValueError(f"checkpoint_keep_last must be >= 0, got {self.checkpoint_keep_last}")
 
     @property
     def net_input_channels(self) -> int:
