@@ -1,0 +1,29 @@
+{
+  "thresholds": {
+    "znear_frac": 0.05,
+    "zfar_frac": 0.5,
+    "lum_threshold": 0.25,
+    "conf_threshold": 0.5
+  },
+  "luma_weights": [
+    0.2126,
+    0.7152,
+    0.0722
+  ],
+  "point_ids": [
+    70,
+    81,
+    115,
+    118,
+    123,
+    146,
+    307,
+    324,
+    384,
+    392,
+    399
+  ],
+  "n_in_region": 18,
+  "mass_in_region": 7.099924156442285,
+  "dark_mass_fraction": 0.4798443236079061
+}

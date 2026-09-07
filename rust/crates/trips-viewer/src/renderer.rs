@@ -38,6 +38,7 @@ use burn_wgpu::{CubeTensor, WgpuRuntime};
 
 use crate::blend::{Blend, BlendMode};
 use crate::bundle::{Bounds, Bundle, SplatImage};
+use crate::edit::apply::{EditedPoints, COVERAGE_EPS, PROBE_BACKGROUND};
 
 /// `cat([layer_i, block_i], dim=1)` for every level.
 ///
@@ -87,6 +88,60 @@ fn concat_blocks(layers: &[Tensor<4>], blocks: &[Tensor<4>]) -> Vec<Tensor<4>> {
 /// the call site rather than a runtime condition.
 fn resolve_network_output(rgb: burn::tensor::Tensor<4>) -> CubeTensor<WgpuRuntime> {
     burn_bridge::resolve_to_cube_float(rgb)
+}
+
+/// Fold the probe pass's three channels into the displayed image.
+///
+/// `edit` is `[1, 3, H, W]` = `[sum(T a w_edit), sum(T a touched), sum(T a)]`
+/// straight out of the probe pyramid (`Renderer::edit_pixels`). Dividing the
+/// first two by the third turns each alpha-weighted SUM into the alpha-weighted
+/// AVERAGE `docs/EDITOR.md` §2 asks for — "`w_edit`'s alpha-weighted average
+/// over whatever pyramid layer/points cover that pixel".
+///
+/// The `+ COVERAGE_EPS` is the whole "which pixels did an edit touch" test, done
+/// without a comparison: both numerators are bounded above by the coverage, so
+/// on a pixel no point covered they go to `0 / EPS = 0`, `touched` falls to 0,
+/// and `w_pix` falls back to 1 — the untouched TRIPS pixel, unchanged.
+///
+/// `w_pix = 1 * (1 - touched) + w_edit * touched = 1 - touched * (1 - w_edit)`,
+/// then `out = w_pix * trips + (1 - w_pix) * splat`.
+///
+/// # Errors
+/// Returns `Err` when the operands disagree on size, which would otherwise
+/// broadcast into a silently wrong picture.
+fn apply_edit_weight(
+    trips: Tensor<4>,
+    splat: Tensor<4>,
+    edit: Tensor<4>,
+) -> Result<Tensor<4>, String> {
+    let [_, _, th, tw] = trips.dims();
+    let [_, sc, sh, sw] = splat.dims();
+    let [_, ec, eh, ew] = edit.dims();
+    if ec != crate::edit::apply::PROBE_CHANNELS {
+        return Err(format!(
+            "the edit probe must have {} channels, got {ec}",
+            crate::edit::apply::PROBE_CHANNELS
+        ));
+    }
+    if (eh, ew) != (th, tw) || (sh, sw) != (th, tw) || sc < 3 {
+        return Err(format!(
+            "edit weight needs matching sizes, got trips={th}x{tw} splat={sh}x{sw} ({sc}ch)              edit={eh}x{ew}"
+        ));
+    }
+    let coverage = edit.clone().slice_dim(1, 2..3).add_scalar(COVERAGE_EPS);
+    let w_edit = edit
+        .clone()
+        .slice_dim(1, 0..1)
+        .div(coverage.clone())
+        .clamp(0.0, 1.0);
+    let touched = edit.slice_dim(1, 1..2).div(coverage).clamp(0.0, 1.0);
+    let w_pix = touched
+        .mul(w_edit.neg().add_scalar(1.0))
+        .neg()
+        .add_scalar(1.0);
+    Ok(trips
+        .mul(w_pix.clone())
+        .add(splat.mul(w_pix.neg().add_scalar(1.0))))
 }
 
 /// A monotonic clock that is a no-op on the web.
@@ -370,6 +425,12 @@ pub struct BlendStatus {
     pub splat_loaded: bool,
     /// Whether the network carries the gate head.
     pub gate_available: bool,
+    /// Whether an enabled `blend`/`fade` region actually reached this frame's
+    /// pixels (`docs/EDITOR.md` §2).
+    pub edit_applied: bool,
+    /// Whether a region wanted the splat as its second operand and there was
+    /// none, so the edit could not be drawn.
+    pub edit_needs_splat: bool,
 }
 
 impl BlendStatus {
@@ -460,6 +521,22 @@ pub struct Renderer {
     /// across an `await`: [`UploadedPoints`] is cloned out first, which costs
     /// a handle clone, not the bytes.
     uploaded: std::cell::RefCell<UploadedPoints>,
+    /// [`Self::edit_epoch`] at the moment [`Self::uploaded`] was built, so an
+    /// edit invalidates the cached upload the same way a precision lever does.
+    uploaded_epoch: std::cell::Cell<u64>,
+    /// The edit layer's current effect on the point cloud: the kept rows and
+    /// the three-channel probe cloud (`crate::edit::apply`). `None` means "no
+    /// `edits.json`, or none of its regions changes anything", in which case
+    /// every buffer below and every frame is exactly what it was before the
+    /// editor existed.
+    edit: Option<EditedPoints>,
+    /// Bumped by [`Self::set_edits`]; the cache key for both uploads.
+    edit_epoch: u64,
+    /// The probe cloud on the device, rebuilt when [`Self::edit_epoch`] moves.
+    /// Always `FeatureStore::F32`: three channels is a rounding error next to
+    /// the feature buffer, and the per-pixel weight is divided by a coverage,
+    /// which f16 would quantise visibly.
+    probe_uploaded: std::cell::RefCell<Option<(u64, UploadedPoints)>>,
     base_params: PyramidParams,
     background: Option<Vec<f32>>,
     /// The **point cloud's** world-space box, used only for
@@ -586,6 +663,10 @@ impl Renderer {
             device,
             points: bundle.points,
             uploaded: std::cell::RefCell::new(uploaded),
+            uploaded_epoch: std::cell::Cell::new(0),
+            edit: None,
+            edit_epoch: 0,
+            probe_uploaded: std::cell::RefCell::new(None),
             base_params: bundle.manifest.params,
             background,
             bounds,
@@ -651,6 +732,16 @@ impl Renderer {
     #[must_use]
     pub fn live_splat(&self) -> Option<&crate::splat::LiveSplat> {
         self.live_splat.as_ref()
+    }
+
+    /// The loaded splat, mutably, so the edit layer can scale its opacities.
+    ///
+    /// The Gaussian half of `docs/EDITOR.md` §2's "Deletions": a `delete`-op
+    /// region drops Gaussians as well as TRIPS points, or the pixel it cleared
+    /// on one side would simply be filled by the other.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn live_splat_mut(&mut self) -> Option<&mut crate::splat::LiveSplat> {
+        self.live_splat.as_mut()
     }
 
     /// Read `path` and keep it on **this renderer's own device**, so the splat
@@ -877,15 +968,20 @@ impl Renderer {
         &self,
         trips: Tensor<4>,
         gate: Option<Tensor<4>>,
+        edit_pix: Option<Tensor<4>>,
         camera: &Camera,
         frame_index: usize,
         blend: Blend,
     ) -> Result<(Tensor<4>, BlendStatus), String> {
         let [_, _, height, width] = trips.dims();
         let gate_available = gate.is_some();
+        // An active `blend`/`fade` region needs the splat as its second operand
+        // even in TRIPS-only mode: `mix = 0` means "show the Gaussians here",
+        // which is Jordan's own per-region choice, not a Blend-panel one.
+        let needs_splat = blend.mode.needs_splat() || edit_pix.is_some();
         // `camera` is this frame's own camera, at the render resolution, so the
         // live splat is rasterised from exactly where the TRIPS frame was.
-        let (splat, splat_live) = if blend.mode.needs_splat() {
+        let (splat, splat_live) = if needs_splat {
             match self.splat_tensor(camera, frame_index, height, width).await {
                 Some((image, live)) => (Some(image), live),
                 None => (None, false),
@@ -900,6 +996,8 @@ impl Renderer {
             splat_live,
             splat_loaded: self.has_live_splat(),
             gate_available,
+            edit_applied: false,
+            edit_needs_splat: false,
         };
 
         // Anything the frame genuinely cannot draw falls back to TRIPS and says so.
@@ -909,6 +1007,26 @@ impl Renderer {
             status.applied = BlendMode::Trips;
             return Ok((trips, status));
         }
+
+        // The edit override goes on the TRIPS operand FIRST, so every panel mode
+        // below sees "the TRIPS frame as Jordan edited it" rather than each
+        // having to re-derive the mix. Where a region claims a pixel, `w_edit`
+        // decides how much of the splat stands in for TRIPS there; where none
+        // does, this is a bit-exact no-op and the panel behaves exactly as it
+        // did before the editor existed. See `docs/EDITOR.md` §2.
+        let trips = match (edit_pix, splat.as_ref()) {
+            (Some(edit), Some(splat)) => {
+                status.edit_applied = true;
+                apply_edit_weight(trips, splat.clone(), edit)?
+            }
+            (Some(_), None) => {
+                // A region asked for the splat and there is none: say so rather
+                // than showing an unedited frame that looks edited.
+                status.edit_needs_splat = true;
+                trips
+            }
+            (None, _) => trips,
+        };
 
         let image = match blend.mode {
             BlendMode::Trips => trips,
@@ -989,10 +1107,14 @@ impl Renderer {
         self.exposure.resolve(self.pinned, self.tone.median_exposure())
     }
 
-    /// `N`, the number of points.
+    /// `N`, the number of points the next frame will rasterise.
+    ///
+    /// Smaller than the bundle's own count once a `delete`-op region has removed
+    /// rows — which is the honest number for a HUD that is reporting what is
+    /// being drawn.
     #[must_use]
     pub fn num_points(&self) -> usize {
-        self.points.len()
+        self.render_points().len()
     }
 
     /// The decoder to run this frame, at the requested precision.
@@ -1018,13 +1140,108 @@ impl Renderer {
     fn resident_points(&self, params: &PyramidParams) -> Result<UploadedPoints, String> {
         {
             let current = self.uploaded.borrow();
-            if current.feature_store() == params.feature_store {
+            if current.feature_store() == params.feature_store
+                && self.uploaded_epoch.get() == self.edit_epoch
+            {
                 return Ok(current.clone());
             }
         }
-        let fresh = UploadedPoints::new(&self.points, params.feature_store, &self.device)?;
+        let fresh = UploadedPoints::new(self.render_points(), params.feature_store, &self.device)?;
         *self.uploaded.borrow_mut() = fresh.clone();
+        self.uploaded_epoch.set(self.edit_epoch);
         Ok(fresh)
+    }
+
+    /// The point set the rasteriser actually draws: the bundle's own, or the
+    /// edit layer's copy with every `delete`-op row already removed.
+    fn render_points(&self) -> &PointSet {
+        self.edit
+            .as_ref()
+            .map_or(&self.points, |edit| &edit.points)
+    }
+
+    /// The bundle's UNEDITED point set, for composing region weights against.
+    ///
+    /// Deliberately not [`Self::render_points`]: `pointset` regions index
+    /// `points.npz`'s own row order (`docs/EDITOR.md` §1), which a delete would
+    /// otherwise renumber under them.
+    #[must_use]
+    pub fn base_points(&self) -> &PointSet {
+        &self.points
+    }
+
+    /// Install the edit layer's point sets, or clear it with `None`.
+    ///
+    /// Bumps the upload epoch, so the next frame re-uploads both clouds. Costs
+    /// nothing until then; the composition itself happens on the caller's side
+    /// (`crate::edit::apply::edited_points`), once per edit change rather than
+    /// once per frame — `docs/EDITOR.md` §2's "Region membership is evaluated
+    /// once per edit change".
+    pub fn set_edits(&mut self, edited: Option<EditedPoints>) {
+        self.edit = edited;
+        self.edit_epoch = self.edit_epoch.wrapping_add(1);
+    }
+
+    /// `(points deleted, points an enabled blend/fade region claims)`, or `None`
+    /// when no edit is applied.
+    #[must_use]
+    pub fn edit_summary(&self) -> Option<(usize, usize)> {
+        self.edit
+            .as_ref()
+            .map(|edit| (edit.num_deleted, edit.num_touched))
+    }
+
+    /// Whether this frame will pay for the probe pyramid pass.
+    #[must_use]
+    pub fn has_edit_probe(&self) -> bool {
+        self.edit.as_ref().is_some_and(|edit| edit.probe.is_some())
+    }
+
+    /// The probe cloud on the device, or `None` when no `blend`/`fade` region is
+    /// active and the second pyramid pass can be skipped entirely.
+    ///
+    /// # Errors
+    /// Returns `Err` if the upload fails.
+    fn resident_probe(&self) -> Result<Option<UploadedPoints>, String> {
+        let Some(probe) = self.edit.as_ref().and_then(|edit| edit.probe.as_ref()) else {
+            self.probe_uploaded.borrow_mut().take();
+            return Ok(None);
+        };
+        if let Some((epoch, uploaded)) = self.probe_uploaded.borrow().as_ref() {
+            if *epoch == self.edit_epoch {
+                return Ok(Some(uploaded.clone()));
+            }
+        }
+        let fresh = UploadedPoints::new(probe, FeatureStore::F32, &self.device)?;
+        *self.probe_uploaded.borrow_mut() = Some((self.edit_epoch, fresh.clone()));
+        Ok(Some(fresh))
+    }
+
+    /// Rasterise the probe cloud at `camera` and hand back level 0 as
+    /// `[1, 3, h, w]` = `[w_edit_sum, touched_sum, coverage]`.
+    ///
+    /// The second pyramid pass `docs/EDITOR.md` §2 calls "a sibling buffer
+    /// rendered as its own tiny pyramid pass". It runs at the same camera with
+    /// the same `params`, over the same surviving rows with the same `conf`, so
+    /// its fragments and alphas are the main pass's own and its third channel
+    /// really is that pass's coverage.
+    ///
+    /// # Errors
+    /// Returns `Err` on a rasteriser failure, which fails the frame rather than
+    /// silently drawing an unedited picture.
+    async fn edit_pixels(
+        &self,
+        camera: &Camera,
+        params: &PyramidParams,
+    ) -> Result<Option<Tensor<4>>, String> {
+        let Some(probe) = self.resident_probe()? else {
+            return Ok(None);
+        };
+        let mut probe_params = *params;
+        probe_params.feature_store = FeatureStore::F32;
+        let render =
+            render_pyramid_uploaded(&probe, camera, &probe_params, Some(&PROBE_BACKGROUND)).await?;
+        Ok(Some(render.layer_tensor(0)))
     }
 
     /// Bytes of device memory the point set occupies — the per-frame upload
@@ -1111,7 +1328,10 @@ impl Renderer {
                     frame_index,
                     self.exposure_override(),
                 )?;
-                let (rgb, status) = self.compose(trips, gate, camera, frame_index, blend).await?;
+                let edit_pix = self.edit_pixels(camera, &params).await?;
+                let (rgb, status) = self
+                    .compose(trips, gate, edit_pix, camera, frame_index, blend)
+                    .await?;
                 blend_status = Some(status);
                 let [_, out_c, h, w] = rgb.dims();
                 if h != height as usize || w != width as usize {
@@ -1202,7 +1422,10 @@ impl Renderer {
         let trips =
             self.tone
                 .forward_with_exposure(colour, frame_index, self.exposure_override())?;
-        let (rgb, _status) = self.compose(trips, gate, camera, frame_index, blend).await?;
+        let edit_pix = self.edit_pixels(camera, &params).await?;
+        let (rgb, _status) = self
+            .compose(trips, gate, edit_pix, camera, frame_index, blend)
+            .await?;
         let [_, channels, height, width] = rgb.dims();
         let data = rgb
             .into_data_async()
@@ -1226,6 +1449,8 @@ mod blend_status_tests {
             splat_live: false,
             splat_loaded: false,
             gate_available: false,
+            edit_applied: false,
+            edit_needs_splat: false,
         }
     }
 

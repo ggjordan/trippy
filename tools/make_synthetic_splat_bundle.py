@@ -55,7 +55,10 @@ from test_train_helpers import (
     tiny_train_config,
 )
 
+from trippy.edit.golden import write_shade_views
+from trippy.edit.model import EditDocument, Region
 from trippy.render.bundle import BUNDLE_JSON_FILENAME, export_bundle
+from trippy.train import prune
 from trippy.train.config import PointSourceConfig
 from trippy.train.export import write_gaussian_ply
 from trippy.train.trainer import Trainer
@@ -66,6 +69,31 @@ DEFAULT_SPLAT_SIZE = 0.25
 #: How many Gaussians the PLY holds. Enough that the splat render covers most of
 #: the frame from an off-capture pose, few enough that loading is instant.
 DEFAULT_NUM_SPLATS = 4000
+
+#: The synthetic scene's own COLMAP images have ZERO observations
+#: (`tests.test_train_helpers.build_synthetic_scene` writes an empty observation
+#: line per image), so `prune.build_shade_region` falls back to its documented
+#: `d = 1.0`. The default depth-slab fractions (0.05..0.50 of `d`) would then
+#: describe a slab 0.05..0.5 world units deep, and this scene's points sit at
+#: z in [4, 8] -- the finder would select nothing, for a reason that has nothing
+#: to do with whether it works. These two fractions put the slab at 1..10 world
+#: units instead, which is where the geometry actually is. Both sides read them
+#: out of the sidecar, so the Python and Rust selections still agree exactly.
+SHADE_ZNEAR_FRAC = 1.0
+SHADE_ZFAR_FRAC = 10.0
+
+#: A `delete` box covering roughly the +x half of the synthetic cloud
+#: (`x in [-2, 2]`, `y in [-1.5, 1.5]`, `z in [4, 8]`). The screenshot check
+#: renders with and without it; half the frame has to change.
+EDIT_DELETE_BOX = {
+    "center": [1.25, 0.0, 6.0],
+    "half_extents": [1.5, 3.0, 3.0],
+}
+
+#: A `blend` sphere in the other half, at `mix = 0` (pure splat). Its job is to
+#: exercise the probe pyramid pass and the per-pixel weight, which the delete
+#: box does not touch.
+EDIT_BLEND_SPHERE = {"center": [-1.25, 0.0, 6.0], "radius": 1.2}
 
 
 def write_splat_ply(path: Path, num_splats: int, splat_size: float, seed: int) -> Path:
@@ -108,6 +136,76 @@ def write_splat_ply(path: Path, num_splats: int, splat_size: float, seed: int) -
     conf = np.full(num_splats, 0.9, dtype=np.float32)
     size = np.full(num_splats, float(splat_size), dtype=np.float32)
     return write_gaussian_ply(path, xyz=xyz, rgb=rgb, conf=conf, size=size)
+
+
+def write_edits(bundle_dir: Path, document: dict) -> Path:
+    """Write a synthetic `edits.json` next to `bundle.json`.
+
+    Two regions, chosen so one screenshot pair proves each half of
+    docs/EDITOR.md Sec 2 separately:
+
+    - a `delete` box over the +x half of the cloud, which removes TRIPS points
+      AND (via `compose_gaussian_weights`) scales those Gaussians' opacity to
+      zero, so the frame must change there and `undo` must restore it exactly;
+    - a `blend` sphere at `mix = 0` in the -x half, which changes NO point's
+      alpha at all and can only show up through the probe pass's per-pixel
+      weight -- so if the frame changes inside it, that machinery works.
+
+    The document is built through the ordinary mutation API, so it carries a
+    real undo log the viewer (and `EditDocument.undo`) can walk.
+
+    Args:
+        bundle_dir: the bundle directory (holding `bundle.json`).
+        document: the parsed `bundle.json`, for its `"format"`.
+
+    Returns:
+        The path written.
+    """
+    edits = EditDocument.new(document.get("format", ""))
+    edits.add_region(
+        Region(
+            id="r-syndel1",
+            name="delete: +x half",
+            kind="box",
+            params=dict(EDIT_DELETE_BOX),
+            mix=0.0,
+            op="delete",
+        )
+    )
+    edits.add_region(
+        Region(
+            id="r-synmix2",
+            name="blend to splat: -x sphere",
+            kind="sphere",
+            params=dict(EDIT_BLEND_SPHERE),
+            mix=0.0,
+            op="blend",
+        )
+    )
+    return edits.save(bundle_dir / "edits.json")
+
+
+def write_shade_sidecar(bundle_dir: Path, scene_root: Path) -> Path:
+    """Write `shade_views.json` so the viewer's shade finder has frames to test.
+
+    The cameras and each frame's median observed depth come from
+    `trippy.train.prune.build_shade_region` -- the audit's own function, not a
+    re-derivation -- so a selection the viewer makes from this file is the
+    selection `trippy.edit.shade_finder.find_shade_pointset` makes from the same
+    COLMAP model at the same thresholds. See `SHADE_ZNEAR_FRAC` for the one
+    deliberate deviation from the shipped defaults, and why.
+
+    Args:
+        bundle_dir: the bundle directory.
+        scene_root: the synthetic scene (holding `sparse_txt/`).
+
+    Returns:
+        The path written.
+    """
+    sparse_dir = scene_root / "sparse_txt"
+    frames = sorted(p.name for p in (scene_root / "images").glob("*.jpg"))
+    views = prune.build_shade_region(sparse_dir, frames, SHADE_ZNEAR_FRAC, SHADE_ZFAR_FRAC)
+    return write_shade_views(bundle_dir, views, SHADE_ZNEAR_FRAC, SHADE_ZFAR_FRAC)
 
 
 def build(out: Path, num_splats: int, splat_size: float, seed: int, epochs: int) -> Path:
@@ -164,9 +262,13 @@ def build(out: Path, num_splats: int, splat_size: float, seed: int, epochs: int)
         raise SystemExit(
             "export-bundle wrote no blend.splat_ply; the live splat path has nothing to open"
         )
+    edits_path = write_edits(Path(bundle_dir), document)
+    shade_path = write_shade_sidecar(Path(bundle_dir), Path(scene_root))
     print(f"✓ bundle {bundle_dir}")
     print(f"  blend.splat_ply = {blend['splat_ply']}")
     print(f"  views = {len(document['views'])}, default_view = {document['default_view']}")
+    print(f"  edits = {edits_path} (2 regions: one delete box, one blend sphere)")
+    print(f"  shade frames = {shade_path}")
     return Path(bundle_dir)
 
 

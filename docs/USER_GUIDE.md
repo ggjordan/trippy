@@ -279,6 +279,126 @@ trippy eval --checkpoint <run>/checkpoints/checkpoint_best.pt --gate-scale 0
 trippy eval --checkpoint <run>/checkpoints/checkpoint_best.pt --gate-scale 2
 ```
 
+## The Editor: regions, mix, delete, undo (press `M`)
+
+Press **`M`** in the viewer (or launch it with `--edit` to start there). Three panels appear on the right: **Regions**,
+**Inspector** and **Tools**. Press `M` again and they are gone; nothing about the
+scene changes when they are hidden, and a bundle with no edits renders exactly the
+frame it rendered before the editor existed.
+
+An edit is a **region** plus what to do inside it. Regions live in a file called
+`edits.json`, saved next to `bundle.json`; delete that file and the scene is back
+to untouched.
+
+### The three things a region can do
+
+| op | what happens inside the region |
+|---|---|
+| **blend** | the mix slider decides: 0 = show the Gaussian splat there, 1 = show TRIPS there |
+| **fade** | the same, but it *multiplies* whatever an earlier region already decided — the gentle version |
+| **delete** | the points AND the Gaussians inside are removed before anything is drawn. Nothing can bring them back at any mix, from any angle |
+
+Regions are a **stack**. The one lowest in the list wins where two overlap, and a
+`delete` always beats a `blend` above it — so a slider on an unrelated region can
+never un-delete something.
+
+### Making one
+
+1. Fly so the thing you want is in the middle of the screen (the orbit pivot).
+2. Press `M`, then click **+ box**, **+ sphere** or **+ lid**. The new region is
+   born at the look-at point, about a twelfth of the scene across.
+3. Drag the **mix** slider, or click **delete** for the hard version.
+4. Nudge and resize it with the arrow keys and `[` / `]`, or type exact numbers in
+   the Inspector. (There is no 3D drag handle yet — that is E3.)
+5. **Cmd-S** writes `edits.json`. Closing and reopening the bundle restores the
+   regions, the mixes AND the undo history.
+
+**+ lid** is pre-filled with the Karekare pool plane that was already fitted and
+A/B-checked, so the pool lid is one click plus one save.
+
+### Keys
+
+| key | action |
+|---|---|
+| `M` | show/hide the editor |
+| `T` | switch between the Regions tool and the shade-cloud finder |
+| `H` | preview highlight on/off |
+| arrows, `PageUp`/`PageDown` | nudge the selected region along world X/Z and Y |
+| `[` / `]` | shrink / grow the selected region |
+| `Delete` / `Backspace` | remove the selected region |
+| `Cmd-Z` / `Cmd-Shift-Z` | undo / redo |
+| `Cmd-S` | save `edits.json` |
+
+Every key the viewer already used (`V X B Tab - = F R N P W A S D Q E`) still does
+what it did.
+
+### Find shade clouds
+
+Press `T` to switch the Tools panel to the **shade-cloud finder**. Four sliders —
+darkness, confidence, and the near/far ends of the depth slab — pick out the dark,
+low-confidence points floating in front of what the shade photographs actually saw.
+The panel counts them live and shows the audit's own **dark mass fraction** next to
+them.
+
+- **`H`** tints the current selection magenta and dims everything else. Press `V`
+  to switch to the *raw level-0* view, where the tint is the rasteriser's own
+  pixels rather than the network's guess about them — that is the honest picture of
+  what is selected.
+- **add as region (fade)** or **(delete)** turns the live preview into a real
+  region you can then undo, re-mix or save like any other.
+
+The finder needs to know where the shade photographs were taken. That comes from a
+small file, `shade_views.json`, written once per bundle:
+
+```
+PYTHONPATH=. python -c "
+from trippy.edit.golden import write_shade_views
+from trippy.train import prune
+views = prune.build_shade_region('<scene>/sparse/0', ['IMG_3828.jpg', 'IMG_3830.jpg'], 0.05, 0.5)
+write_shade_views('<bundle>', views, 0.05, 0.5)
+"
+```
+
+Without it the panel says so and the finder is unavailable, rather than quietly
+guessing.
+
+### Checking an edit without opening a window
+
+```
+# what weight did every point end up with?  (no GPU, no window)
+rust/target/release/trips-viewer <bundle> --dump-weights weights.json
+
+# what would the finder select at these thresholds?
+rust/target/release/trips-viewer <bundle> --dump-shade shade.json \
+    --shade-lum 0.25 --shade-conf 0.5
+
+# a picture of the edited scene, same code path as the window
+rust/target/release/trips-viewer <bundle> --screenshot edited.png
+rust/target/release/trips-viewer <bundle> --edits nowhere.json --screenshot clean.png
+```
+
+`--dump-weights` is the file `trippy apply-edits` has to agree with, to six decimal
+places. That agreement is checked automatically on every test run.
+
+### Publishing an edit
+
+`edits.json` is the input to the Python side:
+
+```
+trippy apply-edits --bundle <bundle> --out <edited-bundle>
+```
+
+which writes a new bundle with the deleted points gone, the per-point weights
+alongside, and (if the bundle names a Gaussian `.ply`) a filtered copy of it.
+
+### What is not built yet
+
+- No 3D drag handles on a region — use the arrow keys or type the numbers.
+- No click-on-a-cloud-to-select (E4) and no SAM-3 object selection (E5).
+- A region with `mix < 1` needs a Gaussian splat to mix *with*. On a bundle with no
+  `blend.splat_ply`, the panel says the frame is showing unedited TRIPS there
+  rather than pretending.
+
 ## How to open the TRIPS viewer in a web browser (Mac, v0.5.0)
 
 The same scene, the same renderer, in a browser tab instead of an app window.

@@ -1,0 +1,344 @@
+{
+  "format": "trippy-edits-1",
+  "bundle_format": "trippy-bundle-1",
+  "regions": [
+    {
+      "id": "r-box0001",
+      "name": "rotated box",
+      "kind": "box",
+      "enabled": true,
+      "mix": 0.25,
+      "op": "blend",
+      "params": {
+        "center": [
+          0.0,
+          0.0,
+          4.0
+        ],
+        "half_extents": [
+          1.5,
+          0.8,
+          1.2
+        ],
+        "quat": [
+          0.9238795325112867,
+          0.0,
+          0.0,
+          0.3826834323650898
+        ]
+      }
+    },
+    {
+      "id": "r-sph0002",
+      "name": "fading sphere",
+      "kind": "sphere",
+      "enabled": true,
+      "mix": 0.5,
+      "op": "fade",
+      "params": {
+        "center": [
+          0.5,
+          0.2,
+          3.5
+        ],
+        "radius": 1.1
+      }
+    },
+    {
+      "id": "r-lid0003",
+      "name": "graded lid",
+      "kind": "lid",
+      "enabled": true,
+      "mix": 0.0,
+      "op": "fade",
+      "params": {
+        "up": [
+          0.0,
+          -1.0,
+          0.0
+        ],
+        "height": -0.5,
+        "center": [
+          0.0,
+          0.0,
+          5.0
+        ],
+        "radius": 1.6,
+        "falloff": 0.8,
+        "band": 0.9
+      }
+    },
+    {
+      "id": "r-pts0004",
+      "name": "shade cloud",
+      "kind": "pointset",
+      "enabled": true,
+      "mix": 0.0,
+      "op": "fade",
+      "params": {
+        "point_ids": [
+          0,
+          17,
+          34,
+          51,
+          68,
+          85,
+          102,
+          119,
+          136,
+          153,
+          170,
+          187,
+          204,
+          221,
+          238,
+          255,
+          272,
+          289,
+          306,
+          323,
+          340,
+          357,
+          374,
+          391
+        ]
+      }
+    },
+    {
+      "id": "r-off0006",
+      "name": "disabled sphere",
+      "kind": "sphere",
+      "enabled": false,
+      "mix": 1.0,
+      "op": "blend",
+      "params": {
+        "center": [
+          0.0,
+          0.0,
+          4.0
+        ],
+        "radius": 10.0
+      }
+    },
+    {
+      "id": "r-del0005",
+      "name": "delete box",
+      "kind": "box",
+      "enabled": true,
+      "mix": 0.0,
+      "op": "delete",
+      "params": {
+        "center": [
+          -1.2,
+          0.0,
+          6.0
+        ],
+        "half_extents": [
+          0.9,
+          1.5,
+          1.4
+        ]
+      }
+    }
+  ],
+  "order": [
+    "r-box0001",
+    "r-sph0002",
+    "r-lid0003",
+    "r-pts0004",
+    "r-off0006",
+    "r-del0005"
+  ],
+  "undo_stack": {
+    "cursor": 8,
+    "log": [
+      {
+        "type": "add_region",
+        "region": {
+          "id": "r-box0001",
+          "name": "rotated box",
+          "kind": "box",
+          "enabled": true,
+          "mix": 0.25,
+          "op": "blend",
+          "params": {
+            "center": [
+              0.0,
+              0.0,
+              4.0
+            ],
+            "half_extents": [
+              1.5,
+              0.8,
+              1.2
+            ],
+            "quat": [
+              0.9238795325112867,
+              0.0,
+              0.0,
+              0.3826834323650898
+            ]
+          }
+        },
+        "index": null
+      },
+      {
+        "type": "add_region",
+        "region": {
+          "id": "r-sph0002",
+          "name": "fading sphere",
+          "kind": "sphere",
+          "enabled": true,
+          "mix": 0.5,
+          "op": "fade",
+          "params": {
+            "center": [
+              0.5,
+              0.2,
+              3.5
+            ],
+            "radius": 1.1
+          }
+        },
+        "index": null
+      },
+      {
+        "type": "add_region",
+        "region": {
+          "id": "r-lid0003",
+          "name": "graded lid",
+          "kind": "lid",
+          "enabled": true,
+          "mix": 0.0,
+          "op": "fade",
+          "params": {
+            "up": [
+              0.0,
+              -1.0,
+              0.0
+            ],
+            "height": -0.5,
+            "center": [
+              0.0,
+              0.0,
+              5.0
+            ],
+            "radius": 1.6,
+            "falloff": 0.8,
+            "band": 0.9
+          }
+        },
+        "index": null
+      },
+      {
+        "type": "add_region",
+        "region": {
+          "id": "r-pts0004",
+          "name": "shade cloud",
+          "kind": "pointset",
+          "enabled": true,
+          "mix": 0.0,
+          "op": "fade",
+          "params": {
+            "point_ids": [
+              0,
+              17,
+              34,
+              51,
+              68,
+              85,
+              102,
+              119,
+              136,
+              153,
+              170,
+              187,
+              204,
+              221,
+              238,
+              255,
+              272,
+              289,
+              306,
+              323,
+              340,
+              357,
+              374,
+              391
+            ]
+          }
+        },
+        "index": null
+      },
+      {
+        "type": "add_region",
+        "region": {
+          "id": "r-del0005",
+          "name": "delete box",
+          "kind": "box",
+          "enabled": true,
+          "mix": 0.0,
+          "op": "delete",
+          "params": {
+            "center": [
+              -1.2,
+              0.0,
+              6.0
+            ],
+            "half_extents": [
+              0.9,
+              1.5,
+              1.4
+            ]
+          }
+        },
+        "index": null
+      },
+      {
+        "type": "add_region",
+        "region": {
+          "id": "r-off0006",
+          "name": "disabled sphere",
+          "kind": "sphere",
+          "enabled": true,
+          "mix": 1.0,
+          "op": "blend",
+          "params": {
+            "center": [
+              0.0,
+              0.0,
+              4.0
+            ],
+            "radius": 10.0
+          }
+        },
+        "index": null
+      },
+      {
+        "type": "update_region",
+        "id": "r-off0006",
+        "changes": {
+          "enabled": false
+        }
+      },
+      {
+        "type": "reorder",
+        "order": [
+          "r-box0001",
+          "r-sph0002",
+          "r-lid0003",
+          "r-pts0004",
+          "r-off0006",
+          "r-del0005"
+        ]
+      },
+      {
+        "type": "update_region",
+        "id": "r-box0001",
+        "changes": {
+          "mix": 1.0
+        }
+      }
+    ]
+  }
+}
