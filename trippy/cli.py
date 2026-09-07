@@ -229,6 +229,15 @@ from trippy.constants import (
     RASTER_MODES,
     RASTER_NUM_LAYERS,
     RENDER_CACHE_SUBDIR,
+    SAM3_DEFAULT_DEVICE,
+    SAM3_DEVICES,
+    SAM3_MASK_THRESHOLD,
+    SAM_LIFT_DEFAULT_MIX,
+    SAM_LIFT_DEFAULT_OP,
+    SAM_LIFT_DEFAULT_VIEWS_AROUND,
+    SAM_LIFT_DEPTH_CELL_PX,
+    SAM_LIFT_DEPTH_TOL,
+    SAM_LIFT_VOTE_FRACTION,
     SHADE_FRAMES_KK,
     SHADE_PRUNE_DEFAULT_CONF_THRESHOLD,
     SHADE_PRUNE_DEFAULT_LUM_THRESHOLD,
@@ -942,6 +951,78 @@ def _cmd_edits_shade_find(args: argparse.Namespace) -> int:
     edits = _load_or_create_edits(edits_path, args.bundle)
     edits.add_region(region)
     edits.save(edits_path)
+    print(json.dumps(summary, indent=2))
+    return 0
+
+
+def _cmd_edits_sam(args: argparse.Namespace) -> int:
+    """`trippy edits sam --bundle <dir> --scene <root> --view IMG.jpg --point U V | --box ... --out edits.json`.
+
+    Segments ONE photograph with the local SAM 3 (docs/EDITOR.md Sec 3
+    "4. SAM 3 lift (E5)") and lifts the mask onto the bundle's points as a
+    `pointset` region. `--device mps` is GPU work and belongs inside a
+    `scripts/gpu_submit.sh` job; the default is CPU. `--mask NAME=PATH`
+    replaces SAM 3 with mask arrays already on disk (a re-lift, or a CPU
+    test), and says so in the summary's `segmenter` field rather than
+    pretending SAM ran.
+    """
+    from trippy.edit.sam_lift import sam_lift
+    from trippy.edit.sam_runner import MaskFileSegmenter, Sam3Segmenter, SamPrompt
+
+    if args.point is not None:
+        prompt = SamPrompt(kind="point", point=(args.point[0], args.point[1]))
+    elif args.box is not None:
+        prompt = SamPrompt(kind="box", box=tuple(args.box))
+    else:
+        prompt = SamPrompt(kind="text", text=args.text)
+
+    segmenter: object
+    if args.mask:
+        masks: dict[str, str] = {}
+        for entry in args.mask:
+            name, _, path = entry.partition("=")
+            if not path:
+                print(f"trippy edits sam: --mask wants NAME=PATH, got {entry!r}", file=sys.stderr)
+                return 2
+            masks[name] = path
+        segmenter = MaskFileSegmenter(masks=masks)
+    else:
+        segmenter = Sam3Segmenter(
+            device=args.device,
+            work_dir=args.sam_work_dir,
+            options={"mask_threshold": args.mask_threshold},
+        )
+
+    try:
+        region, summary = sam_lift(
+            args.bundle,
+            args.scene,
+            args.view,
+            prompt,
+            segmenter,
+            views_around=args.views_around,
+            op=args.op,
+            mix=args.mix,
+            name=args.name,
+            cell_px=args.depth_cell_px,
+            depth_tol=args.depth_tol,
+            vote_fraction=args.vote_fraction,
+            apply_scene_distortion=not args.no_scene_distortion,
+            preview=args.preview,
+        )
+    except (ValueError, KeyError, FileNotFoundError, RuntimeError) as exc:
+        print(f"trippy edits sam: {exc}", file=sys.stderr)
+        return 2
+
+    edits_path = _resolve_edits_path(args.out, args.bundle)
+    edits = _load_or_create_edits(edits_path, args.bundle)
+    edits.add_region(region)
+    edits.save(edits_path)
+    summary["region_id"] = region.id
+    summary["edits"] = str(edits_path)
+    if args.summary_out:
+        Path(args.summary_out).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.summary_out).write_text(json.dumps(summary, indent=2))
     print(json.dumps(summary, indent=2))
     return 0
 
@@ -1771,6 +1852,58 @@ def build_parser() -> argparse.ArgumentParser:
     shade_find.add_argument("--name", default="shade cloud", help="region name")
     shade_find.add_argument("--out", required=True, help="edits.json to update (created if missing)")
     shade_find.set_defaults(func=_cmd_edits_shade_find)
+
+    sam = edits_sub.add_parser(
+        "sam",
+        help="segment one photo with the local SAM 3 and lift the mask onto the points",
+    )
+    sam.add_argument("--bundle", required=True, help="bundle directory (bundle.json + points.npz)")
+    sam.add_argument("--scene", required=True, help="scene root (images/ + sparse/0 or sparse_txt)")
+    sam.add_argument("--view", required=True, help="which registered view to prompt, e.g. IMG_3703.jpg")
+    prompt_group = sam.add_mutually_exclusive_group(required=True)
+    prompt_group.add_argument(
+        "--point", type=float, nargs=2, default=None, metavar=("U", "V"),
+        help="click point in PHOTO pixels",
+    )  # fmt: skip
+    prompt_group.add_argument(
+        "--box", type=float, nargs=4, default=None, metavar=("X0", "Y0", "X1", "Y1"),
+        help="box in PHOTO pixels",
+    )  # fmt: skip
+    prompt_group.add_argument("--text", default=None, help="SAM 3 open-vocabulary phrase")
+    sam.add_argument(
+        "--views-around", type=int, default=SAM_LIFT_DEFAULT_VIEWS_AROUND,
+        help="also segment this many nearest capture views and majority-vote (0 = prompted view only)",
+    )  # fmt: skip
+    sam.add_argument("--out", required=True, help="edits.json to update (created if missing)")
+    sam.add_argument("--op", choices=EDIT_REGION_OPS, default=SAM_LIFT_DEFAULT_OP)
+    sam.add_argument("--mix", type=float, default=SAM_LIFT_DEFAULT_MIX)
+    sam.add_argument("--name", default=None, help="region name (default: 'sam: <prompt>')")
+    sam.add_argument(
+        "--device", choices=SAM3_DEVICES, default=SAM3_DEFAULT_DEVICE,
+        help="SAM 3 device; mps is GPU work and only ever runs inside a scripts/gpu_submit.sh job",
+    )  # fmt: skip
+    sam.add_argument(
+        "--mask-threshold", type=float, default=SAM3_MASK_THRESHOLD,
+        help="per-pixel probability above which a SAM 3 pixel is inside the mask",
+    )  # fmt: skip
+    sam.add_argument("--depth-cell-px", type=int, default=SAM_LIFT_DEPTH_CELL_PX)
+    sam.add_argument("--depth-tol", type=float, default=SAM_LIFT_DEPTH_TOL)
+    sam.add_argument("--vote-fraction", type=float, default=SAM_LIFT_VOTE_FRACTION)
+    sam.add_argument(
+        "--no-scene-distortion", action="store_true",
+        help="project with the bundle's own optics only, without re-applying the COLMAP lens",
+    )  # fmt: skip
+    sam.add_argument(
+        "--mask", action="append", default=None, metavar="NAME=PATH",
+        help="use a mask .npy instead of running SAM 3 for that view (repeatable)",
+    )  # fmt: skip
+    sam.add_argument(
+        "--sam-work-dir", default=None,
+        help="keep each view's mask.npy/info.json here (arrays only, never images)",
+    )  # fmt: skip
+    sam.add_argument("--preview", default=None, help="PNG: from-scratch heatmap of the selection")
+    sam.add_argument("--summary-out", default=None, help="also write the summary JSON here")
+    sam.set_defaults(func=_cmd_edits_sam)
 
     add_box = edits_sub.add_parser("add-box", help="append an (optionally rotated) box region")
     add_box.add_argument("--edits", required=True, help="edits.json to update (created if missing)")
