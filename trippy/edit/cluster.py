@@ -77,14 +77,13 @@ from trippy.constants import (
     CLICK_DEFAULT_MAX_POINTS,
     CLICK_DEFAULT_MAX_RADIUS_CAMERA_FACTOR,
     CLICK_DEFAULT_MIX,
-    CLICK_DEFAULT_NAME,
     CLICK_DEFAULT_OP,
     CLICK_DEFAULT_RADIUS_PX,
     CLICK_FALLBACK_MAX_RADIUS_FACTOR,
     CLICK_GROW_KNN_K,
     CLICK_PREVIEW_MAX_DIM,
 )
-from trippy.edit.model import Region, new_region_id
+from trippy.edit.model import Region, auto_region_name, new_region_id
 from trippy.geom.xform_a import project_pinhole, world_to_cam
 from trippy.points.knn_size import median_nn_distance
 
@@ -265,7 +264,8 @@ def click_to_cluster(
     op: str = CLICK_DEFAULT_OP,
     mix: float = CLICK_DEFAULT_MIX,
     region_id: str | None = None,
-    name: str = CLICK_DEFAULT_NAME,
+    name: str | None = None,
+    existing_names: Any = (),
 ) -> tuple[Region, dict[str, Any]]:
     """Click `px` in `camera`'s view; grow a `pointset` Region from the nearest surface there.
 
@@ -293,7 +293,12 @@ def click_to_cluster(
             gap threshold (see `trippy.constants.CLICK_DEFAULT_DEPTH_GAP_FACTOR`).
         op, mix: the new Region's own fields (docs/EDITOR.md Sec 1).
         region_id: stable id for the new region (default: a fresh one).
-        name: shown in the Regions panel.
+        name: shown in the Regions panel. `None` (the default) auto-names
+            the region `"click-<n>"` (`trippy.edit.model.auto_region_name`,
+            docs/EDITOR.md Sec 1 "Named regions").
+        existing_names: the target document's current region names, used
+            ONLY to number the auto name above; ignored when `name` is
+            given explicitly.
 
     Returns:
         `(region, summary)`. `summary` always has `n_candidates`,
@@ -327,6 +332,20 @@ def click_to_cluster(
     candidate_mask = (depth > 0.0) & (px_dist <= float(radius_px))
     candidate_idx = np.flatnonzero(candidate_mask)
 
+    resolved_name = name if name is not None else auto_region_name(existing_names, "click")
+    source = {
+        "tool": "click",
+        "params": {
+            "view": camera.name,
+            "px": [u0, v0],
+            "radius_px": float(radius_px),
+            "colour_tol": float(colour_tol),
+            "max_radius": max_radius,
+            "op": op,
+            "mix": float(mix),
+        },
+    }
+
     summary: dict[str, Any] = {
         "click_px": [u0, v0],
         "radius_px": float(radius_px),
@@ -338,11 +357,12 @@ def click_to_cluster(
     if candidate_idx.size == 0 or n == 0:
         region = Region(
             id=region_id or new_region_id(),
-            name=name,
+            name=resolved_name,
             kind="pointset",
             params={"point_ids": []},
             mix=mix,
             op=op,
+            source=source,
         )
         summary.update({"n_seed": 0, "n_selected": 0, "hit_max_points": False})
         summary["warning"] = "no points projected within radius_px of the click"
@@ -390,11 +410,12 @@ def click_to_cluster(
     point_ids = sorted(selected)
     region = Region(
         id=region_id or new_region_id(),
-        name=name,
+        name=resolved_name,
         kind="pointset",
         params={"point_ids": point_ids},
         mix=mix,
         op=op,
+        source=source,
     )
     summary.update(
         {

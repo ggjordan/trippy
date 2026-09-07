@@ -83,6 +83,7 @@ from trippy.constants import (
     TRAIN_METRICS_FILENAME,
     TRAIN_PSNR_EPS,
 )
+from trippy.edit.checkpoint import render_edit_weight_map
 from trippy.geom import xform_b
 from trippy.hybrid import gate as gate_mod
 from trippy.hybrid.gaussian_input import GaussianInputs
@@ -1215,6 +1216,18 @@ class Trainer:
                 # channel never reaches a code path that assumes rgb.
                 net_rgb, gate = self.split_net_output(net_out)
                 pred = self._tone_map(net_rgb, frame_index)
+                if gate is not None:
+                    # The gate-suppression multiply `trippy.render.candidate.render_candidate`
+                    # already applies for an edited, gate-hybrid checkpoint (docs/EDITOR.md
+                    # Sec 5) -- closing the documented "Trainer.evaluate does not get it" gap
+                    # (trippy.edit.checkpoint's own module docstring). `render_edit_weight_map`
+                    # returns None whenever `apply_edits_to_trainer` was never called or found
+                    # nothing to suppress, so an unedited eval takes the exact same path as
+                    # before this existed (bit-identical: no edit weight map, no multiply).
+                    edit_weight_map = render_edit_weight_map(self, item["K"], R, t, (height, width))
+                    if edit_weight_map is not None:
+                        edit_weight_map = _center_crop_like(edit_weight_map, gate.shape[-2], gate.shape[-1])
+                        gate = gate * edit_weight_map.to(dtype=gate.dtype, device=gate.device)
                 pred, gate = self.apply_gate(pred, gate, gaussian)
 
                 target_c = _center_crop_like(target, pred.shape[-2], pred.shape[-1])

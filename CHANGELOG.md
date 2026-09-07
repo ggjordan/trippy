@@ -3,6 +3,40 @@ All notable changes to trippy. Format: Keep a Changelog. Versions: semver tags `
 
 ## [Unreleased]
 ### Added
+- **Brush regions (Python side), named regions, and the `trippy eval --edits`
+  gate-suppression gap is closed (`docs/EDITOR.md` Sec 1, Sec 5).**
+  - **`brush`-kind regions**: a sparse voxel set (`origin`/`cell_size`/`cells`,
+    optional per-cell `weights`) is now one of `Region.kind`'s options
+    (`trippy.edit.model`). `brush_membership` looks a point's own voxel up in
+    the occupied set; `paint_sphere`/`paint_along`/`erase` are the pure,
+    functional authoring helpers a brush tool calls (box-sphere intersection,
+    not "voxel centre inside the sphere"), and `trippy edits add-brush` is
+    the CLI equivalent of one stroke. It composes through the SAME
+    `region_weight`/`region_contains` dispatch every other kind does, so
+    `trippy.edit.weights`/`apply`/`checkpoint` needed no brush-specific code
+    at all. `EditDocument.save` externalises a large brush's `cells`/
+    `weights` into an `.npz` sidecar (`EDIT_BRUSH_NPZ_CELL_THRESHOLD`) in the
+    WRITTEN copy only; Python's own loader always replays the (never
+    externalised) undo log. `tests/fixtures/synthetic/edit_golden/brush.json`
+    (`trippy.edit.golden.build_brush_fixture`) is the parity fixture for a
+    future Rust `brush` twin.
+  - **Named regions**: `Region.source` (`{"tool": ..., ...}` or `None`)
+    records which tool made a region and with what prompt/parameters;
+    `trippy.edit.model.auto_region_name` gives tool-authored regions a
+    stateless, self-healing numbered name (`click-1`, `sam-box-IMG_3703-2`,
+    `shade-clouds-3`, `brush-4`, ...) when the caller does not name one
+    explicitly. `shade_finder`/`cluster`/`sam_lift` all fill both fields now.
+    `trippy edits list/rename/toggle/remove --edits edits.json` is the new
+    CLI for a future Named Objects panel to script against.
+  - **`trippy eval --edits` gate multiply**: `Trainer.evaluate` now calls
+    `trippy.edit.checkpoint.render_edit_weight_map` itself, exactly where
+    `trippy.render.candidate.render_candidate` already did, so a `blend`/
+    `fade` region's gate suppression shows up in `trippy eval` too, not only
+    in `candidate-report`/`distill --stage render` -- closing the gap
+    `trippy.edit.checkpoint`'s own module docstring used to document. The
+    non-edit path is unchanged: `render_edit_weight_map` returns `None`
+    whenever there is nothing to suppress, so an unedited `trippy eval` is
+    bit-identical to before.
 - **The SAM 3 lift is in the viewer (`docs/EDITOR.md` Sec 3 "5.", Sec 6's E5
   row): drag a box on the render and `trippy edits sam` runs as a child
   process.** E5's viewer half. The viewer segments nothing itself -- SAM 3 is

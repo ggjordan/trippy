@@ -10,8 +10,17 @@ Invariants under test: `evaluate_checkpoint` rebuilds a `Trainer` from a
     -- this is what lets `trippy eval --checkpoint` backfill a shade split
     for a checkpoint that finished training before the split existed,
     without retraining it (docs/EXPERIMENTS.md "Leaderboard").
+    On a gate-hybrid checkpoint, `Trainer.evaluate` now also applies the
+    edit-weight gate-suppression multiply for `blend`/`fade` regions
+    (docs/EDITOR.md Sec 5's previously-documented "trippy eval --edits does
+    not get this" gap, `trippy.edit.checkpoint.render_edit_weight_map`) --
+    the non-edit path stays bit-identical (an empty `edits.json` changes
+    nothing), a `delete` region still changes PSNR by removing points, and a
+    `fade`/`blend` region now ALSO measurably suppresses the reported gate.
 All fixtures are the synthetic scene from `tests/test_train_helpers.py`
-(never a real Splats scene or checkpoint).
+(never a real Splats scene or checkpoint); the gate-hybrid fixtures are
+`tests/test_hybrid_a_helpers.py`'s synthetic fake-render scene (never a real
+Splats render).
 """
 
 from __future__ import annotations
@@ -20,12 +29,22 @@ import json
 import re
 from pathlib import Path
 
+from test_hybrid_a_helpers import hybrid_train_config
 from test_train_helpers import build_synthetic_ply, build_synthetic_scene, tiny_train_config
 
-from trippy.train.eval import evaluate_checkpoint
+from trippy.edit.model import EditDocument, Region
+from trippy.train.eval import build_trainer_from_checkpoint, evaluate_checkpoint
 from trippy.train.trainer import Trainer
 
 _MANUAL_DIRNAME_RE = re.compile(r"^eval_manual_\d{8}-\d{6}$")
+
+
+def _gate_checkpoint(tmp_path: Path) -> Path:
+    """A one-step-trained, gate-hybrid checkpoint (the synthetic fake-render fixture)."""
+    cfg, _names = hybrid_train_config(tmp_path, gate={"enabled": True}, dropout_gaussian_p=0.0)
+    trainer = Trainer(cfg)
+    trainer.train_step()
+    return trainer.save_checkpoint(epoch=1)
 
 
 def _build_and_checkpoint(tmp_path: Path, **overrides) -> Path:
@@ -110,3 +129,69 @@ def test_evaluate_checkpoint_repeated_calls_do_not_collide(tmp_path: Path) -> No
     assert len(manual_dirs) >= 1
     for d in manual_dirs:
         assert (d / "metrics.json").exists()
+
+
+# --- closing the gate-suppression gap on a gate-hybrid checkpoint (docs/EDITOR.md Sec 5) --
+
+
+def test_evaluate_checkpoint_empty_edits_is_bit_identical_on_a_gate_hybrid(tmp_path: Path) -> None:
+    """The non-edit path must be untouched: an empty edits.json changes nothing."""
+    ckpt_path = _gate_checkpoint(tmp_path)
+    baseline = evaluate_checkpoint(ckpt_path, device="cpu")
+
+    empty_path = tmp_path / "empty_edits.json"
+    EditDocument.new().save(empty_path)
+    with_empty_edits = evaluate_checkpoint(ckpt_path, device="cpu", edits_path=empty_path)
+
+    assert with_empty_edits["psnr_mean"] == baseline["psnr_mean"]
+    assert with_empty_edits["gate"]["mean"] == baseline["gate"]["mean"]
+    assert with_empty_edits["edits"]["gate_suppression_active"] is False
+
+
+def test_evaluate_checkpoint_delete_region_changes_psnr_on_a_gate_hybrid(tmp_path: Path) -> None:
+    """A `delete` region removes points before any image renders -- PSNR must move."""
+    ckpt_path = _gate_checkpoint(tmp_path)
+    baseline = evaluate_checkpoint(ckpt_path, device="cpu")
+
+    n_before = len(build_trainer_from_checkpoint(ckpt_path, device="cpu").point_params)
+    edits = EditDocument.new()
+    edits.add_region(
+        Region(
+            id="r-del", name="del", kind="pointset",
+            params={"point_ids": list(range(n_before // 2))}, op="delete",
+        )
+    )  # fmt: skip
+    edits_path = tmp_path / "delete_edits.json"
+    edits.save(edits_path)
+
+    edited = evaluate_checkpoint(ckpt_path, device="cpu", edits_path=edits_path)
+
+    assert edited["edits"]["n_removed"] == n_before // 2
+    assert edited["psnr_mean"] != baseline["psnr_mean"]
+
+
+def test_evaluate_checkpoint_fade_region_suppresses_the_gate(tmp_path: Path) -> None:
+    """The closed gap itself: a `fade` region must now move the reported gate, not just PSNR."""
+    ckpt_path = _gate_checkpoint(tmp_path)
+    baseline = evaluate_checkpoint(ckpt_path, device="cpu")
+    assert "gate" in baseline, "the gate-hybrid fixture must actually exercise the gate"
+
+    n_before = len(build_trainer_from_checkpoint(ckpt_path, device="cpu").point_params)
+    edits = EditDocument.new()
+    edits.add_region(
+        Region(
+            id="r-fade", name="fade", kind="pointset",
+            params={"point_ids": list(range(n_before))}, mix=0.0, op="fade",
+        )
+    )  # fmt: skip
+    edits_path = tmp_path / "fade_edits.json"
+    edits.save(edits_path)
+
+    edited = evaluate_checkpoint(ckpt_path, device="cpu", edits_path=edits_path)
+
+    assert edited["edits"]["gate_suppression_active"] is True
+    assert edited["edits"]["n_removed"] == 0, "fade removes no points -- only the gate moves"
+    # Suppressing the WHOLE cloud's gate towards TRIPS (mix=0.0) can only pull the mean
+    # gate down, never up (trippy.edit.checkpoint's own module docstring).
+    assert edited["gate"]["mean"] < baseline["gate"]["mean"]
+    assert edited["psnr_mean"] != baseline["psnr_mean"]

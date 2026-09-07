@@ -25,11 +25,17 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+from trippy.constants import EDIT_BRUSH_NPZ_CELL_THRESHOLD
 from trippy.edit.model import (
     EditDocument,
     Region,
+    auto_region_name,
     box_membership,
+    brush_membership,
+    erase,
     lid_membership,
+    paint_along,
+    paint_sphere,
     pointset_membership,
     region_contains,
     region_weight,
@@ -338,3 +344,245 @@ def test_validate_checks_bundle_format(tmp_path) -> None:
     edits.validate(expected_bundle_format="trippy-bundle-1")  # ok
     with pytest.raises(ValueError, match="bundle_format"):
         edits.validate(expected_bundle_format="something-else")
+
+
+# --- brush: membership, painting, erasing -------------------------------------------------
+
+
+def _brush_region(cells=(), weights=None, cell_size=1.0, origin=(0.0, 0.0, 0.0)) -> Region:
+    params = {"origin": list(origin), "cell_size": cell_size, "cells": [list(c) for c in cells]}
+    if weights is not None:
+        params["weights"] = list(weights)
+    return Region(id="r-brush", name="brush", kind="brush", params=params, op="delete")
+
+
+def test_brush_membership_looks_up_a_points_own_cell() -> None:
+    region = _brush_region(cells=[[0, 0, 0], [1, 0, 0]], cell_size=1.0)
+    xyz = np.array(
+        [
+            [0.5, 0.5, 0.5],  # cell (0,0,0) -- occupied
+            [1.5, 0.5, 0.5],  # cell (1,0,0) -- occupied
+            [-0.5, 0.5, 0.5],  # cell (-1,0,0) -- not occupied
+            [5.0, 5.0, 5.0],  # far outside any occupied cell
+        ]
+    )
+    weight = brush_membership(xyz, region.params["origin"], region.params["cell_size"], region.params["cells"])
+    assert weight.tolist() == [1.0, 1.0, 0.0, 0.0]
+
+
+def test_brush_membership_uses_negative_cell_indices_correctly() -> None:
+    # A regression pin for the structured-dtype sort/search: negative int64 fields
+    # must sort/compare numerically, not byte-wise (see model.py's own comment).
+    region = _brush_region(cells=[[-3, -2, -1], [0, 0, 0], [2, 2, 2]], cell_size=0.5)
+    xyz = np.array([[-1.4, -0.9, -0.4], [0.1, 0.1, 0.1], [1.1, 1.1, 1.1]])
+    weight = brush_membership(xyz, region.params["origin"], region.params["cell_size"], region.params["cells"])
+    assert weight.tolist() == [1.0, 1.0, 1.0]
+
+
+def test_brush_membership_default_weight_is_one_per_cell() -> None:
+    region = _brush_region(cells=[[0, 0, 0]])
+    xyz = np.array([[0.1, 0.1, 0.1]])
+    assert brush_membership(xyz, region.params["origin"], region.params["cell_size"], region.params["cells"]).tolist() == [1.0]
+
+
+def test_brush_membership_reads_per_cell_weight() -> None:
+    region = _brush_region(cells=[[0, 0, 0], [1, 0, 0]], weights=[0.25, 0.75])
+    xyz = np.array([[0.1, 0.1, 0.1], [1.1, 0.1, 0.1]])
+    weight = brush_membership(
+        xyz, region.params["origin"], region.params["cell_size"], region.params["cells"], region.params["weights"]
+    )
+    np.testing.assert_allclose(weight, [0.25, 0.75])
+
+
+def test_brush_membership_empty_cells() -> None:
+    region = _brush_region(cells=[])
+    xyz = np.array([[0.0, 0.0, 0.0]])
+    assert brush_membership(xyz, region.params["origin"], region.params["cell_size"], region.params["cells"]).tolist() == [0.0]
+
+
+def test_region_weight_and_contains_dispatch_to_brush() -> None:
+    region = _brush_region(cells=[[0, 0, 0]], weights=[0.4])
+    xyz = np.array([[0.1, 0.1, 0.1], [9.0, 9.0, 9.0]])
+    weight = region_weight(region, xyz)
+    np.testing.assert_allclose(weight, [0.4, 0.0])
+    # No lid-style hard/graded split for brush: region_contains is weight > 0.
+    assert region_contains(region, xyz).tolist() == [True, False]
+
+
+def test_paint_sphere_touches_every_cell_the_sphere_overlaps() -> None:
+    region = _brush_region(cell_size=1.0)
+    painted = paint_sphere(region, center=(0.5, 0.5, 0.5), radius=0.4)
+    # A radius-0.4 sphere centred in cell (0,0,0) does not reach any neighbour cell.
+    assert painted.params["cells"] == [[0, 0, 0]]
+    assert "weights" not in painted.params  # every painted cell is weight 1.0 -> omitted
+
+    painted_wide = paint_sphere(region, center=(0.5, 0.5, 0.5), radius=1.0)
+    cells = {tuple(c) for c in painted_wide.params["cells"]}
+    assert (0, 0, 0) in cells
+    assert len(cells) > 1  # the wider sphere reaches neighbouring cells too
+
+
+def test_paint_sphere_returns_a_new_region_and_never_mutates_the_input() -> None:
+    region = _brush_region(cell_size=1.0)
+    original_cells = list(region.params["cells"])
+    painted = paint_sphere(region, center=(0.5, 0.5, 0.5), radius=0.4)
+    assert region.params["cells"] == original_cells
+    assert painted is not region
+    assert painted.id == region.id and painted.op == region.op
+
+
+def test_paint_sphere_repeated_strengthens_never_weakens() -> None:
+    region = _brush_region(cell_size=1.0)
+    weak = paint_sphere(region, center=(0.5, 0.5, 0.5), radius=0.4, weight=0.3)
+    strong = paint_sphere(weak, center=(0.5, 0.5, 0.5), radius=0.4, weight=0.9)
+    weight = brush_membership(
+        np.array([[0.5, 0.5, 0.5]]), strong.params["origin"], strong.params["cell_size"],
+        strong.params["cells"], strong.params.get("weights"),
+    )
+    assert weight[0] == pytest.approx(0.9)
+
+    # Painting a WEAKER stroke over an already-strong cell does not weaken it.
+    still_strong = paint_sphere(strong, center=(0.5, 0.5, 0.5), radius=0.4, weight=0.1)
+    weight2 = brush_membership(
+        np.array([[0.5, 0.5, 0.5]]), still_strong.params["origin"], still_strong.params["cell_size"],
+        still_strong.params["cells"], still_strong.params.get("weights"),
+    )
+    assert weight2[0] == pytest.approx(0.9)
+
+
+def test_paint_along_unions_a_stroke_of_spheres() -> None:
+    region = _brush_region(cell_size=1.0)
+    stroke = paint_along(region, points=[(0.5, 0.5, 0.5), (3.5, 0.5, 0.5)], radius=0.3)
+    cells = {tuple(c) for c in stroke.params["cells"]}
+    assert (0, 0, 0) in cells
+    assert (3, 0, 0) in cells
+    assert len(cells) == 2  # the two spheres are far apart and don't touch a shared cell
+
+
+def test_erase_removes_only_the_touched_cells() -> None:
+    region = _brush_region(cells=[[0, 0, 0], [5, 5, 5]], cell_size=1.0)
+    erased = erase(region, center=(0.5, 0.5, 0.5), radius=0.4)
+    assert erased.params["cells"] == [[5, 5, 5]]
+
+
+def test_erase_needs_a_brush_region() -> None:
+    box = Region(id="r1", name="x", kind="box", params={"center": [0, 0, 0], "half_extents": [1, 1, 1]})
+    with pytest.raises(ValueError, match="brush"):
+        erase(box, center=(0, 0, 0), radius=1.0)
+    with pytest.raises(ValueError, match="brush"):
+        paint_sphere(box, center=(0, 0, 0), radius=1.0)
+
+
+def test_region_rejects_bad_brush_params() -> None:
+    with pytest.raises(ValueError, match="cell_size"):
+        Region(id="r1", name="x", kind="brush", params={"origin": [0, 0, 0], "cell_size": 0.0, "cells": []})
+    with pytest.raises(ValueError, match="cells"):
+        Region(id="r1", name="x", kind="brush", params={"origin": [0, 0, 0], "cell_size": 1.0, "cells": "nope"})
+    with pytest.raises(ValueError, match="weights"):
+        Region(
+            id="r1", name="x", kind="brush",
+            params={"origin": [0, 0, 0], "cell_size": 1.0, "cells": [[0, 0, 0]], "weights": [0.5, 0.5]},
+        )
+    with pytest.raises(ValueError, match="weights"):
+        Region(
+            id="r1", name="x", kind="brush",
+            params={"origin": [0, 0, 0], "cell_size": 1.0, "cells": [[0, 0, 0]], "weights": [1.5]},
+        )
+    with pytest.raises(ValueError, match="int32"):
+        Region(
+            id="r1", name="x", kind="brush",
+            params={"origin": [0, 0, 0], "cell_size": 1.0, "cells": [[2**31, 0, 0]]},
+        )
+
+
+def test_brush_region_json_round_trip() -> None:
+    region = _brush_region(cells=[[1, -2, 3]], weights=[0.5])
+    assert Region.from_json(region.to_json()).to_json() == region.to_json()
+
+
+def test_brush_npz_sidecar_written_above_threshold(tmp_path) -> None:
+    n = EDIT_BRUSH_NPZ_CELL_THRESHOLD + 10
+    cells = [[i, 0, 0] for i in range(n)]
+    region = _brush_region(cells=cells, cell_size=1.0)
+    edits = EditDocument.new()
+    edits.add_region(region)
+
+    path = tmp_path / "edits.json"
+    edits.save(path)
+
+    import json as _json
+
+    doc = _json.loads(path.read_text())
+    params = doc["regions"][0]["params"]
+    assert "cells" not in params
+    assert params["cells_npz"] == f"edits_brush_{region.id}.npz"
+    assert params["n_cells"] == n
+    sidecar = np.load(path.parent / params["cells_npz"])
+    assert sidecar["cells"].shape == (n, 3)
+    assert sidecar["cells"].dtype == np.int32
+
+    # Python's own loader never needs the sidecar (it replays the log, which is
+    # never externalised) -- reloading must still reproduce every cell exactly.
+    reloaded = EditDocument.load(path)
+    assert sorted(map(tuple, reloaded.regions[0].params["cells"])) == sorted(map(tuple, cells))
+
+
+def test_brush_below_threshold_stays_inline(tmp_path) -> None:
+    region = _brush_region(cells=[[0, 0, 0], [1, 0, 0]], cell_size=1.0)
+    edits = EditDocument.new()
+    edits.add_region(region)
+    path = tmp_path / "edits.json"
+    edits.save(path)
+
+    import json as _json
+
+    doc = _json.loads(path.read_text())
+    params = doc["regions"][0]["params"]
+    assert params["cells"] == [[0, 0, 0], [1, 0, 0]]
+    assert "cells_npz" not in params
+    assert not (path.parent / f"edits_brush_{region.id}.npz").exists()
+
+
+# --- Region.source ---------------------------------------------------------------------
+
+
+def test_region_source_round_trips() -> None:
+    region = Region(
+        id="r1", name="x", kind="sphere", params={"center": [0, 0, 0], "radius": 1.0},
+        source={"tool": "click", "params": {"view": "IMG_1.jpg"}},
+    )
+    assert Region.from_json(region.to_json()).source == {"tool": "click", "params": {"view": "IMG_1.jpg"}}
+
+
+def test_region_source_defaults_to_none() -> None:
+    region = Region(id="r1", name="x", kind="sphere", params={"center": [0, 0, 0], "radius": 1.0})
+    assert region.source is None
+    assert region.to_json()["source"] is None
+
+
+def test_region_rejects_non_dict_source() -> None:
+    with pytest.raises(ValueError, match="source"):
+        Region(id="r1", name="x", kind="sphere", params={"center": [0, 0, 0], "radius": 1.0}, source="nope")
+
+
+# --- auto_region_name --------------------------------------------------------------------
+
+
+def test_auto_region_name_numbers_sequentially_across_tools() -> None:
+    names: list[str] = []
+    names.append(auto_region_name(names, "click"))
+    names.append(auto_region_name(names, "sam-box", detail="IMG_3703"))
+    names.append(auto_region_name(names, "shade-clouds"))
+    names.append(auto_region_name(names, "brush"))
+    assert names == ["click-1", "sam-box-IMG_3703-2", "shade-clouds-3", "brush-4"]
+
+
+def test_auto_region_name_self_heals_after_removal() -> None:
+    # No stored counter: the next name is derived from whatever names exist now.
+    assert auto_region_name(["click-1", "click-2"], "click") == "click-3"
+    assert auto_region_name(["click-1"], "click") == "click-2"  # "click-2" removed
+    assert auto_region_name([], "click") == "click-1"
+
+
+def test_auto_region_name_ignores_hand_authored_names_without_a_counter_suffix() -> None:
+    assert auto_region_name(["pool lid", "fence"], "click") == "click-1"

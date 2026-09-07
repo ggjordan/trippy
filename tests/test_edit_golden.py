@@ -36,7 +36,7 @@ import numpy as np
 
 from trippy.edit import golden
 from trippy.edit.cluster import CameraView, click_to_cluster
-from trippy.edit.model import EditDocument
+from trippy.edit.model import EditDocument, Region, region_contains, region_weight
 from trippy.edit.weights import compose_gaussian_weights, compose_trips_weights
 from trippy.train import prune
 
@@ -52,6 +52,7 @@ EXPECTED_FILES = (
     "expected_shade.json",
     "click.json",
     "expected_click.json",
+    "brush.json",
 )
 
 
@@ -309,3 +310,29 @@ def test_each_click_case_pins_a_different_branch() -> None:
     assert miss["point_ids"] == []
     assert miss["n_candidates"] == 0
     assert miss["warning"]
+
+
+# --- the brush region (Python-side only; recorded for a future Rust twin) ------------
+
+
+def test_the_brush_fixture_is_derived_not_transcribed() -> None:
+    doc = _load("brush.json")
+    assert doc["format"] == "trippy-edit-brush-1"
+    region = Region.from_json(doc["region"])
+    assert region.kind == "brush"
+
+    xyz = np.asarray(doc["xyz"], dtype=np.float64).reshape(-1, 3)
+    weight = region_weight(region, xyz)
+    contains = region_contains(region, xyz)
+    np.testing.assert_allclose(weight, doc["expected_weight"], rtol=0, atol=0)
+    assert contains.tolist() == doc["expected_contains"]
+
+
+def test_the_brush_fixture_exercises_paint_and_erase_and_a_graded_weight() -> None:
+    doc = _load("brush.json")
+    weight = doc["expected_weight"]
+    assert any(w == 0.0 for w in weight), "some query points must land outside the brush"
+    assert any(w == 1.0 for w in weight), "some query points must land in a full-weight cell"
+    assert any(0.0 < w < 1.0 for w in weight), "the erase must leave some graded (< 1.0) cells behind"
+    params = doc["region"]["params"]
+    assert params["weights"] is not None and len(params["weights"]) == len(params["cells"])

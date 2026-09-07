@@ -1723,16 +1723,16 @@ candidate-report`/`trippy eval`/`trippy distill --stage render`.
   the rendered image set reflect the deletion.
 - `trippy candidate-report`/`trippy eval --edits edits.json` run the same
   keep-mask surgery directly against a checkpoint, no bundle required. On a
-  gate-hybrid checkpoint, `candidate-report`'s renders (`trippy.render.
-  candidate.render_candidate`) additionally multiply the trained blend gate,
-  per pixel, by the per-point weight's projection wherever a `blend`/`fade`
-  region touches a surviving point -- splatted as an auxiliary
-  `render_pyramid` feature channel and read back from level 0 (per-pixel
-  weight rendering has no first-class output in the Python renderer today;
-  this is the documented fallback, `docs/EDITOR.md` Sec 5). `trippy eval`
-  applies the keep-mask deletion only, not the gate multiply (`Trainer.
-  evaluate`'s own render path is out of `trippy.edit.checkpoint`'s reach --
-  a documented gap, not a silent one).
+  gate-hybrid checkpoint, BOTH commands' renders (`trippy.render.candidate.
+  render_candidate` and, as of 2026-09-07, `Trainer.evaluate` itself)
+  multiply the trained blend gate, per pixel, by the per-point weight's
+  projection wherever a `blend`/`fade` region touches a surviving point --
+  splatted as an auxiliary `render_pyramid` feature channel and read back
+  from level 0 (per-pixel weight rendering has no first-class output in the
+  Python renderer today; this is the documented fallback, `docs/EDITOR.md`
+  Sec 5). `trippy eval`'s render path used to apply the keep-mask deletion
+  only and not the gate multiply -- see "Brush regions, named regions, and
+  the `trippy eval --edits` gate gap" below for that fix.
 
 A CPU end-to-end on the synthetic bundle/checkpoint above (`n=300` TRIPS
 points, half deleted by a `pointset` region): `apply-edits --target both`
@@ -1767,3 +1767,66 @@ done** -- `docs/EDITOR.md` Sec 7 already flags splat-side per-Gaussian
 weight rendering as unproven/unscheduled, and this work does not change
 that; the checkpoint-side gate-suppression multiply above is a documented,
 TRIPS-only-direction simplification of it, not the real thing.
+
+**Brush regions, named regions, and the `trippy eval --edits` gate gap
+(2026-09-07, `docs/EDITOR.md` Sec 1, Sec 5)**: three independent, Python-side
+closes.
+
+- **`brush`-kind regions** (`trippy.edit.model`): a sparse voxel set
+  (`origin`/`cell_size`/`cells`, optional per-cell `weights`) with a plain
+  cell-lookup membership test (`brush_membership`) that composes through the
+  SAME `region_weight`/`region_contains` dispatch every other kind uses --
+  `trippy.edit.weights`/`apply`/`checkpoint` needed zero brush-specific code.
+  `paint_sphere`/`paint_along` (a stroke) and `erase` are pure, functional
+  authoring helpers: a box-sphere intersection test against every voxel in a
+  sphere's bounding box (painting every cell the sphere actually overlaps,
+  not merely voxels whose centre is inside it), with repeated painting only
+  ever strengthening a cell (`max(existing, weight)`). `EditDocument.save`
+  externalises a brush region's `cells`/`weights` into an `.npz` sidecar once
+  it exceeds `EDIT_BRUSH_NPZ_CELL_THRESHOLD` cells, in the WRITTEN copy of
+  `regions[]` only -- Python's own loader always replays the (never
+  externalised) undo log, so this only matters to an external reader (the
+  Rust viewer) reading the materialised region list directly. CLI: `trippy
+  edits add-brush --edits edits.json --cell-size C --center x y z --radius
+  r`. `tests/fixtures/synthetic/edit_golden/brush.json`
+  (`trippy.edit.golden.build_brush_fixture`) exercises all three authoring
+  helpers in sequence and records the resulting per-point weights, as the
+  parity target for a future Rust `edit::brush`.
+- **Named regions**: `Region.source` (`{"tool": ..., ...}` or `None`, never
+  read by any membership test) records which tool made a region and with
+  what prompt/parameters; `trippy.edit.model.auto_region_name` gives a
+  tool-authored region with no explicit name a stateless, self-healing
+  numbered name (`"<tool>[-<detail>]-<n>"`, `n` derived from the highest
+  `-<digits>` suffix among the document's own region names right now, not a
+  stored counter) -- `click-1`, `sam-box-IMG_3703-2`, `shade-clouds-3`,
+  `brush-4`. `trippy.edit.shade_finder.find_shade_pointset`,
+  `trippy.edit.cluster.click_to_cluster` and `trippy.edit.sam_lift.sam_lift`
+  all fill both fields now (an explicit `name=`/`--name` still overrides).
+  New CLI: `trippy edits list/rename/toggle/remove --edits edits.json` --
+  `list` prints every region's `id`/`name`/`kind`/`op`/`mix`/`enabled`/
+  `source` (JSON), the others mutate one region by `id` through the existing
+  undo-logged `EditDocument` methods, for a future Named Objects panel to
+  script against.
+- **The `trippy eval --edits` gate-suppression gap is closed**:
+  `Trainer.evaluate` now calls `trippy.edit.checkpoint.
+  render_edit_weight_map` itself, right after splitting the gate off the
+  network output and before `apply_gate` -- the exact spot `render_candidate`
+  already did it. The non-edit path is bit-for-bit unchanged
+  (`render_edit_weight_map` returns `None` whenever there is nothing to
+  suppress).
+
+Tests (`tests/test_edit_model.py`, `tests/test_edit_golden.py`,
+`tests/test_edit_shade_finder.py`, `tests/test_edit_cluster.py`,
+`tests/test_edit_sam.py`, `tests/test_cli_edits.py`, `tests/test_train_eval.py`;
+CPU, synthetic fixtures only): brush membership (incl. negative cell indices,
+a regression pin for the structured-dtype sort/search) and validation;
+`paint_sphere`/`paint_along`/`erase` never mutate their input and paint every
+cell a sphere overlaps; the `.npz` sidecar is written only above threshold and
+Python's own reload still reproduces every cell exactly; `Region.source`
+round-trips and defaults to `None`; `auto_region_name` numbers sequentially
+across tools and self-heals after a region is removed; the brush golden
+fixture is derived, not transcribed; `edits add-brush/list/rename/toggle/
+remove` CLI exit codes and behaviour; on a synthetic gate-hybrid checkpoint,
+`evaluate_checkpoint` with an empty `edits.json` reproduces the baseline
+metrics exactly, a `delete` region still changes PSNR, and a `fade` region
+measurably lowers the reported gate mean (and no points).
