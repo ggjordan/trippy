@@ -3,6 +3,7 @@
 Last updated: 2026-09-06 (fix/viewer-kk session; previous: web-perf)
 
 ## Done
+- 2026-09-08 04:30: Editor complete in the viewer: brush painting (per-stroke undo, golden parity), Named Objects panel (enable/mix/solo/rename), drag gizmos (PR #53, build-0119). Open: brush depth anchor is an O(points) scan (unmeasured on a Karekare-scale cloud); viewer keeps brush cells inline in edits.json (no npz sidecar writer); lid has no plane-normal handle.
 - **feat/live-splat (2026-09-07): the Gaussian splat is rendered LIVE in the viewer, at any pose.**
   `bundle.json`'s `blend.splat_ply` is loaded once into `brush_render::Splats` on the viewer's own
   device (`trips-viewer/src/splat.rs`, `brush-serde` for the ply, `brush-render` for the raster,
