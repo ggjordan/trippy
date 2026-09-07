@@ -207,13 +207,15 @@ You will see two lines about it:
 
 ```
 loading splat /Users/.../kklid_20000.ply ...
-splat loaded: 8912345 Gaussians, SH degree 3, 41000 ms
+splat loaded: 8910382 Gaussians, SH degree 3, 2731 ms
 ```
 
-Loading is the slow part, once, when the scene opens: a 2 GB `.ply` takes tens of seconds.
-Rendering it after that is a per-frame cost like anything else. The panel's bottom line says
-which you are looking at — `rendered LIVE at this pose` or `a precomputed render of this
-capture view`.
+Those are the real numbers for `kklid_20000.ply` (2.1 GB, 8.9 million Gaussians): **about
+2.7 seconds** to open, once, when the scene opens. After that it is **27 ms a frame at
+1080p** — but the TRIPS half of the same frame is ~185 ms, so in practice turning the Blend
+panel on costs you roughly 15% and you will not notice it. The panel's bottom line says which
+you are looking at — `rendered LIVE at this pose` or `a precomputed render of this capture
+view`.
 
 **If the `.ply` cannot be opened** (it was moved, or the bundle came from another machine) the
 viewer says so on stderr, keeps working, and falls back to what it did before: **precomputed
@@ -229,7 +231,8 @@ downscaled to 512 px on the long edge). In that state:
 `--splat-ply <path>` points the viewer at a different `.ply` than the bundle names.
 `--no-live-splat` turns the live path off and gives you exactly the older behaviour.
 `--splat-subsample <n>` keeps every n-th Gaussian, which is the lever to reach for if a very
-large `.ply` will not fit.
+large `.ply` will not fit — on Karekare, `--splat-subsample 4` takes the splat render from
+27 ms to 10 ms and the memory with it.
 
 ### What the two halves have in common, and what they do not
 

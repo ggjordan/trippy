@@ -469,6 +469,14 @@ coverage and a pixel no Gaussian covers is exactly 0 — the same convention
 `SplatImage::masked_rgb` produces, which is what lets the live and precomputed operands
 be interchangeable.
 
+**What it costs** (job `trippy-live-splat-perf-1`, rc 0, M3 Ultra): `kklid_20000.ply`
+— 8 910 382 Gaussians, SH degree 3, 2.1 GB — loads in **2.7 s** and renders in
+**27.1 ms at 1920x1080** (37 fps, 4.8 M visible), 33.4 ms at 1008x756, or 10.4 ms
+with `--splat-subsample 4`. Against a ~185 ms U-Net-bound frame that is about
++15 %; on the synthetic 4 000-Gaussian fixture the blend is free within noise
+(TRIPS 185.67 ms vs `mix 0.5` 184.83 ms). Full table, and the two results worth
+not skimming past, in `docs/LIMITATIONS.md` "Live Gaussian splat in the viewer".
+
 `brush-render` and `brush-serde` are path dependencies into the submodule under
 `[target.'cfg(not(target_family = "wasm"))'.dependencies]`, exactly the way
 `brush-pyramid` already reaches `brush-cube`/`brush-sort`/`brush-prefix-sum` (ADR-0005).
@@ -520,6 +528,7 @@ bash scripts/gpu_submit.sh --prio 12 --wait mac-viewer-gpu-N -- bash -c \
 - `--splat-bench N` times the **splat render alone** — no pyramid, no U-Net, no
   compositing — and reports how many Gaussians were visible, so a figure taken with the
   camera looking away from the splat cannot be mistaken for a rasteriser measurement.
+  Numbers in `docs/LIMITATIONS.md`.
   `--render-size WxH` sets an explicit headless resolution, so any bundle can be
   measured at 1080p whatever its capture size. `--splat-ply`, `--splat-subsample` and
   `--no-live-splat` choose, thin, or disable the splat.

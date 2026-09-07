@@ -310,6 +310,12 @@ All notable changes to trippy. Format: Keep a Changelog. Versions: semver tags `
   - `brush-render` + `brush-serde` are path dependencies into the submodule (not `brush-dataset`,
     which is the same loader plus `image`/`reqwest`/`async_zip`/`clap`), `cfg`-gated to non-wasm
     so `trips-web`'s graph is unchanged. **The submodule itself is untouched.**
+  - **Cost, measured** (`trippy-live-splat-perf-1`, rc 0, M3 Ultra): `kklid_20000.ply`
+    (8 910 382 Gaussians, SH degree 3, 2.1 GB) loads in **2.7 s** and renders in **27.1 ms at
+    1920x1080** (37 fps, 4 798 874 visible) or 33.4 ms at 1008x756; `--splat-subsample 4` gives
+    10.4 ms. Against a ~185 ms U-Net-bound frame that is about **+15%**, and on the synthetic
+    4 000-Gaussian fixture the blend is free within noise (TRIPS 185.67 ms vs mix 184.83 ms).
+    Full table in `docs/LIMITATIONS.md`.
   - Proof without a window: `scripts/viewer_splat_check.sh` renders a synthetic bundle three
     times at a pose yawed off a capture view — `mix 0` (live splat), `mix 1` (TRIPS) and
     `mix 0 --no-live-splat` (control) — and fails unless the first two differ *and* the control

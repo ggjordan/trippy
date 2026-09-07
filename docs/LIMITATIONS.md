@@ -1173,16 +1173,60 @@ and correct everywhere; the other half degrades off-path exactly as it did befor
 `splat only`, `manual mix` and `split screen` are unaffected on any bundle, and
 nothing at all changes on a non-hybrid Gaussian-seeded bundle (`G = 0`).
 
-### Loading is not incremental, and it is not cheap
+### Loading is not incremental (but it turned out to be cheap)
 
-`LiveSplat::load` blocks until the whole `.ply` is parsed and uploaded. On
-`kklid_20000.ply` (2.1 GB, 8.9 M Gaussians, SH degree 3) that is tens of seconds
-before the window appears, and the parser allocates the full per-attribute
-`Vec<f32>`s up front (~2.2 GB) on top of the device tensors. `brush-serde` can
-stream partial `Splats` (`stream_splat_from_ply(..., streaming = true)`) and
-`apps/brush-app` uses that to show a splat filling in as it loads; the viewer does
-not, because a half-loaded splat blended into a TRIPS frame is a picture of
-neither. `--splat-subsample <n>` is the lever if a `.ply` will not fit at all.
+`LiveSplat::load` blocks until the whole `.ply` is parsed and uploaded, and the
+parser allocates the full per-attribute `Vec<f32>`s up front (~2.2 GB for
+`kklid_20000.ply`) on top of the device tensors. `brush-serde` can stream partial
+`Splats` (`stream_splat_from_ply(..., streaming = true)`) and `apps/brush-app`
+uses that to show a splat filling in as it loads; the viewer does not, because a
+half-loaded splat blended into a TRIPS frame is a picture of neither.
+
+That was written expecting it to hurt. Measured, it does not: **2.7 s** for
+`kklid_20000.ply` (2.1 GB, 8 910 382 Gaussians, SH degree 3), once, at scene
+open. `--splat-subsample <n>` remains the lever if a `.ply` will not fit in
+device memory at all — it is a stride applied *during* parsing, so it shrinks the
+host allocation too.
+
+### What it costs, measured (job `trippy-live-splat-perf-1`, rc 0, M3 Ultra)
+
+`--splat-bench N` times the splat render alone — no pyramid, no U-Net, no
+compositing — and reports how many Gaussians survived the cull, so a figure taken
+with the camera pointed away from the splat cannot be mistaken for a rasteriser
+measurement.
+
+| splat | resolution | median | visible | tile intersections | load |
+|---|---|---|---|---|---|
+| synthetic, 4 000, SH 0 | 1008x756 | **3.15 ms** (318 fps) | 4 000 | 1.18 M | 2 ms |
+| synthetic, 4 000, SH 0 | 1920x1080 | **4.57 ms** (219 fps) | 4 000 | 3.65 M | 2 ms |
+| `kklid_20000.ply`, 8 910 382, SH 3 | 1008x756 | **33.35 ms** (30 fps) | 4 985 575 | 9.53 M | 2 731 ms |
+| `kklid_20000.ply`, 8 910 382, SH 3 | 1920x1080 | **27.14 ms** (37 fps) | 4 798 874 | 12.38 M | 2 669 ms |
+| `kklid_20000.ply`, `--splat-subsample 4`, 2 227 595 | 1920x1080 | **10.36 ms** (97 fps) | 1 199 230 | 3.09 M | 2 366 ms |
+
+Whole frame at 1920x1080 on the synthetic bundle, same job: TRIPS only
+**185.67 ms**, `mix 0.5` (live splat blended in) **184.83 ms** — i.e. the blend is
+**free within run-to-run noise**, because the frame is U-Net-bound (see "the frame
+is network-bound, not sort-bound" above) and the synthetic splat's 4.57 ms
+disappears into it. On Karekare the splat's 27 ms against a ~185 ms frame is
+about **+15 %**, which is the honest figure to quote for the real scene.
+
+Two things in that table are worth not skimming past.
+
+**4.99 M of 8.91 M Gaussians are visible from the kk-coherent bundle's view 85**,
+so `kklid_20000.ply` and that bundle *do* share a world frame despite the PLY
+having been fitted on the karekare-v2 reconstruction. These are real rasteriser
+timings, not frustum-cull timings — which is exactly the question `visible` exists
+to answer, and it was a live doubt before the job ran.
+
+**1920x1080 is faster than 1008x756** (27.14 vs 33.35 ms) despite more pixels and
+30 % more tile intersections. Not investigated, so this is an observation rather
+than a finding: the likely cause is that `--render-size` scales `fx`/`fy` by the
+*width* ratio (1.905) while only 1.43x more rows exist, so every splat is
+magnified and each tile's front-to-back accumulation reaches the alpha cutoff
+after fewer Gaussians. If that is right, the rasteriser is early-out-bound rather
+than intersection-bound at this splat count, and the lever that matters is splat
+size on screen, not resolution. Worth a `--profile`-style breakdown before anyone
+optimises against it.
 
 ### The web viewer has no live splat
 
