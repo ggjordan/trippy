@@ -1,6 +1,6 @@
 # Results digest for Jordan (kept current by the Orchestrator; numbers in research/trips-metal.md)
 
-Last updated 2026-09-07 05:00. Open things in `~/Splats/output/Jordan-Review/` (`4-other/`, `2-open-in-brush/`).
+Last updated 2026-09-07 15:35. Open things in `~/Splats/output/Jordan-Review/` (`4-other/`, `2-open-in-brush/`).
 
 ## What to click first
 1. `4-other/exp0010-shade-prune-viewer.command` — best kk-coherent candidate so far (see table). Also `full2-broadcast-viewer-v2.command` for the un-pruned version.
@@ -25,10 +25,11 @@ Last updated 2026-09-07 05:00. Open things in `~/Splats/output/Jordan-Review/` (
 - The dark-mass audit is the metric that tracks your complaint directly, and it still favours the Gaussians.
   Whether the shade reads as shading is your viewer verdict.
 
+## Editor (new since this morning)
+Press M in any TRIPS viewer launcher: regions (box, sphere, pool lid) with per-region splat/TRIPS mix, fade or delete; Shift-click selects an object; the SAM tool cuts an object out from a capture view (about 10 s on CPU); the shade-cloud finder selects dark floating points with live thresholds; undo/redo; Cmd-S saves `edits.json` next to the bundle. `trippy apply-edits` publishes edits into the TRIPS export or an edited splat. Details: docs/EDITOR.md, docs/USER_GUIDE.md.
+
 ## What is queued (each self-delivers a viewer launcher + audit table when done)
-trips-mode 300-epoch Karekare (resumed), alternating shade hold-out (broadcast + trips), hybrid A
-(Gaussian render fused into the network; broadcast + trips), union point set (Gaussians + monocular depth;
-broadcast + trips). About 4-5 hours each, in that order, behind Splats' own jobs.
+Full Karekare-v2 (the scene with the big tree): masked, unmasked, point removal, splat renders + hybrid, shade prune, hybrid with the explicit gate; then hybrid-A and the remaining kk-coherent arms. Paused for the Hunua splat queue until about 21:20 on 2026-09-07 (Jordan's request), then resumes from the epoch-20 checkpoint.
 
 ## Negative results so far
 - Design C (network only refines Gaussian renders): shade got worse (-2 dB). Not the fix.
