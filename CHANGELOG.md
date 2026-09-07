@@ -3,6 +3,36 @@ All notable changes to trippy. Format: Keep a Changelog. Versions: semver tags `
 
 ## [Unreleased]
 ### Added
+- **Click-to-cluster, Python side (`docs/EDITOR.md` Sec 3 "1.", E4): `trippy
+  edits click`.** New `trippy/edit/cluster.py`: projects every point of a
+  bundle's `points.npz` into a named view (`trippy.geom.xform_a`, numbers
+  only, no distortion model), takes the points whose projection lands
+  within `--radius-px` of the click, picks the nearest-camera depth MODE
+  among them as the seed (so a click through a gap onto a same-coloured
+  surface behind the clicked object does not select the background), and
+  grows a `pointset` region from that seed by repeated k-NN queries
+  (`scipy.spatial.cKDTree`, the same query shape `trippy.points.knn_size`
+  uses) gated by a colour-distance threshold (`feat[:, :3]`, the same base
+  colour `trippy.edit.shade_finder` reads) and a hard `max_radius` (world
+  units, defaulting to the bundle's own median nearest-CAMERA spacing —
+  not point density) and `max_points` cap.
+  - `trippy edits click --bundle DIR --view IMG_xxxx.jpg --px U V
+    [--radius-px 12] [--colour-tol 0.15] [--max-radius R] [--max-points
+    200000] [--knn-k 16] [--depth-gap-factor 1.0] --op fade|delete|blend
+    --mix 0.5 --out edits.json [--preview heatmap.png]` appends the region
+    to `edits.json` (created if missing, same convention as `add-box`/
+    `add-sphere`/`add-lid`/`shade-find`).
+  - `--preview` writes a from-scratch heatmap PNG (a synthetic point-density
+    scatter of the selected points' own projections, no photograph content —
+    `AGENTS.md` Sec 6's allowed "abstract heatmap" case) plus the selection
+    counts in the printed JSON summary.
+  - 17 new CPU tests in `tests/test_edit_cluster.py`: an isolated coloured
+    blob is selected and a same-coloured blob behind it through a depth gap
+    is not; the colour gate stops growth at a touching, differently-coloured
+    cluster's boundary; `max_radius`/`max_points` caps are respected; the CLI
+    round-trips through `EditDocument.load`. Synthetic point clouds only.
+  - The viewer's own click handler (casting a ray from `camera.rs::Controller`
+    and calling this) is a later, Rust-side task — not built here.
 - **Viewer editor publish path finished (`docs/EDITOR.md` Sec 5, E6): `trippy
   apply-edits --target trips|distilled|both`, `export.ply`, distilled-PLY
   reapply, and `--edits` on `trippy candidate-report`/`trippy eval`/`trippy

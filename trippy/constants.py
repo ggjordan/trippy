@@ -1593,3 +1593,67 @@ EDIT_APPLY_DEFAULT_TARGET = "both"
 # stays MPS-kernel-shape-valid even though this path is not exercised on MPS today.
 EDIT_GATE_WEIGHT_CHANNEL_INDEX = 4
 EDIT_GATE_WEIGHT_NUM_CHANNELS = 8
+
+# --- edit/cluster.py : click-to-cluster (E4, docs/EDITOR.md Sec 3 "1.") -----------
+
+# Default click-catchment radius, screen pixels: how far a point's projection may
+# land from the clicked pixel and still be considered "under the cursor". The
+# brief's own worked example.
+CLICK_DEFAULT_RADIUS_PX = 12.0
+
+# Default colour-distance gate: two points whose `feat[:, :3]` (clipped to [0, 1],
+# the same base-colour slice `trippy.edit.shade_finder` reads) differ by more than
+# this Euclidean distance never join the same grown region. The brief's own
+# worked example; comfortably tighter than the ~1.0-1.7 distance between two
+# visually distinct hues, loose enough for a single object's own shading/noise.
+CLICK_DEFAULT_COLOUR_TOL = 0.15
+
+# Default hard cap on a single click-to-cluster selection's size -- the brief's
+# own worked example; large enough for any object a click plausibly means, small
+# enough that a mis-click on a huge same-colour surface (a wall, the sky) cannot
+# silently select millions of points.
+CLICK_DEFAULT_MAX_POINTS = 200_000
+
+# How many nearest neighbours each growth step queries per frontier point
+# (`scipy.spatial.cKDTree.query`, the same call shape `trippy.points.knn_size`
+# uses). Small: growth is a local flood-fill, not a global neighbourhood search,
+# and a larger k mostly adds query cost without changing which points are
+# eventually reachable through short hops.
+CLICK_GROW_KNN_K = 16
+
+# The depth-mode gap threshold and the growth's own max radius share ONE scene
+# scale by design (`click_to_cluster`'s docstring): a real object's own depth
+# extent and its lateral extent are both "about one object", so a single scale
+# separates "another surface behind a gap" from "this object's own depth" and
+# caps "how far this object plausibly reaches" at the same number. This factor
+# multiplies that scale to get the depth-gap threshold; 1.0 means "a gap wider
+# than the growth radius itself is a different surface, not this object".
+CLICK_DEFAULT_DEPTH_GAP_FACTOR = 1.0
+
+# Default max-radius scale, in units of the scene's own median NEAREST-CAMERA
+# spacing (`trippy.points.knn_size.median_nn_distance` applied to the bundle's
+# own camera centres, not to `xyz` -- "median camera spacing" per docs/EDITOR.md
+# Sec 3 "1. Click-to-cluster (E4)"): camera baseline is a physically meaningful
+# scene scale that survives however dense or sparse the point cloud itself is
+# (a thin, high-density surface and a coarse one should still cap an object
+# selection at "about how big things in this scene tend to be"), whereas the
+# point cloud's own nearest-neighbour spacing measures sampling density, not
+# object size. `CLICK_FALLBACK_MAX_RADIUS_FACTOR` below is the fallback when
+# fewer than two camera centres are available (a single-view call with no
+# bundle context) and multiplies the point cloud's own median NN spacing
+# instead, which is the next-best scale available in that case.
+CLICK_DEFAULT_MAX_RADIUS_CAMERA_FACTOR = 1.0
+CLICK_FALLBACK_MAX_RADIUS_FACTOR = 50.0
+
+# `trippy edits click`'s default op/mix, matching docs/EDITOR.md Sec 1's own
+# worked click-to-cluster example (a fade, mixed rather than an instant pop or
+# hard delete, since the user has not yet confirmed the selection is right).
+CLICK_DEFAULT_OP = "fade"
+CLICK_DEFAULT_MIX = 0.5
+CLICK_DEFAULT_NAME = "click cluster"
+
+# `trippy edits click --preview`: longest edge of the from-scratch heatmap PNG,
+# same reasoning as `trippy.render.bundle.BUNDLE_SPLAT_MAX_DIM` -- a preview is
+# for "does this look like the right blob", not a delivered image, and capping
+# it keeps a debug artifact from a multi-thousand-pixel view unreasonably large.
+CLICK_PREVIEW_MAX_DIM = 512

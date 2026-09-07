@@ -1,9 +1,10 @@
 # Editing: turning `trips-viewer` into an edit tool
 
-Status: **Python side implemented, including the publish path** (`trippy/edit/`:
-`model.py`, `weights.py`, `shade_finder.py`, `apply.py`, `checkpoint.py`;
-`trippy apply-edits --target trips|distilled|both`, `trippy edits
-shade-find/add-box/add-sphere/add-lid`, and `--edits` on `trippy
+Status: **Python side implemented, including the publish path and
+click-to-cluster** (`trippy/edit/`: `model.py`, `weights.py`,
+`shade_finder.py`, `apply.py`, `checkpoint.py`, `cluster.py`; `trippy
+apply-edits --target trips|distilled|both`, `trippy edits
+shade-find/add-box/add-sphere/add-lid/click`, and `--edits` on `trippy
 candidate-report`/`trippy eval`/`trippy distill --stage render` in
 `trippy/cli.py`; see `docs/EXPERIMENTS.md` "Edits" for the worked run and
 test list). The Rust viewer (§0/§2's render integration, §3's selection
@@ -31,6 +32,9 @@ nudge/resize instead), click-to-cluster (E4), the SAM-3 lift (E5), and the
 `brush`-kind voxel region.
 
 Three implementation notes, all explained where they matter below:
+tools' UI/ray-cast half, §4's UI) is **not implemented** -- this document
+remains the spec for that work. Four implementation notes, all explained
+where they matter below:
 
 - **`box`'s schema is `center`/`half_extents`/`quat`** (an oriented box),
   not this section's axis-aligned `min`/`max` -- a rotated box is testable
@@ -57,6 +61,20 @@ Three implementation notes, all explained where they matter below:
   `blend`/`fade` leave alpha alone so the probe pass's alpha-weighted
   average is an average of the *untouched* alphas. See §2 "The probe pass"
   and `rust/crates/trips-viewer/src/edit/apply.rs`.
+- **Click-to-cluster's Python side (§3's "1.") projects with
+  `trippy.geom.xform_a` and applies NO lens distortion** -- that module has
+  no distortion model at all (Saiga's 8-coefficient form lives in
+  `trippy.render.parity`, torch-only; `trippy.geom.camera`'s OpenCV form is
+  a third, different convention again). Exact on a trippy-native bundle
+  (whose views carry all-zero distortion by construction,
+  `trippy.render.bundle.native_views`); a first-order approximation of
+  "which points are near this click" on a TRIPS/ADOP bundle. The default
+  `max_radius` (how far a grown region may reach from its seed) is the
+  bundle's own median NEAREST-CAMERA spacing, not point-cloud density --
+  `trippy.edit.cluster.default_max_radius_from_bundle`, reusing
+  `trippy.points.knn_size.median_nn_distance`'s exact cKDTree query pattern
+  against camera centres instead of `xyz`. See `trippy.edit.cluster`'s
+  module docstring for the full algorithm and every constant's reasoning.
 
 `docs/decisions/ADR-0007-viewer-editing.md` is still accurate to the
 sections below; this document is the detailed spec the milestones in §6
@@ -212,7 +230,8 @@ ADR-0006-viewer-integration.md` "Performance levers are render parameters").
   `Bundle::load`). This is what the shade-cloud finder, click-to-cluster and
   the SAM-3 lift all produce. **Implemented for the shade-cloud finder**
   (`trippy.edit.shade_finder.find_shade_pointset`, CLI: `trippy edits
-  shade-find`); click-to-cluster and SAM-3 lift are not built.
+  shade-find`) **and for click-to-cluster** (`trippy.edit.cluster.
+  click_to_cluster`, CLI: `trippy edits click`); the SAM-3 lift is not built.
 
 **`op` semantics:**
 
@@ -394,6 +413,28 @@ space from the clicked point, with a size/tightness slider in the Inspector.
 No rendered depth buffer needed (§2's "why not depth lookup" applies here
 too) — the ray/point-cloud nearest-neighbour test is a pure CPU geometry
 query against data the renderer already holds.
+
+**Python side implemented** (`trippy.edit.cluster`, CLI: `trippy edits
+click --bundle DIR --view IMG_xxxx.jpg --px U V [--radius-px 12]
+[--colour-tol 0.15] [--max-radius R] [--max-points 200000] --op
+fade|delete|blend --mix M --out edits.json [--preview heatmap.png]`),
+ahead of the Rust viewer's ray cast: every point is projected into a named
+*registered* view (`trippy.geom.xform_a`, no distortion — see the status
+header's implementation note) rather than cast along an arbitrary free-fly
+camera ray, since the Python side has no live `camera.rs::Controller` to
+ask. The points within `radius_px` of the click are clustered by camera-
+space depth; the mode nearest the camera seeds the region (this is what
+keeps a click from selecting a same-coloured surface glimpsed through a
+gap behind the clicked object — see the module docstring's step 3). Growth
+from that seed is k-NN in 3D (`scipy.spatial.cKDTree`, the same query
+pattern `trippy.points.knn_size` uses) gated by colour distance
+(`feat[:, :3]`, `trippy.edit.shade_finder`'s own base-colour slice) and a
+hard `max_radius` (world units, defaulting to the bundle's median nearest-
+CAMERA spacing) and `max_points` cap. `--preview` writes a from-scratch
+point-density heatmap PNG of the selection (no photo content). The
+viewer's own ray cast against a live camera and the Inspector's
+size/tightness slider are still Rust-side, unbuilt work — see E4's own row
+in §6.
 
 ### 2. Shade-cloud finder (E2)
 
@@ -619,7 +660,7 @@ schedule.
 | **E1** | Region data model (`edits.json` read/write), `box`/`sphere` region kinds, per-point weight compositing (§2's non-depth design) on the TRIPS side only, undo/redo, save/load surviving a bundle close+reopen | 1 wk | Draw a box or sphere region in the viewer, set `mix`, see the TRIPS render change inside it and nothing outside it; undo removes the region; closing and reopening the bundle restores it exactly (region list, mix values, undo history) | **Done** (2026-09-07), except the 3D drag gizmos, which E1 replaced with Inspector fields + arrow-key nudge / `[`-`]` resize. `rust/crates/trips-viewer/src/edit/*` + `src/edit_ui.rs`. Measured on the synthetic bundle: a `blend` sphere at `mix = 0` changes 4.74 % of the pixels in its own half of the frame and **0.00 %** of the other half; a `delete` box changes 63.97 % of its half; undoing it reproduces the unedited frame **bit for bit** (max channel diff 0). |
 | **E2** | Shade-cloud finder: `trippy edit-prep` precompute + live threshold sliders + preview-highlight `ViewMode` + "select" → `pointset` region | 3 d | On a bundle whose scene has registered shade frames, the finder's default thresholds select a `pointset` region whose `dark_mass_fraction` (via `trippy.train.prune.dark_mass_stats` on the selected IDs) matches the audit's own number for that scene to float precision; deleting the region and re-running the audit shows the drop | **Done** (2026-09-07). Four live sliders (lum, conf, znear/zfar fractions) over `shade_views.json`, the precompute written by `trippy.edit.golden.write_shade_views`; "add as region (fade / delete)"; and a preview that **tints** the selection instead of adding a `ViewMode` (see the note under this table). `trips-viewer --dump-shade` selects the same ids and the same `dark_mass_fraction` as `trippy.edit.shade_finder.find_shade_pointset` on the synthetic bundle (`tests/test_edit_viewer_parity.py`). |
 | **E3** | `lid` region kind + 3D gizmo (plane/radius drag) + hard-clip delete semantics | 2 d | Loading the Karekare pool bundle with a `lid` region seeded from `SURFACE_LID.md`'s numbers removes the haze from every angle at every `mix`/exposure; dragging the radius ring changes the affected point count live | **Region kind + hard-clip semantics done** (`trippy.edit.model.lid_membership`, `trippy edits add-lid`); the 3D gizmo is not built. |
-| **E4** | Click-to-cluster: ray cast + k-d tree + k-NN growth in world+colour space, radius slider | 3 d | Clicking a point-cloud cluster selects a `pointset` region that visibly matches the clicked object's extent, without needing a depth buffer | Not started. |
+| **E4** | Click-to-cluster: ray cast + k-d tree + k-NN growth in world+colour space, radius slider | 3 d | Clicking a point-cloud cluster selects a `pointset` region that visibly matches the clicked object's extent, without needing a depth buffer | **Python side done** (`trippy.edit.cluster`, `trippy edits click`; synthetic-scene tests: an isolated blob is selected and a same-coloured blob behind it through a depth gap is not, the colour gate separates touching differently-coloured clusters, `max_radius`/`max_points` caps are respected, `tests/test_edit_cluster.py`); the viewer's ray cast against a live camera, the Inspector's size/tightness slider, and the "click on empty space seeds a new cluster" UI wiring (§4) are not built. |
 | **E5** | SAM 3 lift: photo segmentation, multi-view projection + majority vote, `pointset` region output | 2–3 wk | Segmenting an object in 2–3 registered views of the same scene produces one `pointset` region that, previewed, highlights that object and not its neighbours; runs entirely local (no image leaves the machine) | Not started. |
 | **E6** | Publish path: `trippy apply-edits`, TRIPS `export.ply` mask wiring, distilled-splat publish order (edit-then-distil for pointset regions, geometry-reapply for box/sphere/lid) | 3 d | `trippy apply-edits --target both` on a bundle with a mix of region kinds produces a TRIPS PLY with the deleted points absent and, after a `trippy distill` run on the same edited bundle, a distilled PLY that also lacks them; a box/sphere/lid region re-applied directly to an already-distilled PLY (no re-distillation) also removes the matching geometry | **Done** (`trippy/edit/apply.py`, `trippy/edit/checkpoint.py`): `--target trips\|distilled\|both` (default `both`); `trips`/`both` write the filtered TRIPS `points.npz`/`blend_weights.npy`/`export.ply` and, if named, a filtered `blend.splat_ply`; `distilled`/`both` (with `--distilled-ply`) re-apply box/sphere/lid regions to an already-distilled PLY as delete/opacity-scale-fade; `--edits` wired into `trippy distill --stage render` (edit-then-distil ordering) and into `trippy candidate-report`/`trippy eval` (checkpoint-side keep mask + gate suppression on gate-hybrid checkpoints, `candidate-report` only — see §5's own paragraph for the `eval` gap). |
 

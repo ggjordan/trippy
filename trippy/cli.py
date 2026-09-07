@@ -130,13 +130,20 @@ anything.
 `apply-edits` and `edits <subcommand>` are the Python side of the viewer
 editor (docs/EDITOR.md, docs/decisions/ADR-0007-viewer-editing.md), so
 regions can be authored and published before the viewer's own UI exists.
-`edits shade-find`/`add-box`/`add-sphere`/`add-lid` append a `Region` to an
-`edits.json` file (created if missing) -- `shade-find` runs
+`edits shade-find`/`add-box`/`add-sphere`/`add-lid`/`click` append a
+`Region` to an `edits.json` file (created if missing) -- `shade-find` runs
 `trippy.edit.shade_finder` (built on `trippy.train.prune`'s exact audit
 functions) against a bundle's `points.npz` and a scene's shade frames;
 `add-box`/`add-sphere`/`add-lid` take the region's geometry straight from
 flags (`add-lid`'s defaults are the Karekare pool's already-fitted numbers,
-`~/Splats/tools/SURFACE_LID.md` Sec 3). `apply-edits --bundle <dir> --edits
+`~/Splats/tools/SURFACE_LID.md` Sec 3); `click --bundle <dir> --view <name>
+--px U V` (`trippy.edit.cluster.click_to_cluster`, docs/EDITOR.md Sec 3
+"1. Click-to-cluster (E4)") projects every point into the named view
+(`trippy.geom.xform_a`), seeds from the nearest-camera depth mode among the
+points within `--radius-px` of the click, and grows a `pointset` region by
+3D k-NN with a colour-distance gate and a world-space max radius (default:
+median camera spacing); `--preview PNG` additionally writes a from-scratch
+point-density heatmap of the selection (no photo content). `apply-edits --bundle <dir> --edits
 edits.json --out <dir> [--target trips|distilled|both] [--distilled-ply
 <path>]` (`trippy.edit.apply.apply_edits`, default target "both") composes
 the edits' regions (`trippy.edit.weights`) against the bundle's TRIPS
@@ -177,6 +184,14 @@ from trippy.constants import (
     CANDIDATE_REPORT_JSON_FILENAME,
     CANDIDATE_REPORT_OFFPATH_DIRNAME,
     CANDIDATE_REPORT_README_FILENAME,
+    CLICK_DEFAULT_COLOUR_TOL,
+    CLICK_DEFAULT_DEPTH_GAP_FACTOR,
+    CLICK_DEFAULT_MAX_POINTS,
+    CLICK_DEFAULT_MIX,
+    CLICK_DEFAULT_NAME,
+    CLICK_DEFAULT_OP,
+    CLICK_DEFAULT_RADIUS_PX,
+    CLICK_GROW_KNN_K,
     DEFAULT_DENSITY_COLMAP_SPARSE_DIR,
     DEFAULT_DENSITY_GAUSSIAN_PLY,
     DEFAULT_MIN_OPACITY,
@@ -1016,6 +1031,47 @@ def _cmd_edits_add_lid(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_edits_click(args: argparse.Namespace) -> int:
+    """`trippy edits click --bundle <dir> --view <name> --px U V --out edits.json [--preview PNG]`.
+
+    Projects every point of `--bundle`'s own `points.npz` into `--view` (a
+    registered `bundle.json` view name), grows a `pointset` region from the
+    surface nearest the clicked pixel (`trippy.edit.cluster.click_to_cluster`,
+    docs/EDITOR.md Sec 3 "1. Click-to-cluster (E4)"), and appends it to
+    `--out` (created if missing, like `edits shade-find`/`add-*`). `--preview`
+    additionally writes a from-scratch heatmap PNG of the selected points'
+    own projections (no photo content -- `AGENTS.md` Sec 6).
+    """
+    from trippy.edit.cluster import click_to_cluster_in_bundle
+
+    try:
+        region, summary = click_to_cluster_in_bundle(
+            args.bundle,
+            args.view,
+            (args.px[0], args.px[1]),
+            radius_px=args.radius_px,
+            colour_tol=args.colour_tol,
+            max_radius=args.max_radius,
+            max_points=args.max_points,
+            knn_k=args.knn_k,
+            depth_gap_factor=args.depth_gap_factor,
+            op=args.op,
+            mix=args.mix,
+            name=args.name,
+            preview_path=args.preview,
+        )
+    except (ValueError, FileNotFoundError, KeyError) as exc:
+        print(f"trippy edits click: {exc}", file=sys.stderr)
+        return 2
+
+    edits_path = Path(args.out)
+    edits = _load_or_create_edits(edits_path, args.bundle)
+    edits.add_region(region)
+    edits.save(edits_path)
+    print(json.dumps(summary, indent=2))
+    return 0
+
+
 def _cmd_leaderboard(args: argparse.Namespace) -> int:
     """`trippy leaderboard --out <dir> [--deliver]`: one comparison table across every run."""
     # Deferred import: pulls in PIL/yaml, which `trippy smoke`/`density` have no need for.
@@ -1757,6 +1813,40 @@ def build_parser() -> argparse.ArgumentParser:
     add_lid.add_argument("--mix", type=float, default=1.0)
     add_lid.add_argument("--op", choices=EDIT_REGION_OPS, default="delete")
     add_lid.set_defaults(func=_cmd_edits_add_lid)
+
+    click = edits_sub.add_parser(
+        "click",
+        help="click-to-cluster: grow a pointset region from the surface nearest a clicked pixel (E4)",
+    )
+    click.add_argument("--bundle", required=True, help="bundle directory (bundle.json + points.npz)")
+    click.add_argument("--view", required=True, help="a bundle.json views[] entry's own name (e.g. IMG_0001.jpg)")
+    click.add_argument("--px", type=float, nargs=2, required=True, metavar=("U", "V"), help="clicked pixel")
+    click.add_argument("--radius-px", type=float, default=CLICK_DEFAULT_RADIUS_PX, help="click catchment radius, px")
+    click.add_argument(
+        "--colour-tol", type=float, default=CLICK_DEFAULT_COLOUR_TOL,
+        help="max colour distance (Euclidean, feat[:, :3] in [0, 1]) from the seed's own mean colour",
+    )  # fmt: skip
+    click.add_argument(
+        "--max-radius", type=float, default=None,
+        help="max distance (world units) from the seed centroid; default: median camera spacing "
+        "(trippy.edit.cluster.default_max_radius_from_bundle)",
+    )  # fmt: skip
+    click.add_argument("--max-points", type=int, default=CLICK_DEFAULT_MAX_POINTS, help="hard cap on selection size")
+    click.add_argument("--knn-k", type=int, default=CLICK_GROW_KNN_K, help="neighbours queried per growth step")
+    click.add_argument(
+        "--depth-gap-factor", type=float, default=CLICK_DEFAULT_DEPTH_GAP_FACTOR,
+        help="multiplies max-radius to get the depth-mode gap threshold (nearest-surface seeding)",
+    )  # fmt: skip
+    click.add_argument("--name", default=CLICK_DEFAULT_NAME, help="region name")
+    click.add_argument("--op", choices=EDIT_REGION_OPS, default=CLICK_DEFAULT_OP)
+    click.add_argument("--mix", type=float, default=CLICK_DEFAULT_MIX)
+    click.add_argument("--out", required=True, help="edits.json to update (created if missing)")
+    click.add_argument(
+        "--preview", default=None,
+        help="also write a from-scratch heatmap PNG of the selected points' own projections here "
+        "(no photo content)",
+    )  # fmt: skip
+    click.set_defaults(func=_cmd_edits_click)
 
     leaderboard = sub.add_parser(
         "leaderboard",
