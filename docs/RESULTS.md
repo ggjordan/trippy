@@ -19,6 +19,7 @@ Last updated 2026-09-07 15:35. Open things in `~/Splats/output/Jordan-Review/` (
 | + TRIPS point removal (EXP-0010 A) | 17.67 | 15.44 | 36.8% |
 | + audit-aligned shade prune (EXP-0010 B) — **walk this one** | **17.75** | **15.59** | **24.1%** |
 | Alternating shade hold-out (trained on 3 of the 6 shade frames; scored on the other 3) | 17.94 | 16.79 | 36.7% |
+| karekare-v2 (full, masked) | TRIPS plain, ep 122/300 | 15.06 | – | 34.5% (Gaussians 17.3%) | kkv2-1-full-masked-viewer.command | not a fix alone; arms 3/5/6/7 pending |
 
 - PSNR uses exposure borrowed from neighbouring training frames (TRIPS's own method; no held-out photo is used).
   The earlier 8.49 dB shade number was an exposure bug (10 photos without EXIF got a 58x gain).

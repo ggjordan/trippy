@@ -3,6 +3,7 @@
 Last updated: 2026-09-06 (fix/viewer-kk session; previous: web-perf)
 
 ## Done
+- 2026-09-08 10:26: kkv2-1-full-masked done (epoch 122/300, budget): PSNR 15.06 dB, shade dark-mass 34.5% vs 17.3% Gaussians. Delivered kkv2-1-full-masked-viewer.command + dolly + honesty + PLY. REVIEW QUEUE for Jordan: open that launcher and judge the big-tree shade. kkv2-2-full-unmasked running; kkv2-8 continuation queued after kkv2-7. sam-ui-proof4 passed on MPS.
 - 2026-09-08 04:30: Editor complete in the viewer: brush painting (per-stroke undo, golden parity), Named Objects panel (enable/mix/solo/rename), drag gizmos (PR #53, build-0119). Open: brush depth anchor is an O(points) scan (unmeasured on a Karekare-scale cloud); viewer keeps brush cells inline in edits.json (no npz sidecar writer); lid has no plane-normal handle.
 - **feat/live-splat (2026-09-07): the Gaussian splat is rendered LIVE in the viewer, at any pose.**
   `bundle.json`'s `blend.splat_ply` is loaded once into `brush_render::Splats` on the viewer's own
