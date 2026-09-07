@@ -232,6 +232,7 @@ from trippy.constants import (
     SAM3_DEFAULT_DEVICE,
     SAM3_DEVICES,
     SAM3_MASK_THRESHOLD,
+    SAM_FAKE_ENV,
     SAM_LIFT_DEFAULT_MIX,
     SAM_LIFT_DEFAULT_OP,
     SAM_LIFT_DEFAULT_VIEWS_AROUND,
@@ -253,6 +254,7 @@ from trippy.constants import (
     TRAIN_REPORT_DIRNAME,
     TRAIN_REPORT_FAILED_FILENAME,
 )
+from trippy.edit.sam_lift import PROMPT_SPACES
 from trippy.eval.audits import audit_report
 from trippy.hybrid.config_c import HybridCConfig
 from trippy.hybrid.train_c import HybridCTrainer
@@ -263,7 +265,7 @@ from trippy.points.gaussian_ply import GaussianPlySource
 from trippy.points.monodepth import MonoDepthSource
 from trippy.points.source import PointSource
 from trippy.render import pyramid_render
-from trippy.render.bundle import TRIPS_DEFAULT_EPOCH
+from trippy.render.bundle import BUNDLE_JSON_FILENAME, TRIPS_DEFAULT_EPOCH
 from trippy.render.bundle import export_bundle as write_export_bundle
 from trippy.render.candidate import render_candidate
 from trippy.render.dolly import shade_dolly_poses
@@ -955,19 +957,58 @@ def _cmd_edits_shade_find(args: argparse.Namespace) -> int:
     return 0
 
 
+def _bundle_scene_root(bundle_dir: str) -> str | None:
+    """`bundle.json`'s own `scene_root`, or None when it does not record one.
+
+    Written by `trippy.render.bundle.bundle_document` since 2026-09-07 so a
+    tool that has a bundle does not also have to be told where the
+    photographs are -- which is what lets `trips-viewer`'s SAM tool spawn
+    `trippy edits sam` with no `--scene` at all (docs/EDITOR.md Sec 3
+    "4. SAM 3 lift (E5)"). An older bundle simply has no such key.
+    """
+    path = Path(bundle_dir) / BUNDLE_JSON_FILENAME
+    try:
+        document = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    root = document.get("scene_root")
+    return str(root) if root else None
+
+
 def _cmd_edits_sam(args: argparse.Namespace) -> int:
-    """`trippy edits sam --bundle <dir> --scene <root> --view IMG.jpg --point U V | --box ... --out edits.json`.
+    """`trippy edits sam --bundle <dir> [--scene <root>] --view IMG.jpg --point U V | --box ... --out edits.json`.
 
     Segments ONE photograph with the local SAM 3 (docs/EDITOR.md Sec 3
     "4. SAM 3 lift (E5)") and lifts the mask onto the bundle's points as a
     `pointset` region. `--device mps` is GPU work and belongs inside a
     `scripts/gpu_submit.sh` job; the default is CPU. `--mask NAME=PATH`
     replaces SAM 3 with mask arrays already on disk (a re-lift, or a CPU
-    test), and says so in the summary's `segmenter` field rather than
+    test), and `--fake` (or `TRIPPY_SAM_FAKE=1`) synthesises the mask from
+    the prompt; both say so in the summary's `segmenter` field rather than
     pretending SAM ran.
+
+    Output contract, because `trips-viewer` runs this as a CHILD PROCESS and
+    parses what it prints: every progress line goes to stdout prefixed
+    `sam: `, and the LAST line of stdout is the whole summary as ONE compact
+    JSON object. `--summary-out` still writes the indented form to a file.
     """
     from trippy.edit.sam_lift import sam_lift
-    from trippy.edit.sam_runner import MaskFileSegmenter, Sam3Segmenter, SamPrompt
+    from trippy.edit.sam_runner import (
+        FakeSegmenter,
+        MaskFileSegmenter,
+        Sam3Segmenter,
+        SamPrompt,
+        fake_requested,
+    )
+
+    scene = args.scene or _bundle_scene_root(args.bundle)
+    if not scene:
+        print(
+            f"trippy edits sam: --scene is required ({args.bundle}/{BUNDLE_JSON_FILENAME} "
+            "records no scene_root; re-export the bundle or pass --scene)",
+            file=sys.stderr,
+        )
+        return 2
 
     if args.point is not None:
         prompt = SamPrompt(kind="point", point=(args.point[0], args.point[1]))
@@ -977,7 +1018,12 @@ def _cmd_edits_sam(args: argparse.Namespace) -> int:
         prompt = SamPrompt(kind="text", text=args.text)
 
     segmenter: object
-    if args.mask:
+    if fake_requested(args.fake):
+        # No SAM 3, no weights, no venv: the mask is the prompt's own
+        # footprint. Everything after it -- projection, depth gate, vote,
+        # region, summary -- is the shipped code path.
+        segmenter = FakeSegmenter()
+    elif args.mask:
         masks: dict[str, str] = {}
         for entry in args.mask:
             name, _, path = entry.partition("=")
@@ -993,10 +1039,14 @@ def _cmd_edits_sam(args: argparse.Namespace) -> int:
             options={"mask_threshold": args.mask_threshold},
         )
 
+    def note(message: str) -> None:
+        """One progress line, flushed: the viewer reads these while it waits."""
+        print(f"sam: {message}", flush=True)
+
     try:
         region, summary = sam_lift(
             args.bundle,
-            args.scene,
+            scene,
             args.view,
             prompt,
             segmenter,
@@ -1009,6 +1059,8 @@ def _cmd_edits_sam(args: argparse.Namespace) -> int:
             vote_fraction=args.vote_fraction,
             apply_scene_distortion=not args.no_scene_distortion,
             preview=args.preview,
+            prompt_space=args.prompt_space,
+            progress=note,
         )
     except (ValueError, KeyError, FileNotFoundError, RuntimeError) as exc:
         print(f"trippy edits sam: {exc}", file=sys.stderr)
@@ -1020,10 +1072,15 @@ def _cmd_edits_sam(args: argparse.Namespace) -> int:
     edits.save(edits_path)
     summary["region_id"] = region.id
     summary["edits"] = str(edits_path)
+    summary["scene_root"] = str(scene)
     if args.summary_out:
         Path(args.summary_out).parent.mkdir(parents=True, exist_ok=True)
         Path(args.summary_out).write_text(json.dumps(summary, indent=2))
-    print(json.dumps(summary, indent=2))
+    note(f"wrote region {region.id} ({len(region.params['point_ids'])} points) to {edits_path}")
+    # LAST line, one compact object: `trips_viewer::sam_child` parses exactly
+    # this to learn the counts, and the `sam: ` prefix above is what keeps
+    # every other line from being mistaken for it.
+    print(json.dumps(summary), flush=True)
     return 0
 
 
@@ -1858,7 +1915,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="segment one photo with the local SAM 3 and lift the mask onto the points",
     )
     sam.add_argument("--bundle", required=True, help="bundle directory (bundle.json + points.npz)")
-    sam.add_argument("--scene", required=True, help="scene root (images/ + sparse/0 or sparse_txt)")
+    sam.add_argument(
+        "--scene", default=None,
+        help="scene root (images/ + sparse/0 or sparse_txt); "
+             "optional when bundle.json records scene_root",
+    )  # fmt: skip
     sam.add_argument("--view", required=True, help="which registered view to prompt, e.g. IMG_3703.jpg")
     prompt_group = sam.add_mutually_exclusive_group(required=True)
     prompt_group.add_argument(
@@ -1900,6 +1961,16 @@ def build_parser() -> argparse.ArgumentParser:
     sam.add_argument(
         "--sam-work-dir", default=None,
         help="keep each view's mask.npy/info.json here (arrays only, never images)",
+    )  # fmt: skip
+    sam.add_argument(
+        "--prompt-space", choices=PROMPT_SPACES, default="photo",
+        help="which pixel grid --point/--box are measured in: the photograph (default) "
+             "or the bundle VIEW's smaller raster (what trips-viewer's SAM tool sends)",
+    )  # fmt: skip
+    sam.add_argument(
+        "--fake", action="store_true",
+        help=f"synthesise the mask from the prompt instead of loading SAM 3 "
+             f"(same as {SAM_FAKE_ENV}=1); the summary says segmenter=fake",
     )  # fmt: skip
     sam.add_argument("--preview", default=None, help="PNG: from-scratch heatmap of the selection")
     sam.add_argument("--summary-out", default=None, help="also write the summary JSON here")

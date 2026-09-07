@@ -1257,20 +1257,46 @@ feature. `trips-web` passes a constant `BlendMode::Trips`, which is a hard no-op
   `triton.backends.compiler` unconditionally (the same wall
   `~/Splats/research/sam3-person.md` documents; the Splats venv already
   carries a `triton` shim, and this stub is what makes `torchvision.ops`
-  import on top of it). (b) A `torch.autocast(bfloat16)` region around
-  inference, because `sam3.perflib.fused.addmm_act` casts its own inputs to
-  bfloat16 and hands the result to the next fp32 `Linear` — without an
-  autocast the first ViT MLP raises "mat1 and mat2 must have the same dtype".
-  Both are in `trippy/edit/sam_runner.py` with the reason inline. If the
-  Splats SAM checkout is updated, re-check both.
+  import on top of it). (b) An **fp32 rebinding of
+  `sam3.perflib.fused.addmm_act`**, because that function casts its own
+  inputs to bfloat16 unconditionally and hands the result to the next fp32
+  layer. Both are in `trippy/edit/sam_runner.py` with the reason inline. If
+  the Splats SAM checkout is updated, re-check both.
+- **Corrected 2026-09-07: the `torch.autocast(bfloat16)` region this section
+  first described was the wrong fix, and is gone.** It made the CPU run
+  *work* but 6x slower (58.8 s against **9.2 s** for the same lift with no
+  autocast and `addmm_act` rebound to fp32 — identical mask, 129,712 mask
+  pixels, 74,007 points selected), because bfloat16 on CPU is emulated. On
+  MPS it did not work at all: the MPS autocast policy casts a convolution's
+  INPUT but not its WEIGHT, so the pass died with `Input type
+  (MPSBFloat16Type) and weight type (torch.FloatTensor) should be the same`
+  (job `trippy-edit-sam-1`). The shipped fix removes bfloat16 at its source
+  (`_install_fp32_addmm`, both the definition site and `sam3.model.vitdet`'s
+  import-time copy of it) and runs with no autocast on either device. fp32 is
+  strictly more accurate than the bf16 path CUDA takes, so this cannot make a
+  mask worse.
+- **MPS needs two further rebindings of SAM 3's own code, neither of them a
+  fallback.** (a) `build_sam3_image_model` only calls `.to(device)` when
+  `device == "cuda"`, so on MPS the weights stay on the CPU while
+  `Sam3Processor` puts the image on the GPU — `Input type (MPSFloatType) and
+  weight type (torch.FloatTensor) should be the same` (job
+  `trippy-edit-sam-2`). `sam_runner` moves the model itself. (b) The ViT's
+  default rotary embedding goes through `torch.view_as_complex`, which MPS
+  does not implement; SAM 3 already ships the real-valued twin
+  (`ViT(use_rope_real=True)` → `freqs_cis_real`/`freqs_cis_imag`,
+  `apply_rotary_enc_real`) and it has no learned parameters of its own, so
+  the checkpoint loads identically — `sam3/model_builder.py`'s
+  `_create_vit_backbone` simply never passes the flag, and
+  `_install_real_rope` rebinds that factory on MPS. `PYTORCH_ENABLE_MPS_
+  FALLBACK` is untouched by any of this.
 - **The mask threshold is a real knob, not a formality.** `Sam3Processor`
   hardcodes "inside = probability > 0.5"; `sam_runner` reproduces that but
   thresholds the probability map itself so `--mask-threshold` can move it.
   On a *synthetic* flat-colour disc SAM 3 was confidently right about where
   the object was while peaking at ≈0.42, which at 0.5 returns only the
-  object's **outline** — measured identically in fp32 and under autocast, so
-  it is the model's calibration on out-of-distribution input, not a numerics
-  bug. On the real kk-coherent photo the same prompt peaked at 0.90 and the
+  object's **outline** — measured identically in fp32 and (before it was
+  removed) under autocast, so it is the model's calibration on
+  out-of-distribution input, not a numerics bug. On the real kk-coherent photo the same prompt peaked at 0.90 and the
   mask was solid, so the default is right for photographs; be suspicious of
   a lift whose `mask_area_fraction` is tiny and whose `mask_prob_max` is just
   under the threshold.
@@ -1303,8 +1329,10 @@ feature. `trips-web` passes a constant `BlendMode::Trips`, which is a hard no-op
   STRICT majority of the views that can see a point (`floor(f·n) + 1`), so
   with exactly two eligible views a point needs BOTH of them — the result is
   the intersection of the two lifts, not a consensus. Measured on
-  kk-coherent (`IMG_3703.jpg` box prompt + one neighbour, CPU): 72,455 points
-  from the prompted view alone, 15,476 from the neighbour (whose own mask was
+  kk-coherent (`IMG_3703.jpg` box prompt + one neighbour, CPU, under the
+  since-removed autocast): 72,455 points from the prompted view alone (the
+  fp32 path selects 74,007 of 104,218 projected inside the mask), 15,476 from
+  the neighbour (whose own mask was
   tighter: 0.164% of its frame vs 1.044%), 15,111 after the vote. That is the
   honest behaviour of a two-view majority and it is why the neighbour count
   should be 0 (trust one view) or >= 2 (a real vote); `--vote-fraction` below

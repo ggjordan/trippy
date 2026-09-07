@@ -3,6 +3,70 @@ All notable changes to trippy. Format: Keep a Changelog. Versions: semver tags `
 
 ## [Unreleased]
 ### Added
+- **The SAM 3 lift is in the viewer (`docs/EDITOR.md` Sec 3 "5.", Sec 6's E5
+  row): drag a box on the render and `trippy edits sam` runs as a child
+  process.** E5's viewer half. The viewer segments nothing itself -- SAM 3 is
+  never imported into trippy's process and never into the viewer's -- it is a
+  process supervisor around the command that already existed.
+  - **A `SAM 3 lift` tool** in `src/edit_ui.rs` (`T` now cycles Regions ->
+    shade-cloud finder -> click-to-cluster -> SAM 3 lift): a primary **drag**
+    on the render draws a marquee and becomes `--box`, **Alt-click** becomes
+    `--point`, with op/mix/views-around/device controls, a **run** button, a
+    **Cancel** button that kills the child, and the child's own stdout
+    streaming into a log pane while it works. Shift-drag still orbits and
+    right/middle-drag still pan, so the gesture is borrowed for one tool
+    rather than taken (`src/app.rs`).
+  - **The camera must be pinned to a capture view**, because the lift needs the
+    PHOTOGRAPH. Off a view the gesture is discarded and the camera snaps to the
+    nearest capture view (`edit::sam::nearest_view`) with the panel saying which
+    one -- re-using pixels measured on a free-flying frame would segment the
+    wrong part of the image while looking like it worked.
+  - **The render-pixel -> view-pixel mapping** (`src/edit/sam.rs`,
+    unit-tested). `Controller::render_camera` scales `fy` by the WIDTH ratio
+    and `cy` by the HEIGHT ratio, so a plain height ratio in `v` is wrong on a
+    window-shaped render; the mapping goes through normalised image
+    coordinates and is exact for every camera sharing the view's `R`/`t`. Its
+    tests project world points through both cameras and compare, and one test
+    exists purely to fail if someone "simplifies" it back to a ratio.
+  - **The child-process state machine** (`src/sam_child.rs`, unit-tested
+    against a `/bin/sh` fake child): one child at a time, killed on Cancel
+    **and on drop**; two reader threads so a full stderr pipe cannot deadlock
+    it; stderr shown prefixed `!` and never parsed as JSON; exit 0 with no
+    summary line treated as a FAILURE rather than a silent success; the
+    interpreter resolved as `<trippy_root>/.venv/bin/python` from
+    `bundle.json`, overridable with `$TRIPPY_ROOT` / `$TRIPPY_PYTHON`.
+  - **The import is one undo step.** The child writes into a throwaway
+    `edits.json` under `TMPDIR`; the viewer reads the last region out of it,
+    gives it a fresh id and adds it through `EditDocument::add_region`, so
+    `Cmd-Z` removes it. The lifted points are tinted immediately (`H` toggles).
+  - **Headless `--sam-box X0 Y0 X1 Y1`** (plus `--sam-point`,
+    `--sam-views-around`, `--sam-op`, `--sam-mix`, `--sam-device`,
+    `--sam-fake`, `--sam-undo`). E5's screenshot proof on the generated
+    `synthetic-splat` bundle, box `12 9 36 27` on `IMG_0.jpg`, `--sam-fake`:
+    530 of 4000 points lifted; with `--sam-op delete` 1719 of 1728 pixels
+    differ from the baseline frame (mean 6.15/255); with `--sam-op fade` the
+    tint alone moves 1717 pixels (mean 12.50/255); and `--sam-undo` gives a
+    frame **byte-identical** to a run with no `--sam-box` at all.
+- **`trippy edits sam --fake` / `TRIPPY_SAM_FAKE=1`**: synthesise the mask from
+  the prompt (a box fills its rectangle, a point fills a disc) and run the
+  entire rest of the shipped path -- projection, depth gate, majority vote,
+  region, summary -- with no SAM 3, no 3.4 GB checkpoint and no GPU. This is
+  what makes the viewer's child-process path testable in CI and screenshottable
+  (`trippy/edit/sam_runner.py::FakeSegmenter`). The summary records
+  `"segmenter": "fake"` and never claims SAM ran.
+- **`trippy edits sam --scene` is now optional**, because `bundle.json` records
+  `scene_root` (and `trippy_root`) since this release
+  (`trippy.render.bundle.bundle_document`). The viewer omits `--scene`
+  entirely; a bundle exported before this has no such key, and both the CLI and
+  the SAM panel say so rather than guessing where the photographs are.
+- **`trippy edits sam --prompt-space photo|view`**: the viewer measures its
+  drag-box in the bundle VIEW's pixel grid (it never opens a photograph, so it
+  cannot know the photo's size); `view` multiplies the prompt by that scene's
+  own `photo_scale` before SAM sees it. Default `photo`, unchanged.
+- **`trippy edits sam`'s output is now a contract**: progress goes to stdout
+  one `sam: ` line at a time (so the viewer can show it live) and the LAST
+  stdout line is the whole summary as one compact JSON object.
+
 - **Click-to-cluster in the viewer (`docs/EDITOR.md` Sec 3 "1.", Sec 4, E4):
   SHIFT-CLICK the render to select an object.** The Rust half of E4, a port of
   `trippy/edit/cluster.py` into `rust/crates/trips-viewer/src/edit/cluster.rs`:
@@ -345,6 +409,28 @@ All notable changes to trippy. Format: Keep a Changelog. Versions: semver tags `
 - `experiments/EXP-0011-karekare-v2/config_hybrid_gate.yaml`: `config_hybrid.yaml` with the gate
   on and nothing else changed, queued as `kkv2-7-hybrid-gate`.
 ### Fixed
+- **`trippy edits sam --device mps` works.** Three separate walls, all in SAM 3's
+  own code and all fixed by rebinding rather than by an MPS fallback
+  (`PYTORCH_ENABLE_MPS_FALLBACK` is untouched):
+  - `sam3.perflib.fused.addmm_act` casts its inputs to bfloat16 unconditionally
+    and hands the result to the next fp32 layer. MPS's autocast policy casts a
+    convolution's INPUT but not its WEIGHT, so the pass died with `Input type
+    (MPSBFloat16Type) and weight type (torch.FloatTensor) should be the same`.
+  - `build_sam3_image_model` only calls `.to(device)` for CUDA, leaving the
+    weights on the CPU while the image went to the GPU (`MPSFloatType` vs
+    `torch.FloatTensor`).
+  - the ViT's default rotary embedding uses `torch.view_as_complex`, which MPS
+    does not implement; SAM 3 ships the real-valued twin
+    (`ViT(use_rope_real=True)`) but the builder never passes the flag, and it
+    has no learned parameters, so the checkpoint loads identically.
+- **The `torch.autocast(bfloat16)` region round SAM 3 inference is gone, and
+  the CPU lift got 6x faster: 9.2 s against 58.8 s** for the same mask (129,712
+  mask pixels, 74,007 of 104,218 in-mask points selected on
+  `exp0010-shade-prune`). bfloat16 on CPU is emulated; taking it out at its
+  source instead of chasing it with an autocast is both correct on MPS and
+  much faster on CPU. fp32 is strictly more accurate than the bf16 path CUDA
+  takes. `docs/EDITOR.md` Sec 3 and `docs/LIMITATIONS.md`'s SAM section, which
+  both described the autocast as the fix, are corrected.
 - **`rust/crates/trips-web` did not compile.** The Blend panel changed `Renderer::render` and
   `render_to_host` to take a `Blend`, and the web viewer's three call sites were not updated;
   `wasm32` is not on the push path (`scripts/build.sh` checks the native graph only) so nothing

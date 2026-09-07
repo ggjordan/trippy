@@ -1756,3 +1756,20 @@ SAM_LIFT_DEPTH_SUPPORT_FRAC = 0.25
 # about WHERE the object is while peaking near 0.4, which at 0.5 returns only
 # the object's outline (measured on a synthetic flat-colour disc, 2026-09-07).
 SAM3_MASK_THRESHOLD = 0.5
+
+# --- SAM lift: the fake segmenter (no SAM 3, no weights, no image decode) ----
+
+# Setting this environment variable to "1" makes `trippy edits sam` run the
+# WHOLE lift -- projection, depth gate, majority vote, region write, summary --
+# against a synthetic mask instead of SAM 3. It exists so the viewer's SAM tool
+# (docs/EDITOR.md Sec 3 "4. SAM 3 lift (E5)") has a child process it can drive
+# in a test and in the screenshot proof without a GPU, a 2 GB checkpoint, or
+# Splats' SAM venv. `--fake` on the command line does the same thing; the
+# summary says `"segmenter": "fake"` either way and never claims SAM ran.
+SAM_FAKE_ENV = "TRIPPY_SAM_FAKE"
+
+# Radius, in PHOTO pixels, of the disc the fake segmenter returns for a `point`
+# prompt. Sized to be a plausible object footprint at the resolutions trippy's
+# bundles carry (1008 px wide views), and the same number the neighbour-view
+# prompts get, so a fake `--views-around N` run still exercises the vote.
+SAM_FAKE_POINT_RADIUS_PX = 24.0

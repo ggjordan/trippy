@@ -79,9 +79,11 @@ from typing import Any
 import numpy as np
 
 __all__ = [
+    "FakeSegmenter",
     "MaskFileSegmenter",
     "Sam3Segmenter",
     "SamPrompt",
+    "fake_requested",
     "run_sam3",
     "sam3_command",
 ]
@@ -412,6 +414,99 @@ class MaskFileSegmenter:
         }
 
 
+def _fake_point_radius() -> float:
+    """[`FakeSegmenter`]'s default disc radius, photo pixels.
+
+    A function, not a module constant, because this module's imports are
+    stdlib + numpy only: the child half runs under Splats' python 3.11 SAM
+    venv, which cannot import `trippy` at all (see the module invariants).
+    """
+    from trippy.constants import SAM_FAKE_POINT_RADIUS_PX
+
+    return float(SAM_FAKE_POINT_RADIUS_PX)
+
+
+@dataclass
+class FakeSegmenter:
+    """A synthetic segmenter: the lift's whole path, with no SAM 3 anywhere.
+
+    `trippy edits sam --fake` (or `TRIPPY_SAM_FAKE=1`) installs this instead
+    of [`Sam3Segmenter`]. It exists because the viewer's SAM tool
+    (docs/EDITOR.md Sec 3 "4. SAM 3 lift (E5)") drives `trippy edits sam` as a
+    CHILD PROCESS, and the viewer's own tests -- and the screenshot proof --
+    need that child to start, print progress, finish, and hand back a real
+    `pointset` region, on CPU, in under a second, without the 3.4 GB
+    checkpoint or Splats' SAM venv. Everything downstream of the mask
+    (projection, the depth gate, the majority vote, the region, the summary)
+    is the SHIPPED code, so what the fake proves is the plumbing, never SAM 3's
+    segmentation quality.
+
+    The mask is a pure function of the prompt, in the photo's own pixels:
+    a `box` prompt fills its rectangle, a `point` prompt fills a disc of
+    `SAM_FAKE_POINT_RADIUS_PX` around it, and a `text` prompt fills the middle
+    ninth of the frame (there is nothing in a phrase to derive geometry from,
+    and a mask covering everything would make the depth gate meaningless).
+
+    Nothing here decodes the photograph: only its size is read, from the file
+    header, exactly as `trippy.edit.sam_lift.photo_size` does.
+
+    Attributes:
+        point_radius_px: disc radius for a `point` prompt, photo pixels.
+        seen: every `(photo name, prompt)` this was asked for, in order --
+            the viewer's tests assert on the neighbour prompts.
+    """
+
+    point_radius_px: float = field(default_factory=lambda: _fake_point_radius())
+    seen: list[tuple[str, SamPrompt]] = field(default_factory=list)
+
+    def __call__(self, image: str | Path, prompt: SamPrompt) -> tuple[np.ndarray, dict[str, Any]]:
+        """Draw the prompt's own footprint as a mask at the photo's size."""
+        # Deferred: `sam_lift` imports this module, so a module-level import
+        # back the other way would be a cycle.
+        from trippy.edit.sam_lift import photo_size
+
+        path = Path(image)
+        self.seen.append((path.name, prompt))
+        width, height = photo_size(path)
+        mask = np.zeros((height, width), dtype=bool)
+        if prompt.kind == "box":
+            x0, y0, x1, y1 = (float(v) for v in prompt.box)  # type: ignore[misc]
+            c0 = max(0, min(width, round(min(x0, x1))))
+            c1 = max(0, min(width, round(max(x0, x1))))
+            r0 = max(0, min(height, round(min(y0, y1))))
+            r1 = max(0, min(height, round(max(y0, y1))))
+            mask[r0:r1, c0:c1] = True
+        elif prompt.kind == "point":
+            u, v = (float(c) for c in prompt.point)  # type: ignore[misc]
+            rows = np.arange(height, dtype=np.float64)[:, None]
+            cols = np.arange(width, dtype=np.float64)[None, :]
+            mask = ((cols - u) ** 2 + (rows - v) ** 2) <= self.point_radius_px**2
+        else:
+            mask[height // 3 : 2 * height // 3, width // 3 : 2 * width // 3] = True
+        return mask, {
+            "segmenter": "fake",
+            "prompt": prompt.to_json(),
+            "height": int(height),
+            "width": int(width),
+            "mask_area_fraction": float(mask.mean()) if mask.size else 0.0,
+        }
+
+
+def fake_requested(flag: bool = False) -> bool:
+    """Whether this run must use [`FakeSegmenter`] rather than SAM 3.
+
+    Args:
+        flag: the `--fake` command-line switch.
+
+    Returns:
+        True when `flag` is set or `TRIPPY_SAM_FAKE` is "1" in the
+        environment -- the switch the viewer sets on the child it spawns.
+    """
+    from trippy.constants import SAM_FAKE_ENV
+
+    return bool(flag) or os.environ.get(SAM_FAKE_ENV, "") == "1"
+
+
 # --------------------------------------------------------------------------
 # Child side: runs under Splats' SAM venv python, imports sam3 by sys.path
 # --------------------------------------------------------------------------
@@ -467,6 +562,94 @@ def _install_dynamo_stub() -> None:
     sys.modules.setdefault("torch._dynamo", dynamo)
     sys.modules.setdefault("torch._dynamo.utils", utils)
     torch._dynamo = dynamo  # type: ignore[attr-defined]
+
+
+def _install_fp32_addmm() -> bool:
+    """Take bfloat16 out of SAM 3's graph at its source. Both devices.
+
+    `sam3/perflib/fused.py::addmm_act` casts bias, input and weight to
+    bfloat16 unconditionally and returns bfloat16. On CUDA an autocast region
+    round the forward pass then casts every FOLLOWING op's weights to match,
+    so the bf16 tensor is harmless. Off CUDA it is not:
+
+    - on CPU an autocast makes it *work*, but slowly -- bf16 on CPU is
+      emulated, and the same lift measured 58.8 s with the autocast against
+      **9.2 s** with this patch and no autocast, for the same mask (129,712
+      mask pixels, 74,007 points selected; 2026-09-07);
+    - on MPS an autocast is not even enough. Its op policy casts a
+      convolution's INPUT but not its WEIGHT, so the pass dies with
+      "Input type (MPSBFloat16Type) and weight type (torch.FloatTensor)
+      should be the same" (job `trippy-edit-sam-1`).
+
+    So the fix is not more autocast, it is no bfloat16: this rebinds
+    `addmm_act` to the mathematically identical UNFUSED form in whatever
+    dtype the input already has. `aten::_addmm_activation` is `addmm` plus
+    `relu`/`gelu(approximate="none")`, and `F.linear` is that same `addmm`,
+    so the only differences are the fusion and the dtype -- and fp32 is
+    strictly MORE accurate than the bf16 path CUDA takes.
+
+    Both bindings are replaced: `sam3.model.vitdet` does
+    `from sam3.perflib.fused import addmm_act` at import time, so patching
+    only the definition site would leave the caller on the old function.
+
+    Returns:
+        True when the patch was installed, False when SAM 3's layout has
+        changed and there was nothing to patch -- reported in `info.json`
+        rather than silently assumed.
+    """
+    import torch
+    import torch.nn.functional as F
+
+    def addmm_act_fp32(activation: Any, linear: Any, mat1: Any) -> Any:
+        """`addmm_act`'s contract, unfused and without the bfloat16 cast."""
+        if torch.is_grad_enabled():
+            raise ValueError("Expected grad to be disabled.")
+        out = F.linear(mat1, linear.weight.detach(), linear.bias.detach())
+        if activation in (F.relu, torch.nn.ReLU):
+            return F.relu(out)
+        if activation in (F.gelu, torch.nn.GELU):
+            return F.gelu(out)
+        raise ValueError(f"Unexpected activation {activation}")
+
+    installed = False
+    for module_name in ("sam3.perflib.fused", "sam3.model.vitdet"):
+        module = sys.modules.get(module_name)
+        if module is not None and hasattr(module, "addmm_act"):
+            module.addmm_act = addmm_act_fp32  # type: ignore[attr-defined]
+            installed = True
+    return installed
+
+
+def _install_real_rope() -> bool:
+    """Make SAM 3's ViT use its REAL-valued rotary embedding. **MPS only.**
+
+    The ViT's default rotary encoding goes through `torch.view_as_complex`,
+    which MPS does not implement. SAM 3 already ships the real-valued twin
+    (`ViT(use_rope_real=True)` -> `freqs_cis_real`/`freqs_cis_imag` and
+    `apply_rotary_enc_real`) and it is arithmetically the same rotation with
+    no learned parameters of its own, so the checkpoint loads identically --
+    the model builder simply never passes the flag
+    (`sam3/model_builder.py::_create_vit_backbone`). This rebinds that
+    factory to default it on.
+
+    Returns:
+        True when the patch was installed, False when the factory is not
+        where it used to be.
+    """
+    import functools
+
+    module = sys.modules.get("sam3.model_builder")
+    original = getattr(module, "_create_vit_backbone", None)
+    if module is None or original is None:
+        return False
+
+    @functools.wraps(original)
+    def create_vit_backbone_real(*args: Any, **kwargs: Any) -> Any:
+        kwargs["use_rope_real"] = True
+        return original(*args, **kwargs)
+
+    module._create_vit_backbone = create_vit_backbone_real  # type: ignore[attr-defined]
+    return True
 
 
 def _child_parser() -> argparse.ArgumentParser:
@@ -576,57 +759,78 @@ def _child_main(argv: list[str] | None = None) -> int:
     from sam3.model.sam3_image_processor import Sam3Processor
     from sam3.model_builder import build_sam3_image_model
 
+    # Right after the sam3 imports: both bindings of `addmm_act` exist to be
+    # replaced, and nothing has run yet. Unconditional -- bfloat16 is a CUDA
+    # optimisation that costs 6x on CPU and does not work at all on MPS.
+    fp32_addmm = _install_fp32_addmm()
+    if not fp32_addmm:
+        raise RuntimeError(
+            "could not patch sam3's addmm_act; its unconditional bfloat16 cast makes the "
+            "CPU run 6x slower and the MPS run fail outright (see _install_fp32_addmm)"
+        )
+    # MPS has no `torch.view_as_complex`, which the ViT's default rotary
+    # embedding uses; SAM 3's own real-valued twin is exact (_install_real_rope).
+    real_rope = args.device == "mps" and _install_real_rope()
+    if args.device == "mps" and not real_rope:
+        raise RuntimeError(
+            "could not patch sam3's ViT factory to use_rope_real=True; MPS has no "
+            "torch.view_as_complex (see _install_real_rope)"
+        )
+
     t0 = time.time()
     model = build_sam3_image_model(
         device=args.device,
         checkpoint_path=args.weights,
         load_from_HF=False,
     )
+    # `build_sam3_image_model` only moves the model when `device == "cuda"`;
+    # everything else is left on the CPU while `Sam3Processor` puts the IMAGE
+    # on `device`, which on MPS fails with "Input type (MPSFloatType) and
+    # weight type (torch.FloatTensor) should be the same" (job
+    # `trippy-edit-sam-2`, 2026-09-07). A no-op when device is already cpu.
+    model = model.to(args.device)
     processor = Sam3Processor(
         model, resolution=args.resolution, device=args.device, confidence_threshold=args.threshold
     )
     t_load = time.time() - t0
 
     t1 = time.time()
-    # SAM 3's ViT MLPs run through `sam3.perflib.fused.addmm_act`, which casts
-    # its own inputs to bfloat16 and hands the result to the NEXT fp32 Linear
-    # -- that only type-checks inside an autocast region (CUDA runs get one
-    # from the training/eval harness). Without this context the first MLP
-    # raises "mat1 and mat2 must have the same dtype, but got BFloat16 and
-    # Float" on CPU and on MPS. This is an autocast, not an MPS *fallback*:
+    # No autocast, on either device: `_install_fp32_addmm` above already took
+    # bfloat16 out of the graph at its source, and adding an autocast back
+    # would only reintroduce the mixed dtypes it removed (and, on CPU, the 6x
+    # emulation cost). Nothing here is an MPS *fallback* either:
     # PYTORCH_ENABLE_MPS_FALLBACK stays whatever the queue job set it to.
-    with torch.autocast(device_type=args.device, dtype=torch.bfloat16):
-        with Image.open(args.image) as handle:
-            image = handle.convert("RGB")
-            width, height = image.size
-            state = processor.set_image(image)
+    with Image.open(args.image) as handle:
+        image = handle.convert("RGB")
+        width, height = image.size
+        state = processor.set_image(image)
 
-        if args.kind == "text":
-            state = processor.set_text_prompt(args.text, state)
-        elif args.kind == "box":
-            x0, y0, x1, y1 = args.box
-            cx, cy = (x0 + x1) / 2.0 / width, (y0 + y1) / 2.0 / height
-            bw, bh = abs(x1 - x0) / width, abs(y1 - y0) / height
-            state = processor.add_geometric_prompt([cx, cy, bw, bh], True, state)
-        else:
-            # `Sam3Processor` exposes boxes but not points; the underlying
-            # Prompt does carry them (geometry_encoders.Prompt.append_points,
-            # "points in normalized xy"), and `add_geometric_prompt`'s own
-            # body is exactly this sequence with `append_boxes` instead.
-            u, v = args.point
-            if "language_features" not in state["backbone_out"]:
-                state["backbone_out"].update(
-                    model.backbone.forward_text(["visual"], device=args.device)
-                )
-            if "geometric_prompt" not in state:
-                state["geometric_prompt"] = model._get_dummy_prompt()
-            points = torch.tensor([u / width, v / height], device=args.device, dtype=torch.float32)
-            state["geometric_prompt"].append_points(
-                points.view(1, 1, 2),
-                torch.ones(1, 1, device=args.device, dtype=torch.long),
-                mask=torch.zeros(1, 1, device=args.device, dtype=torch.bool),
+    if args.kind == "text":
+        state = processor.set_text_prompt(args.text, state)
+    elif args.kind == "box":
+        x0, y0, x1, y1 = args.box
+        cx, cy = (x0 + x1) / 2.0 / width, (y0 + y1) / 2.0 / height
+        bw, bh = abs(x1 - x0) / width, abs(y1 - y0) / height
+        state = processor.add_geometric_prompt([cx, cy, bw, bh], True, state)
+    else:
+        # `Sam3Processor` exposes boxes but not points; the underlying
+        # Prompt does carry them (geometry_encoders.Prompt.append_points,
+        # "points in normalized xy"), and `add_geometric_prompt`'s own
+        # body is exactly this sequence with `append_boxes` instead.
+        u, v = args.point
+        if "language_features" not in state["backbone_out"]:
+            state["backbone_out"].update(
+                model.backbone.forward_text(["visual"], device=args.device)
             )
-            state = processor._forward_grounding(state)
+        if "geometric_prompt" not in state:
+            state["geometric_prompt"] = model._get_dummy_prompt()
+        points = torch.tensor([u / width, v / height], device=args.device, dtype=torch.float32)
+        state["geometric_prompt"].append_points(
+            points.view(1, 1, 2),
+            torch.ones(1, 1, device=args.device, dtype=torch.long),
+            mask=torch.zeros(1, 1, device=args.device, dtype=torch.bool),
+        )
+        state = processor._forward_grounding(state)
     t_infer = time.time() - t1
 
     # `masks_logits` is the per-pixel PROBABILITY at the photo's own
@@ -639,7 +843,7 @@ def _child_main(argv: list[str] | None = None) -> int:
     probs = state["masks_logits"]
     if probs.ndim == 4:
         probs = probs[:, 0]
-    # `.float()` first: numpy has no bfloat16, and autocast can leave one here.
+    # `.float()` first: numpy has no bfloat16 and no MPS.
     probs_np = probs.detach().to("cpu").float().numpy()
     masks_np = probs_np > args.mask_threshold
     scores_np = state["scores"].detach().to("cpu").float().numpy().astype(np.float64)
@@ -662,6 +866,8 @@ def _child_main(argv: list[str] | None = None) -> int:
             "mask_area_fraction": float(mask.mean()),
             "mask_area_px": int(mask.sum()),
             "device": args.device,
+            "fp32_addmm": bool(fp32_addmm),
+            "real_rope": bool(real_rope),
             "resolution": int(args.resolution),
             "threshold": float(args.threshold),
             "mask_threshold": float(args.mask_threshold),

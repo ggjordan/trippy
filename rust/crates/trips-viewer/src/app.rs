@@ -34,8 +34,9 @@ use eframe::egui;
 use crate::blit::{BlitCallback, BlitResources};
 use crate::blend::{Blend, BlendMode, GATE_SCALE_MAX, GATE_SCALE_MIN};
 use crate::bundle::Bundle;
-use crate::edit_ui::EditSession;
+use crate::edit_ui::{EditSession, SamGesture};
 use trips_viewer::edit::cluster::ClickCamera;
+use trips_viewer::edit::sam as sam_geom;
 use crate::camera::{Controller, Mode};
 use crate::renderer::{ExposureMode, Renderer, Settings, ViewMode, MANUAL_EXPOSURE_LIMIT};
 
@@ -52,6 +53,13 @@ const EDGE_OF_BOX: f32 = 0.999;
 
 /// Render-scale presets the `-`/`=` keys step between.
 const SCALE_STEPS: [f32; 4] = [0.5, 0.75, 0.9, 1.0];
+
+/// The SAM tool's drag rectangle: `edit::apply::PREVIEW_TINT`'s magenta, so the
+/// box Jordan is drawing and the points it selects are the one colour.
+const SAM_MARQUEE_COLOUR: egui::Color32 = egui::Color32::from_rgb(255, 0, 255);
+
+/// Stroke width of that rectangle, egui points.
+const SAM_MARQUEE_WIDTH: f32 = 1.5;
 
 /// The viewer.
 pub struct ViewerApp {
@@ -80,6 +88,12 @@ pub struct ViewerApp {
     /// finder. Toggled with `M` and hidden by default, so a viewing session is
     /// exactly the session v0.6.0 shipped (`docs/EDITOR.md` §4).
     edit: EditSession,
+    /// The SAM tool's live drag rectangle, `(start, current)` in egui points.
+    ///
+    /// Kept here rather than in [`EditSession`] because it is a WINDOW thing:
+    /// it exists only to be painted over the render, and the session is handed
+    /// the finished gesture in render pixels once the button comes up.
+    sam_drag: Option<(egui::Pos2, egui::Pos2)>,
 }
 
 impl ViewerApp {
@@ -146,6 +160,12 @@ impl ViewerApp {
         let bundle_dir = bundle.dir.clone();
         let bundle_format = bundle.manifest.format.clone();
         let blend_manifest = bundle.manifest.blend.clone();
+        // The SAM tool spawns `trippy edits sam` from the checkout the bundle
+        // was exported by, and lets that child find the photographs from
+        // `scene_root` -- so both come off the manifest before it moves into
+        // the renderer (`crate::sam_child`).
+        let trippy_root = bundle.manifest.trippy_root.clone();
+        let has_scene_root = bundle.manifest.scene_root.is_some();
         let mut renderer = Renderer::new(bundle, burn_device)?;
         // On the SAME device eframe just handed Burn, so the splat image and the
         // TRIPS frame are two tensors on one allocator (`crate::splat`'s first
@@ -162,6 +182,7 @@ impl ViewerApp {
         // with a saved `edits.json` must render edited on its first frame and
         // `apply` needs the renderer's own point cloud to compose against.
         let mut edit = EditSession::open_with_path(&bundle_dir, &bundle_format, edits);
+        edit.set_bundle_paths(trippy_root.as_deref(), has_scene_root);
         // The click tool's `max_radius` is the bundle's own median camera
         // spacing, which needs the views and the cloud -- both of which exist
         // only now (`trippy.edit.cluster.default_max_radius_from_bundle`).
@@ -192,6 +213,7 @@ impl ViewerApp {
             blend,
             has_blend,
             edit,
+            sam_drag: None,
         })
     }
 
@@ -255,12 +277,39 @@ impl ViewerApp {
     fn handle_input(&mut self, ctx: &egui::Context, response: &egui::Response, dt: f32) {
         let viewport_height = response.rect.height();
         let delta = response.drag_delta();
-        if response.dragged_by(egui::PointerButton::Primary) {
+        // The SAM tool's marquee (`docs/EDITOR.md` §3, E5). It takes the
+        // PRIMARY drag while that tool has focus, which is what "drag a box on
+        // the render" means; orbit is still one modifier away (Shift-drag) and
+        // right/middle-drag still pans, so navigation loses nothing permanent
+        // and nothing at all outside this one tool.
+        let sam_box_drag = self.edit.sam_tool_active()
+            && response.dragged_by(egui::PointerButton::Primary)
+            && !ctx.input(|i| i.modifiers.shift);
+        if sam_box_drag {
+            if let Some(pos) = response.interact_pointer_pos() {
+                let start = self.sam_drag.map_or(pos, |(s, _)| s);
+                self.sam_drag = Some((start, pos));
+            }
+        } else if response.dragged_by(egui::PointerButton::Primary) {
             self.controller.drag(delta.x, delta.y);
         } else if response.dragged_by(egui::PointerButton::Secondary)
             || response.dragged_by(egui::PointerButton::Middle)
         {
             self.controller.pan(delta.x, delta.y, viewport_height);
+        }
+        // The gesture is finished when the button comes up; only then is it
+        // worth converting, and only then is a tiny drag known to be a click.
+        if !response.dragged_by(egui::PointerButton::Primary) {
+            if let Some((start, end)) = self.sam_drag.take() {
+                let ppp = ctx.pixels_per_point();
+                let scale = self.settings.render_scale;
+                let min = (response.rect.min.x, response.rect.min.y);
+                let a = sam_geom::render_pixel((start.x, start.y), min, ppp, scale);
+                let b = sam_geom::render_pixel((end.x, end.y), min, ppp, scale);
+                if sam_geom::is_box_drag(a, b) {
+                    self.edit.request_sam(SamGesture::Box(a, b));
+                }
+            }
         }
         if response.dragged() {
             ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
@@ -279,11 +328,32 @@ impl ViewerApp {
         if self.edit.active && response.clicked() && ctx.input(|i| i.modifiers.shift) {
             if let Some(pos) = response.interact_pointer_pos() {
                 let ppp = ctx.pixels_per_point();
-                let scale = self.settings.render_scale.clamp(0.1, 1.0);
-                self.edit.request_click((
-                    f64::from((pos.x - response.rect.min.x) * ppp * scale),
-                    f64::from((pos.y - response.rect.min.y) * ppp * scale),
+                let scale = self.settings.render_scale;
+                self.edit.request_click(sam_geom::render_pixel(
+                    (pos.x, pos.y),
+                    (response.rect.min.x, response.rect.min.y),
+                    ppp,
+                    scale,
                 ));
+            }
+        }
+
+        // Alt-click is the SAM tool's point prompt (`docs/EDITOR.md` §3, E5).
+        // Alt is bound to nothing else in this viewer, so this costs no
+        // existing gesture; and it is a CLICK, so an Alt-drag is still a drag.
+        if self.edit.active
+            && response.clicked()
+            && ctx.input(|i| i.modifiers.alt && !i.modifiers.shift)
+        {
+            if let Some(pos) = response.interact_pointer_pos() {
+                let ppp = ctx.pixels_per_point();
+                let scale = self.settings.render_scale;
+                self.edit.request_sam(SamGesture::Point(sam_geom::render_pixel(
+                    (pos.x, pos.y),
+                    (response.rect.min.x, response.rect.min.y),
+                    ppp,
+                    scale,
+                )));
             }
         }
 
@@ -731,6 +801,22 @@ impl eframe::App for ViewerApp {
 
         self.edit
             .resolve_click(&ClickCamera::from_render_camera(&camera), &self.renderer);
+        // The SAM tool's own two steps, in the same place and for the same
+        // reason: the gesture was measured in this frame's render pixels, so it
+        // is mapped with this frame's camera; and the child's state machine is
+        // advanced once per frame so its progress reaches the panel while it
+        // runs (`docs/EDITOR.md` §3, E5).
+        self.edit.resolve_sam(
+            &camera,
+            &reference,
+            self.controller.is_pinned(),
+            &self.views,
+            self.controller.position,
+        );
+        if let Some(position) = self.edit.take_sam_snap() {
+            self.controller.snap_to_position(&self.views, position);
+        }
+        self.edit.poll_sam();
         self.edit.refresh_shade(&self.renderer);
         if let Err(e) = self.edit.apply(&mut self.renderer) {
             self.error = Some(e);
@@ -753,6 +839,18 @@ impl eframe::App for ViewerApp {
                 BlitCallback::new(&frame).paint_into(ui, rect);
             }
             Err(message) => self.error = Some(message),
+        }
+
+        // The marquee, drawn over the finished frame so it is never part of the
+        // render (and so `--screenshot` never contains it).
+        if let Some((start, end)) = self.sam_drag {
+            let painter = ui.painter_at(rect);
+            painter.rect_stroke(
+                egui::Rect::from_two_pos(start, end),
+                0.0,
+                egui::Stroke::new(SAM_MARQUEE_WIDTH, SAM_MARQUEE_COLOUR),
+                egui::StrokeKind::Middle,
+            );
         }
 
         if self.edit.active {
