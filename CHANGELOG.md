@@ -2,6 +2,8 @@
 All notable changes to trippy. Format: Keep a Changelog. Versions: semver tags `vX.Y.Z`. Every push also gets a `build-NNNN` tag.
 
 ## [Unreleased]
+
+## [v0.6.0] - 2026-09-08
 ### Added
 - **The viewer's brush tool, Named Objects panel and 3D drag gizmos
   (`docs/EDITOR.md` Sec 1, Sec 4, Sec 6).** The last three viewer pieces that
