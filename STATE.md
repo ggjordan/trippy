@@ -48,6 +48,10 @@ Last updated: 2026-09-06 (fix/viewer-kk session; previous: web-perf)
 - GPU queue (prio 70, filename order): exp0010-removal (running), exp0010-shade-prune, full2-trips-resume, full3-alt-bc, full3-alt, hybrid-a-all-levels-bc, hybrid-a-all-levels, kkv2-0-smoke, kkv2-1-full-masked, kkv2-2-full-unmasked, kkv2-3-removal, kkv2-4-render-1/2/3, kkv2-5-hybrid, removal-rel, union-broadcast, union-trips. Roughly two days of GPU. Each training self-delivers a viewer launcher + audit table.
 - Worktrees that MUST stay until their queued jobs finish (job scripts cd into them): .worktrees/karekare-v2 (kkv2-0..6), .worktrees/blend-gate (kkv2-7-hybrid-gate, blend-gate-viewer2/3), .worktrees/live-splat (live-splat-perf-1), .worktrees/edit-sam (edit-sam-1). point-removal's jobs are done: remove it. Remove with scripts/worktree_rm.sh.
 - No subagents running. Editor E1-E5 shipped (viewer UI for SAM prompts and 3D gizmos remain).
+- Worktrees that MUST stay until their queued jobs finish (job scripts cd into them): .worktrees/karekare-v2 (kkv2-0..6), .worktrees/blend-gate (kkv2-7-hybrid-gate, blend-gate-viewer2/3), .worktrees/live-splat (live-splat-perf-1). point-removal's jobs are done: remove it. Remove with scripts/worktree_rm.sh.
+- feat/edit-sam (large/high): SAM 3 mask lift -> pointset regions (Python; inference via the queue).
+- feat/editor-click (mid/high): viewer click-to-select (Rust port of the cluster maths) + 'new region from selection'.
+- feat/editor-ui (large/high): Regions panel (box/sphere/lid), per-region mix/op, undo/redo, save/load edits.json, hot-apply weights in both renderers, shade-cloud finder tool (ADR-0007 E1+E2).
 
 ## Next (in order)
 1. Merge scene-io + points; launch feat/raster (large/high: numpy reference + Metal blend_fwd + pyramid forward) and feat/net (mid/high: U-Net + tone mapper ports) once TRIPS_REFERENCE.md lands.
