@@ -30,6 +30,10 @@
 pub mod blend;
 pub mod bundle;
 pub mod camera;
+/// The edit layer: `edits.json`, region maths, per-point weights, the shade
+/// finder. Platform-neutral like the rest of this library — the egui panels
+/// that drive it live in the binary (`src/edit_ui.rs`). See `docs/EDITOR.md`.
+pub mod edit;
 pub mod renderer;
 
 /// The live Gaussian splat (`blend.splat_ply` rendered at the viewer's own

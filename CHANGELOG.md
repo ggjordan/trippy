@@ -42,6 +42,56 @@ All notable changes to trippy. Format: Keep a Changelog. Versions: semver tags `
     `tests/test_cli_distill.py`, `tests/test_distill_render_set.py`,
     `tests/test_train_eval.py`, `tests/test_train_cli.py`; synthetic fixtures
     only. See `docs/EXPERIMENTS.md` "Edits" for the worked run and full list.
+- **Viewer editor, Rust side: E1 + E2 of `docs/EDITOR.md` (press `M`).** The
+  Regions / Inspector / Tools panels, the render integration, and a headless
+  parity check against the Python half.
+  - New `rust/crates/trips-viewer/src/edit/`: `model.rs` (a line-for-line twin of
+    `trippy/edit/model.py` -- the same `Region`/`EditDocument`, the same
+    append-only undo log replayed the same way, the same oriented-box / sphere /
+    lid / pointset membership arithmetic in f64), `weights.rs` (the twin of
+    `trippy/edit/weights.py`: `blend` sets, `fade` multiplies, `delete` zeroes and
+    latches), `apply.rs` (composed weights -> the two point sets the rasteriser
+    draws) and `shade.rs` (the shade-cloud finder's arithmetic, ported from
+    `trippy/train/prune.py`, so four sliders re-threshold at interaction speed
+    with no subprocess in the loop). `src/edit_ui.rs` is the egui half.
+  - **Regions panel**: create box / sphere / lid at the camera's look-at point,
+    sized from `SceneScale` (never the point cloud's bounds); per-region mix
+    slider (0 = splat, 1 = TRIPS), op (blend / fade / delete), enable toggle,
+    reorder, delete, undo / redo, and `Cmd-S` save. Reopening the bundle restores
+    the region list, the mixes AND the undo history, because `edits.json` carries
+    the log and the cursor verbatim.
+  - **Render integration**, hot-applied when a region changes and never per frame:
+    `delete` removes rows from `PointSet` before rasterisation and scales the
+    matching Gaussians' opacity to zero (`LiveSplat::set_opacity_scale`, a logit
+    round trip through `sigmoid`, with the ply's own raw values kept so an undo is
+    exact); `blend`/`fade` ride a **second three-channel pyramid pass** carrying
+    `[w_edit, touched, 1]` over the same rows with the same `conf`, so level 0's
+    channels divide into the alpha-weighted average `docs/EDITOR.md` §2 specifies.
+    `C = 3` is `SUPPORTED_CHANNELS`' existing pipeline: no kernel change, no new
+    fixture, no risk to the rasteriser's parity tests. The extra pass is paid only
+    while an enabled `blend`/`fade` region exists.
+  - **Shade-cloud finder** (E2): live sliders for luminance, confidence and the
+    znear/zfar depth-slab fractions, over a `shade_views.json` sidecar written by
+    the new `trippy.edit.golden.write_shade_views`; a preview that tints the
+    selection magenta and dims the rest; and one click to commit it as a
+    `pointset` region with op `fade` or `delete`.
+  - **Python/Rust parity, pinned two ways.** New `trippy/edit/golden.py` writes
+    `tests/fixtures/synthetic/edit_golden/` (a synthetic cloud, an `edits.json`
+    exercising every kind and op with a live undo cursor, and the weights + shade
+    selection Python computes from them); `tests/test_edit_golden.py` proves the
+    fixture is still what Python produces, and the Rust `edit::golden` tests prove
+    the viewer reproduces it to **1e-6**. New headless `trips-viewer
+    --dump-weights` (no GPU, no window) and `--dump-shade` run the same comparison
+    against a real bundle (`tests/test_edit_viewer_parity.py`).
+  - New viewer flags: `--edit` (open with the panels up), `--edits <p>`,
+    `--dump-weights <o>`, `--dump-shade <o>`,
+    `--shade-lum/-conf/-znear/-zfar`. `--screenshot` now applies `edits.json` too,
+    so the headless picture is the window's picture.
+  - `tools/make_synthetic_splat_bundle.py` also writes a synthetic `edits.json`
+    (one delete box, one blend sphere) and `shade_views.json`.
+  - Not built: the 3D drag gizmos (E1 ships Inspector fields plus arrow-key nudge
+    and `[`/`]` resize instead), click-to-cluster (E4), the SAM-3 lift (E5).
+  - Docs: `docs/USER_GUIDE.md` "The Editor", `docs/EDITOR.md` status + §2 + §6.
 - **Viewer editor, Python side (`docs/EDITOR.md`, ADR-0007): `edits.json`, weight
   composition, the shade-cloud finder, and `trippy apply-edits`, ahead of the Rust
   viewer UI.** New `trippy/edit/` package: `model.py` (`Region` — box/sphere/lid/

@@ -50,7 +50,21 @@ use std::path::{Path, PathBuf};
 use brush_pyramid::scene::Camera as TripsCamera;
 use brush_render::camera::{focal_to_fov, Camera as BrushCamera};
 use brush_render::gaussian_splats::{SplatRenderMode, Splats, TextureMode};
+use burn::module::{Param, ParamId};
+use burn::tensor::activation::sigmoid;
 use burn::tensor::Tensor;
+
+/// Smallest post-sigmoid opacity a scaled Gaussian is allowed to hold.
+///
+/// `raw_opacity` is a logit, and `logit(0)` is `-inf`, so an edit that scales a
+/// Gaussian's opacity to exactly zero cannot be written back as a raw value.
+/// `1e-8` is `logit == -18.4`: numerically finite in f32, and a contribution of
+/// one part in a hundred million, which is below the rasteriser's own
+/// `alpha_min` and therefore genuinely "not rendered".
+const MIN_EDITED_OPACITY: f32 = 1e-8;
+
+/// Largest, for the same reason at the other end (`logit(1)` is `+inf`).
+const MAX_EDITED_OPACITY: f32 = 1.0 - 1e-6;
 
 /// Convert trippy's COLMAP camera into Brush's.
 ///
@@ -163,6 +177,17 @@ pub struct LiveSplat {
     sh_degree: u32,
     /// Wall clock of [`Self::load`], milliseconds. Reported once, not per frame.
     load_ms: f64,
+    /// The `raw_opacities` the file carried, kept so an edit can be undone
+    /// exactly rather than approximately (a logit round trip is not the
+    /// identity). One tensor handle, not a copy of the bytes.
+    raw_opacities_source: Tensor<1>,
+    /// The Gaussian centres on the host, read back the first time an edit needs
+    /// to test a region against them and kept for the rest of the session.
+    ///
+    /// `3N` f32 — 107 MB on the 8.9 M-Gaussian pool ply, against the 2.1 GB the
+    /// file itself occupied while loading. A `RefCell` for the reason
+    /// `Renderer::uploaded` is one: the borrow is never held across an `await`.
+    means_host: std::cell::RefCell<Option<std::rc::Rc<Vec<f32>>>>,
 }
 
 impl LiveSplat {
@@ -200,13 +225,89 @@ impl LiveSplat {
         let splats = message.data.into_splats(device, mode);
         let num_splats = splats.num_splats() as usize;
         let sh_degree = splats.sh_degree();
+        let raw_opacities_source = splats.raw_opacities.val();
         Ok(Self {
             splats,
             path: path.to_path_buf(),
             num_splats,
             sh_degree,
             load_ms: start.elapsed().as_secs_f64() * 1e3,
+            raw_opacities_source,
+            means_host: std::cell::RefCell::new(None),
         })
+    }
+
+    /// The Gaussian centres on the host, flat `(N, 3)`, read back once.
+    ///
+    /// This is the cloud a `box`/`sphere`/`lid` region is tested against on the
+    /// splat side (`crate::edit::weights::compose_gaussian_weights`). It is a
+    /// DIFFERENT cloud from `points.npz`'s, with different indices, which is
+    /// exactly why `pointset` regions are skipped there.
+    ///
+    /// # Errors
+    /// Returns `Err` if the readback fails.
+    pub async fn means_host(&self) -> Result<std::rc::Rc<Vec<f32>>, String> {
+        if let Some(cached) = self.means_host.borrow().as_ref() {
+            return Ok(cached.clone());
+        }
+        let data = self
+            .splats
+            .means()
+            .into_data_async()
+            .await
+            .map_err(|e| format!("splat means readback: {e:?}"))?
+            .into_vec::<f32>()
+            .map_err(|e| format!("splat means: expected f32: {e:?}"))?;
+        let shared = std::rc::Rc::new(data);
+        *self.means_host.borrow_mut() = Some(shared.clone());
+        Ok(shared)
+    }
+
+    /// Scale every Gaussian's opacity by `scale`, before `brush-render` sees it.
+    ///
+    /// `opacity` is `sigmoid(raw_opacity)`, so scaling it is not scaling the raw
+    /// value: this applies the scale in probability space and writes the logit
+    /// back, `raw' = logit(clamp(scale * sigmoid(raw)))`. A scale of 0 becomes
+    /// [`MIN_EDITED_OPACITY`], which the rasteriser drops.
+    ///
+    /// Always applied to the ply's ORIGINAL opacities, never to an
+    /// already-scaled copy, so calling this repeatedly (a slider drag, an undo)
+    /// cannot compound.
+    ///
+    /// # Arguments
+    /// - `scale`: `(N,)` multipliers in `[0, 1]`; today the caller passes only
+    ///   0 (deleted) or 1 (kept) — see
+    ///   `crate::edit::apply::gaussian_opacity_scale` for why `blend`/`fade`
+    ///   deliberately do not reach here.
+    ///
+    /// # Errors
+    /// Returns `Err` when `scale` is not `(N,)`.
+    pub fn set_opacity_scale(&mut self, scale: &[f32]) -> Result<(), String> {
+        if scale.len() != self.num_splats {
+            return Err(format!(
+                "opacity scale has {} entries, expected {}",
+                scale.len(),
+                self.num_splats
+            ));
+        }
+        let device = self.raw_opacities_source.device();
+        let factor = Tensor::<1>::from_data(
+            burn::tensor::TensorData::new(scale.to_vec(), [self.num_splats]),
+            &device,
+        );
+        let opacity = sigmoid(self.raw_opacities_source.clone())
+            .mul(factor)
+            .clamp(MIN_EDITED_OPACITY, MAX_EDITED_OPACITY);
+        // logit(p) = log(p) - log(1 - p).
+        let raw = opacity.clone().log() - opacity.neg().add_scalar(1.0).log();
+        self.splats.raw_opacities = Param::initialized(ParamId::new(), raw.detach());
+        Ok(())
+    }
+
+    /// Put the ply's own opacities back, exactly.
+    pub fn clear_opacity_scale(&mut self) {
+        self.splats.raw_opacities =
+            Param::initialized(ParamId::new(), self.raw_opacities_source.clone());
     }
 
     /// `N`, the number of Gaussians.

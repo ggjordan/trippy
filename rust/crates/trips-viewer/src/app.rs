@@ -34,6 +34,7 @@ use eframe::egui;
 use crate::blit::{BlitCallback, BlitResources};
 use crate::blend::{Blend, BlendMode, GATE_SCALE_MAX, GATE_SCALE_MIN};
 use crate::bundle::Bundle;
+use crate::edit_ui::EditSession;
 use crate::camera::{Controller, Mode};
 use crate::renderer::{ExposureMode, Renderer, Settings, ViewMode, MANUAL_EXPOSURE_LIMIT};
 
@@ -74,6 +75,10 @@ pub struct ViewerApp {
     /// Whether this bundle carries a `blend` block at all. False hides the
     /// panel entirely, so a non-hybrid scene's UI is exactly what it was.
     has_blend: bool,
+    /// The editor: `edits.json`, the Regions/Inspector/Tools panels, the shade
+    /// finder. Toggled with `M` and hidden by default, so a viewing session is
+    /// exactly the session v0.6.0 shipped (`docs/EDITOR.md` §4).
+    edit: EditSession,
 }
 
 impl ViewerApp {
@@ -83,6 +88,8 @@ impl ViewerApp {
     /// - `cc`: eframe's creation context; must be the wgpu backend.
     /// - `bundle`: the loaded scene.
     /// - `settings`: initial performance levers (from the command line).
+    /// - `splat_args`: how to reach the live Gaussian splat, if at all.
+    /// - `edits`: `--edits`, or `None` for `<bundle>/edits.json`.
     ///
     /// # Errors
     /// Returns `Err` if eframe is not on wgpu, or the weights are rejected.
@@ -91,6 +98,7 @@ impl ViewerApp {
         bundle: Bundle,
         settings: Settings,
         splat_args: &crate::SplatArgs,
+        edits: Option<&std::path::Path>,
     ) -> Result<Self, String> {
         let state = cc
             .wgpu_render_state
@@ -135,6 +143,7 @@ impl ViewerApp {
         let has_blend = bundle.manifest.blend.is_some();
 
         let bundle_dir = bundle.dir.clone();
+        let bundle_format = bundle.manifest.format.clone();
         let blend_manifest = bundle.manifest.blend.clone();
         let mut renderer = Renderer::new(bundle, burn_device)?;
         // On the SAME device eframe just handed Burn, so the splat image and the
@@ -148,6 +157,15 @@ impl ViewerApp {
             splat_args,
         );
         let controller = Controller::new(&views, home, up);
+        // The session is built AFTER the renderer, because a bundle reopened
+        // with a saved `edits.json` must render edited on its first frame and
+        // `apply` needs the renderer's own point cloud to compose against.
+        let mut edit = EditSession::open_with_path(&bundle_dir, &bundle_format, edits);
+        edit.estimate_shade_depths(&renderer);
+        edit.refresh_shade(&renderer);
+        if let Err(e) = edit.apply(&mut renderer) {
+            log::warn!("edits not applied: {e}");
+        }
 
         cc.egui_ctx
             .options_mut(|o| o.theme_preference = egui::ThemePreference::Dark);
@@ -168,6 +186,7 @@ impl ViewerApp {
             error: None,
             blend,
             has_blend,
+            edit,
         })
     }
 
@@ -179,6 +198,12 @@ impl ViewerApp {
     /// Set the initial view mode (from `--mode`).
     pub fn set_mode(&mut self, mode: ViewMode) {
         self.mode = mode;
+    }
+
+    /// Show the editor's panels from the first frame (`--edit`), as if `M` had
+    /// been pressed. Nothing else about the session changes.
+    pub fn set_edit_mode(&mut self, active: bool) {
+        self.edit.active = active;
     }
 
     /// Set the initial navigation mode (orbit by default, `--free` for fly).
@@ -245,6 +270,9 @@ impl ViewerApp {
             return;
         }
 
+        // `M` is read here rather than in `EditSession::handle_keys` so it
+        // works while the edit panels are hidden -- it is the key that shows them.
+        let mut edit_mode_toggled = false;
         ctx.input(|i| {
             if i.key_pressed(egui::Key::V) {
                 self.mode = self.mode.next();
@@ -276,6 +304,9 @@ impl ViewerApp {
             if i.key_pressed(egui::Key::B) {
                 self.blend.mode = self.blend.mode.next();
             }
+            if i.key_pressed(egui::Key::M) {
+                edit_mode_toggled = true;
+            }
 
             let axis = |positive: egui::Key, negative: egui::Key| -> f32 {
                 f32::from(i.key_down(positive)) - f32::from(i.key_down(negative))
@@ -292,6 +323,10 @@ impl ViewerApp {
                 self.controller.scroll(i.smooth_scroll_delta.y / SCROLL_NOTCH);
             }
         });
+        if edit_mode_toggled {
+            self.edit.active = !self.edit.active;
+        }
+        self.edit.handle_keys(ctx, self.controller.scene().diameter());
     }
 
     fn step_scale(&mut self, direction: i32) {
@@ -394,6 +429,36 @@ impl ViewerApp {
             splat_views.len(),
             self.views.len()
         ));
+    }
+
+    /// One line saying what the edit layer is doing to this frame.
+    ///
+    /// Always drawn, even with the Edit window closed: an edited scene that
+    /// does not say it is edited is exactly the honesty failure `AGENTS.md` §7
+    /// is about.
+    fn edit_readout(&mut self, ui: &mut egui::Ui) {
+        let Some((deleted, touched)) = self.renderer.edit_summary() else {
+            if self.edit.doc.regions().is_empty() {
+                return;
+            }
+            ui.separator();
+            ui.label("Edit (M): regions loaded, none of them changes this frame");
+            return;
+        };
+        ui.separator();
+        ui.label(format!(
+            "Edit (M): {} regions | {deleted} points deleted | {touched} points region-mixed{}",
+            self.edit.doc.regions().len(),
+            if self.edit.dirty { " | UNSAVED (Cmd-S)" } else { "" }
+        ));
+        if let Some(status) = self.last_stats.as_ref().and_then(|s| s.blend) {
+            if status.edit_needs_splat {
+                ui.colored_label(
+                    egui::Color32::from_rgb(255, 200, 120),
+                    "a region asks for the splat (mix < 1) and none is available at this pose:                      the frame is showing unedited TRIPS there",
+                );
+            }
+        }
     }
 
     /// The overlay: what is being shown, how fast, and the levers.
@@ -564,6 +629,7 @@ impl ViewerApp {
         }
 
         self.blend_panel(ui);
+        self.edit_readout(ui);
 
         ui.horizontal(|ui| {
             if ui.button("R: home").clicked() {
@@ -626,6 +692,17 @@ impl eframe::App for ViewerApp {
         let width = ((rect.width() * ppp * scale).round() as usize).max(16);
         let height = ((rect.height() * ppp * scale).round() as usize).max(16);
 
+        // The editor's work happens HERE, before the render, and only when a
+        // widget or a key asked for it: `refresh_shade` re-thresholds the
+        // audit's numbers, `apply` recomposes the per-point weights and
+        // re-uploads. Both are no-ops on a frame where nothing changed, which
+        // is why flying through an edited scene costs what flying through an
+        // unedited one does.
+        self.edit.refresh_shade(&self.renderer);
+        if let Err(e) = self.edit.apply(&mut self.renderer) {
+            self.error = Some(e);
+        }
+
         let reference = self.controller.reference().clone();
         let camera = self.controller.render_camera(width, height, &reference);
         let frame_index = reference.index;
@@ -647,6 +724,18 @@ impl eframe::App for ViewerApp {
                 BlitCallback::new(&frame).paint_into(ui, rect);
             }
             Err(message) => self.error = Some(message),
+        }
+
+        if self.edit.active {
+            let scene = self.controller.scene();
+            let look_at = self.controller.target();
+            let diameter = scene.diameter();
+            let points = self.renderer.num_points();
+            egui::Window::new("Edit (M)")
+                .default_pos(rect.min + egui::vec2(rect.width() - 460.0, 12.0))
+                .default_width(430.0)
+                .resizable(true)
+                .show(ctx, |ui| self.edit.ui(ui, look_at, diameter, points));
         }
 
         if self.show_panel {

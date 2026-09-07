@@ -31,6 +31,15 @@ if [ -f rust/Cargo.toml ]; then
   # exercised separately via scripts/cpu_heavy.sh, never on every push.
   echo "▶ cargo test (rust/: brush-pyramid, brush-unet)"
   ( cd rust && cargo test -p brush-pyramid -p brush-unet -q )
+  # trips-viewer's tests are CPU-only (the edit model, the region maths, the
+  # undo log, weight composition and the Python golden fixture) but the crate
+  # only exists inside the `gpu` feature graph, so they are run in RELEASE --
+  # the same profile the viewer itself is built in, which means this reuses
+  # those artefacts instead of codegen'ing Burn/CubeCL/wgpu a second time in
+  # debug. See scripts/build.sh's note next to `cargo check -p trips-viewer`.
+  # First run in a fresh checkout is minutes; every run after it is seconds.
+  echo "▶ cargo test --release -p trips-viewer (edit model, region maths, undo log)"
+  ( cd rust && cargo test --release -p trips-viewer -q )
 fi
 
 echo "✓ tests OK"

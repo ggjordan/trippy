@@ -10,6 +10,27 @@ test list). The Rust viewer (§0/§2's render integration, §3's selection
 tools, §4's UI) is **not implemented** -- this document remains the spec
 for that work. Three implementation notes, all explained where they matter
 below:
+Status: **E1 and E2 shipped on both sides** (2026-09-07).
+
+- Python: `trippy/edit/` (`model.py`, `weights.py`, `shade_finder.py`,
+  `apply.py`, and `golden.py`, the parity fixture), `trippy apply-edits`
+  and `trippy edits shade-find/add-box/add-sphere/add-lid`.
+- Rust viewer: `rust/crates/trips-viewer/src/edit/` (the platform-neutral
+  twin: `model.rs`, `weights.rs`, `apply.rs`, `shade.rs`) plus
+  `src/edit_ui.rs` (the Regions/Inspector/Tools panels, `M`) and the render
+  integration in `renderer.rs`/`splat.rs`.
+- The two sides are pinned together by `tests/fixtures/synthetic/edit_golden/`
+  — written by `trippy.edit.golden`, read by BOTH
+  `tests/test_edit_golden.py` and the Rust `edit::golden` tests, which agree
+  to 1e-6. `trips-viewer --dump-weights` / `--dump-shade` run the same
+  comparison against a real bundle
+  (`tests/test_edit_viewer_parity.py`).
+
+Not built: the 3D drag gizmos (E1 shipped Inspector fields + keyboard
+nudge/resize instead), click-to-cluster (E4), the SAM-3 lift (E5), and the
+`brush`-kind voxel region.
+
+Three implementation notes, all explained where they matter below:
 
 - **`box`'s schema is `center`/`half_extents`/`quat`** (an oriented box),
   not this section's axis-aligned `min`/`max` -- a rotated box is testable
@@ -27,6 +48,15 @@ below:
   paragraph for why (there is no live-editable per-point splat channel on
   a checkpoint-only path) and `trippy.edit.checkpoint`'s module docstring
   for the exact reasoning.
+- **`blend`/`fade` do NOT scale a point's alpha, only `delete` does.** §2
+  originally read as "the weight multiplies the point's alpha"; taken
+  literally that makes a `mix = 0` region invisible in the TRIPS pass, so
+  the per-pixel blend has no coverage there to mix the splat *into* and the
+  two mechanisms cancel. The shipped rule is: `delete` removes rows before
+  rasterisation (a weight of 0 that really means "not rendered"), and
+  `blend`/`fade` leave alpha alone so the probe pass's alpha-weighted
+  average is an average of the *untouched* alphas. See §2 "The probe pass"
+  and `rust/crates/trips-viewer/src/edit/apply.rs`.
 
 `docs/decisions/ADR-0007-viewer-editing.md` is still accurate to the
 sections below; this document is the detailed spec the milestones in §6
@@ -268,20 +298,48 @@ concatenate it as one more feature channel) and let the ordinary
 front-to-back blend produce a correctly-weighted composite, with **no new
 kernels, no new backward pass, no depth buffer**:
 
-- **TRIPS side**: `PointSet::feat` gains one extra channel (or a sibling
-  buffer rendered as its own tiny pyramid pass, mirroring how
-  `RawLevel0`/`Coverage` already reuse the one render for a second purpose)
-  holding `w_edit` per point. It rasterises through the existing
-  `blend_fwd` exactly like colour; the composited value at a pixel is
-  `w_edit`'s alpha-weighted average over whatever pyramid layer/points
-  cover that pixel — precisely what a "region weight at this pixel" should
-  mean for content the network is inventing across several points' worth of
-  support.
-- **Splat side**: analogous — the region weight rides as a Gaussian's own
-  scalar attribute, rendered as a second forward pass with the scalar in
-  place of the SH DC term (`surface.rs`'s own technique, cited above),
-  giving a real alpha-composited `w_edit` per pixel with the unmodified
-  `brush-render` rasteriser.
+- **TRIPS side** (**implemented**, the "sibling buffer" option): a second
+  `PointSet` over the same surviving rows, with the same `xyz`/`size`/`conf`
+  and a **three-channel** feature vector `[w_edit, touched, 1]`, rasterised
+  by a second `render_pyramid_uploaded` call at the same camera with the
+  same `PyramidParams` and an all-zero background. Because the two clouds
+  share `conf`, the two passes place identical fragments with identical
+  alphas, so at level 0 the three channels are `sum(T a w_edit)`,
+  `sum(T a touched)` and `sum(T a) = 1 - t_final`. Dividing the first two by
+  the third is exactly the alpha-weighted average this paragraph asks for.
+  Three channels and not four or five because
+  `brush_pyramid::params::SUPPORTED_CHANNELS` is `[3, 4, 8]`: `C = 3` compiles
+  the rasteriser's **existing** pipeline, so this needed no kernel change, no
+  new fixture, no widening of the U-Net's input and no risk to the parity
+  tests. See `rust/crates/trips-viewer/src/edit/apply.rs` and
+  `Renderer::edit_pixels`.
+  - `touched` is the one quantity with no Python twin: it is "did any enabled
+    `blend`/`fade` region claim this point", and it is what makes a region an
+    *override* of the gate only where it applies. Where nothing is touched it
+    is 0, the division gives 0, and `w_pix` falls back to 1 — a bit-exact
+    no-op, which is why an unedited bundle renders the frame it always did.
+  - The cost is one extra pyramid pass, paid **only** while an enabled
+    `blend`/`fade` region exists. A `delete`-only session, and every unedited
+    session, pays nothing.
+  - Known limit: the edit is applied to the TRIPS operand *before* the Blend
+    panel's own mode, so a region can always pull a pixel towards the splat
+    but a `mix = 1` region does not force pure TRIPS over a gate that wanted
+    the splat. The direction that matters (Jordan hiding TRIPS content)
+    works; the reverse is a corner case, recorded rather than hidden.
+- **Splat side**: `delete` is implemented and `blend`/`fade` deliberately are
+  not. A `delete`-op region scales the matching Gaussians' opacity to
+  effectively zero before `brush_render::render_splats` sees them
+  (`LiveSplat::set_opacity_scale`: `raw' = logit(clamp(scale * sigmoid(raw)))`,
+  because `raw_opacity` is a logit and `logit(0)` is not finite; the ply's own
+  raw values are kept so an undo restores them exactly). `blend`/`fade` do NOT
+  touch a Gaussian's opacity: their mix is the per-pixel choice above, and
+  dimming the Gaussians as well would apply it twice and in the wrong
+  direction — a `mix = 0` region asks for MORE splat, not less. This is
+  exactly what `trippy.edit.apply.apply_edits` does on the publish side, where
+  the PLY is filtered by `compose_gaussian_weights(...).delete_mask` and
+  nothing else. The "scalar in place of the SH DC term" second pass is
+  therefore still unbuilt, and still the route if a per-pixel splat-side
+  weight is ever wanted.
 
 Region membership itself is evaluated **once per edit change**, not once
 per frame: `O(points × regions)`, cached until `edits.json` changes, exactly
@@ -441,23 +499,29 @@ Jordan can hide edit chrome while still flying around:
 **Keys** (chosen to avoid every key `app.rs::ViewerApp::handle_input`
 already binds — `V X Tab - = F R N P W A S D Q E` and drag/scroll):
 
+**As shipped** (E1/E2). Rows marked *not built* wait on E3/E4.
+
 | key | action |
 |---|---|
-| `M` | toggle edit mode (shows Regions/Inspector/Tools; click-drag on canvas now selects/manipulates instead of orbiting, mirroring how `F` already swaps the meaning of drag between orbit and fly) |
-| `T` | cycle active tool (click-to-cluster → shade finder → SAM-3 → lid gizmo) |
-| `[` / `]` | shrink/grow the active tool's brush/cluster radius |
-| `Delete` / `Backspace` | apply `delete` to the selected region |
+| `M` | toggle edit mode (shows Regions/Inspector/Tools). `--edit` opens straight into it. Click-drag on the canvas still orbits: with no gizmos to hit, swapping the drag would only take navigation away |
+| `T` | cycle the active tool (Regions ↔ shade-cloud finder) |
+| arrows, `PageUp`/`PageDown` | nudge the selected region along world X/Z and Y by `NUDGE_SCENE_FRACTION` of the scene diameter — **E1's replacement for the 3D drag gizmo** |
+| `[` / `]` | shrink/grow the selected region by `RESIZE_STEP` |
+| `Delete` / `Backspace` | remove the selected region (its `op` is a separate field in the Inspector) |
 | `Cmd`/`Ctrl` + `Z` | undo |
 | `Cmd`/`Ctrl` + `Shift` + `Z` | redo |
 | `Cmd`/`Ctrl` + `S` | save `edits.json` |
-| `Cmd`/`Ctrl` + `N` | new region from the current selection |
-| `H` | toggle preview-highlight view (the new `ViewMode` from §0) |
+| `H` | toggle the preview highlight (a tinted point cloud, not a new `ViewMode` — see §6) |
+| `Cmd`/`Ctrl` + `N` | *not built*: "new region from the current selection" belongs with click-to-cluster (E4). The shade finder's own "add as region" buttons are E2's version of it |
 
-Left-click behaviour while in edit mode: on empty space with click-to-cluster
-active, seeds a new cluster at the ray hit; on an existing region's gizmo
-(lid plane/ring, box corner, sphere radius handle), drags that handle instead
-— the same "response is scoped to what the drag started on" discipline
-`app.rs`'s own module doc already calls out as the fix for the
+Left-click behaviour while in edit mode: **unchanged from viewing** in E1/E2 —
+there is no gizmo to hit yet, so the canvas keeps orbiting and every region is
+placed at the camera's look-at point and shaped from the Inspector or the
+keyboard. When the gizmos land (E3/E4) the rule is: on empty space with
+click-to-cluster active, seed a new cluster at the ray hit; on an existing
+region's gizmo (lid plane/ring, box corner, sphere radius handle), drag that
+handle instead — the same "response is scoped to what the drag started on"
+discipline `app.rs`'s own module doc already calls out as the fix for the
 `egui_wants_pointer_input` trap (`dragged_by`, not a global "is anything
 active" check).
 
@@ -552,12 +616,26 @@ schedule.
 
 | # | Scope | Estimate | Acceptance | Status |
 |---|---|---|---|---|
-| **E1** | Region data model (`edits.json` read/write), `box`/`sphere` region kinds, per-point weight compositing (§2's non-depth design) on the TRIPS side only, undo/redo, save/load surviving a bundle close+reopen | 1 wk | Draw a box or sphere region in the viewer, set `mix`, see the TRIPS render change inside it and nothing outside it; undo removes the region; closing and reopening the bundle restores it exactly (region list, mix values, undo history) | **Python side done** (`trippy/edit/model.py`, `weights.py`); the viewer draw/render half is not built. |
-| **E2** | Shade-cloud finder: `trippy edit-prep` precompute + live threshold sliders + preview-highlight `ViewMode` + "select" → `pointset` region | 3 d | On a bundle whose scene has registered shade frames, the finder's default thresholds select a `pointset` region whose `dark_mass_fraction` (via `trippy.train.prune.dark_mass_stats` on the selected IDs) matches the audit's own number for that scene to float precision; deleting the region and re-running the audit shows the drop | **CLI precompute+select done** (`trippy edits shade-find`, `trippy/edit/shade_finder.py`; acceptance verified on the synthetic scene, `docs/EXPERIMENTS.md` "Edits"); the live threshold sliders and preview-highlight `ViewMode` are not built. |
+| **E1** | Region data model (`edits.json` read/write), `box`/`sphere` region kinds, per-point weight compositing (§2's non-depth design) on the TRIPS side only, undo/redo, save/load surviving a bundle close+reopen | 1 wk | Draw a box or sphere region in the viewer, set `mix`, see the TRIPS render change inside it and nothing outside it; undo removes the region; closing and reopening the bundle restores it exactly (region list, mix values, undo history) | **Done** (2026-09-07), except the 3D drag gizmos, which E1 replaced with Inspector fields + arrow-key nudge / `[`-`]` resize. `rust/crates/trips-viewer/src/edit/*` + `src/edit_ui.rs`. Measured on the synthetic bundle: a `blend` sphere at `mix = 0` changes 4.74 % of the pixels in its own half of the frame and **0.00 %** of the other half; a `delete` box changes 63.97 % of its half; undoing it reproduces the unedited frame **bit for bit** (max channel diff 0). |
+| **E2** | Shade-cloud finder: `trippy edit-prep` precompute + live threshold sliders + preview-highlight `ViewMode` + "select" → `pointset` region | 3 d | On a bundle whose scene has registered shade frames, the finder's default thresholds select a `pointset` region whose `dark_mass_fraction` (via `trippy.train.prune.dark_mass_stats` on the selected IDs) matches the audit's own number for that scene to float precision; deleting the region and re-running the audit shows the drop | **Done** (2026-09-07). Four live sliders (lum, conf, znear/zfar fractions) over `shade_views.json`, the precompute written by `trippy.edit.golden.write_shade_views`; "add as region (fade / delete)"; and a preview that **tints** the selection instead of adding a `ViewMode` (see the note under this table). `trips-viewer --dump-shade` selects the same ids and the same `dark_mass_fraction` as `trippy.edit.shade_finder.find_shade_pointset` on the synthetic bundle (`tests/test_edit_viewer_parity.py`). |
 | **E3** | `lid` region kind + 3D gizmo (plane/radius drag) + hard-clip delete semantics | 2 d | Loading the Karekare pool bundle with a `lid` region seeded from `SURFACE_LID.md`'s numbers removes the haze from every angle at every `mix`/exposure; dragging the radius ring changes the affected point count live | **Region kind + hard-clip semantics done** (`trippy.edit.model.lid_membership`, `trippy edits add-lid`); the 3D gizmo is not built. |
 | **E4** | Click-to-cluster: ray cast + k-d tree + k-NN growth in world+colour space, radius slider | 3 d | Clicking a point-cloud cluster selects a `pointset` region that visibly matches the clicked object's extent, without needing a depth buffer | Not started. |
 | **E5** | SAM 3 lift: photo segmentation, multi-view projection + majority vote, `pointset` region output | 2–3 wk | Segmenting an object in 2–3 registered views of the same scene produces one `pointset` region that, previewed, highlights that object and not its neighbours; runs entirely local (no image leaves the machine) | Not started. |
 | **E6** | Publish path: `trippy apply-edits`, TRIPS `export.ply` mask wiring, distilled-splat publish order (edit-then-distil for pointset regions, geometry-reapply for box/sphere/lid) | 3 d | `trippy apply-edits --target both` on a bundle with a mix of region kinds produces a TRIPS PLY with the deleted points absent and, after a `trippy distill` run on the same edited bundle, a distilled PLY that also lacks them; a box/sphere/lid region re-applied directly to an already-distilled PLY (no re-distillation) also removes the matching geometry | **Done** (`trippy/edit/apply.py`, `trippy/edit/checkpoint.py`): `--target trips\|distilled\|both` (default `both`); `trips`/`both` write the filtered TRIPS `points.npz`/`blend_weights.npy`/`export.ply` and, if named, a filtered `blend.splat_ply`; `distilled`/`both` (with `--distilled-ply`) re-apply box/sphere/lid regions to an already-distilled PLY as delete/opacity-scale-fade; `--edits` wired into `trippy distill --stage render` (edit-then-distil ordering) and into `trippy candidate-report`/`trippy eval` (checkpoint-side keep mask + gate suppression on gate-hybrid checkpoints, `candidate-report` only — see §5's own paragraph for the `eval` gap). |
+
+**Two deviations worth naming.** (1) The preview highlight is not a fourth
+`ViewMode`: it is a copy of the point cloud with the selection's first three
+feature channels set to magenta and everything else dimmed
+(`edit::apply::tinted_points`), which rides the existing render with no new
+shader and no new `match` arm, and is *most* honest in the existing
+`RawLevel0` view where the tint is the rasteriser's own pixels rather than the
+network's guess about them. (2) The shade finder's `d` (each frame's median
+COLMAP-observed depth) is precomputed into `shade_views.json` rather than
+re-derived in Rust — it is the one input no slider moves. Everything a slider
+DOES move (`znear = znear_frac * d`, `zfar`, luminance, confidence) is ported
+and recomputed live in `edit/shade.rs`; there is no subprocess in the
+interaction loop. Without the sidecar the finder falls back to estimating `d`
+from the bundle's own points and **says so in the panel**.
 
 E1 already includes undo/save per the brief; E2–E5 add tool-specific
 selection UI on top of the E1 data model and do not need to repeat undo/save
@@ -578,6 +656,16 @@ plumbing. `brush`-kind (voxel) regions and splat-side weight compositing
   `surface.rs`'s depth-distortion term was. Treat that as unproven until an
   agreement test exists (mirroring `docs/ARCHITECTURE.md`'s own "implement
   transforms twice independently" discipline).
+- **Region-test cost, measured.** The Regions panel reports the wall time of
+  the last recomposition ("weights recomputed in N ms"), so the number
+  `docs/EDITOR.md` used to ask for is now on screen during a session rather
+  than estimated. On the 4 000-point synthetic bundle with two regions it is
+  under a millisecond; the Karekare-scale figure is still to be taken from a
+  real session, and the two `O(points x regions)` passes it covers (TRIPS
+  points, and Gaussian centres only when a `delete` region is enabled) are the
+  ones to watch. The Gaussian pass is skipped entirely unless a `delete`
+  region exists, which is what keeps a mix-slider drag on a multi-million-
+  Gaussian ply cheap.
 - **Region-test cost still needs a real budget check.** §2's "once per edit
   change, not once per frame" design is much cheaper than a per-pixel SDF,
   but "once per edit change" on a multi-million-point Karekare scene with

@@ -23,6 +23,7 @@
 
 mod app;
 mod blit;
+mod edit_ui;
 
 // The platform-neutral half lives in this package's library target (`src/lib.rs`)
 // so `rust/crates/trips-web` can compile the identical bundle loader, camera and
@@ -76,6 +77,24 @@ from a Gaussian .ply; see docs/USER_GUIDE.md):
                        also shrinks the parser's allocation -- the only lever
                        that helps peak memory on a multi-GB ply)
 
+Editing (docs/EDITOR.md; press M in the window for the panels):
+  --edit               open with the Regions/Inspector/Tools panels already up
+                       (the same thing M toggles)
+  --edits <p>          read this edits.json instead of <BUNDLE_DIR>/edits.json
+  --dump-weights <o>   compose the per-point weights from edits.json, write them
+                       to <o> as JSON and exit. No GPU, no window: this is the
+                       half of the Python/Rust parity check that runs against a
+                       REAL bundle (`trippy apply-edits` must agree to 1e-6)
+  --dump-shade <o>     run the shade-cloud finder over <BUNDLE_DIR>/shade_views.json
+                       at the thresholds below and write the selected point ids
+                       to <o> as JSON (the headless twin of the Tools panel);
+                       must select the same ids as `trippy edits shade-find`
+  --shade-lum <f>      dark-luminance cutoff (default 0.25)
+  --shade-conf <f>     effective-confidence cutoff (default 0.50)
+  --shade-znear <f>    near plane / each frame's median depth (default: the
+                       sidecar's own, else 0.05)
+  --shade-zfar <f>     far plane / median depth (default: the sidecar's, else 0.50)
+
 Headless (no window; used by the acceptance check and the perf table):
   --screenshot <o.png> render one frame to a PNG and exit
   --camera-yaw-deg <d> yaw the camera off the chosen view by <d> degrees first;
@@ -96,6 +115,7 @@ Keys:
   F          orbit <-> free      R  back to the view it opened at
   N / P      next / previous capture view
   B          cycle the blend mode (hybrid bundles)
+  M          edit mode: Regions / Inspector / Tools (docs/EDITOR.md)
   V          cycle network / raw level-0 / coverage
   X          cycle the exposure the tone mapper applies
   - / =      render scale        TAB  hide the panel
@@ -155,6 +175,23 @@ struct Args {
     render_size: Option<(usize, usize)>,
     /// `--splat-bench <n>`: time the splat render alone.
     splat_bench: Option<usize>,
+    /// `--edit`: open with the editor's panels shown.
+    edit: bool,
+    /// `--edits <p>`: an `edits.json` somewhere other than next to `bundle.json`.
+    edits: Option<PathBuf>,
+    /// `--dump-weights <o>`: write the composed per-point weights and exit.
+    dump_weights: Option<PathBuf>,
+    /// `--dump-shade <o>`: write the shade finder's selection and exit.
+    dump_shade: Option<PathBuf>,
+    /// `--shade-lum` / `--shade-conf` / `--shade-znear` / `--shade-zfar`, each
+    /// `None` for "the sidecar's own value, else the shipped default".
+    shade_lum: Option<f64>,
+    /// See [`Self::shade_lum`].
+    shade_conf: Option<f64>,
+    /// See [`Self::shade_lum`].
+    shade_znear: Option<f64>,
+    /// See [`Self::shade_lum`].
+    shade_zfar: Option<f64>,
 }
 
 /// Parse `1920x1080`.
@@ -255,6 +292,14 @@ fn parse_args() -> Result<Args, String> {
         splat: SplatArgs::default(),
         render_size: None,
         splat_bench: None,
+        edit: false,
+        edits: None,
+        dump_weights: None,
+        dump_shade: None,
+        shade_lum: None,
+        shade_conf: None,
+        shade_znear: None,
+        shade_zfar: None,
     };
     let mut argv = std::env::args().skip(1);
     while let Some(flag) = argv.next() {
@@ -321,6 +366,23 @@ fn parse_args() -> Result<Args, String> {
                         .map_err(|e| format!("--splat-subsample: {e}"))?,
                 );
             }
+            "--edit" => args.edit = true,
+            "--edits" => args.edits = Some(PathBuf::from(value()?)),
+            "--dump-weights" => args.dump_weights = Some(PathBuf::from(value()?)),
+            "--dump-shade" => args.dump_shade = Some(PathBuf::from(value()?)),
+            "--shade-lum" => {
+                args.shade_lum = Some(value()?.parse().map_err(|e| format!("--shade-lum: {e}"))?);
+            }
+            "--shade-conf" => {
+                args.shade_conf = Some(value()?.parse().map_err(|e| format!("--shade-conf: {e}"))?);
+            }
+            "--shade-znear" => {
+                args.shade_znear =
+                    Some(value()?.parse().map_err(|e| format!("--shade-znear: {e}"))?);
+            }
+            "--shade-zfar" => {
+                args.shade_zfar = Some(value()?.parse().map_err(|e| format!("--shade-zfar: {e}"))?);
+            }
             "--free" => args.free = true,
             "--frames" => args.warmup = value()?.parse().map_err(|e| format!("--frames: {e}"))?,
             "--bench" => args.bench = Some(value()?.parse().map_err(|e| format!("--bench: {e}"))?),
@@ -348,6 +410,150 @@ fn resolve_bundle(explicit: Option<PathBuf>, headless: bool) -> Result<PathBuf, 
         .ok_or_else(|| "no bundle chosen".to_owned())
 }
 
+/// `"format"` of the file `--dump-weights` writes.
+const DUMP_WEIGHTS_FORMAT: &str = "trippy-edit-weights-1";
+
+/// Compose the per-point weights from `edits.json` and write them as JSON.
+///
+/// **No GPU and no window.** This is the half of the Python/Rust parity check
+/// that runs against a real bundle: `trippy apply-edits` writes the same
+/// `weight` array into `blend_weights.npy`, and the two must agree to 1e-6
+/// (`docs/EDITOR.md` §6, `trippy/edit/golden.py`). The committed fixture in
+/// `tests/fixtures/synthetic/edit_golden/` is the automated version of the same
+/// comparison; this one is what you point at a scene.
+///
+/// # Arguments
+/// - `bundle`: the loaded scene (only its `points.npz` `xyz` is read).
+/// - `edits`: the `edits.json` to compose; a missing file composes to the
+///   identity, which is a meaningful answer rather than an error.
+/// - `out`: destination JSON.
+///
+/// # Errors
+/// Returns `Err` when `edits` exists but does not parse or does not validate
+/// against this bundle's format, or when `out` cannot be written.
+fn dump_weights(bundle: &Bundle, edits: &std::path::Path, out: &std::path::Path) -> Result<(), String> {
+    use trips_viewer::edit::weights::{compose_trips_weights, widen};
+    use trips_viewer::edit::EditDocument;
+
+    let doc = if edits.exists() {
+        EditDocument::load(edits)?
+    } else {
+        eprintln!("{} does not exist: composing the identity", edits.display());
+        EditDocument::new(bundle.manifest.format.clone())
+    };
+    doc.validate(Some(&bundle.manifest.format))?;
+    let composed = compose_trips_weights(&doc, &widen(&bundle.points.xyz));
+    let document = serde_json::json!({
+        "format": DUMP_WEIGHTS_FORMAT,
+        "bundle": bundle.dir.display().to_string(),
+        "edits": edits.display().to_string(),
+        "n": composed.weight.len(),
+        "num_regions": doc.regions().len(),
+        "num_deleted": composed.num_deleted(),
+        "num_touched": composed.num_touched(),
+        "weight": composed.weight,
+        "delete_mask": composed.delete_mask,
+    });
+    let text =
+        serde_json::to_string(&document).map_err(|e| format!("serialising weights: {e}"))?;
+    std::fs::write(out, text).map_err(|e| format!("{}: {e}", out.display()))?;
+    eprintln!(
+        "wrote {} ({} points, {} deleted, {} region-mixed, {} regions)",
+        out.display(),
+        composed.weight.len(),
+        composed.num_deleted(),
+        composed.num_touched(),
+        doc.regions().len()
+    );
+    Ok(())
+}
+
+/// `"format"` of the file `--dump-shade` writes.
+const DUMP_SHADE_FORMAT: &str = "trippy-edit-shade-1";
+
+/// Run the shade-cloud finder headlessly and write its selection.
+///
+/// The Tools panel's sliders, without a window: the same
+/// `trips_viewer::edit::shade::find` the panel calls, over the same
+/// `shade_views.json`, so "the viewer selects what
+/// `trippy.edit.shade_finder.find_shade_pointset` selects" is checkable without
+/// anyone opening a GUI (`docs/EDITOR.md` §6, E2's acceptance).
+///
+/// Base colour is `clip(feat[:, :3], 0, 1)`, exactly the slice
+/// `find_shade_pointset_in_bundle` reads and the exporter writes.
+///
+/// # Arguments
+/// - `bundle`: the loaded scene.
+/// - `args`: the four `--shade-*` overrides.
+/// - `out`: destination JSON.
+///
+/// # Errors
+/// Returns `Err` when the bundle carries no `shade_views.json`, when it does
+/// not parse, or when `out` cannot be written.
+fn dump_shade(bundle: &Bundle, args: &Args, out: &std::path::Path) -> Result<(), String> {
+    use trips_viewer::edit::shade;
+
+    let sidecar = shade::ShadeViews::load(&bundle.dir)?.ok_or_else(|| {
+        format!(
+            "{} has no {}; write one with trippy.edit.golden.write_shade_views",
+            bundle.dir.display(),
+            shade::SHADE_VIEWS_FILENAME
+        )
+    })?;
+    let defaults = shade::Thresholds::default();
+    let thresholds = shade::Thresholds {
+        znear_frac: args.shade_znear.unwrap_or(sidecar.znear_frac),
+        zfar_frac: args.shade_zfar.unwrap_or(sidecar.zfar_frac),
+        lum_threshold: args.shade_lum.unwrap_or(defaults.lum_threshold),
+        conf_threshold: args.shade_conf.unwrap_or(defaults.conf_threshold),
+    };
+
+    let points = &bundle.points;
+    let channels = points.num_channels;
+    let mut rgb = Vec::with_capacity(points.len() * 3);
+    for row in 0..points.len() {
+        for c in 0..3 {
+            rgb.push(f64::from(points.feat[row * channels + c].clamp(0.0, 1.0)));
+        }
+    }
+    let conf: Vec<f64> = points.conf.iter().map(|c| f64::from(*c)).collect();
+    let found = shade::find(
+        &sidecar.views,
+        &trips_viewer::edit::weights::widen(&points.xyz),
+        &rgb,
+        &conf,
+        thresholds,
+    );
+
+    let document = serde_json::json!({
+        "format": DUMP_SHADE_FORMAT,
+        "bundle": bundle.dir.display().to_string(),
+        "frames": sidecar.views.iter().map(|v| v.name.clone()).collect::<Vec<_>>(),
+        "thresholds": {
+            "znear_frac": thresholds.znear_frac,
+            "zfar_frac": thresholds.zfar_frac,
+            "lum_threshold": thresholds.lum_threshold,
+            "conf_threshold": thresholds.conf_threshold,
+        },
+        "n": points.len(),
+        "n_in_region": found.n_in_region,
+        "mass_in_region": found.mass_in_region,
+        "dark_mass_fraction": found.dark_mass_fraction,
+        "point_ids": found.point_ids,
+    });
+    let text = serde_json::to_string(&document).map_err(|e| format!("serialising shade: {e}"))?;
+    std::fs::write(out, text).map_err(|e| format!("{}: {e}", out.display()))?;
+    eprintln!(
+        "wrote {} ({} of {} points selected, {} in region, dark mass fraction {:.6})",
+        out.display(),
+        found.point_ids.len(),
+        points.len(),
+        found.n_in_region,
+        found.dark_mass_fraction
+    );
+    Ok(())
+}
+
 /// The headless paths: `--screenshot` and `--bench`.
 ///
 /// Both create their **own** Burn device (there is no window to borrow one
@@ -368,9 +574,26 @@ fn run_headless(args: &Args, bundle: Bundle) -> Result<(), String> {
     let frame_index = view.index;
     let camera_view = view.clone();
     let bundle_dir = bundle.dir.clone();
+    let bundle_format = bundle.manifest.format.clone();
     let blend_manifest = bundle.manifest.blend.clone();
     let mut renderer = Renderer::new(bundle, device.clone())?;
     attach_live_splat(&mut renderer, &bundle_dir, blend_manifest.as_ref(), &args.splat);
+    // `--screenshot` must draw the picture the WINDOW draws, edits included --
+    // that is the whole point of the screenshot check (`main.rs`'s own
+    // invariant). A bundle with no `edits.json` applies nothing and costs
+    // nothing.
+    let mut edits = crate::edit_ui::EditSession::open_with_path(
+        &bundle_dir,
+        &bundle_format,
+        args.edits.as_deref(),
+    );
+    edits.apply(&mut renderer)?;
+    if let Some((deleted, touched)) = renderer.edit_summary() {
+        eprintln!(
+            "edits applied: {} regions, {deleted} points deleted, {touched} region-mixed",
+            edits.doc.regions().len()
+        );
+    }
     let scale = args.settings.render_scale.clamp(0.1, 1.0);
     // `--render-size` wins over `--scale`: measuring a 1080p frame must not
     // depend on the capture happening to be 1080p.
@@ -561,6 +784,8 @@ fn run() -> Result<(), String> {
     let headless = args.screenshot.is_some()
         || args.bench.is_some()
         || args.splat_bench.is_some()
+        || args.dump_weights.is_some()
+        || args.dump_shade.is_some()
         || args.settings.profile;
     let dir = resolve_bundle(args.bundle.clone(), headless)?;
     let bundle = Bundle::load(&dir)?;
@@ -571,6 +796,18 @@ fn run() -> Result<(), String> {
         bundle.manifest.num_channels,
         bundle.manifest.views.len()
     );
+
+    if let Some(out) = &args.dump_weights {
+        let edits = args
+            .edits
+            .clone()
+            .unwrap_or_else(|| dir.join(trips_viewer::edit::EDITS_FILENAME));
+        return dump_weights(&bundle, &edits, out);
+    }
+
+    if let Some(out) = &args.dump_shade {
+        return dump_shade(&bundle, &args, out);
+    }
 
     if headless {
         return run_headless(&args, bundle);
@@ -595,6 +832,8 @@ fn run() -> Result<(), String> {
     let mode = args.mode;
     let blend_state = args.blend;
     let splat_args = args.splat.clone();
+    let edits = args.edits.clone();
+    let edit_mode = args.edit;
     let navigation = if args.free {
         crate::camera::Mode::Free
     } else {
@@ -612,10 +851,11 @@ fn run() -> Result<(), String> {
         &title,
         options,
         Box::new(move |cc| {
-            let mut app = app::ViewerApp::new(cc, bundle, settings, &splat_args)
+            let mut app = app::ViewerApp::new(cc, bundle, settings, &splat_args, edits.as_deref())
                 .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
             app.set_mode(mode);
             app.set_navigation(navigation);
+            app.set_edit_mode(edit_mode);
             if blend_state != Blend::default() {
                 // Only override the bundle's own starting state when a flag asked
                 // for something else, so a plain launch still opens on the frame
