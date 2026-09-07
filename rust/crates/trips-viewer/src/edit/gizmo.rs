@@ -71,6 +71,8 @@ pub enum Drag {
     Resize,
     /// Ctrl-drag: rotate about the grabbed axis (`box` only).
     Rotate,
+    /// Drag the lid's own normal handle: tilt `up` (`lid` only).
+    Tilt,
 }
 
 /// One projected axis arm.
@@ -99,6 +101,126 @@ impl Arm {
     }
 }
 
+/// The pseudo-axis [`GizmoScreen::pick`] returns for the lid's normal handle —
+/// past the three world axes (`0`/`1`/`2`), never a valid index into
+/// [`GizmoScreen::arms`]. [`Drag`]'s `Tilt` variant is the only one
+/// `edit_ui.rs` builds when this is picked.
+pub const NORMAL_AXIS: usize = 3;
+
+/// A projected screen-space direction from a gizmo's centre, stripped of the
+/// axis/rotation bookkeeping [`Arm`] carries.
+///
+/// Used only to turn a 2D screen drag back into a 3D world displacement —
+/// the lid's normal handle has no world AXIS to move along (it drags a
+/// *direction*, `up`), so its two "arms" are in-plane basis directions chosen
+/// from `up` itself, not world X/Y/Z, and nothing outside [`GizmoScreen::tilted_up`]
+/// needs to know they exist.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ScreenArm {
+    /// Tip minus centre, render pixels.
+    delta: (f64, f64),
+    /// World units this arm is long.
+    world_len: f64,
+}
+
+impl ScreenArm {
+    /// Project `centre_world + dir * len` and record its screen offset from
+    /// `centre_screen`. A zero-length result (behind the camera, or the
+    /// direction points straight at/away from it) is not an error — it just
+    /// contributes nothing to [`GizmoScreen::tilted_up`]'s reconstruction,
+    /// exactly like a zero-length [`Arm`] is skipped by [`GizmoScreen::pick`].
+    fn project(
+        camera: &ClickCamera,
+        centre_world: [f64; 3],
+        centre_screen: (f64, f64),
+        dir: [f64; 3],
+        len: f64,
+    ) -> Self {
+        let tip_world = [
+            dir[0].mul_add(len, centre_world[0]),
+            dir[1].mul_add(len, centre_world[1]),
+            dir[2].mul_add(len, centre_world[2]),
+        ];
+        let (u, v, z) = camera.project(tip_world);
+        let ok = z > 0.0 && u.is_finite() && v.is_finite();
+        Self {
+            delta: if ok { (u - centre_screen.0, v - centre_screen.1) } else { (0.0, 0.0) },
+            world_len: len,
+        }
+    }
+
+    /// How far along this direction, in world units, a screen drag of `drag`
+    /// moves the tip — the same projection-onto-the-arm trick
+    /// [`GizmoScreen::translate_world`] uses.
+    fn along_world(&self, drag: (f64, f64)) -> f64 {
+        let len2 = self.delta.0.mul_add(self.delta.0, self.delta.1 * self.delta.1);
+        if len2 <= f64::EPSILON {
+            return 0.0;
+        }
+        let along = self.delta.0.mul_add(drag.0, self.delta.1 * drag.1) / len2;
+        along * self.world_len
+    }
+}
+
+/// The lid's own 4th handle: drag it to tilt `up` (rotate about the two
+/// in-plane axes), rather than translate/resize/rotate a world axis.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NormalHandle {
+    /// The handle tip, render pixels.
+    pub tip: (f64, f64),
+    /// How far from the centre the tip sits, world units — `up`'s own length
+    /// in the reconstruction [`GizmoScreen::tilted_up`] does.
+    len: f64,
+    /// Two in-plane basis directions (world unit vectors orthogonal to `up`
+    /// and to each other), each projected exactly like a world-axis [`Arm`].
+    /// Captured once, at projection time, so a drag needs no further camera
+    /// calls — the same contract [`Arm`] already keeps.
+    basis: [ScreenArm; 2],
+}
+
+/// Two unit vectors orthogonal to `n` and to each other — an arbitrary but
+/// DETERMINISTIC basis for the plane `n` is normal to (Duff et al.'s "branch
+/// on the largest component" trick is not needed here: a lid's `up` is never
+/// exactly axis-aligned in practice, and the simple helper-vector construction
+/// is exact wherever it is defined, which is everywhere `n` is not ~zero).
+///
+/// # Panics
+/// Never in practice: [`Params::from_json`] already refuses a ~zero `up`, and
+/// every caller here holds a validated [`LidParams`].
+fn orthonormal_basis(n: [f64; 3]) -> ([f64; 3], [f64; 3]) {
+    let norm = dot3(n, n).sqrt().max(1e-12);
+    let n = [n[0] / norm, n[1] / norm, n[2] / norm];
+    // A helper vector not (nearly) parallel to `n`: world X unless `n` is
+    // mostly X, in which case world Y is never nearly parallel to it either.
+    let helper = if n[0].abs() < 0.9 { [1.0, 0.0, 0.0] } else { [0.0, 1.0, 0.0] };
+    let b1_raw = cross(helper, n);
+    let b1_norm = dot3(b1_raw, b1_raw).sqrt().max(1e-12);
+    let b1 = [b1_raw[0] / b1_norm, b1_raw[1] / b1_norm, b1_raw[2] / b1_norm];
+    // `n` and `b1` are already orthonormal, so `n x b1` is unit length too.
+    let b2 = cross(n, b1);
+    (b1, b2)
+}
+
+fn dot3(a: [f64; 3], b: [f64; 3]) -> f64 {
+    a[0].mul_add(b[0], a[1].mul_add(b[1], a[2] * b[2]))
+}
+
+fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+fn normalized(v: [f64; 3]) -> [f64; 3] {
+    let norm = dot3(v, v).sqrt();
+    if norm < 1e-12 {
+        return v;
+    }
+    [v[0] / norm, v[1] / norm, v[2] / norm]
+}
+
 /// A region's gizmo, projected into this frame.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GizmoScreen {
@@ -106,6 +228,9 @@ pub struct GizmoScreen {
     pub centre: (f64, f64),
     /// The three world-axis arms.
     pub arms: [Arm; 3],
+    /// The lid's own plane-normal handle — `None` for every other kind (there
+    /// is no `up` to tilt).
+    pub normal: Option<NormalHandle>,
 }
 
 /// The centre and size a gizmo is built around, for the kinds that have one.
@@ -164,13 +289,39 @@ impl GizmoScreen {
                 away: z >= cz,
             };
         }
+        // The lid's own 4th handle: `up`'s own tip, plus two in-plane basis
+        // directions captured now so a later drag needs no more camera calls
+        // (`ScreenArm::project`'s own doc comment).
+        let normal = if let Params::Lid(lid) = params {
+            let up = normalized(lid.up);
+            let (b1, b2) = orthonormal_basis(up);
+            let tip_world = [
+                up[0].mul_add(arm_len, centre_world[0]),
+                up[1].mul_add(arm_len, centre_world[1]),
+                up[2].mul_add(arm_len, centre_world[2]),
+            ];
+            let (u, v, z) = camera.project(tip_world);
+            (z > 0.0 && u.is_finite() && v.is_finite()).then(|| NormalHandle {
+                tip: (u, v),
+                len: arm_len,
+                basis: [
+                    ScreenArm::project(camera, centre_world, (cu, cv), b1, arm_len),
+                    ScreenArm::project(camera, centre_world, (cu, cv), b2, arm_len),
+                ],
+            })
+        } else {
+            None
+        };
+
         Some(Self {
             centre: (cu, cv),
             arms,
+            normal,
         })
     }
 
-    /// The axis whose handle is within `GRAB_PX` of `px`, nearest first.
+    /// The axis whose handle is within `GRAB_PX` of `px`, nearest first — or
+    /// [`NORMAL_AXIS`] when the lid's own normal handle is the nearest.
     ///
     /// This is what makes the gizmo cost no navigation: a drag that does not
     /// START on a handle is not a gizmo drag at all, so a plain drag anywhere
@@ -188,7 +339,41 @@ impl GizmoScreen {
                 best = Some((d, arm.axis));
             }
         }
+        if let Some(normal) = &self.normal {
+            let d = (normal.tip.0 - px.0).hypot(normal.tip.1 - px.1);
+            if d <= GRAB_PX && best.is_none_or(|(bd, _)| d < bd) {
+                best = Some((d, NORMAL_AXIS));
+            }
+        }
         best.map(|(_, axis)| axis)
+    }
+
+    /// The new `up` a drag of `drag` screen pixels on the normal handle makes,
+    /// or `None` when this gizmo has no normal handle (not a lid) or the drag
+    /// cannot be decomposed (both basis arms are degenerate — practically
+    /// unreachable, since `orthonormal_basis` only fails for a ~zero `up`,
+    /// which [`Params::from_json`] already refuses).
+    ///
+    /// Reconstructs the tip's new world position from `up`'s own length plus
+    /// the drag's components along the two in-plane basis directions captured
+    /// at projection time, then re-normalises — no live camera needed, the
+    /// same contract every other drag method here keeps.
+    #[must_use]
+    pub fn tilted_up(&self, up: [f64; 3], drag: (f64, f64)) -> Option<[f64; 3]> {
+        let normal = self.normal.as_ref()?;
+        let up = normalized(up);
+        let (b1, b2) = orthonormal_basis(up);
+        let d1 = normal.basis[0].along_world(drag);
+        let d2 = normal.basis[1].along_world(drag);
+        let new_dir = [
+            b1[0].mul_add(d1, b2[0].mul_add(d2, up[0] * normal.len)),
+            b1[1].mul_add(d1, b2[1].mul_add(d2, up[1] * normal.len)),
+            b1[2].mul_add(d1, b2[2].mul_add(d2, up[2] * normal.len)),
+        ];
+        if dot3(new_dir, new_dir) < 1e-18 {
+            return None;
+        }
+        Some(normalized(new_dir))
     }
 
     /// How far along `axis`, in world units, a screen drag of `drag` moves the region.
@@ -339,6 +524,28 @@ pub fn rotated(params: &Params, axis: usize, angle: f64) -> Option<Params> {
         half_extents: *half_extents,
         quat: quat_mul(quat_from_axis_angle(world_axis, angle), *quat),
     })
+}
+
+/// `params` with its `up` replaced by `new_up`, `lid` only.
+///
+/// The normal handle's own drag result — [`GizmoScreen::tilted_up`] computes
+/// `new_up` from a screen drag; this is the last step, mirroring how
+/// [`translated`]/[`resized`]/[`rotated`] each turn a drag's number into a new
+/// [`Params`]. `new_up` is expected already-normalised (as `tilted_up`
+/// returns it) but this re-validates rather than trusting the caller, the same
+/// way `Params::from_json` refuses a ~zero `up`.
+#[must_use]
+pub fn tilted(params: &Params, new_up: [f64; 3]) -> Option<Params> {
+    let Params::Lid(lid) = params else {
+        return None;
+    };
+    if dot3(new_up, new_up) < 1e-18 {
+        return None;
+    }
+    Some(Params::Lid(LidParams {
+        up: new_up,
+        ..*lid
+    }))
 }
 
 /// A unit quaternion `(w, x, y, z)` for a rotation of `angle` about `axis`.
@@ -513,6 +720,78 @@ mod tests {
         assert!((clockwise + back).abs() < 1e-9, "twisting back undoes it");
         // A twist that starts on the centre has no angle.
         assert_eq!(g.rotate_angle(2, (100.0, 100.0), (120.0, 100.0)), 0.0);
+    }
+
+    fn lid(center: [f64; 3], up: [f64; 3], radius: f64) -> Params {
+        Params::Lid(LidParams {
+            up,
+            height: 0.0,
+            center,
+            radius,
+            falloff: 0.0,
+            band: 0.0,
+        })
+    }
+
+    #[test]
+    fn a_lid_gets_a_fourth_handle_for_its_normal() {
+        let params = lid([0.0, 0.0, 10.0], [0.0, 1.0, 0.0], 1.0);
+        let g = GizmoScreen::project(&camera(), &params).expect("visible");
+        let normal = g.normal.expect("a lid has a normal handle");
+        // `up` here IS world +Y, so the handle sits exactly where the +Y arm
+        // does — the same "handles sit where the axes really point" check the
+        // three world arms get, extended to the fourth.
+        assert!((normal.tip.0 - g.arms[1].tip.0).abs() < 1e-9, "{normal:?} vs {:?}", g.arms[1]);
+        assert!((normal.tip.1 - g.arms[1].tip.1).abs() < 1e-9);
+
+        // No other kind has one.
+        let sphere_g = GizmoScreen::project(&camera(), &sphere([0.0, 0.0, 10.0], 1.0)).unwrap();
+        assert!(sphere_g.normal.is_none());
+    }
+
+    #[test]
+    fn picking_the_normal_handle_returns_normal_axis() {
+        // `up` NOT aligned with a world axis, so the handle is unambiguously
+        // its own point on screen (no tie with an arm to break).
+        let params = lid([0.0, 0.0, 10.0], [0.6, 0.8, 0.0], 1.0);
+        let g = GizmoScreen::project(&camera(), &params).expect("visible");
+        let tip = g.normal.expect("normal handle").tip;
+        assert_eq!(g.pick(tip), Some(NORMAL_AXIS));
+        // Far from every handle still grabs nothing.
+        assert!(g.pick((400.0, 400.0)).is_none());
+    }
+
+    #[test]
+    fn dragging_the_normal_handle_tilts_up_and_stays_unit_length() {
+        let params = lid([0.0, 0.0, 10.0], [0.0, 1.0, 0.0], 1.0);
+        let g = GizmoScreen::project(&camera(), &params).expect("visible");
+
+        // No drag at all: `up` comes back exactly as it went in (normalised).
+        let same = g.tilted_up([0.0, 1.0, 0.0], (0.0, 0.0)).expect("a lid tilts");
+        assert!(same[0].abs() < 1e-9 && (same[1] - 1.0).abs() < 1e-9 && same[2].abs() < 1e-9);
+
+        // Dragging the tip sideways tilts `up` away from +Y, staying unit length.
+        let tilted = g.tilted_up([0.0, 1.0, 0.0], (20.0, 0.0)).expect("a lid tilts");
+        assert!((dot3(tilted, tilted) - 1.0).abs() < 1e-9, "not unit length: {tilted:?}");
+        assert!((tilted[1] - 1.0).abs() > 1e-6, "the drag did not move it: {tilted:?}");
+
+        // `tilted()` applies the result to the region, every other field kept.
+        let moved = super::tilted(&params, tilted).expect("still a lid");
+        let Params::Lid(after) = moved else {
+            panic!("still a lid")
+        };
+        assert_eq!(after.up, tilted);
+        assert_eq!(after.height, 0.0);
+        assert_eq!(after.center, [0.0, 0.0, 10.0]);
+        assert_eq!(after.radius, 1.0);
+
+        // Nothing but a lid tilts.
+        assert!(super::tilted(&sphere([0.0, 0.0, 10.0], 1.0), [0.0, 1.0, 0.0]).is_none());
+        // A gizmo with no normal handle (not a lid) refuses to tilt anything.
+        assert!(GizmoScreen::project(&camera(), &sphere([0.0, 0.0, 10.0], 1.0))
+            .unwrap()
+            .tilted_up([0.0, 1.0, 0.0], (20.0, 0.0))
+            .is_none());
     }
 
     #[test]

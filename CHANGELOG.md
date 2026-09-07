@@ -2,6 +2,31 @@
 All notable changes to trippy. Format: Keep a Changelog. Versions: semver tags `vX.Y.Z`. Every push also gets a `build-NNNN` tag.
 
 ## [Unreleased]
+### Added
+- **Lid plane-normal gizmo handle** (`docs/EDITOR.md` Sec 1, Sec 6): a 4th
+  handle on a `lid` region, projected along its own `up` instead of a world
+  axis, drags the plane's tilt (rotating about the two in-plane axes) as one
+  undo entry; the Inspector's typed `up` still works, unchanged, alongside it.
+- **Brush npz sidecar writer, viewer side** (`docs/EDITOR.md` Sec 1 "brush"):
+  `EditDocument::save` now externalises a brush region above
+  `EDIT_BRUSH_NPZ_CELL_THRESHOLD` cells into an `edits_brush_<id>.npz`
+  sidecar, matching the Python CLI's writer array-for-array (a from-scratch
+  `.npz` writer, `edit::npz_write`, no new dependency), closing the one
+  deviation the previous release's brush entry noted.
+- New headless viewer flags: `--bench-brush-anchor <n>` (brute force vs the
+  new screen-space grid, ms/sample) and `--brush-npz-selftest <dir>` (writes
+  a synthetic over-threshold brush region's sidecar with no bundle needed,
+  for the Python/Rust cross-language parity test) and `--save-edits <p>`
+  (write the document after any headless mutation).
+
+### Fixed
+- **The brush's per-sample depth anchor was an unmeasured `O(points)` scan.**
+  Measured at 47.4 ms/sample on the real Karekare-scale bundle (7.5M points)
+  -- too slow for a stroke sampling several times a second. `edit::brush::
+  ScreenGrid`, a screen-space bucket index built once per camera pose, drops
+  this to 0.011 ms/sample after a 325.5 ms one-time build, with the same
+  exact result as the brute-force scan (checked against it directly, not
+  approximated).
 
 ## [v0.6.0] - 2026-09-08
 ### Added

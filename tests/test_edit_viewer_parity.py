@@ -49,6 +49,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from trippy.constants import EDIT_BRUSH_NPZ_CELL_THRESHOLD
 from trippy.edit.cluster import CameraView, click_to_cluster
 from trippy.edit.model import EditDocument, Region, erase, paint_along, paint_sphere
 from trippy.edit.shade_finder import find_shade_pointset
@@ -495,3 +496,39 @@ def test_moving_a_region_and_soloing_one_change_the_frame(
     a = pixels(base)
     assert (np.abs(pixels(moved) - a).max(axis=2) > 0).mean() > 0.01, "the gizmo moved nothing"
     assert (np.abs(pixels(solo) - a).max(axis=2) > 0).mean() > 0.01, "solo isolated nothing"
+
+
+def test_brush_npz_sidecar_the_viewer_writes_loads_with_plain_numpy(
+    viewer: Path, tmp_path: Path
+) -> None:
+    """The Rust brush-sidecar writer's own file, read with nothing but `numpy.load`.
+
+    `--brush-npz-selftest` needs no bundle: it writes the SAME synthetic
+    over-threshold stroke `tests/test_edit_model.py`'s
+    `test_brush_npz_sidecar_written_above_threshold` pins on the Python side
+    (`EDIT_BRUSH_NPZ_CELL_THRESHOLD + 10` cells at `[[i, 0, 0], ...]`,
+    `cell_size = 1.0`) and exits. This is the cross-language half of
+    docs/EDITOR.md Sec 1's "brush" sidecar round trip: `edit::model`'s own
+    Rust unit test already proves `brush_pyramid::npz` (the Rust reader) can
+    read the file back; this proves plain `numpy.load` -- what an external
+    reader, or a human with a Python shell, would actually use -- can too.
+    """
+    out_dir = tmp_path / "selftest"
+    out_dir.mkdir()
+    _run(viewer, ["--brush-npz-selftest", str(out_dir)])
+
+    doc = json.loads((out_dir / "edits.json").read_text())
+    params = doc["regions"][0]["params"]
+    n = EDIT_BRUSH_NPZ_CELL_THRESHOLD + 10
+    assert "cells" not in params, "cells must be externalised, not left inline"
+    assert "weights" not in params
+    assert params["cells_npz"] == "edits_brush_r-selftest.npz"
+    assert params["n_cells"] == n
+
+    with np.load(out_dir / params["cells_npz"]) as sidecar:
+        assert sidecar["cells"].dtype == np.int32
+        assert sidecar["cells"].shape == (n, 3)
+        expected = np.zeros((n, 3), dtype=np.int32)
+        expected[:, 0] = np.arange(n)
+        np.testing.assert_array_equal(sidecar["cells"], expected)
+        assert "weights" not in sidecar.files, "an all-1.0 brush writes no weights array"

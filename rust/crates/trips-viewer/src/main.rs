@@ -82,6 +82,17 @@ Editing (docs/EDITOR.md; press M in the window for the panels):
   --edit               open with the Regions/Inspector/Tools panels already up
                        (the same thing M toggles)
   --edits <p>          read this edits.json instead of <BUNDLE_DIR>/edits.json
+  --save-edits <p>     write the document to <p> after every headless
+                       mutation (--brush, --click, --sam-*, --solo,
+                       --move-region), sidecar externalisation included --
+                       the headless twin of Ctrl+S, for scripting a save
+                       without a window
+  --brush-npz-selftest <dir>
+                       write a synthetic brush region above the npz sidecar
+                       threshold to <dir>/edits.json (+ its .npz sidecar)
+                       and exit -- no BUNDLE_DIR needed at all; the
+                       Python/Rust sidecar parity test's Rust half
+                       (docs/EDITOR.md Sec 1, \"brush\")
   --dump-weights <o>   compose the per-point weights from edits.json, write them
                        to <o> as JSON and exit. No GPU, no window: this is the
                        half of the Python/Rust parity check that runs against a
@@ -161,6 +172,14 @@ Headless (no window; used by the acceptance check and the perf table):
                        1080p, whatever its capture resolution)
   --splat-bench <n>    time <n> LIVE SPLAT renders on their own -- no pyramid,
                        no U-Net -- and print the median ms, then exit
+  --bench-brush-anchor <n>
+                       time <n> brush depth-anchor queries against this
+                       bundle's own points and its home (or --view) camera,
+                       BOTH the brute-force O(points) scan and the
+                       screen-space grid it is checked against, and print
+                       ms/sample for each -- no GPU device is touched, so
+                       this is safe to run beside a training that holds the
+                       GPU (docs/EDITOR.md Sec 4, AGENTS.md Sec 6)
 
 Keys:
   left-drag  orbit (or look, in free mode)   right/middle-drag  pan
@@ -233,10 +252,19 @@ struct Args {
     render_size: Option<(usize, usize)>,
     /// `--splat-bench <n>`: time the splat render alone.
     splat_bench: Option<usize>,
+    /// `--bench-brush-anchor <n>`: time the brush depth anchor, brute force vs
+    /// the screen-space grid, over this bundle's own points.
+    bench_brush_anchor: Option<usize>,
     /// `--edit`: open with the editor's panels shown.
     edit: bool,
     /// `--edits <p>`: an `edits.json` somewhere other than next to `bundle.json`.
     edits: Option<PathBuf>,
+    /// `--save-edits <p>`: write the document after every headless mutation.
+    save_edits: Option<PathBuf>,
+    /// `--brush-npz-selftest <dir>`: write a synthetic over-threshold brush
+    /// region's `edits.json` (+ its `.npz` sidecar) to `<dir>` and exit. No
+    /// bundle is read — this is a pure data-model check, not a scene one.
+    brush_npz_selftest: Option<PathBuf>,
     /// `--dump-weights <o>`: write the composed per-point weights and exit.
     dump_weights: Option<PathBuf>,
     /// `--dump-shade <o>`: write the shade finder's selection and exit.
@@ -394,6 +422,7 @@ fn parse_args() -> Result<Args, String> {
         screenshot: None,
         warmup: 2,
         bench: None,
+        bench_brush_anchor: None,
         camera_yaw_deg: None,
         free: false,
         blend: Blend::default(),
@@ -402,6 +431,8 @@ fn parse_args() -> Result<Args, String> {
         splat_bench: None,
         edit: false,
         edits: None,
+        save_edits: None,
+        brush_npz_selftest: None,
         dump_weights: None,
         dump_shade: None,
         shade_lum: None,
@@ -503,6 +534,10 @@ fn parse_args() -> Result<Args, String> {
             }
             "--edit" => args.edit = true,
             "--edits" => args.edits = Some(PathBuf::from(value()?)),
+            "--save-edits" => args.save_edits = Some(PathBuf::from(value()?)),
+            "--brush-npz-selftest" => {
+                args.brush_npz_selftest = Some(PathBuf::from(value()?));
+            }
             "--dump-weights" => args.dump_weights = Some(PathBuf::from(value()?)),
             "--dump-shade" => args.dump_shade = Some(PathBuf::from(value()?)),
             "--shade-lum" => {
@@ -609,6 +644,13 @@ fn parse_args() -> Result<Args, String> {
             "--free" => args.free = true,
             "--frames" => args.warmup = value()?.parse().map_err(|e| format!("--frames: {e}"))?,
             "--bench" => args.bench = Some(value()?.parse().map_err(|e| format!("--bench: {e}"))?),
+            "--bench-brush-anchor" => {
+                args.bench_brush_anchor = Some(
+                    value()?
+                        .parse()
+                        .map_err(|e| format!("--bench-brush-anchor: {e}"))?,
+                );
+            }
             "-h" | "--help" => return Err(USAGE.to_owned()),
             other if other.starts_with('-') => {
                 return Err(format!("unknown flag {other:?}\n\n{USAGE}"))
@@ -832,6 +874,54 @@ fn click_params_for(bundle: &Bundle, args: &Args) -> trips_viewer::edit::ClickPa
 /// - `out`: destination JSON.
 ///
 /// # Errors
+/// `--brush-npz-selftest <dir>`: write a synthetic over-threshold brush
+/// region's `edits.json` (+ its `.npz` sidecar) to `<dir>` and exit.
+///
+/// The Rust half of the sidecar's cross-language parity check
+/// (`docs/EDITOR.md` §1 "brush"): `tests/test_edit_model.py`'s
+/// `test_brush_npz_sidecar_written_above_threshold` pins the SAME recipe
+/// (`EDIT_BRUSH_NPZ_CELL_THRESHOLD + 10` cells at `[[i, 0, 0], ...]`,
+/// `cell_size = 1.0`) on the Python writer; a Python test reads the file THIS
+/// produces with plain `numpy.load` (not `brush_pyramid::npz`, which is the
+/// Rust reader already exercised by `edit::model`'s own unit test) to prove
+/// numpy itself, not just this crate's own reader, accepts what this crate
+/// writes. No bundle, camera or GPU device is involved.
+///
+/// # Errors
+/// Returns `Err` when `EditDocument::save` fails (the directory cannot be
+/// created, or the sidecar cannot be written).
+fn brush_npz_selftest(dir: &std::path::Path) -> Result<(), String> {
+    use trips_viewer::edit::{BrushCells, EditDocument, Op, Params, Region, EDIT_BRUSH_NPZ_CELL_THRESHOLD};
+
+    let n = EDIT_BRUSH_NPZ_CELL_THRESHOLD + 10;
+    #[allow(clippy::cast_possible_wrap)]
+    let cells: Vec<[i64; 3]> = (0..n).map(|i| [i as i64, 0, 0]).collect();
+    let mut brush_cells = BrushCells::new();
+    brush_cells.paint_cells(&cells, 1.0);
+    let region = Region::new(
+        "r-selftest".to_owned(),
+        "brush-1".to_owned(),
+        Params::Brush {
+            origin: [0.0, 0.0, 0.0],
+            cell_size: 1.0,
+            cells: brush_cells,
+        },
+        1.0,
+        Op::Delete,
+    );
+    let mut doc = EditDocument::new(String::new());
+    doc.add_region(&region, None)?;
+
+    let path = dir.join(trips_viewer::edit::EDITS_FILENAME);
+    doc.save(&path)?;
+    eprintln!(
+        "brush-npz-selftest: wrote {} and its sidecar ({n} cells, region {})",
+        path.display(),
+        region.id
+    );
+    Ok(())
+}
+
 /// Returns `Err` when `--click` was not given, when `--view` names no view, or
 /// when `out` cannot be written.
 fn dump_click(bundle: &Bundle, args: &Args, out: &std::path::Path) -> Result<(), String> {
@@ -899,6 +989,90 @@ fn dump_click(bundle: &Bundle, args: &Args, out: &std::path::Path) -> Result<(),
         view.name,
         found.n_candidates,
         found.n_seed,
+    );
+    Ok(())
+}
+
+/// `--bench-brush-anchor N`: time the brush's per-sample depth anchor, brute
+/// force vs the screen-space grid, over this bundle's own points.
+///
+/// `docs/EDITOR.md` Sec 4 flagged `brush::depth_anchor` as an unmeasured
+/// `O(points)` scan at Karekare scale; this is the number, taken on the real
+/// bundle instead of the synthetic one the parity tests use
+/// (`research/trips-metal.md`, `trippy-brush-anchor-perf-1`). No GPU device is
+/// created — this is a plain CPU loop over `points.npz` and one view's own
+/// camera — so it is safe to run beside a training that holds the GPU
+/// (`AGENTS.md` Sec 6).
+///
+/// # Errors
+/// Returns `Err` when `--view` names no view, or when the accelerated path
+/// disagrees with the brute-force one (which the synthetic parity test in
+/// `edit::brush` should have caught first).
+fn bench_brush_anchor(bundle: &Bundle, args: &Args, count: usize) -> Result<(), String> {
+    use trips_viewer::edit::brush::{self, ScreenGrid};
+    use trips_viewer::edit::cluster::ClickCamera;
+
+    let position = pick_view_position(bundle, args.view)?;
+    let view = &bundle.manifest.views[position];
+    let camera = ClickCamera::from_render_camera(&view.camera());
+    let xyz = trips_viewer::edit::weights::widen(&bundle.points.xyz);
+    let n_points = xyz.len() / 3;
+    let count = count.max(1);
+
+    // A deterministic spread of query pixels across this view's own frame
+    // (golden-ratio stepping, not a raster scan, so they cover the frame
+    // rather than one row) -- fixed so a before/after run is comparable
+    // number for number.
+    let (w, h) = (view.width.max(1) as f64, view.height.max(1) as f64);
+    let pixels: Vec<(f64, f64)> = (0..count)
+        .map(|i| {
+            let t = i as f64;
+            ((t * 0.618_033_988_75 * w).rem_euclid(w), (t * 0.832_287_566_42 * h).rem_euclid(h))
+        })
+        .collect();
+
+    let brute_start = std::time::Instant::now();
+    let mut brute_hits = 0_usize;
+    for &px in &pixels {
+        if brush::depth_anchor(&camera, &xyz, px, brush::ANCHOR_RADIUS_PX).is_some() {
+            brute_hits += 1;
+        }
+    }
+    let brute_ms = brute_start.elapsed().as_secs_f64() * 1e3;
+
+    let build_start = std::time::Instant::now();
+    let grid = ScreenGrid::build(&camera, &xyz, brush::ANCHOR_RADIUS_PX);
+    let build_ms = build_start.elapsed().as_secs_f64() * 1e3;
+
+    let grid_start = std::time::Instant::now();
+    let mut grid_hits = 0_usize;
+    for &px in &pixels {
+        if grid.nearest(px, brush::ANCHOR_RADIUS_PX).is_some() {
+            grid_hits += 1;
+        }
+    }
+    let grid_ms = grid_start.elapsed().as_secs_f64() * 1e3;
+
+    if brute_hits != grid_hits {
+        return Err(format!(
+            "bench-brush-anchor: brute force found a point under the cursor {brute_hits}/{count} \
+             times, the grid {grid_hits}/{count} -- the accelerated path has DRIFTED from the \
+             exact one, which edit::brush's own synthetic parity test should have caught"
+        ));
+    }
+
+    println!(
+        "BENCH-BRUSH-ANCHOR {n_points} points, {count} samples, view {:?} ({w}x{h}):\n  \
+         brute force : {:.4} ms/sample ({:.1} ms total)\n  \
+         grid build  : {:.2} ms (once per camera pose)\n  \
+         grid query  : {:.4} ms/sample ({:.1} ms total)\n  \
+         hits        : {grid_hits}/{count} samples landed on a point",
+        view.name,
+        brute_ms / count as f64,
+        brute_ms,
+        build_ms,
+        grid_ms / count as f64,
+        grid_ms,
     );
     Ok(())
 }
@@ -1331,6 +1505,20 @@ fn run_headless(args: &Args, bundle: Bundle) -> Result<(), String> {
         );
     }
 
+    // `--save-edits <p>`: write whatever headless mutation ran above (brush,
+    // click, sam, solo, move-region) to disk, exactly as an interactive `Ctrl+S`
+    // would (`EditDocument::save`, sidecar externalisation included) -- the
+    // headless twin of a save, so a brush region large enough to externalise
+    // can be produced and inspected without opening a window.
+    if let Some(out) = &args.save_edits {
+        edits.save_as(out)?;
+        eprintln!(
+            "saved edits to {} ({} regions)",
+            out.display(),
+            edits.doc.regions().len()
+        );
+    }
+
     if let Some(out) = &args.screenshot {
         let (data, channels, height, width) =
             block_on(renderer.render_to_host(&camera, frame_index, &args.settings, args.blend))?;
@@ -1373,11 +1561,19 @@ fn pick_view_position(bundle: &Bundle, index: Option<usize>) -> Result<usize, St
 
 fn run() -> Result<(), String> {
     let args = parse_args()?;
+
+    // `--brush-npz-selftest` needs no bundle at all -- dispatched before
+    // `resolve_bundle` so a run needs nothing but the flag itself.
+    if let Some(dir) = &args.brush_npz_selftest {
+        return brush_npz_selftest(dir);
+    }
+
     // `--profile` prints per-stage numbers and must not open a window: a
     // headless queue job has no display, and an earlier version hung there.
     let headless = args.screenshot.is_some()
         || args.bench.is_some()
         || args.splat_bench.is_some()
+        || args.bench_brush_anchor.is_some()
         || args.dump_weights.is_some()
         || args.dump_shade.is_some()
         || args.dump_click.is_some()
@@ -1410,6 +1606,10 @@ fn run() -> Result<(), String> {
 
     if let Some(out) = &args.dump_click {
         return dump_click(&bundle, &args, out);
+    }
+
+    if let Some(count) = args.bench_brush_anchor {
+        return bench_brush_anchor(&bundle, &args, count);
     }
 
     if headless {

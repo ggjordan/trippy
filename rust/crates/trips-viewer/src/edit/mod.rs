@@ -30,6 +30,11 @@ pub mod cluster;
 /// See `docs/EDITOR.md` §6's E1/E3 rows.
 pub mod gizmo;
 pub mod model;
+/// A minimal numpy `.npz` writer: the brush sidecar `EditDocument::save`
+/// externalises a large brush region's cells/weights into. Not `pub` beyond
+/// the crate — `model::EditDocument::save` is the only caller, matching how
+/// `trippy.edit.model._externalize_brush` is private to its own module too.
+mod npz_write;
 /// The SAM tool's geometry: render pixels -> the capture view's pixel grid.
 /// See `docs/EDITOR.md` §3 "4. SAM 3 lift (E5)".
 pub mod sam;
@@ -37,12 +42,12 @@ pub mod shade;
 pub mod weights;
 
 pub use apply::{edited_points, gaussian_opacity_scale, EditedPoints, COVERAGE_EPS};
-pub use brush::{depth_anchor, BrushCells};
+pub use brush::{depth_anchor, BrushCells, ScreenGrid};
 pub use cluster::{click_to_cluster, ClickCamera, ClickParams, ClickSelection, PointGrid};
 pub use gizmo::{Drag, GizmoScreen};
 pub use model::{
     auto_name_for, auto_region_name, EditDocument, Kind, LidParams, Op, Params, Region,
-    EDITS_FILENAME,
+    EDITS_FILENAME, EDIT_BRUSH_NPZ_CELL_THRESHOLD,
 };
 pub use sam::{is_box_drag, nearest_view, render_pixel, view_box_from_render, view_pixel_from_render};
 pub use weights::{compose_gaussian_weights, compose_trips_weights, ComposedWeights};

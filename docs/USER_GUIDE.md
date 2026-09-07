@@ -313,9 +313,12 @@ never un-delete something.
 3. Drag the **mix** slider, or click **delete** for the hard version.
 4. **Drag one of the three coloured handles** (red = world X, green = Y, blue = Z)
    to move it along that axis; **Shift-drag** a handle to resize; **Ctrl-drag**
-   one to rotate a box. A drag anywhere *else* still orbits, so navigation is
-   never taken away. The arrow keys, `PageUp`/`PageDown` and `[` / `]` still
-   nudge and resize by exact steps, and the Inspector still takes typed numbers.
+   one to rotate a box. A **lid** gets a **fourth, yellow handle** on its own
+   plane normal — drag it to tilt the plane, instead of typing `up` by hand.
+   A drag anywhere *else* still orbits, so navigation is never taken away.
+   The arrow keys, `PageUp`/`PageDown` and `[` / `]` still nudge and resize by
+   exact steps, and the Inspector still takes typed numbers (for a lid, `up`
+   can be either dragged or typed — both write the same field).
 5. **Cmd-S** writes `edits.json`. Closing and reopening the bundle restores the
    regions, the mixes AND the undo history.
 
@@ -332,7 +335,7 @@ A/B-checked, so the pool lid is one click plus one save.
 | **Shift-click** on the render | select the object under the pointer (click-to-cluster) |
 | **drag** on the render | draw a box for the SAM 3 lift, or paint — *only* while that tool has focus. Shift-drag still orbits |
 | **Alt-click / Alt-drag** | point prompt for the SAM 3 lift; erase, with the brush |
-| **drag a handle** | move the selected region along that axis (Shift: resize, Ctrl: rotate a box) |
+| **drag a handle** | move the selected region along that axis (Shift: resize, Ctrl: rotate a box); on a lid, the 4th yellow handle tilts its plane normal |
 | arrows, `PageUp`/`PageDown` | nudge the selected region along world X/Z and Y |
 | `[` / `]` | shrink / grow the selected region — or the brush radius, while the brush has focus |
 | `Delete` / `Backspace` | remove the selected region |

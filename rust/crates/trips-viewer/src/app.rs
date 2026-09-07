@@ -81,6 +81,10 @@ const GIZMO_AXIS_COLOURS: [egui::Color32; 3] = [
 /// hit despite that.
 const GIZMO_HANDLE_RADIUS: f32 = 4.0;
 
+/// The lid's own plane-normal handle: yellow, so it never reads as a fourth
+/// world axis next to `GIZMO_AXIS_COLOURS`' red/green/blue.
+const GIZMO_NORMAL_COLOUR: egui::Color32 = egui::Color32::from_rgb(235, 205, 60);
+
 /// The viewer.
 pub struct ViewerApp {
     renderer: Renderer,
@@ -992,6 +996,16 @@ impl eframe::App for ViewerApp {
                         egui::Stroke::new(OVERLAY_STROKE_WIDTH, colour),
                     );
                     painter.circle_filled(tip, GIZMO_HANDLE_RADIUS, colour);
+                }
+                // The lid's own 4th handle: its own colour, so it never reads
+                // as a fourth world axis.
+                if let Some(normal) = &gizmo.normal {
+                    let tip = self.egui_pos(rect, ppp, normal.tip);
+                    painter.line_segment(
+                        [centre, tip],
+                        egui::Stroke::new(OVERLAY_STROKE_WIDTH, GIZMO_NORMAL_COLOUR),
+                    );
+                    painter.circle_filled(tip, GIZMO_HANDLE_RADIUS, GIZMO_NORMAL_COLOUR);
                 }
             }
             if let Some((px, radius_px)) = self.edit.brush_cursor() {
