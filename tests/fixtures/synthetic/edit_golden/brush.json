@@ -1,5 +1,66 @@
 {
   "format": "trippy-edit-brush-1",
+  "initial": {
+    "id": "r-brush01",
+    "name": "brush test",
+    "kind": "brush",
+    "enabled": true,
+    "mix": 1.0,
+    "op": "delete",
+    "params": {
+      "origin": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "cell_size": 0.5,
+      "cells": []
+    },
+    "source": null
+  },
+  "strokes": [
+    {
+      "op": "paint_sphere",
+      "radius": 0.9,
+      "center": [
+        1.0,
+        0.0,
+        4.0
+      ],
+      "weight": 1.0
+    },
+    {
+      "op": "paint_along",
+      "radius": 0.4,
+      "points": [
+        [
+          1.0,
+          0.0,
+          4.0
+        ],
+        [
+          1.6,
+          0.0,
+          4.0
+        ],
+        [
+          2.2,
+          0.0,
+          4.0
+        ]
+      ],
+      "weight": 0.6
+    },
+    {
+      "op": "erase",
+      "radius": 0.15,
+      "center": [
+        2.1,
+        0.0,
+        4.0
+      ]
+    }
+  ],
   "region": {
     "id": "r-brush01",
     "name": "brush test",

@@ -32,14 +32,24 @@ use eframe::egui;
 use serde_json::json;
 
 use trips_viewer::edit::apply::{edited_points, gaussian_opacity_scale, tinted_points};
+use trips_viewer::edit::brush::{self, BrushCells};
 use trips_viewer::edit::cluster::{
     self, ClickCamera, ClickParams, ClickSelection, PointGrid, DEFAULT_MAX_POINTS,
 };
-use trips_viewer::edit::model::{new_region_id, LidParams, Op, Params, Region, KAREKARE_LID};
+use trips_viewer::edit::gizmo::{self, Drag, GizmoScreen};
+use trips_viewer::edit::model::{
+    auto_name_for, new_region_id, Op, Params, Region, KAREKARE_LID,
+};
 use trips_viewer::edit::sam::{self as sam_geom, nearest_view};
 use trips_viewer::edit::shade::{self, ShadeSelection, ShadeViews, Thresholds};
-use trips_viewer::edit::weights::{compose_gaussian_weights, compose_trips_weights, widen};
-use trips_viewer::edit::{EditDocument, DEFAULT_REGION_SCENE_FRACTION, EDITS_FILENAME, NUDGE_SCENE_FRACTION, RESIZE_STEP};
+use trips_viewer::edit::weights::{
+    compose_gaussian_weights_solo, compose_trips_weights_solo, widen, RegionCount,
+};
+use trips_viewer::edit::{
+    EditDocument, BRUSH_CELLS_PER_RADIUS, BRUSH_RADIUS_STEP, BRUSH_SAMPLE_PX,
+    DEFAULT_BRUSH_SCENE_FRACTION, DEFAULT_REGION_SCENE_FRACTION, EDITS_FILENAME,
+    NUDGE_SCENE_FRACTION, RESIZE_STEP,
+};
 use trips_viewer::renderer::Renderer;
 
 use crate::sam_child::{
@@ -54,7 +64,10 @@ use crate::sam_child::{
 pub const KEYS_HELP: &str = "\
 M edit mode | T cycle tool | H preview highlight | SHIFT-CLICK the render to select\n\
 SAM tool: DRAG a box on the render (SHIFT-drag still orbits) or ALT-CLICK a point\n\
-arrows + PageUp/PageDown nudge the selected region | [ / ] shrink / grow\n\
+Brush tool: DRAG to paint, ALT-drag to erase (SHIFT-drag still orbits), [ / ] radius\n\
+gizmo: DRAG a handle to move it, SHIFT-drag to resize, CTRL-drag to rotate a box\n\
+arrows + PageUp/PageDown nudge the selected region | [ / ] shrink / grow (brush radius\n\
+while the Brush tool has focus)\n\
 Delete removes the selected region | Cmd-Z undo | Cmd-Shift-Z redo | Cmd-S save";
 
 /// Which tool the Tools panel has focus on.
@@ -70,6 +83,9 @@ pub enum Tool {
     /// Drag a box (or Alt-click) on the render; the local SAM 3 segments that
     /// photograph and the mask is lifted onto the points (E5).
     Sam,
+    /// Drag on the render to paint a sparse-voxel `brush` region in 3D;
+    /// Alt-drag erases (`docs/EDITOR.md` §1 "brush", §4).
+    Brush,
 }
 
 impl Tool {
@@ -79,7 +95,8 @@ impl Tool {
             Self::Regions => Self::ShadeFinder,
             Self::ShadeFinder => Self::ClickCluster,
             Self::ClickCluster => Self::Sam,
-            Self::Sam => Self::Regions,
+            Self::Sam => Self::Brush,
+            Self::Brush => Self::Regions,
         }
     }
 
@@ -89,6 +106,7 @@ impl Tool {
             Self::ShadeFinder => "shade-cloud finder",
             Self::ClickCluster => "click-to-cluster",
             Self::Sam => "SAM 3 lift",
+            Self::Brush => "brush",
         }
     }
 }
@@ -311,6 +329,130 @@ impl Default for SamUi {
     }
 }
 
+/// The brush tool's own state: the settings, the live stroke, and the cloud it
+/// anchors against.
+///
+/// `docs/EDITOR.md` §1 "brush" / §4. The tool paints a `brush`-kind region:
+/// each sample of a drag becomes a world-space sphere at the depth of the
+/// nearest point under the cursor, and the union of those spheres' voxels is
+/// the region.
+pub struct BrushUi {
+    /// Sphere radius, world units. `[` / `]` change it while this tool has focus.
+    radius: f64,
+    /// The weight painted cells get, `[0, 1]`.
+    weight: f64,
+    /// The op a NEW brush region is created with.
+    op: Op,
+    /// The mix it is created with (ignored by `delete`).
+    mix: f64,
+    /// The region strokes go into. A fresh stroke starts a new region when this
+    /// is `None` or names a region that is gone.
+    region: Option<String>,
+    /// The stroke in progress, if the button is down.
+    stroke: Option<Stroke>,
+    /// Render pixels waiting for the frame's camera, oldest first.
+    pending: Vec<(f64, f64)>,
+    /// A widened `(N, 3)` copy of the cloud, for the depth anchor. Built on the
+    /// first stroke and dropped when the tool loses focus, exactly as
+    /// [`ClickCache`] is and for the same reason.
+    cache: Option<Vec<f64>>,
+    /// The last depth the anchor found, world units. Kept so a sample that
+    /// lands on empty space continues the stroke at the depth it started
+    /// rather than inventing one.
+    depth: Option<f64>,
+    /// Where the cursor was last painted, render pixels, and the radius the
+    /// stroke is painting at there, for the on-screen circle.
+    cursor: Option<((f64, f64), f64)>,
+    /// A one-line "what just happened".
+    note: String,
+}
+
+/// One brush gesture, from button-down to button-up.
+struct Stroke {
+    /// The region being painted.
+    region_id: String,
+    /// The name a region this stroke CREATES gets. Chosen once, when the
+    /// stroke starts: recomputing it per frame would see the region the
+    /// stroke's own previous frame added and count it, so a single stroke
+    /// would walk up "brush-1", "brush-2", "brush-3" as it was painted.
+    name: String,
+    /// The grid the region was created on (never changes once it exists).
+    origin: [f64; 3],
+    /// Voxel edge, world units.
+    cell_size: f64,
+    /// The cells as they stand mid-stroke.
+    cells: BrushCells,
+    /// Whether this stroke erases instead of painting (Alt).
+    erasing: bool,
+    /// Whether the region was CREATED by this stroke, so the log entry to
+    /// coalesce into is an `add_region` rather than an `update_region`.
+    creating: bool,
+    /// Whether this stroke has already written to the document — the flag that
+    /// turns the second and later samples into coalesced amendments of the
+    /// first, so one stroke is one undo step.
+    emitted: bool,
+    /// The last sample's pixel, so samples are spaced by `BRUSH_SAMPLE_PX`.
+    last_px: Option<(f64, f64)>,
+    /// How many samples this stroke has painted, for the note.
+    samples: usize,
+}
+
+impl Default for BrushUi {
+    fn default() -> Self {
+        Self {
+            // Replaced by `init_brush_defaults` once the scene's scale is known;
+            // a zero radius paints nothing, which is the safe sentinel.
+            radius: 0.0,
+            weight: 1.0,
+            op: Op::Delete,
+            mix: 0.0,
+            region: None,
+            stroke: None,
+            pending: Vec::new(),
+            cache: None,
+            depth: None,
+            cursor: None,
+            note: String::new(),
+        }
+    }
+}
+
+/// The 3D drag gizmos' state: this frame's handles, and the drag in progress.
+///
+/// `docs/EDITOR.md` §6's E1/E3 row. The maths is in [`gizmo`]; this is the part
+/// that remembers which handle the pointer grabbed and what the region looked
+/// like before the drag started.
+#[derive(Default)]
+pub struct GizmoUi {
+    /// The selected region's handles, projected with the last frame's camera.
+    /// `None` when nothing is selected, the region has no shape, or it is
+    /// behind the camera.
+    screen: Option<GizmoScreen>,
+    /// The drag in progress.
+    drag: Option<GizmoDrag>,
+    /// Whether the handles are drawn at all (the panel's checkbox).
+    show: bool,
+}
+
+/// One gizmo gesture.
+struct GizmoDrag {
+    /// The region being dragged.
+    region_id: String,
+    /// Which world axis was grabbed.
+    axis: usize,
+    /// What the modifiers made of it.
+    kind: Drag,
+    /// The region's geometry when the drag started; every frame recomputes the
+    /// result from THIS, so a long drag cannot accumulate rounding drift.
+    base: Params,
+    /// The handles as they were when the drag started, for the same reason.
+    screen: GizmoScreen,
+    /// Where the pointer went down, render pixels.
+    start_px: (f64, f64),
+    /// Whether a document entry has been written yet (the coalescing flag).
+    emitted: bool,
+}
+
 /// Everything the editor holds for one open bundle.
 pub struct EditSession {
     /// The document, and the only place regions live.
@@ -331,6 +473,21 @@ pub struct EditSession {
     click: ClickUi,
     /// The SAM 3 lift (E5).
     sam: SamUi,
+    /// The brush tool.
+    brush: BrushUi,
+    /// The 3D drag gizmos.
+    gizmo: GizmoUi,
+    /// The Named Objects panel's "solo" region: while it is set, ONLY that
+    /// region composes, so its own effect can be seen apart from every other
+    /// (`docs/EDITOR.md` §4). Never saved — it is a way of looking, not an edit.
+    solo: Option<String>,
+    /// How many points each region claimed at the last [`Self::apply`], for the
+    /// Named Objects panel's count column.
+    counts: Vec<RegionCount>,
+    /// The row the Named Objects panel is renaming, and its buffer.
+    rename_for: Option<String>,
+    /// See [`Self::rename_for`].
+    rename_buffer: String,
     /// The directory holding `bundle.json`. NOT `self.path`'s parent: `--edits`
     /// can put the edit document anywhere, and the SAM child is given a bundle.
     bundle_dir: PathBuf,
@@ -407,6 +564,15 @@ impl EditSession {
             shade: ShadeUi::new(shade_views, bundle_dir),
             click: ClickUi::default(),
             sam: SamUi::default(),
+            brush: BrushUi::default(),
+            gizmo: GizmoUi {
+                show: true,
+                ..GizmoUi::default()
+            },
+            solo: None,
+            counts: Vec::new(),
+            rename_for: None,
+            rename_buffer: String::new(),
             bundle_dir: bundle_dir.to_path_buf(),
             trippy_root: None,
             has_scene_root: false,
@@ -871,6 +1037,476 @@ impl EditSession {
         Ok(())
     }
 
+    // --- the brush tool (paint a sparse-voxel region in 3D) ------------------
+
+    /// Give the brush a radius before anyone has touched a slider.
+    ///
+    /// A fraction of the scene's own diameter, like a new box/sphere: the point
+    /// cloud's bounds are meaningless on a TRIPS export (`renderer.rs`'s
+    /// `bounds` field). Called once at open; never overwrites a user value,
+    /// because it only fires while the radius is still the sentinel `0.0`.
+    pub fn init_brush_defaults(&mut self, scene_diameter: f32) {
+        if self.brush.radius > 0.0 {
+            return;
+        }
+        self.brush.radius = f64::from(scene_diameter * DEFAULT_BRUSH_SCENE_FRACTION).max(1e-6);
+    }
+
+    /// Whether the Brush tool has focus (so `app.rs` knows the drag is a stroke).
+    #[must_use]
+    pub fn brush_tool_active(&self) -> bool {
+        self.active && self.tool == Tool::Brush
+    }
+
+    /// Where to draw the brush cursor: `(render pixel, radius in render px)`.
+    #[must_use]
+    pub const fn brush_cursor(&self) -> Option<((f64, f64), f64)> {
+        self.brush.cursor
+    }
+
+    /// The brush radius, world units (the headless dump and the tests).
+    #[must_use]
+    pub const fn brush_radius(&self) -> f64 {
+        self.brush.radius
+    }
+
+    /// Override the brush's settings (the `--brush-*` headless flags).
+    pub fn set_brush_settings(&mut self, radius: f64, weight: f64, op: Op, mix: f64) {
+        self.brush.radius = radius;
+        self.brush.weight = weight;
+        self.brush.op = op;
+        self.brush.mix = mix;
+        self.tool = Tool::Brush;
+    }
+
+    /// Start a stroke. `erasing` is the Alt-drag.
+    ///
+    /// The region is chosen here, once: an existing brush region if the tool
+    /// has one, otherwise a new one, created on a voxel grid fixed by the
+    /// CURRENT radius. Changing the radius later paints bigger or smaller
+    /// spheres into the same grid; it never re-grids a region, because the
+    /// cells already painted were measured on the old one.
+    pub fn begin_brush_stroke(&mut self, erasing: bool) {
+        if self.brush.stroke.is_some() {
+            return;
+        }
+        let existing = self
+            .brush
+            .region
+            .as_ref()
+            .and_then(|id| self.doc.region(id))
+            .and_then(|r| match &r.params {
+                Params::Brush {
+                    origin,
+                    cell_size,
+                    cells,
+                } => Some((r.id.clone(), *origin, *cell_size, cells.clone())),
+                _ => None,
+            });
+        self.brush.stroke = Some(match existing {
+            Some((region_id, origin, cell_size, cells)) => Stroke {
+                region_id,
+                // Unused on this branch: the region already has a name.
+                name: String::new(),
+                origin,
+                cell_size,
+                cells,
+                erasing,
+                creating: false,
+                emitted: false,
+                last_px: None,
+                samples: 0,
+            },
+            None => Stroke {
+                region_id: new_region_id(),
+                name: auto_name_for(&self.doc, "brush", None),
+                // The grid is anchored at the world origin rather than at the
+                // first dab, so two regions painted in the same scene share a
+                // lattice and a hand-merged `cells` list still means something.
+                origin: [0.0, 0.0, 0.0],
+                cell_size: (self.brush.radius / BRUSH_CELLS_PER_RADIUS).max(1e-9),
+                cells: BrushCells::new(),
+                erasing,
+                creating: true,
+                emitted: false,
+                last_px: None,
+                samples: 0,
+            },
+        });
+    }
+
+    /// Record one sample of the stroke, in the render camera's own pixels.
+    ///
+    /// Dropped when it is within `BRUSH_SAMPLE_PX` of the previous one: a
+    /// pointer resting still would otherwise paint the same sphere every frame,
+    /// and each sample costs one depth-anchor pass over the cloud.
+    pub fn brush_sample(&mut self, px: (f64, f64)) {
+        let Some(stroke) = self.brush.stroke.as_mut() else {
+            return;
+        };
+        if let Some(last) = stroke.last_px {
+            if (px.0 - last.0).hypot(px.1 - last.1) < BRUSH_SAMPLE_PX {
+                return;
+            }
+        }
+        stroke.last_px = Some(px);
+        self.brush.pending.push(px);
+    }
+
+    /// Finish the stroke: the next drag starts a new undo step.
+    pub fn end_brush_stroke(&mut self) {
+        let Some(stroke) = self.brush.stroke.take() else {
+            return;
+        };
+        if stroke.emitted {
+            self.brush.region = Some(stroke.region_id);
+            self.brush.note = format!(
+                "{} stroke: {} samples, {} cells",
+                if stroke.erasing { "erase" } else { "paint" },
+                stroke.samples,
+                stroke.cells.len()
+            );
+        }
+        self.brush.cursor = None;
+    }
+
+    /// Whether a stroke is in progress (so `app.rs` keeps feeding it pixels).
+    #[must_use]
+    pub const fn brush_stroking(&self) -> bool {
+        self.brush.stroke.is_some()
+    }
+
+    /// Paint every pending sample against this frame's camera.
+    ///
+    /// The two-step every gesture in this viewer uses: `app.rs` records pixels
+    /// while the pointer is in egui's coordinates, and the work happens here,
+    /// once the frame's camera exists (`docs/EDITOR.md` §4's last paragraph).
+    /// A no-op on every frame with nothing pending.
+    pub fn resolve_brush(&mut self, camera: &ClickCamera, renderer: &Renderer) {
+        if self.brush.pending.is_empty() || self.brush.stroke.is_none() {
+            // A pending sample with no stroke cannot happen through either
+            // caller, and dropping it silently would be the wrong answer if it
+            // ever could: leave it for the frame that has a stroke.
+            return;
+        }
+        let samples: Vec<(f64, f64)> = std::mem::take(&mut self.brush.pending);
+        if self.brush.cache.is_none() {
+            self.brush.cache = Some(widen(&renderer.base_points().xyz));
+        }
+        let cache = self.brush.cache.as_ref().expect("just built");
+        let radius = self.brush.radius;
+        let weight = self.brush.weight;
+
+        // Every sample becomes a world centre first, so one stroke is ONE
+        // `paint_along` over the path rather than N separate spheres — the same
+        // shape the Python's own `paint_along` produces for a dragged stroke.
+        let mut path: Vec<[f64; 3]> = Vec::with_capacity(samples.len());
+        let mut last_pixel = None;
+        for px in samples {
+            let depth = brush::depth_anchor(camera, cache, px, brush::ANCHOR_RADIUS_PX)
+                .or(self.brush.depth);
+            let Some(depth) = depth else {
+                // Nothing under the cursor and no earlier anchor: painting at an
+                // invented depth would put cells somewhere Jordan cannot see.
+                self.brush.note =
+                    "no point under the cursor yet -- aim at the scene to anchor the stroke"
+                        .to_owned();
+                continue;
+            };
+            self.brush.depth = Some(depth);
+            path.push(camera.unproject(px, depth));
+            last_pixel = Some((px, depth));
+        }
+        if let Some((px, depth)) = last_pixel {
+            // The stroke's own radius, in this frame's pixels, for the cursor
+            // ring: `fx * r / z` is the projection of a sphere at that depth.
+            self.brush.cursor = Some((px, camera.fx * radius / depth));
+        }
+        if path.is_empty() {
+            return;
+        }
+
+        let Some(stroke) = self.brush.stroke.as_mut() else {
+            return;
+        };
+        let (origin, cell_size, erasing) = (stroke.origin, stroke.cell_size, stroke.erasing);
+        let result = if erasing {
+            path.iter()
+                .try_fold(0_usize, |n, centre| {
+                    brush::erase(&mut stroke.cells, origin, cell_size, *centre, radius)
+                        .map(|dropped| n + dropped)
+                })
+                .map(|_| ())
+        } else {
+            brush::paint_along(&mut stroke.cells, origin, cell_size, &path, radius, weight)
+                .map(|_| ())
+        };
+        if let Err(e) = result {
+            self.error = Some(e);
+            return;
+        }
+        stroke.samples += path.len();
+        self.commit_stroke();
+    }
+
+    /// Write the stroke so far into the document, as ONE undo entry.
+    ///
+    /// The first write of a stroke appends; every later write of the SAME
+    /// stroke replaces it (`EditDocument::add_region_coalesced` /
+    /// `update_region_coalesced`), so a stroke that took 200 frames is one
+    /// `Cmd-Z` and `edits.json` carries one entry for it.
+    fn commit_stroke(&mut self) {
+        let Some(stroke) = self.brush.stroke.as_ref() else {
+            return;
+        };
+        let params = Params::Brush {
+            origin: stroke.origin,
+            cell_size: stroke.cell_size,
+            cells: stroke.cells.clone(),
+        };
+        let (region_id, creating, emitted) =
+            (stroke.region_id.clone(), stroke.creating, stroke.emitted);
+        let name = stroke.name.clone();
+        let result = if creating {
+            let region = Region::new(region_id.clone(), name, params, self.brush.mix, self.brush.op)
+                .with_source(
+                    "brush",
+                    json!({
+                        "radius": self.brush.radius,
+                        "weight": self.brush.weight,
+                        "cell_size": stroke.cell_size,
+                    }),
+                );
+            self.doc.add_region_coalesced(&region, None, emitted)
+        } else {
+            self.doc
+                .update_region_coalesced(&region_id, json!({ "params": params.to_json() }), emitted)
+        };
+        let ok = result.is_ok();
+        self.record(result);
+        if ok {
+            if let Some(stroke) = self.brush.stroke.as_mut() {
+                stroke.emitted = true;
+            }
+            self.selected = Some(region_id.clone());
+            self.brush.region = Some(region_id);
+        }
+    }
+
+    /// Forget the tool's current region, so the next stroke starts a new one.
+    pub fn new_brush_region(&mut self) {
+        self.brush.region = None;
+        self.brush.note = "the next stroke starts a new region".to_owned();
+    }
+
+    // --- the 3D drag gizmos --------------------------------------------------
+
+    /// Project the selected region's handles with this frame's camera.
+    ///
+    /// Called once per frame from `app.rs`, right after the camera is built and
+    /// before the render, so the handles `app.rs` paints and the handles a drag
+    /// hit-tests against are the same ones.
+    pub fn update_gizmo(&mut self, camera: &ClickCamera) {
+        self.gizmo.screen = if self.gizmo_available() {
+            self.selected
+                .as_ref()
+                .and_then(|id| self.doc.region(id))
+                .and_then(|region| GizmoScreen::project(camera, &region.params))
+        } else {
+            None
+        };
+    }
+
+    /// Whether a gizmo drag is possible at all right now.
+    ///
+    /// Not while the SAM or Brush tool has focus: those two have taken the
+    /// primary drag for their own gesture, and a handle under the pointer must
+    /// not silently steal a brush stroke.
+    #[must_use]
+    pub fn gizmo_available(&self) -> bool {
+        self.active && self.gizmo.show && !matches!(self.tool, Tool::Sam | Tool::Brush)
+    }
+
+    /// This frame's handles, for the egui painter (`app.rs`).
+    #[must_use]
+    pub const fn gizmo_screen(&self) -> Option<&GizmoScreen> {
+        self.gizmo.screen.as_ref()
+    }
+
+    /// Whether a gizmo drag is in progress (so `app.rs` does not orbit).
+    #[must_use]
+    pub const fn gizmo_dragging(&self) -> bool {
+        self.gizmo.drag.is_some()
+    }
+
+    /// Try to grab a handle at `px`. `true` when the drag belongs to the gizmo.
+    ///
+    /// A drag that grabs nothing returns `false` and `app.rs` orbits with it,
+    /// which is what keeps navigation intact: the gizmo takes the drag only
+    /// where a handle is (`docs/EDITOR.md` §4, "a drag is scoped to what it
+    /// started on").
+    pub fn begin_gizmo_drag(&mut self, px: (f64, f64), shift: bool, ctrl: bool) -> bool {
+        if !self.gizmo_available() || self.gizmo.drag.is_some() {
+            return false;
+        }
+        let Some(screen) = self.gizmo.screen.clone() else {
+            return false;
+        };
+        let Some(axis) = screen.pick(px) else {
+            return false;
+        };
+        let Some(region) = self
+            .selected
+            .as_ref()
+            .and_then(|id| self.doc.region(id))
+            .cloned()
+        else {
+            return false;
+        };
+        let kind = match (shift, ctrl) {
+            (true, _) => Drag::Resize,
+            (false, true) => Drag::Rotate,
+            (false, false) => Drag::Translate,
+        };
+        if kind == Drag::Rotate && !matches!(region.params, Params::Box { .. }) {
+            self.note = "only a box has an orientation to rotate".to_owned();
+            return false;
+        }
+        self.gizmo.drag = Some(GizmoDrag {
+            region_id: region.id,
+            axis,
+            kind,
+            base: region.params,
+            screen,
+            start_px: px,
+            emitted: false,
+        });
+        true
+    }
+
+    /// Apply the drag at `px`, recomputed from the gesture's own starting state.
+    ///
+    /// Absolute rather than incremental: the region is always
+    /// `f(base, pointer - start)`, so a slow drag and a fast one over the same
+    /// path end in the same place and nothing accumulates rounding error.
+    pub fn gizmo_drag_to(&mut self, px: (f64, f64)) {
+        let Some(drag) = self.gizmo.drag.as_ref() else {
+            return;
+        };
+        let total = (px.0 - drag.start_px.0, px.1 - drag.start_px.1);
+        if total.0.hypot(total.1) < gizmo::MIN_DRAG_PX {
+            return;
+        }
+        let params = match drag.kind {
+            Drag::Translate => {
+                let along = drag.screen.translate_world(drag.axis, total);
+                let mut delta = [0.0_f64; 3];
+                delta[drag.axis] = along;
+                gizmo::translated(&drag.base, delta)
+            }
+            Drag::Resize => {
+                gizmo::resized(&drag.base, drag.screen.resize_factor(drag.axis, total))
+            }
+            Drag::Rotate => gizmo::rotated(
+                &drag.base,
+                drag.axis,
+                drag.screen.rotate_angle(drag.axis, drag.start_px, px),
+            ),
+        };
+        let Some(params) = params else {
+            return;
+        };
+        let (id, emitted) = (drag.region_id.clone(), drag.emitted);
+        let result =
+            self.doc
+                .update_region_coalesced(&id, json!({ "params": params.to_json() }), emitted);
+        let ok = result.is_ok();
+        self.record(result);
+        if ok {
+            if let Some(drag) = self.gizmo.drag.as_mut() {
+                drag.emitted = true;
+            }
+            self.note = match self.gizmo.drag.as_ref().map(|d| d.kind) {
+                Some(Drag::Translate) => format!("moved along {}", axis_name(self.gizmo_axis())),
+                Some(Drag::Resize) => format!("resized on {}", axis_name(self.gizmo_axis())),
+                Some(Drag::Rotate) => format!("rotated about {}", axis_name(self.gizmo_axis())),
+                None => String::new(),
+            };
+        }
+    }
+
+    /// Which axis the current drag grabbed, for the note.
+    fn gizmo_axis(&self) -> usize {
+        self.gizmo.drag.as_ref().map_or(0, |d| d.axis)
+    }
+
+    /// Finish the gizmo drag: the next one is a new undo step.
+    pub fn end_gizmo_drag(&mut self) {
+        self.gizmo.drag = None;
+    }
+
+    /// Move the selected region along `axis` by `delta` world units, as ONE
+    /// undo entry (the headless `--move-region` proof).
+    ///
+    /// The same `gizmo::translated` a drag goes through, so the headless twin
+    /// exercises the shipped path and not a parallel one.
+    pub fn move_selected_region(&mut self, delta: [f64; 3]) -> bool {
+        self.nudge_selected(delta);
+        self.error.is_none()
+    }
+
+    // --- the Named Objects panel --------------------------------------------
+
+    /// Select a region by id, or by name when no id matches. `false` when
+    /// neither does.
+    ///
+    /// The headless twin of clicking a row in the Named Objects panel; names
+    /// are accepted because `--move-region brush-1` is what a proof script has
+    /// (`docs/EDITOR.md` §1's auto names are stable, ids are random hex).
+    pub fn select_region(&mut self, id_or_name: &str) -> bool {
+        let found = self
+            .doc
+            .regions()
+            .iter()
+            .find(|r| r.id == id_or_name)
+            .or_else(|| self.doc.regions().iter().find(|r| r.name == id_or_name))
+            .map(|r| r.id.clone());
+        match found {
+            Some(id) => {
+                self.selected = Some(id);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The selected region's id, if any.
+    #[must_use]
+    pub fn selected_id(&self) -> Option<&str> {
+        self.selected.as_deref()
+    }
+
+    /// Show only `id`'s effect, or `None` for all of them.
+    pub fn set_solo(&mut self, id: Option<&str>) {
+        let next = id.map(ToOwned::to_owned);
+        if self.solo != next {
+            self.solo = next;
+            self.needs_apply = true;
+        }
+    }
+
+    /// The soloed region, if any.
+    #[must_use]
+    pub fn solo(&self) -> Option<&str> {
+        self.solo.as_deref()
+    }
+
+    /// How many points a region claimed at the last apply.
+    #[must_use]
+    fn count_for(&self, id: &str) -> Option<usize> {
+        self.counts.iter().find(|c| c.id == id).map(|c| c.count)
+    }
+
     /// Recompose the per-point weights and hand the renderer its point sets.
     ///
     /// A no-op unless a widget or a key asked for it. This is the one place
@@ -895,15 +1531,20 @@ impl EditSession {
         // this is the path every unedited bundle takes on every open.
         if preview_ids.is_none() && !self.doc.regions().iter().any(|r| r.enabled) {
             renderer.set_edits(None);
+            self.counts.clear();
             self.last_apply_ms = started.elapsed().as_secs_f64() * 1e3;
             return Ok(());
         }
+        let solo = self.solo.clone();
 
         // The borrow of `renderer` ends with this block; `edited` owns its data.
         let (edited, gaussian_needed) = {
             let base = renderer.base_points();
-            let composed = compose_trips_weights(&self.doc, &widen(&base.xyz));
+            let composed = compose_trips_weights_solo(&self.doc, &widen(&base.xyz), solo.as_deref());
             let gaussian_needed = composed.delete_mask.iter().any(|d| *d);
+            // The Named Objects panel's count column, observed on the way
+            // through rather than recomputed by a second O(points x regions) pass.
+            self.counts.clone_from(&composed.per_region);
             let edited = match preview_ids.as_deref() {
                 Some(ids) => edited_points(&tinted_points(base, ids), &composed)?,
                 None => edited_points(base, &composed)?,
@@ -925,7 +1566,8 @@ impl EditSession {
                     block_on(splat.means_host())?
                 };
                 if gaussian_needed {
-                    let composed = compose_gaussian_weights(&self.doc, &widen(&means));
+                    let composed =
+                        compose_gaussian_weights_solo(&self.doc, &widen(&means), solo.as_deref());
                     Some(gaussian_opacity_scale(&composed))
                 } else {
                     Some(None)
@@ -1036,6 +1678,11 @@ impl EditSession {
     }
 
     /// Move the selected region's centre by `delta` world units.
+    ///
+    /// The keyboard nudge and the translate gizmo share
+    /// [`gizmo::translated`], so an arrow key and a drag can never disagree
+    /// about what "move" means. A `pointset` has no centre and a `brush`'s
+    /// cells are measured on its own grid, so neither moves.
     fn nudge_selected(&mut self, delta: [f64; 3]) {
         let Some(region) = self
             .selected
@@ -1045,32 +1692,13 @@ impl EditSession {
         else {
             return;
         };
-        let moved = match region.params.clone() {
-            Params::Box {
-                center,
-                half_extents,
-                quat,
-            } => Params::Box {
-                center: add3(center, delta),
-                half_extents,
-                quat,
-            },
-            Params::Sphere { center, radius } => Params::Sphere {
-                center: add3(center, delta),
-                radius,
-            },
-            Params::Lid(lid) => Params::Lid(LidParams {
-                center: add3(lid.center, delta),
-                ..lid
-            }),
-            // A pointset has no centre to move; nudging it would have to move
-            // the points themselves, which is not an edit this tool makes.
-            Params::Pointset { .. } => return,
+        let Some(moved) = gizmo::translated(&region.params, delta) else {
+            return;
         };
         self.set_params(&region.id, &moved);
     }
 
-    /// Scale the selected region's size by `factor`.
+    /// Scale the selected region's size by `factor` (shares the resize gizmo's maths).
     fn resize_selected(&mut self, factor: f64) {
         let Some(region) = self
             .selected
@@ -1080,31 +1708,31 @@ impl EditSession {
         else {
             return;
         };
-        let resized = match region.params.clone() {
-            Params::Box {
-                center,
-                half_extents,
-                quat,
-            } => Params::Box {
-                center,
-                half_extents: [
-                    half_extents[0] * factor,
-                    half_extents[1] * factor,
-                    half_extents[2] * factor,
-                ],
-                quat,
-            },
-            Params::Sphere { center, radius } => Params::Sphere {
-                center,
-                radius: radius * factor,
-            },
-            Params::Lid(lid) => Params::Lid(LidParams {
-                radius: lid.radius * factor,
-                ..lid
-            }),
-            Params::Pointset { .. } => return,
+        let Some(resized) = gizmo::resized(&region.params, factor) else {
+            return;
         };
         self.set_params(&region.id, &resized);
+    }
+
+    /// Push a mix change through the undo log, coalescing a slider drag.
+    ///
+    /// A slider emits a change per FRAME while it is dragged, and one undo step
+    /// per frame of a drag is not an undo history anyone can use. Consecutive
+    /// mix changes to the same region therefore collapse into one entry (the
+    /// same `update_region_coalesced` the gizmo and the brush use); any other
+    /// edit in between ends the run, so `Cmd-Z` after a fiddle returns the mix
+    /// to what it was before the fiddle started.
+    fn set_mix(&mut self, id: &str, mix: f64) {
+        let coalesce = self.doc.log.get(self.doc.cursor.wrapping_sub(1)).is_some_and(|e| {
+            self.doc.cursor == self.doc.log.len()
+                && e.get("type").and_then(serde_json::Value::as_str) == Some("update_region")
+                && e.get("id").and_then(serde_json::Value::as_str) == Some(id)
+                && e.pointer("/changes/mix").is_some()
+        });
+        let result = self
+            .doc
+            .update_region_coalesced(id, json!({ "mix": mix }), coalesce);
+        self.record(result);
     }
 
     /// Push a params change through the undo log.
@@ -1215,7 +1843,13 @@ impl EditSession {
             match self.tool {
                 Tool::ClickCluster => self.click.preview = !self.click.preview,
                 Tool::Sam => self.sam.preview = !self.sam.preview,
-                Tool::Regions | Tool::ShadeFinder => self.shade.preview = !self.shade.preview,
+                // The brush has no preview of its own -- what a stroke paints IS
+                // the region, and the region is already in the frame -- so `H`
+                // keeps the one meaning it has everywhere else. The 3D handles
+                // have their own checkbox in the Regions panel.
+                Tool::Regions | Tool::ShadeFinder | Tool::Brush => {
+                    self.shade.preview = !self.shade.preview;
+                }
             }
             self.needs_apply = true;
         }
@@ -1223,7 +1857,19 @@ impl EditSession {
             self.delete_selected();
         }
         if resize > 0.0 {
-            self.resize_selected(resize);
+            if self.tool == Tool::Brush {
+                // While painting there is no selected region to resize, and a
+                // brush without a radius key is unusable (`docs/EDITOR.md` §4).
+                let step = if resize > 1.0 {
+                    BRUSH_RADIUS_STEP
+                } else {
+                    1.0 / BRUSH_RADIUS_STEP
+                };
+                self.brush.radius = (self.brush.radius * step).max(1e-9);
+                self.brush.note = format!("brush radius {:.4} world units", self.brush.radius);
+            } else {
+                self.resize_selected(resize);
+            }
         }
         if nudge.iter().any(|d| *d != 0.0) {
             self.nudge_selected(nudge);
@@ -1246,6 +1892,8 @@ impl EditSession {
         num_points: usize,
     ) {
         self.regions_panel(ui, look_at, scene_diameter);
+        ui.separator();
+        self.named_objects_panel(ui);
         ui.separator();
         self.inspector_panel(ui, scene_diameter);
         ui.separator();
@@ -1402,6 +2050,16 @@ impl EditSession {
             "new regions are born at the look-at point ({:.2}, {:.2}, {:.2}), {half:.2} u across",
             look_at.x, look_at.y, look_at.z
         ));
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.gizmo.show, "3D handles")
+                .on_hover_text(
+                    "drag a handle to move the selected region along that axis; SHIFT-drag \
+                     resizes, CTRL-drag rotates a box. A drag anywhere else still orbits.",
+                );
+            if self.gizmo.show && self.gizmo.screen.is_none() && self.selected.is_some() {
+                ui.label("(no handles: this kind has no shape, or it is behind the camera)");
+            }
+        });
     }
 
     /// The Inspector: name, op, mix, and the selected region's own numbers.
@@ -1457,8 +2115,7 @@ impl EditSession {
                 .add(egui::Slider::new(&mut mix, 0.0..=1.0).text("mix (0 = splat, 1 = TRIPS)"))
                 .changed()
             {
-                let result = self.doc.update_region(&region.id, json!({ "mix": mix }));
-                self.record(result);
+                self.set_mix(&region.id, mix);
             }
         }
 
@@ -1494,6 +2151,25 @@ impl EditSession {
                     point_ids.len()
                 ));
             }
+            Params::Brush {
+                origin,
+                cell_size,
+                cells,
+            } => {
+                ui.label(format!(
+                    "{} painted voxel cells of {cell_size:.4} world units, on a grid anchored \
+                     at ({:.2}, {:.2}, {:.2})",
+                    cells.len(),
+                    origin[0],
+                    origin[1],
+                    origin[2],
+                ));
+                ui.label(
+                    "paint more of it with the Brush tool (T); the grid is fixed when the \
+                     region is created, so the radius slider changes the STROKE, not the cells \
+                     already painted",
+                );
+            }
         }
         if changed {
             self.set_params(&region.id, &params);
@@ -1509,7 +2185,13 @@ impl EditSession {
         ui.label(egui::RichText::new("Tools (T)").strong());
         let previous = self.tool;
         ui.horizontal(|ui| {
-            for tool in [Tool::Regions, Tool::ShadeFinder, Tool::ClickCluster, Tool::Sam] {
+            for tool in [
+                Tool::Regions,
+                Tool::ShadeFinder,
+                Tool::ClickCluster,
+                Tool::Sam,
+                Tool::Brush,
+            ] {
                 ui.selectable_value(&mut self.tool, tool, tool.label());
             }
         });
@@ -1517,6 +2199,10 @@ impl EditSession {
             // Leaving the tool drops its index: a `f64` copy of the cloud is
             // not something to hold for a tool nobody is using (`ClickCache`).
             self.click.cache = None;
+        }
+        if previous == Tool::Brush && self.tool != previous {
+            // Same rule for the brush's own widened copy of the cloud.
+            self.brush.cache = None;
         }
         match self.tool {
             Tool::Regions => {
@@ -1529,6 +2215,10 @@ impl EditSession {
             }
             Tool::Sam => {
                 self.sam_panel(ui, num_points);
+                return;
+            }
+            Tool::Brush => {
+                self.brush_panel(ui, num_points);
                 return;
             }
             Tool::ShadeFinder => {}
@@ -1742,6 +2432,267 @@ impl EditSession {
             ui.collapsing("command", |ui| {
                 ui.label(egui::RichText::new(&self.sam.command).monospace().size(11.0));
             });
+        }
+    }
+
+    /// The Brush panel: radius, weight, op/mix, and what the last stroke did.
+    ///
+    /// `docs/EDITOR.md` §1 "brush" / §4. The stroke itself is a drag on the
+    /// render; everything here is the settings it uses and the state it leaves.
+    fn brush_panel(&mut self, ui: &mut egui::Ui, num_points: usize) {
+        ui.label(
+            "DRAG on the render to paint a 3D brush region, ALT-drag to erase. \
+             SHIFT-drag still orbits. Each dab is a sphere at the depth of the nearest \
+             point under the cursor -- aim at the scene, not at empty sky.",
+        );
+
+        let mut radius = self.brush.radius;
+        // Logarithmic, like the click tool's own radius: scene scales differ by
+        // orders of magnitude and a linear slider is unusable on both.
+        if ui
+            .add(
+                egui::Slider::new(&mut radius, 1e-4..=1e3)
+                    .logarithmic(true)
+                    .text("radius (world units)  [ / ]"),
+            )
+            .changed()
+        {
+            self.brush.radius = radius.max(1e-9);
+        }
+        ui.add(
+            egui::Slider::new(&mut self.brush.weight, 0.0..=1.0)
+                .text("weight: how strongly a painted cell claims a point"),
+        );
+
+        let active = self
+            .brush
+            .region
+            .as_ref()
+            .and_then(|id| self.doc.region(id))
+            .map(|r| (r.id.clone(), r.name.clone(), r.op, r.mix));
+        match &active {
+            Some((id, name, _, _)) => {
+                let cells = self
+                    .doc
+                    .region(id)
+                    .and_then(|r| match &r.params {
+                        Params::Brush { cells, .. } => Some(cells.len()),
+                        _ => None,
+                    })
+                    .unwrap_or(0);
+                ui.label(format!(
+                    "painting into {name}: {cells} cells, {} of {num_points} points claimed",
+                    self.count_for(id)
+                        .map_or_else(|| "?".to_owned(), |n| n.to_string())
+                ));
+            }
+            None => {
+                ui.label("the next stroke creates a new brush region");
+                ui.horizontal(|ui| {
+                    ui.label("new region op:");
+                    for op in Op::ALL {
+                        ui.selectable_value(&mut self.brush.op, op, op.as_str());
+                    }
+                });
+                if self.brush.op == Op::Delete {
+                    ui.label("delete ignores mix: the painted points are removed");
+                } else {
+                    ui.add(
+                        egui::Slider::new(&mut self.brush.mix, 0.0..=1.0)
+                            .text("mix (0 = splat, 1 = TRIPS)"),
+                    );
+                }
+            }
+        }
+
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(active.is_some(), egui::Button::new("start a new region"))
+                .on_hover_text("the next stroke paints into a fresh brush region")
+                .clicked()
+            {
+                self.new_brush_region();
+            }
+            if ui
+                .add_enabled(active.is_some(), egui::Button::new("select in Inspector"))
+                .clicked()
+            {
+                self.selected.clone_from(&self.brush.region);
+            }
+        });
+        if !self.brush.note.is_empty() {
+            ui.label(&self.brush.note);
+        }
+    }
+
+    /// The Named Objects panel: every region, grouped by the tool that made it.
+    ///
+    /// `docs/EDITOR.md` §4's Regions panel, grown into the list the brief asks
+    /// for: name, source tool, kind, how many points it claims, an enable
+    /// toggle, a mix slider, rename, remove, and "solo". Grouping is by
+    /// `Region.source.tool` (`docs/EDITOR.md` §1 "Named regions"), with
+    /// hand-authored regions in their own group — the same provenance the CLI's
+    /// `trippy edits list` prints.
+    #[allow(clippy::too_many_lines)]
+    fn named_objects_panel(&mut self, ui: &mut egui::Ui) {
+        let groups = group_by_tool(self.doc.regions());
+
+        let header = format!(
+            "Named Objects ({} region{}, {} group{})",
+            self.doc.regions().len(),
+            if self.doc.regions().len() == 1 { "" } else { "s" },
+            groups.len(),
+            if groups.len() == 1 { "" } else { "s" },
+        );
+        let mut toggled: Option<(String, bool)> = None;
+        let mut mixed: Option<(String, f64)> = None;
+        let mut removed: Option<String> = None;
+        let mut renamed: Option<(String, String)> = None;
+        let mut solo_click: Option<String> = None;
+        let mut selected: Option<String> = None;
+
+        egui::CollapsingHeader::new(egui::RichText::new(header).strong())
+            .id_salt("named-objects")
+            .default_open(true)
+            .show(ui, |ui| {
+                if groups.is_empty() {
+                    ui.label("no regions yet -- paint one with the Brush tool, or add a box");
+                    return;
+                }
+                if self.solo.is_some() {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(255, 200, 120),
+                        "SOLO is on: the render shows one region's effect and no other",
+                    );
+                }
+                egui::ScrollArea::vertical()
+                    .id_salt("named-objects-scroll")
+                    .max_height(260.0)
+                    .show(ui, |ui| {
+                        for (tool, regions) in &groups {
+                            ui.label(egui::RichText::new(format!("{tool} ({})", regions.len())).italics());
+                            for region in regions {
+                                let id = region.id.as_str();
+                                ui.horizontal(|ui| {
+                                    let mut enabled = region.enabled;
+                                    if ui
+                                        .checkbox(&mut enabled, "")
+                                        .on_hover_text("enable / disable without deleting")
+                                        .changed()
+                                    {
+                                        toggled = Some((id.to_owned(), enabled));
+                                    }
+                                    if self.rename_for.as_deref() == Some(id) {
+                                        let response = ui.add(
+                                            egui::TextEdit::singleline(&mut self.rename_buffer)
+                                                .desired_width(150.0),
+                                        );
+                                        response.request_focus();
+                                        let done = ui.button("ok").clicked()
+                                            || (response.lost_focus()
+                                                && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                                        if done {
+                                            renamed = Some((
+                                                id.to_owned(),
+                                                self.rename_buffer.clone(),
+                                            ));
+                                        }
+                                    } else {
+                                        let label = if region.name.is_empty() {
+                                            id.to_owned()
+                                        } else {
+                                            region.name.clone()
+                                        };
+                                        if ui
+                                            .selectable_label(
+                                                self.selected.as_deref() == Some(id),
+                                                label,
+                                            )
+                                            .clicked()
+                                        {
+                                            selected = Some(id.to_owned());
+                                        }
+                                    }
+                                    ui.label(format!("[{} {}]", region.short_kind(), region.op.as_str()));
+                                    ui.label(match (region.enabled, self.count_for(id)) {
+                                        (false, _) => "off".to_owned(),
+                                        (true, Some(n)) => format!("{n} pts"),
+                                        (true, None) => "-".to_owned(),
+                                    });
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.add_space(24.0);
+                                    if region.op == Op::Delete {
+                                        ui.label("delete (no mix)");
+                                    } else {
+                                        let mut mix = region.mix;
+                                        if ui
+                                            .add(
+                                                egui::Slider::new(&mut mix, 0.0..=1.0)
+                                                    .show_value(true)
+                                                    .text("mix"),
+                                            )
+                                            .changed()
+                                        {
+                                            mixed = Some((id.to_owned(), mix));
+                                        }
+                                    }
+                                    let soloed = self.solo.as_deref() == Some(id);
+                                    if ui
+                                        .selectable_label(soloed, "solo")
+                                        .on_hover_text(
+                                            "show ONLY this region's effect (a disabled region \
+                                             still shows nothing)",
+                                        )
+                                        .clicked()
+                                    {
+                                        solo_click = Some(id.to_owned());
+                                    }
+                                    if ui.button("rename").clicked() {
+                                        self.rename_for = Some(id.to_owned());
+                                        self.rename_buffer.clone_from(&region.name);
+                                    }
+                                    if ui.button("remove").clicked() {
+                                        removed = Some(id.to_owned());
+                                    }
+                                });
+                            }
+                        }
+                    });
+            });
+
+        // Every mutation is applied AFTER the loop: the rows borrow `self.doc`.
+        if let Some(id) = selected {
+            self.selected = Some(id);
+        }
+        if let Some((id, enabled)) = toggled {
+            let result = self.doc.update_region(&id, json!({ "enabled": enabled }));
+            self.record(result);
+        }
+        if let Some((id, mix)) = mixed {
+            self.set_mix(&id, mix);
+        }
+        if let Some((id, name)) = renamed {
+            let result = self.doc.update_region(&id, json!({ "name": name }));
+            self.record(result);
+            self.rename_for = None;
+        }
+        if let Some(id) = solo_click {
+            let next = (self.solo.as_deref() != Some(id.as_str())).then_some(id);
+            self.set_solo(next.as_deref());
+        }
+        if let Some(id) = removed {
+            let result = self.doc.remove_region(&id);
+            self.record(result);
+            if self.selected.as_deref() == Some(id.as_str()) {
+                self.selected = None;
+            }
+            if self.solo.as_deref() == Some(id.as_str()) {
+                self.set_solo(None);
+            }
+            if self.brush.region.as_deref() == Some(id.as_str()) {
+                self.brush.region = None;
+            }
         }
     }
 
@@ -1968,8 +2919,35 @@ impl EditSession {
     }
 }
 
-fn add3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
-    [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
+/// The label a region with no `source` is grouped under in Named Objects.
+const HAND_AUTHORED_GROUP: &str = "hand-authored";
+
+/// Regions grouped by the tool that made them (`Region.source.tool`).
+///
+/// Paint order within a group, and groups in the order they first appear, so
+/// the list is stable while regions are added and removed — a list that
+/// reordered itself under Jordan's pointer would be worse than an unsorted one.
+fn group_by_tool(regions: &[Region]) -> Vec<(String, Vec<Region>)> {
+    let mut groups: Vec<(String, Vec<Region>)> = Vec::new();
+    for region in regions {
+        let tool = region
+            .source_tool()
+            .map_or_else(|| HAND_AUTHORED_GROUP.to_owned(), ToOwned::to_owned);
+        match groups.iter_mut().find(|(name, _)| *name == tool) {
+            Some((_, list)) => list.push(region.clone()),
+            None => groups.push((tool, vec![region.clone()])),
+        }
+    }
+    groups
+}
+
+/// `0/1/2` -> `"world X"/"world Y"/"world Z"`, for the gizmo's own note.
+fn axis_name(axis: usize) -> &'static str {
+    match axis {
+        0 => "world X",
+        1 => "world Y",
+        _ => "world Z",
+    }
 }
 
 /// A labelled row of three drag boxes. Returns whether any changed.
@@ -2020,6 +2998,8 @@ mod tests {
         assert_eq!(tool, Tool::ClickCluster);
         tool = tool.next();
         assert_eq!(tool, Tool::Sam);
+        tool = tool.next();
+        assert_eq!(tool, Tool::Brush);
         tool = tool.next();
         assert_eq!(tool, Tool::Regions);
     }
@@ -2235,7 +3215,7 @@ mod tests {
         let mut tool = Tool::ClickCluster;
         tool = tool.next();
         assert_eq!(tool, Tool::Sam);
-        assert_eq!(tool.next(), Tool::Regions);
+        assert_eq!(tool.next(), Tool::Brush);
     }
 
     #[test]
@@ -2376,6 +3356,426 @@ mod tests {
         assert_eq!(session.preview_ids(), None);
         session.set_sam_preview(true);
         assert_eq!(session.preview_ids(), Some(vec![7]));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- the brush tool, the gizmos and Named Objects -----------------------
+
+    /// The camera `edit::gizmo`'s own tests use: at the origin, looking down
+    /// +Z, 100 px focal length, principal point (100, 100).
+    fn a_camera() -> ClickCamera {
+        ClickCamera {
+            r: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+            t: [0.0, 0.0, 0.0],
+            fx: 100.0,
+            fy: 100.0,
+            cx: 100.0,
+            cy: 100.0,
+        }
+    }
+
+    #[test]
+    fn the_tool_cycle_reaches_the_brush_and_returns() {
+        let mut tool = Tool::Sam;
+        tool = tool.next();
+        assert_eq!(tool, Tool::Brush);
+        assert_eq!(tool.next(), Tool::Regions);
+    }
+
+    #[test]
+    fn one_brush_stroke_is_one_region_one_source_and_one_undo_step() {
+        let (dir, mut session) = a_session("brush-stroke");
+        session.init_brush_defaults(4.0);
+        assert!(session.brush_radius() > 0.0, "the radius comes from the scene");
+        session.set_brush_settings(0.5, 0.75, Op::Delete, 0.0);
+        assert_eq!(session.tool, Tool::Brush);
+
+        // Two frames of one stroke. (`resolve_brush` needs a live Renderer for
+        // its depth anchor, so the sphere is painted here and the SESSION's own
+        // commit path — which is what carries the undo semantics — is exercised.)
+        session.begin_brush_stroke(false);
+        for centre in [[0.0, 0.0, 4.0], [0.3, 0.0, 4.0]] {
+            let stroke = session.brush.stroke.as_mut().expect("stroking");
+            brush::paint_sphere(
+                &mut stroke.cells,
+                stroke.origin,
+                stroke.cell_size,
+                centre,
+                0.5,
+                0.75,
+            )
+            .unwrap();
+            session.commit_stroke();
+        }
+        session.end_brush_stroke();
+
+        assert_eq!(session.doc.regions().len(), 1, "one stroke, one region");
+        assert_eq!(session.doc.log.len(), 1, "one stroke, one undo entry");
+        let region = &session.doc.regions()[0];
+        assert_eq!(region.name, "brush-1", "the auto name Python would give it");
+        assert_eq!(region.source_tool(), Some("brush"));
+        assert_eq!(region.op, Op::Delete);
+        let Params::Brush { cells, .. } = &region.params else {
+            panic!("a brush stroke makes a brush region")
+        };
+        assert!(cells.len() > 1, "both dabs painted");
+        assert!(
+            cells.weights().iter().all(|w| (w - 0.75).abs() < 1e-12),
+            "the weight slider reaches the cells"
+        );
+
+        // One Cmd-Z takes the whole stroke back.
+        session.undo_once();
+        assert!(session.doc.regions().is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_second_stroke_paints_into_the_same_region_as_its_own_undo_step() {
+        let (dir, mut session) = a_session("brush-second");
+        session.set_brush_settings(0.5, 1.0, Op::Delete, 0.0);
+        session.begin_brush_stroke(false);
+        {
+            let stroke = session.brush.stroke.as_mut().expect("stroking");
+            brush::paint_sphere(&mut stroke.cells, stroke.origin, stroke.cell_size,
+                                [0.0, 0.0, 4.0], 0.5, 1.0).unwrap();
+        }
+        session.commit_stroke();
+        session.end_brush_stroke();
+        let after_first = match &session.doc.regions()[0].params {
+            Params::Brush { cells, .. } => cells.len(),
+            _ => panic!("a brush"),
+        };
+
+        session.begin_brush_stroke(false);
+        {
+            let stroke = session.brush.stroke.as_mut().expect("stroking");
+            assert!(!stroke.creating, "the second stroke reuses the tool's region");
+            brush::paint_sphere(&mut stroke.cells, stroke.origin, stroke.cell_size,
+                                [2.0, 0.0, 4.0], 0.5, 1.0).unwrap();
+        }
+        session.commit_stroke();
+        session.end_brush_stroke();
+
+        assert_eq!(session.doc.regions().len(), 1, "still one region");
+        assert_eq!(session.doc.log.len(), 2, "two strokes, two undo steps");
+        let after_second = match &session.doc.regions()[0].params {
+            Params::Brush { cells, .. } => cells.len(),
+            _ => panic!("a brush"),
+        };
+        assert!(after_second > after_first, "the second stroke added cells");
+
+        // "start a new region" is what makes the next stroke its own object.
+        session.new_brush_region();
+        session.begin_brush_stroke(false);
+        assert!(session.brush.stroke.as_ref().expect("stroking").creating);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_alt_stroke_erases_what_a_stroke_painted() {
+        let (dir, mut session) = a_session("brush-erase");
+        session.set_brush_settings(0.5, 1.0, Op::Delete, 0.0);
+        session.begin_brush_stroke(false);
+        {
+            let stroke = session.brush.stroke.as_mut().expect("stroking");
+            brush::paint_sphere(&mut stroke.cells, stroke.origin, stroke.cell_size,
+                                [0.0, 0.0, 4.0], 0.5, 1.0).unwrap();
+            assert!(!stroke.erasing);
+        }
+        session.commit_stroke();
+        session.end_brush_stroke();
+
+        session.begin_brush_stroke(true);
+        {
+            let stroke = session.brush.stroke.as_mut().expect("stroking");
+            assert!(stroke.erasing, "Alt makes the stroke an erase");
+            brush::erase(&mut stroke.cells, stroke.origin, stroke.cell_size,
+                         [0.0, 0.0, 4.0], 0.5).unwrap();
+            assert!(stroke.cells.is_empty(), "the erase cleared the dab");
+        }
+        session.commit_stroke();
+        session.end_brush_stroke();
+
+        let Params::Brush { cells, .. } = &session.doc.regions()[0].params else {
+            panic!("a brush")
+        };
+        assert!(cells.is_empty(), "the region survives, its cells do not");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_brush_keys_change_the_radius_not_the_selected_region() {
+        let (dir, mut session) = a_session("brush-keys");
+        session.set_brush_settings(1.0, 1.0, Op::Delete, 0.0);
+        // `[` / `]` are read in `handle_keys`, which needs an egui context; the
+        // branch they take is the thing worth pinning, and it is this one.
+        assert_eq!(session.tool, Tool::Brush);
+        session.brush.radius *= BRUSH_RADIUS_STEP;
+        assert!((session.brush_radius() - BRUSH_RADIUS_STEP).abs() < 1e-12);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_gizmo_drag_moves_the_region_and_is_one_undo_step() {
+        let (dir, mut session) = a_session("gizmo-drag");
+        session.active = true;
+        session.add(Region::new(
+            "r-g".to_owned(),
+            "sphere".to_owned(),
+            Params::Sphere {
+                center: [0.0, 0.0, 10.0],
+                radius: 1.0,
+            },
+            0.0,
+            Op::Blend,
+        ));
+        let entries = session.doc.log.len();
+        session.update_gizmo(&a_camera());
+        let screen = session.gizmo_screen().expect("a sphere in front has handles");
+        let tip = screen.arms[0].tip;
+
+        // Grab the +X handle and drag it 16 px right: one arm length, 1.6 u.
+        assert!(session.begin_gizmo_drag(tip, false, false), "the handle is grabbed");
+        session.gizmo_drag_to((tip.0 + 8.0, tip.1));
+        session.gizmo_drag_to((tip.0 + 16.0, tip.1));
+        session.end_gizmo_drag();
+
+        let Params::Sphere { center, radius } = session.doc.region("r-g").unwrap().params else {
+            panic!("still a sphere")
+        };
+        assert!((center[0] - 1.6).abs() < 1e-6, "{center:?}");
+        assert!((radius - 1.0).abs() < 1e-12, "a translate does not resize");
+        assert_eq!(
+            session.doc.log.len(),
+            entries + 1,
+            "however many frames the drag took, it is one entry"
+        );
+        session.undo_once();
+        assert!(
+            matches!(session.doc.region("r-g").unwrap().params,
+                     Params::Sphere { center, .. } if center[0] == 0.0),
+            "one Cmd-Z puts it back"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_drag_that_starts_off_a_handle_is_not_a_gizmo_drag() {
+        // This is what keeps navigation: `app.rs` orbits with every drag
+        // `begin_gizmo_drag` refuses.
+        let (dir, mut session) = a_session("gizmo-miss");
+        session.active = true;
+        session.add(Region::new(
+            "r-g".to_owned(),
+            "sphere".to_owned(),
+            Params::Sphere {
+                center: [0.0, 0.0, 10.0],
+                radius: 1.0,
+            },
+            0.0,
+            Op::Blend,
+        ));
+        session.update_gizmo(&a_camera());
+        assert!(!session.begin_gizmo_drag((400.0, 400.0), false, false));
+        assert!(!session.gizmo_dragging());
+
+        // Nor is one made while the Brush tool has the drag.
+        session.tool = Tool::Brush;
+        session.update_gizmo(&a_camera());
+        assert!(session.gizmo_screen().is_none(), "no handles to steal the stroke");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn shift_and_ctrl_drags_resize_and_rotate() {
+        let (dir, mut session) = a_session("gizmo-mods");
+        session.active = true;
+        session.add(Region::new(
+            "r-b".to_owned(),
+            "box".to_owned(),
+            Params::Box {
+                center: [0.0, 0.0, 10.0],
+                half_extents: [1.0, 1.0, 1.0],
+                quat: [1.0, 0.0, 0.0, 0.0],
+            },
+            0.0,
+            Op::Blend,
+        ));
+        session.update_gizmo(&a_camera());
+        let tip = session.gizmo_screen().expect("handles").arms[0].tip;
+
+        assert!(session.begin_gizmo_drag(tip, true, false), "shift grabs a resize");
+        session.gizmo_drag_to((tip.0 + gizmo::RESIZE_PX_PER_DOUBLING, tip.1));
+        session.end_gizmo_drag();
+        let Params::Box { half_extents, .. } = session.doc.region("r-b").unwrap().params else {
+            panic!("still a box")
+        };
+        assert!((half_extents[0] - 2.0).abs() < 1e-6, "{half_extents:?}");
+
+        session.update_gizmo(&a_camera());
+        let centre = session.gizmo_screen().expect("handles").centre;
+        let grab = (centre.0 + 40.0, centre.1);
+        // The handle moved with the resize; grab it wherever it is now.
+        let tip = session.gizmo_screen().expect("handles").arms[0].tip;
+        assert!(session.begin_gizmo_drag(tip, false, true), "ctrl grabs a rotate");
+        session.gizmo_drag_to((grab.0, grab.1 + 40.0));
+        session.end_gizmo_drag();
+        let Params::Box { quat, .. } = session.doc.region("r-b").unwrap().params else {
+            panic!("still a box")
+        };
+        assert!(
+            (quat[0] - 1.0).abs() > 1e-9,
+            "the box really turned: {quat:?}"
+        );
+
+        // A sphere has no orientation, so ctrl refuses rather than pretending.
+        session.add(Region::new(
+            "r-s".to_owned(),
+            "sphere".to_owned(),
+            Params::Sphere {
+                center: [0.0, 0.0, 10.0],
+                radius: 1.0,
+            },
+            0.0,
+            Op::Blend,
+        ));
+        session.update_gizmo(&a_camera());
+        let tip = session.gizmo_screen().expect("handles").arms[0].tip;
+        assert!(!session.begin_gizmo_drag(tip, false, true));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn named_objects_groups_by_the_tool_that_made_each_region() {
+        let hand = Region::new(
+            "r-1".to_owned(),
+            "pool lid".to_owned(),
+            Params::Sphere {
+                center: [0.0, 0.0, 0.0],
+                radius: 1.0,
+            },
+            0.0,
+            Op::Delete,
+        );
+        let painted = Region::new(
+            "r-2".to_owned(),
+            "brush-1".to_owned(),
+            Params::Sphere {
+                center: [0.0, 0.0, 0.0],
+                radius: 1.0,
+            },
+            0.0,
+            Op::Delete,
+        )
+        .with_source("brush", json!({ "radius": 0.5 }));
+        let clicked = Region::new(
+            "r-3".to_owned(),
+            "click-2".to_owned(),
+            Params::Pointset { point_ids: vec![1] },
+            0.0,
+            Op::Fade,
+        )
+        .with_source("click", json!({}));
+        let painted_again = Region {
+            id: "r-4".to_owned(),
+            ..painted.clone()
+        };
+
+        let groups = group_by_tool(&[hand, painted, clicked, painted_again]);
+        let names: Vec<&str> = groups.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["hand-authored", "brush", "click"], "first-seen order");
+        assert_eq!(groups[1].1.len(), 2, "both brush regions in one group");
+        assert_eq!(groups[0].1[0].name, "pool lid");
+    }
+
+    #[test]
+    fn solo_is_a_way_of_looking_and_not_an_edit() {
+        let (dir, mut session) = a_session("solo");
+        session.add(Region::new(
+            "r-1".to_owned(),
+            "a".to_owned(),
+            Params::Sphere {
+                center: [0.0, 0.0, 0.0],
+                radius: 1.0,
+            },
+            0.0,
+            Op::Delete,
+        ));
+        let entries = session.doc.log.len();
+        session.needs_apply = false;
+
+        session.set_solo(Some("r-1"));
+        assert_eq!(session.solo(), Some("r-1"));
+        assert!(session.needs_apply, "solo has to reach the render");
+        assert_eq!(session.doc.log.len(), entries, "and nothing else");
+
+        // Removing the soloed region takes solo off with it, or the panel would
+        // show "SOLO is on" over a region that no longer exists.
+        session.selected = Some("r-1".to_owned());
+        session.delete_selected();
+        session.set_solo(None);
+        assert_eq!(session.solo(), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_region_can_be_selected_by_name_for_the_headless_flags() {
+        let (dir, mut session) = a_session("select-by-name");
+        session.add(Region::new(
+            "r-xyz".to_owned(),
+            "left blob".to_owned(),
+            Params::Sphere {
+                center: [0.0, 0.0, 0.0],
+                radius: 1.0,
+            },
+            0.0,
+            Op::Delete,
+        ));
+        assert!(session.select_region("left blob"));
+        assert_eq!(session.selected_id(), Some("r-xyz"));
+        assert!(session.select_region("r-xyz"));
+        assert!(!session.select_region("nothing of the sort"));
+
+        // `--move-region` goes through the same translate the gizmo does.
+        assert!(session.move_selected_region([0.5, 0.0, 0.0]));
+        assert!(matches!(
+            session.doc.region("r-xyz").unwrap().params,
+            Params::Sphere { center, .. } if (center[0] - 0.5).abs() < 1e-12
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_mix_slider_drag_is_one_undo_step_and_a_later_edit_ends_it() {
+        let (dir, mut session) = a_session("mix-coalesce");
+        session.add(Region::new(
+            "r-m".to_owned(),
+            "sphere".to_owned(),
+            Params::Sphere {
+                center: [0.0, 0.0, 0.0],
+                radius: 1.0,
+            },
+            1.0,
+            Op::Blend,
+        ));
+        let after_add = session.doc.log.len();
+        for mix in [0.9, 0.6, 0.3, 0.1] {
+            session.set_mix("r-m", mix);
+        }
+        assert_eq!(session.doc.log.len(), after_add + 1, "one drag, one entry");
+        session.undo_once();
+        assert!(
+            (session.doc.region("r-m").unwrap().mix - 1.0).abs() < 1e-12,
+            "Cmd-Z returns the mix to what it was before the fiddle"
+        );
+        session.redo();
+
+        // Another edit ends the run, so the NEXT drag is its own step.
+        session.selected = Some("r-m".to_owned());
+        session.nudge_selected([0.1, 0.0, 0.0]);
+        session.set_mix("r-m", 0.4);
+        assert_eq!(session.doc.log.len(), after_add + 3);
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -21,6 +21,13 @@
 //!     - `pointset` regions index the TRIPS cloud's own row order, so
 //!       [`compose_gaussian_weights`] skips them rather than guess a
 //!       correspondence to a Gaussian PLY's rows.
+//!     - [`ComposedWeights::per_region`] and [`compose_point_weights_solo`]'s
+//!       `solo` argument are viewer-only too, and for the same reason as
+//!       `touched`: the Named Objects panel has to say how many points each
+//!       region actually claims, and "solo" has to show one region's effect
+//!       alone. Neither changes what the shared code path computes — `solo =
+//!       None` is the Python's own behaviour, byte for byte, and the counts are
+//!       observed on the way through rather than computed by a second pass.
 //!     - [`ComposedWeights::touched`] is the ONE quantity with no Python twin:
 //!       it is the viewer's "did any region have an opinion here" mask, needed
 //!       because a region edit must override the *gate* only where it applies
@@ -49,6 +56,20 @@ pub struct ComposedWeights {
     pub touched: Vec<f64>,
     /// `(N,)`: true where a `delete`-op region removed the point.
     pub delete_mask: Vec<bool>,
+    /// Per region, in paint order: its id and how many points it actually
+    /// claimed *at the moment it applied* — i.e. after any earlier `delete`
+    /// took its own points out of play. That is the number the Named Objects
+    /// panel shows, because it is the number the frame reflects.
+    pub per_region: Vec<RegionCount>,
+}
+
+/// One region's contribution, for the Named Objects panel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegionCount {
+    /// The region's id.
+    pub id: String,
+    /// How many points it claimed (membership > 0, or the hard clip for `delete`).
+    pub count: usize,
 }
 
 impl ComposedWeights {
@@ -101,6 +122,8 @@ impl Lookup<'_> {
 
 /// Compose `edits`' enabled regions against `xyz`, starting from `default`.
 ///
+/// The `solo`-free entry point; see [`compose_point_weights_solo`].
+///
 /// # Arguments
 /// - `edits`: the document; regions are applied in `edits.order()`.
 /// - `xyz`: flat `(N, 3)` world-frame positions, row-major. For a `pointset`
@@ -120,17 +143,39 @@ pub fn compose_point_weights(
     default: f64,
     skip_pointset: bool,
 ) -> ComposedWeights {
+    compose_point_weights_solo(edits, xyz, default, skip_pointset, None)
+}
+
+/// [`compose_point_weights`], with an optional "only this region" filter.
+///
+/// `solo = Some(id)` skips every OTHER region, enabled or not, so the frame
+/// shows one region's effect alone — the Named Objects panel's solo button
+/// (`docs/EDITOR.md` §4). `solo = None` is exactly the Python's behaviour and
+/// is what every parity test runs.
+///
+/// # Panics
+/// Panics if `xyz.len()` is not a multiple of 3, which is a programming error
+/// at the call site rather than a runtime condition.
+#[must_use]
+pub fn compose_point_weights_solo(
+    edits: &EditDocument,
+    xyz: &[f64],
+    default: f64,
+    skip_pointset: bool,
+    solo: Option<&str>,
+) -> ComposedWeights {
     assert!(xyz.len() % 3 == 0, "xyz must be a flat (N, 3) array");
     let n = xyz.len() / 3;
     let mut weight = vec![default; n];
     let mut touched = vec![0.0_f64; n];
     let mut delete_mask = vec![false; n];
+    let mut per_region: Vec<RegionCount> = Vec::with_capacity(edits.order().len());
 
     for id in edits.order() {
         let Some(region) = edits.region(id) else {
             continue;
         };
-        if !region.enabled {
+        if !region.enabled || solo.is_some_and(|only| only != region.id) {
             continue;
         }
         if skip_pointset && region.kind == Kind::Pointset {
@@ -144,6 +189,7 @@ pub fn compose_point_weights(
             },
         };
 
+        let mut claimed = 0_usize;
         for i in 0..n {
             // `active`: a point a previous region already deleted takes no
             // further part in composition (see the module's third invariant).
@@ -156,6 +202,7 @@ pub fn compose_point_weights(
                     delete_mask[i] = true;
                     weight[i] = 0.0;
                     touched[i] = 0.0;
+                    claimed += 1;
                 }
                 continue;
             }
@@ -163,6 +210,7 @@ pub fn compose_point_weights(
             if m == 0.0 {
                 continue;
             }
+            claimed += 1;
             weight[i] = match region.op {
                 Op::Blend => weight[i].mul_add(1.0 - m, region.mix * m),
                 // `fade` multiplies: w *= 1 - m*(1 - mix).
@@ -171,12 +219,17 @@ pub fn compose_point_weights(
             };
             touched[i] = touched[i].mul_add(1.0 - m, m);
         }
+        per_region.push(RegionCount {
+            id: region.id.clone(),
+            count: claimed,
+        });
     }
 
     ComposedWeights {
         weight,
         touched,
         delete_mask,
+        per_region,
     }
 }
 
@@ -191,6 +244,19 @@ pub fn compose_trips_weights(edits: &EditDocument, xyz: &[f64]) -> ComposedWeigh
     compose_point_weights(edits, xyz, GATE_DEFAULT_WEIGHT, false)
 }
 
+/// [`compose_trips_weights`] with the Named Objects panel's solo filter.
+///
+/// # Panics
+/// As [`compose_point_weights`].
+#[must_use]
+pub fn compose_trips_weights_solo(
+    edits: &EditDocument,
+    xyz: &[f64],
+    solo: Option<&str>,
+) -> ComposedWeights {
+    compose_point_weights_solo(edits, xyz, GATE_DEFAULT_WEIGHT, false, solo)
+}
+
 /// Gaussian splat centres: `pointset` regions skipped (a different row order).
 ///
 /// The twin of `trippy.edit.weights.compose_gaussian_weights`.
@@ -200,6 +266,19 @@ pub fn compose_trips_weights(edits: &EditDocument, xyz: &[f64]) -> ComposedWeigh
 #[must_use]
 pub fn compose_gaussian_weights(edits: &EditDocument, xyz: &[f64]) -> ComposedWeights {
     compose_point_weights(edits, xyz, GATE_DEFAULT_WEIGHT, true)
+}
+
+/// [`compose_gaussian_weights`] with the Named Objects panel's solo filter.
+///
+/// # Panics
+/// As [`compose_point_weights`].
+#[must_use]
+pub fn compose_gaussian_weights_solo(
+    edits: &EditDocument,
+    xyz: &[f64],
+    solo: Option<&str>,
+) -> ComposedWeights {
+    compose_point_weights_solo(edits, xyz, GATE_DEFAULT_WEIGHT, true, solo)
 }
 
 /// Widen a `(N, 3)` f32 position array to f64, exactly as `numpy`'s

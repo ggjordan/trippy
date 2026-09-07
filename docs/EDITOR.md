@@ -7,10 +7,8 @@ apply-edits --target trips|distilled|both`, `trippy edits
 shade-find/add-box/add-sphere/add-lid/click`, and `--edits` on `trippy
 candidate-report`/`trippy eval`/`trippy distill --stage render` in
 `trippy/cli.py`; see `docs/EXPERIMENTS.md` "Edits" for the worked run and
-test list). The Rust viewer (§0/§2's render integration, §3's selection
-tools, §4's UI) is **not implemented** -- this document remains the spec
-for that work. Three implementation notes, all explained where they matter
-below:
+test list).
+
 Status: **E1, E2 and E4 shipped on both sides** (2026-09-07).
 
 - Python: `trippy/edit/` (`model.py`, `weights.py`, `shade_finder.py`,
@@ -34,11 +32,6 @@ half is `src/edit/sam.rs` (the render-pixel -> view-pixel mapping),
 `src/sam_child.rs` (the `trippy edits sam` child process) and the `SAM 3
 lift` tool in `src/edit_ui.rs`; see §3's "5. The SAM tool in the viewer".
 
-Not built: the 3D drag gizmos (E1 shipped Inspector fields + keyboard
-nudge/resize instead), E3's lid gizmo, and the viewer's own brush tool /
-Named Objects panel (see the next Status line -- the `brush`-kind region
-and the naming convention it needs are now Python-side implemented).
-
 Status: **brush regions, named regions, and the `trippy eval --edits` gate
 gap are done on the Python side** (2026-09-07). `trippy/edit/model.py`
 adds `brush`-kind regions (`brush_membership`, `paint_sphere`/
@@ -47,24 +40,48 @@ entry) and `Region.source` + `auto_region_name` (§1's "Named regions");
 `shade_finder.py`/`cluster.py`/`sam_lift.py` fill both on every region they
 produce; `trippy edits add-brush` and `edits list/rename/toggle/remove`
 are the new CLI. `trippy.train.trainer.Trainer.evaluate` now applies the
-gate-suppression multiply too, closing §5's own documented gap. The Rust
-viewer's brush tool and Named Objects panel are not built -- this document
-remains the spec for that work; `tests/fixtures/synthetic/edit_golden/
-brush.json` is the parity fixture waiting for it.
+gate-suppression multiply too, closing §5's own documented gap.
 
-Three implementation notes, all explained where they matter below:
-tools' UI/ray-cast half, §4's UI) is **not implemented** -- this document
-remains the spec for that work. Four implementation notes, all explained
-where they matter below:
+Status: **the viewer's brush tool, its Named Objects panel and the 3D drag
+gizmos are shipped** (2026-09-08). This closes the last three viewer pieces
+this document was still a spec for:
+
+- **Brush** (`src/edit/brush.rs`, the `brush` tool in `src/edit_ui.rs`, the
+  drag in `src/app.rs`, `--brush*` in `src/main.rs`): drag on the render to
+  paint spheres of `brush_radius` at the depth of the nearest point under the
+  cursor (the same projection trick click-to-cluster uses, inverted --
+  `ClickCamera::unproject`), Alt-drag to erase, `[`/`]` for the radius, a
+  weight slider, and **one undo entry per stroke** however many frames the
+  drag took (`EditDocument::update_region_coalesced` /
+  `add_region_coalesced`). Parity with the Python is pinned by
+  `tests/fixtures/synthetic/edit_golden/brush.json`, which now records the
+  three AUTHORING calls as well as their result: the Rust side replays
+  `paint_sphere`/`paint_along`/`erase` and must arrive at the same cells, in
+  the same order, with the same weights.
+- **Named Objects** (`edit_ui.rs`'s `named_objects_panel`): every region with
+  its name, source tool, kind, live point count, enable toggle, mix slider,
+  rename, remove and **solo**, grouped by `Region.source.tool`. Regions made
+  in the viewer get the same auto names the CLI gives
+  (`model::auto_region_name`, pinned by `edit_golden/names.json`).
+- **Gizmos** (`src/edit/gizmo.rs`, painted by `app.rs`'s egui painter):
+  three projected axis handles on the selected box/sphere/lid; drag to
+  translate along that axis, Shift-drag to resize, Ctrl-drag to rotate a box.
+  A drag that does not START on a handle still orbits, so navigation loses
+  nothing; the keyboard nudges stay, and now share `gizmo::translated` /
+  `gizmo::resized` with the drag so the two cannot disagree.
+
+Four implementation notes, all explained where they matter below:
 
 - **`box`'s schema is `center`/`half_extents`/`quat`** (an oriented box),
   not this section's axis-aligned `min`/`max` -- a rotated box is testable
   where an axis-aligned-only schema is not; identity `quat` recovers an
   axis-aligned box exactly. See §1's `box` entry.
 - **The Python `lid` region kind is E3's hard-clip action already**
-  (`op="delete"`/`"fade"`, `trippy.edit.model.lid_membership`); its 3D
-  gizmo (drag the plane/radius in the viewer) is not built. See §1's `lid`
-  entry and §6's E3 row.
+  (`op="delete"`/`"fade"`, `trippy.edit.model.lid_membership`). Its 3D gizmo
+  is E1's general one (`src/edit/gizmo.rs`, shipped 2026-09-08): a lid is
+  moved by dragging a handle and its `radius` scaled by Shift-dragging one,
+  rather than by a ring of its own. `up`/`height` are still typed in the
+  Inspector. See §1's `lid` entry and §6's E3 row.
 - **The checkpoint-side gate-suppression multiply (§5) is a documented
   simplification, not the full per-pixel override §2 describes** -- it
   multiplies the trained blend gate by the editor's own per-point weight
@@ -289,11 +306,23 @@ call directly).
   `trippy edits add-brush` (one region + one sphere stroke).
   `tests/fixtures/synthetic/edit_golden/brush.json`
   (`trippy.edit.golden.build_brush_fixture`) exercises `paint_sphere`,
-  `paint_along` and `erase` in sequence and records the resulting per-point
-  weights, as the parity target for a future Rust `edit::brush`. **Not
-  built**: the viewer's own brush tool (drag-to-paint on the render) and
-  its Inspector affordances — this is the Rust follow-up §3/§4 still spec,
-  not implemented.
+  `paint_along` and `erase` in sequence and records **both** the three
+  authoring calls (`"strokes"`) and the region + per-point weights they
+  produce, which is what the Rust twin
+  (`rust/crates/trips-viewer/src/edit/brush.rs`) replays: it must arrive at
+  the same cells, in the same order, with the same weights, and then agree
+  on every query point's membership. Recording the calls and not only their
+  result is deliberate — a port that voxelised a sphere by "is the cell's
+  CENTRE inside it" would reproduce a smaller cell set that still passed
+  every membership lookup. **Shipped on the viewer side too** (2026-09-08):
+  the `brush` tool paints on the render (§4), and one stroke is one undo
+  entry. The one deviation from the Python: the viewer keeps a brush's
+  cells INLINE when it saves, rather than externalising them into the
+  `.npz` sidecar above `EDIT_BRUSH_NPZ_CELL_THRESHOLD` cells. Neither
+  loader ever reads that sidecar (both reconstruct every region by
+  replaying `undo_stack.log`, which is never externalised), so the two
+  files differ only in size, and adding an npz WRITER to the viewer would
+  buy nothing a reader can see.
 - `lid`: `up`, `height`, `center`, `radius`, `falloff`, `band` — **the same
   six numbers as `~/Splats/tools/SURFACE_LID.md`'s `--lid-*` flags**, so the
   Karekare pool's already-fitted values
@@ -308,7 +337,8 @@ call directly).
   see that function's docstring for the formula, mirrored across the plane
   from `SURFACE_LID.md`'s own `band_i`/`region_i` shape). `trippy edits
   add-lid` with no geometry flags seeds exactly the numbers above. The 3D
-  gizmo (drag the plane/radius in the viewer) is not built.
+  gizmo is E1's general one (drag a handle to move the lid, Shift-drag to
+  scale its radius; §6's E3 row).
 - `pointset`: `point_ids: [u32, ...]` — indices into `points.npz`'s `xyz`
   array (the TRIPS point cloud's own row order, stable for the life of a
   bundle since nothing in the viewer re-sorts or re-indexes points after
@@ -601,9 +631,14 @@ automatically the way training-time `shade_prune` does.
 
 ### 3. Lid (E3)
 
-Not really a "selection tool" — a fixed-shape region with a plane/radius/
-falloff gizmo in the 3D view (drag the plane, drag the radius ring), seeded
-from `SURFACE_LID.md`'s numbers when the scene is Karekare. See §1/§2.
+Not really a "selection tool" — a fixed-shape region seeded from
+`SURFACE_LID.md`'s numbers when the scene is Karekare. **Shipped**, with one
+deviation from this paragraph's original "drag the plane, drag the radius
+ring": the lid uses the SAME gizmo every other shape does
+(`src/edit/gizmo.rs`), so a drag on a handle moves it and a Shift-drag scales
+`radius`. One gizmo that behaves identically on three region kinds is worth
+more than a bespoke ring, and the plane's normal — the one thing a ring would
+add — is already correct on the only scene that has one. See §1/§2.
 
 ### 4. SAM 3 lift (E5)
 
@@ -831,10 +866,11 @@ splat_bundle.py`; 4000 points, 48x36 views), box `12 9 36 27` on `IMG_0.jpg`,
 
 ## 4. UI sketch
 
-Three egui panels, added the same way the existing HUD window is built
-(`app.rs::ViewerApp::overlay`, an `egui::Window`) — an "Edit" window shown
-alongside it, toggled independently of the existing Tab-toggled HUD so
-Jordan can hide edit chrome while still flying around:
+Four egui panels (the sketch's three, plus **Named Objects**), added the same
+way the existing HUD window is built (`app.rs::ViewerApp::overlay`, an
+`egui::Window`) — an "Edit" window shown alongside it, toggled independently of
+the existing Tab-toggled HUD so Jordan can hide edit chrome while still flying
+around:
 
 ```
 ┌─ Regions ──────────────────────┐  ┌─ Inspector ──────────────────┐
@@ -847,8 +883,17 @@ Jordan can hide edit chrome while still flying around:
 │  drag to reorder (paint order) │  │ height: [-0.49    ] up: [...] │
 └─────────────────────────────────┘  │ radius: [2.5] falloff:[1.0]  │
                                       │ band:   [0.05]                │
-┌─ Tools ─────────────────────────┐  │ [preview] [select] [delete]  │
-│ ( ) click-to-cluster            │  └────────────────────────────────┘
+┌─ Named Objects (2 groups) ──────┐  │ [preview] [select] [delete]  │
+│ brush (2)                        │  └────────────────────────────────┘
+│  [x] brush-1   [brush delete] 312 pts
+│      mix ----   [solo][rename][remove]
+│  [x] brush-3   [brush fade]   88 pts
+│ hand-authored (1)                │
+│  [x] pool lid  [lid delete]  1204 pts
+└───────────────────────────────────┘
+
+┌─ Tools ─────────────────────────┐
+│ ( ) click-to-cluster            │
 │ ( ) shade-cloud finder           │
 │     lum <  [0.25]                │
 │     conf < [0.50]                │
@@ -857,39 +902,51 @@ Jordan can hide edit chrome while still flying around:
 │     the render, or alt-click     │
 │     op/mix, views around, device │
 │     [run SAM lift] [cancel]      │
-│ ( ) lid gizmo (drag in 3D view)  │
+│ ( ) brush: drag to paint, alt to │
+│     erase; radius / weight       │
+│     [start a new region]         │
 └───────────────────────────────────┘
+
+The 3D gizmo is not a panel: it is three coloured handles drawn over the render
+itself, on whichever region the Inspector has selected (box, sphere or lid).
 ```
 
 **Keys** (chosen to avoid every key `app.rs::ViewerApp::handle_input`
 already binds — `V X Tab - = F R N P W A S D Q E` and drag/scroll):
 
-**As shipped** (E1/E2/E4). Rows marked *not built* wait on E3.
+**As shipped** (E1/E2/E4/E5, plus the brush and the gizmos, 2026-09-08).
 
 | key | action |
 |---|---|
-| `M` | toggle edit mode (shows Regions/Inspector/Tools). `--edit` opens straight into it. Click-drag on the canvas still orbits: with no gizmos to hit, swapping the drag would only take navigation away |
+| `M` | toggle edit mode (shows Regions/Named Objects/Inspector/Tools). `--edit` opens straight into it. Click-drag on the canvas still orbits *unless it starts on a gizmo handle* — the drag is scoped to what it started on, so navigation is never taken away |
 | **Shift-click** | E4's selection gesture: cluster the object under the pointer. Read from the scene `Response` like every drag, and scoped to `clicked()` rather than `dragged()`, so a Shift-DRAG still orbits and navigation loses nothing |
-| **drag** | E5's box prompt, **only while the SAM tool has focus**. Shift-drag still orbits and right/middle-drag still pans, so the gesture is borrowed for one tool rather than taken |
-| **Alt-click** | E5's point prompt. Alt is bound to nothing else in this viewer, so this costs no existing gesture |
-| `T` | cycle the active tool (Regions → shade-cloud finder → click-to-cluster → SAM 3 lift) |
-| arrows, `PageUp`/`PageDown` | nudge the selected region along world X/Z and Y by `NUDGE_SCENE_FRACTION` of the scene diameter — **E1's replacement for the 3D drag gizmo** |
-| `[` / `]` | shrink/grow the selected region by `RESIZE_STEP` |
+| **drag** | E5's box prompt **while the SAM tool has focus**, a brush stroke **while the Brush tool has focus**, and a gizmo drag when it STARTS on a handle. Shift-drag still orbits and right/middle-drag still pans in every case, so each gesture is borrowed rather than taken |
+| **Alt-click / Alt-drag** | E5's point prompt; with the Brush tool, an ERASE stroke. Alt is bound to nothing else in this viewer, so this costs no existing gesture |
+| **drag a gizmo handle** | translate the selected box/sphere/lid along that handle's world axis. **Shift-drag** a handle resizes; **Ctrl-drag** rotates a box about that axis (nothing else has an orientation to rotate). One drag = one undo entry, however many frames it took |
+| `T` | cycle the active tool (Regions → shade-cloud finder → click-to-cluster → SAM 3 lift → brush) |
+| arrows, `PageUp`/`PageDown` | nudge the selected region along world X/Z and Y by `NUDGE_SCENE_FRACTION` of the scene diameter — **kept alongside the gizmos**: an exact step needs neither a visible handle nor a mouse, and both go through the same `gizmo::translated` |
+| `[` / `]` | shrink/grow the selected region by `RESIZE_STEP` — or the **brush radius** by `BRUSH_RADIUS_STEP`, while the Brush tool has focus |
 | `Delete` / `Backspace` | remove the selected region (its `op` is a separate field in the Inspector) |
 | `Cmd`/`Ctrl` + `Z` | undo |
 | `Cmd`/`Ctrl` + `Shift` + `Z` | redo |
 | `Cmd`/`Ctrl` + `S` | save `edits.json` |
-| `H` | toggle the preview highlight of whichever tool has focus (a tinted point cloud, not a new `ViewMode` — see §6). Where several tools have a live preview, the union is tinted the one colour |
+| `H` | toggle the preview highlight of whichever tool has focus (a tinted point cloud, not a new `ViewMode` — see §6). Where several tools have a live preview, the union is tinted the one colour. The brush has no preview of its own — what a stroke paints IS the region — so `H` keeps its one meaning; the 3D handles have their own checkbox in the Regions panel |
 | `Cmd`/`Ctrl` + `N` | *not built*, and not needed: "new region from the current selection" is the **add as region** button next to each tool's own selection (E2's shade finder, E4's click-to-cluster), where the op and mix for it are chosen |
 
-Left-click behaviour while in edit mode: **unchanged from viewing**. A plain
-drag orbits; a plain click does nothing. E4 added exactly one gesture on top —
-**Shift-click**, which clusters — rather than taking the plain click away,
-because the click-to-cluster tool is one of three and the other two have no use
-for it. When the lid gizmo lands (E3) the rule stays: a drag is scoped to what
-it started on — the same `dragged_by`, not a global "is anything active"
-check, discipline `app.rs`'s own module doc calls out as the fix for the
-`egui_wants_pointer_input` trap.
+Left-click behaviour while in edit mode: **unchanged from viewing**, except
+where a tool or a handle has explicitly claimed the drag. A plain drag orbits; a
+plain click does nothing. E4 added exactly one gesture on top — **Shift-click**,
+which clusters — rather than taking the plain click away. The gizmos keep the
+same rule and are the clearest case of it: a drag is scoped to what it started
+on (`GizmoScreen::pick`, within `GRAB_PX` of a handle, decided once when the
+button goes down), the same `dragged_by`-not-a-global-flag discipline `app.rs`'s
+own module doc calls out as the fix for the `egui_wants_pointer_input` trap. Two
+consequences worth stating plainly: the handles a drag hit-tests against were
+projected at the end of the PREVIOUS frame (the camera is built after
+`handle_input`), which is invisible in practice because a camera moving fast
+enough to matter is a camera being orbited; and the handles and the brush ring
+are drawn by the egui painter OVER the finished frame, so `--screenshot` shows
+the edit and never the tool.
 
 The clicked pixel is handed on in the **render's** coordinates (egui points
 times `pixels_per_point` times the render-scale lever), not egui points, because
@@ -999,12 +1056,10 @@ schedule.
 
 | # | Scope | Estimate | Acceptance | Status |
 |---|---|---|---|---|
-| **E1** | Region data model (`edits.json` read/write), `box`/`sphere` region kinds, per-point weight compositing (§2's non-depth design) on the TRIPS side only, undo/redo, save/load surviving a bundle close+reopen | 1 wk | Draw a box or sphere region in the viewer, set `mix`, see the TRIPS render change inside it and nothing outside it; undo removes the region; closing and reopening the bundle restores it exactly (region list, mix values, undo history) | **Done** (2026-09-07), except the 3D drag gizmos, which E1 replaced with Inspector fields + arrow-key nudge / `[`-`]` resize. `rust/crates/trips-viewer/src/edit/*` + `src/edit_ui.rs`. Measured on the synthetic bundle: a `blend` sphere at `mix = 0` changes 4.74 % of the pixels in its own half of the frame and **0.00 %** of the other half; a `delete` box changes 63.97 % of its half; undoing it reproduces the unedited frame **bit for bit** (max channel diff 0). |
+| **E1** | Region data model (`edits.json` read/write), `box`/`sphere` region kinds, per-point weight compositing (§2's non-depth design) on the TRIPS side only, undo/redo, save/load surviving a bundle close+reopen | 1 wk | Draw a box or sphere region in the viewer, set `mix`, see the TRIPS render change inside it and nothing outside it; undo removes the region; closing and reopening the bundle restores it exactly (region list, mix values, undo history) | **Done** (2026-09-07); the **3D drag gizmos landed 2026-09-08** (`src/edit/gizmo.rs`: three projected world-axis handles on the selected box/sphere/lid, drag to translate, Shift-drag to resize, Ctrl-drag to rotate a box, one undo entry per drag), alongside the Inspector fields and the arrow-key nudge / `[`-`]` resize E1 shipped first — the keyboard steps stayed and now share `gizmo::translated`/`gizmo::resized` with the drag. `rust/crates/trips-viewer/src/edit/*` + `src/edit_ui.rs`. Measured on the synthetic bundle: a `blend` sphere at `mix = 0` changes 4.74 % of the pixels in its own half of the frame and **0.00 %** of the other half; a `delete` box changes 63.97 % of its half; undoing it reproduces the unedited frame **bit for bit** (max channel diff 0). Gizmo proof (2026-09-08, same bundle at 480x360): `--move-region "left blob" 0.9 0 0`, the headless twin of a translate drag, changes **8.22 %** of the frame's pixels (max channel diff 57) against the same edits rendered without it. |
 | **E2** | Shade-cloud finder: `trippy edit-prep` precompute + live threshold sliders + preview-highlight `ViewMode` + "select" → `pointset` region | 3 d | On a bundle whose scene has registered shade frames, the finder's default thresholds select a `pointset` region whose `dark_mass_fraction` (via `trippy.train.prune.dark_mass_stats` on the selected IDs) matches the audit's own number for that scene to float precision; deleting the region and re-running the audit shows the drop | **Done** (2026-09-07). Four live sliders (lum, conf, znear/zfar fractions) over `shade_views.json`, the precompute written by `trippy.edit.golden.write_shade_views`; "add as region (fade / delete)"; and a preview that **tints** the selection instead of adding a `ViewMode` (see the note under this table). `trips-viewer --dump-shade` selects the same ids and the same `dark_mass_fraction` as `trippy.edit.shade_finder.find_shade_pointset` on the synthetic bundle (`tests/test_edit_viewer_parity.py`). |
-| **E3** | `lid` region kind + 3D gizmo (plane/radius drag) + hard-clip delete semantics | 2 d | Loading the Karekare pool bundle with a `lid` region seeded from `SURFACE_LID.md`'s numbers removes the haze from every angle at every `mix`/exposure; dragging the radius ring changes the affected point count live | **Region kind + hard-clip semantics done** (`trippy.edit.model.lid_membership`, `trippy edits add-lid`); the 3D gizmo is not built. |
+| **E3** | `lid` region kind + 3D gizmo (plane/radius drag) + hard-clip delete semantics | 2 d | Loading the Karekare pool bundle with a `lid` region seeded from `SURFACE_LID.md`'s numbers removes the haze from every angle at every `mix`/exposure; dragging the radius ring changes the affected point count live | **Done** (2026-09-08). Region kind + hard-clip semantics: `trippy.edit.model.lid_membership`, `trippy edits add-lid`. The 3D gizmo is E1's (`src/edit/gizmo.rs`), which treats a lid like every other shape: its handles are placed at `lid.center` and a Shift-drag scales `lid.radius`, so "drag the radius ring" is a Shift-drag on a handle rather than a ring of its own. Not built: a handle for `up`/`height` specifically — the plane's normal is still typed in the Inspector, where the Karekare numbers are already correct. |
 | **E4** | Click-to-cluster: ray cast + k-d tree + k-NN growth in world+colour space, radius slider | 3 d | Clicking a point-cloud cluster selects a `pointset` region that visibly matches the clicked object's extent, without needing a depth buffer | **Done** (2026-09-07), on both sides. Python: `trippy.edit.cluster`, `trippy edits click` (`tests/test_edit_cluster.py`). Rust: `edit/cluster.rs` (the projection, the depth-mode seed, an exact k-NN spatial hash in place of the unavailable k-d tree, the colour/radius/point gates), the **Selection panel** with the four sliders + op/mix + "add as region" + "clear" in `edit_ui.rs`, and **Shift-click** on the render in `app.rs`. Parity is exact, not approximate: the committed `click.json`/`expected_click.json` fixture replays four clicks (depth-mode seeding, the colour gate, the `max_points` cut-off, a miss) and both languages return the identical id list; `--click U V --dump-click` reproduces it against a real bundle. Measured on the synthetic bundle at 480x360: a click at (240, 180) selects 261 of 4000 points, the tint changes **71.55 %** of the frame's pixels (3.81 % of them turning magenta, the rest dimmed by the preview) with a max channel diff of 79, and a run without `--click` reproduces the untinted frame **bit for bit** (0.0000 % of pixels differ, max channel diff 0). Not built: an Inspector-side gizmo for a committed `pointset` region (there is no shape to drag). |
-| **E5** | SAM 3 lift: photo segmentation, multi-view projection + majority vote, `pointset` region output | 2–3 wk | Segmenting an object in 2–3 registered views of the same scene produces one `pointset` region that, previewed, highlights that object and not its neighbours; runs entirely local (no image leaves the machine) | Not started. |
-| **E4** | Click-to-cluster: ray cast + k-d tree + k-NN growth in world+colour space, radius slider | 3 d | Clicking a point-cloud cluster selects a `pointset` region that visibly matches the clicked object's extent, without needing a depth buffer | Not started. |
 | **E5** | SAM 3 lift: photo segmentation, multi-view projection + majority vote, `pointset` region output | 2–3 wk | Segmenting an object in 2–3 registered views of the same scene produces one `pointset` region that, previewed, highlights that object and not its neighbours; runs entirely local (no image leaves the machine) | **Shipped, both sides.** Python: `trippy/edit/sam_lift.py`, `trippy/edit/sam_runner.py`, `trippy edits sam` (§3's "Implemented" note has the command, the depth-gate and the vote rules). Viewer: the `SAM 3 lift` tool — drag a box or Alt-click on the render while pinned to a capture view, one `trippy edits sam` child with live progress and a Cancel button, and the region imported through the undo log and tinted (§3's "5. The SAM tool in the viewer"). SAM 3 runs locally in a subprocess under Splats' SAM venv, on CPU (~9 s/view) or MPS; the whole path is CPU-testable and screenshottable with `--fake` / `TRIPPY_SAM_FAKE=1`, which needs no checkpoint and no GPU (`tests/test_edit_sam.py`, `trips-viewer --sam-box`). Not built: batching several views into ONE child (each view still pays a model load, `docs/LIMITATIONS.md`), and any per-point clean-up of the returned selection. |
 | **E6** | Publish path: `trippy apply-edits`, TRIPS `export.ply` mask wiring, distilled-splat publish order (edit-then-distil for pointset regions, geometry-reapply for box/sphere/lid) | 3 d | `trippy apply-edits --target both` on a bundle with a mix of region kinds produces a TRIPS PLY with the deleted points absent and, after a `trippy distill` run on the same edited bundle, a distilled PLY that also lacks them; a box/sphere/lid region re-applied directly to an already-distilled PLY (no re-distillation) also removes the matching geometry | **Done** (`trippy/edit/apply.py`, `trippy/edit/checkpoint.py`): `--target trips\|distilled\|both` (default `both`); `trips`/`both` write the filtered TRIPS `points.npz`/`blend_weights.npy`/`export.ply` and, if named, a filtered `blend.splat_ply`; `distilled`/`both` (with `--distilled-ply`) re-apply box/sphere/lid regions to an already-distilled PLY as delete/opacity-scale-fade; `--edits` wired into `trippy distill --stage render` (edit-then-distil ordering) and into `trippy candidate-report`/`trippy eval` (checkpoint-side keep mask + gate suppression on gate-hybrid checkpoints, BOTH commands as of 2026-09-07 — see §5's own paragraph). |
 
@@ -1024,12 +1079,37 @@ from the bundle's own points and **says so in the panel**.
 
 E1 already includes undo/save per the brief; E2–E5 add tool-specific
 selection UI on top of the E1 data model and do not need to repeat undo/save
-plumbing. `brush`-kind (voxel) regions are Python-side implemented (§1's
-`brush` entry) but not in any milestone above — the viewer's own brush tool
-(drag-to-paint on the render) is Rust follow-up work, tracked here rather
-than given its own "E" number since it is additive to E1's data model in
-the same way E2–E5 are. Splat-side weight compositing (§2's "splat side"
-bullet) is also not in any milestone above — see §7.
+plumbing. `brush`-kind (voxel) regions and the Named Objects panel are in no
+milestone above — they are additive to E1's data model in the same way E2–E5
+are, and are tracked here rather than given their own "E" numbers. Both are
+now **shipped on both sides** (2026-09-08):
+
+- **Brush.** Python: `trippy.edit.model`'s `brush_membership`/`paint_sphere`/
+  `paint_along`/`erase` + `trippy edits add-brush`. Viewer:
+  `src/edit/brush.rs` and the `brush` tool (drag to paint, Alt-drag to erase,
+  `[`/`]` for the radius, a weight slider, one undo entry per stroke). Parity
+  is exact, not approximate: `edit_golden/brush.json` records the three
+  authoring calls and both sides replay them to the same cells **in the same
+  order** with the same weights, then agree on every query point's membership;
+  `--dump-weights` re-checks the membership over a real `points.npz`
+  (`tests/test_edit_viewer_parity.py`). Measured on the synthetic bundle at
+  480x360: one dab at (240, 180) with `radius 0.5 --brush-op delete` removes
+  110 of 4 000 points and changes **4.21 %** of the frame (max channel diff
+  50); a two-pixel stroke to (300, 210) removes 299 and changes **8.51 %**;
+  `--brush-undo` reproduces the unedited frame **byte for byte** (0.00 % of
+  pixels differ, max channel diff 0).
+- **Named Objects.** Every region with its name, source tool, kind, live point
+  count, enable toggle, mix slider, rename, remove and **solo**, grouped by
+  `Region.source.tool` with hand-authored regions in their own group. Viewer
+  regions are auto-named by `model::auto_region_name`, the port of
+  `trippy.edit.model.auto_region_name`, pinned case for case by
+  `edit_golden/names.json`. Solo is a way of looking and never saved:
+  `weights::compose_point_weights_solo` skips every other region for one
+  composition. Measured on the same bundle: soloing one of two `delete`
+  spheres changes **3.77 %** of the frame against both being on.
+
+Splat-side weight compositing (§2's "splat side" bullet) is also not in any
+milestone above — see §7.
 
 ## 7. Risks
 

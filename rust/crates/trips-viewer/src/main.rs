@@ -126,6 +126,25 @@ Editing (docs/EDITOR.md; press M in the window for the panels):
                        whole path -- child, progress, region, tint -- with no
                        checkpoint and no GPU. This is what the screenshot proof
                        and the tests use
+  --brush <U> <V>      paint a brush dab at render pixel (U, V), as a CLICK
+                       with the Brush tool does. The stroke is anchored at the
+                       depth of the nearest point under that pixel
+  --brush-to <U> <V>   a second pixel: the stroke is painted ALONG the segment
+                       between the two, like a drag
+  --brush-radius <f>   stroke radius, world units (default: 4% of the scene)
+  --brush-weight <f>   painted cell weight, 0..1 (default 1)
+  --brush-op <op>      blend | fade | delete for the new region (delete)
+  --brush-mix <f>      its mix, 0 = splat, 1 = TRIPS (default 0)
+  --brush-erase        erase instead of paint (the window's ALT-drag)
+  --brush-undo         after painting, undo the stroke. The frame must then be
+                       identical to a run with no --brush at all -- the brush
+                       screenshot proof
+  --move-region <ID> <DX> <DY> <DZ>
+                       translate a region (by id or by name) by world units and
+                       exit through the render: the headless twin of dragging
+                       its translate gizmo
+  --solo <ID>          compose ONLY this region (by id or name), as the Named
+                       Objects panel's solo button does
   --sam-undo           after importing, undo it. The frame must then be
                        identical to a run with no --sam-box at all, which is
                        the undo-restores-it half of the E5 proof
@@ -153,6 +172,8 @@ Keys:
   M          edit mode: Regions / Inspector / Tools (docs/EDITOR.md)
   shift-click  in edit mode: select the object under the pointer (E4)
   drag / alt-click  with the SAM tool: box / point prompt for the lift (E5)
+  drag / alt-drag   with the Brush tool: paint / erase a 3D brush region
+  drag a handle     move the selected region (shift: resize, ctrl: rotate a box)
   V          cycle network / raw level-0 / coverage
   X          cycle the exposure the tone mapper applies
   - / =      render scale        TAB  hide the panel
@@ -259,6 +280,26 @@ struct Args {
     sam_fake: bool,
     /// `--sam-undo`.
     sam_undo: bool,
+    /// `--brush U V`: the first (or only) dab, in RENDER pixels.
+    brush: Option<(f64, f64)>,
+    /// `--brush-to U V`: the stroke's far end, in RENDER pixels.
+    brush_to: Option<(f64, f64)>,
+    /// `--brush-radius`, world units; `None` means the scene-derived default.
+    brush_radius: Option<f64>,
+    /// `--brush-weight`.
+    brush_weight: f64,
+    /// `--brush-op`.
+    brush_op: trips_viewer::edit::Op,
+    /// `--brush-mix`.
+    brush_mix: f64,
+    /// `--brush-erase`.
+    brush_erase: bool,
+    /// `--brush-undo`.
+    brush_undo: bool,
+    /// `--move-region ID DX DY DZ`.
+    move_region: Option<(String, [f64; 3])>,
+    /// `--solo ID`.
+    solo: Option<String>,
 }
 
 /// Parse `1920x1080`.
@@ -381,6 +422,19 @@ fn parse_args() -> Result<Args, String> {
         sam_device: "cpu",
         sam_fake: false,
         sam_undo: false,
+        brush: None,
+        brush_to: None,
+        brush_radius: None,
+        brush_weight: 1.0,
+        // A painted region that deletes is the one whose effect a screenshot
+        // can see without a splat to blend towards, which is what the proof in
+        // `docs/EDITOR.md` §6 measures.
+        brush_op: trips_viewer::edit::Op::Delete,
+        brush_mix: 0.0,
+        brush_erase: false,
+        brush_undo: false,
+        move_region: None,
+        solo: None,
     };
     let mut argv = std::env::args().skip(1);
     while let Some(flag) = argv.next() {
@@ -518,6 +572,40 @@ fn parse_args() -> Result<Args, String> {
                 args.click_max_points =
                     Some(value()?.parse().map_err(|e| format!("--click-max-points: {e}"))?);
             }
+            "--brush" => {
+                let u: f64 = value()?.parse().map_err(|e| format!("--brush U: {e}"))?;
+                let v: f64 = value()?.parse().map_err(|e| format!("--brush V: {e}"))?;
+                args.brush = Some((u, v));
+            }
+            "--brush-to" => {
+                let u: f64 = value()?.parse().map_err(|e| format!("--brush-to U: {e}"))?;
+                let v: f64 = value()?.parse().map_err(|e| format!("--brush-to V: {e}"))?;
+                args.brush_to = Some((u, v));
+            }
+            "--brush-radius" => {
+                args.brush_radius =
+                    Some(value()?.parse().map_err(|e| format!("--brush-radius: {e}"))?);
+            }
+            "--brush-weight" => {
+                args.brush_weight = value()?.parse().map_err(|e| format!("--brush-weight: {e}"))?;
+            }
+            "--brush-op" => args.brush_op = trips_viewer::edit::Op::parse(&value()?)?,
+            "--brush-mix" => {
+                args.brush_mix = value()?.parse().map_err(|e| format!("--brush-mix: {e}"))?;
+            }
+            "--brush-erase" => args.brush_erase = true,
+            "--brush-undo" => args.brush_undo = true,
+            "--move-region" => {
+                let id = value()?;
+                let mut delta = [0.0_f64; 3];
+                for (index, slot) in delta.iter_mut().enumerate() {
+                    *slot = value()?
+                        .parse()
+                        .map_err(|e| format!("--move-region value {}: {e}", index + 1))?;
+                }
+                args.move_region = Some((id, delta));
+            }
+            "--solo" => args.solo = Some(value()?),
             "--free" => args.free = true,
             "--frames" => args.warmup = value()?.parse().map_err(|e| format!("--frames: {e}"))?,
             "--bench" => args.bench = Some(value()?.parse().map_err(|e| format!("--bench: {e}"))?),
@@ -815,6 +903,46 @@ fn dump_click(bundle: &Bundle, args: &Args, out: &std::path::Path) -> Result<(),
     Ok(())
 }
 
+/// Every region's name and id, for an error message that can be acted on.
+fn region_names(edits: &crate::edit_ui::EditSession) -> String {
+    let names: Vec<String> = edits
+        .doc
+        .regions()
+        .iter()
+        .map(|r| format!("{:?} ({})", r.name, r.id))
+        .collect();
+    if names.is_empty() {
+        "no regions".to_owned()
+    } else {
+        names.join(", ")
+    }
+}
+
+/// The pixels a drag from `from` to `to` would have sampled.
+///
+/// `EditSession::brush_sample` drops anything closer than `BRUSH_SAMPLE_PX` to
+/// the previous sample, so this walks the segment at exactly that spacing: a
+/// headless stroke paints the path a dragged one paints, not a fatter or
+/// thinner one.
+fn stroke_samples(from: (f64, f64), to: (f64, f64)) -> Vec<(f64, f64)> {
+    let length = (to.0 - from.0).hypot(to.1 - from.1);
+    if length <= trips_viewer::edit::BRUSH_SAMPLE_PX {
+        return vec![to];
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let steps = (length / trips_viewer::edit::BRUSH_SAMPLE_PX).ceil() as usize;
+    (1..=steps)
+        .map(|i| {
+            #[allow(clippy::cast_precision_loss)]
+            let t = i as f64 / steps as f64;
+            (
+                from.0 + (to.0 - from.0) * t,
+                from.1 + (to.1 - from.1) * t,
+            )
+        })
+        .collect()
+}
+
 /// The headless paths: `--screenshot` and `--bench`.
 ///
 /// Both create their **own** Burn device (there is no window to borrow one
@@ -909,6 +1037,113 @@ fn run_headless(args: &Args, bundle: Bundle) -> Result<(), String> {
                 .as_ref()
                 .map_or_else(String::new, |w| format!(" -- {w}"))
         );
+    }
+
+    // `--solo <ID>`: the Named Objects panel's solo button, headlessly. Applied
+    // BEFORE the other gestures so a run that both paints and solos shows the
+    // painted region alone.
+    if let Some(id) = args.solo.as_deref() {
+        if !edits.select_region(id) {
+            return Err(format!(
+                "--solo {id:?} names no region; this bundle's edits.json has {}",
+                region_names(&edits)
+            ));
+        }
+        let resolved = edits.selected_id().expect("just selected").to_owned();
+        edits.set_solo(Some(&resolved));
+        edits.apply(&mut renderer)?;
+        eprintln!(
+            "solo: only {id} composes ({})",
+            edits.solo().unwrap_or("nothing")
+        );
+    }
+
+    // `--move-region ID DX DY DZ`: the translate gizmo's headless twin. It goes
+    // through the SAME `edit::gizmo::translated` a drag does, so this proves the
+    // shipped path and not a parallel one (`docs/EDITOR.md` §6's E1 row).
+    if let Some((id, delta)) = args.move_region.as_ref() {
+        if !edits.select_region(id) {
+            return Err(format!(
+                "--move-region {id:?} names no region; this bundle's edits.json has {}",
+                region_names(&edits)
+            ));
+        }
+        let resolved = edits.selected_id().expect("just selected").to_owned();
+        let before = edits.doc.region(&resolved).map(|r| r.params.clone());
+        if !edits.move_selected_region(*delta) {
+            return Err(format!(
+                "--move-region {id:?} failed: {}",
+                edits.last_error().unwrap_or("no reason given")
+            ));
+        }
+        let after = edits.doc.region(&resolved).map(|r| r.params.clone());
+        if before == after {
+            return Err(format!(
+                "--move-region {id:?} changed nothing: a pointset or brush region has no \
+                 centre to move (docs/EDITOR.md §1)"
+            ));
+        }
+        edits.apply(&mut renderer)?;
+        eprintln!(
+            "moved {id} ({resolved}) by ({}, {}, {}) world units",
+            delta[0], delta[1], delta[2]
+        );
+    }
+
+    // `--brush U V [--brush-to U V]`: the headless twin of a brush stroke. Same
+    // session, same `EditSession::resolve_brush`, same undo log -- only the
+    // gesture is a flag instead of a drag (`docs/EDITOR.md` §6's brush row).
+    if let Some(px) = args.brush {
+        let radius = args.brush_radius.unwrap_or_else(|| {
+            f64::from(controller.scene().diameter() * trips_viewer::edit::DEFAULT_BRUSH_SCENE_FRACTION)
+        });
+        edits.set_brush_settings(radius, args.brush_weight, args.brush_op, args.brush_mix);
+        edits.begin_brush_stroke(args.brush_erase);
+        edits.brush_sample(px);
+        if let Some(to) = args.brush_to {
+            // The samples a drag would have produced, at the spacing the window
+            // uses, so a headless stroke and a dragged one paint the same path.
+            for point in stroke_samples(px, to) {
+                edits.brush_sample(point);
+            }
+        }
+        edits.resolve_brush(
+            &trips_viewer::edit::cluster::ClickCamera::from_render_camera(&camera),
+            &renderer,
+        );
+        edits.end_brush_stroke();
+        let painted = edits.doc.regions().last().map(|r| {
+            (
+                r.id.clone(),
+                r.name.clone(),
+                match &r.params {
+                    trips_viewer::edit::Params::Brush { cells, .. } => cells.len(),
+                    _ => 0,
+                },
+            )
+        });
+        match painted {
+            Some((id, name, cells)) if cells > 0 || args.brush_erase => eprintln!(
+                "brush {} at ({}, {}) radius {}: region {name} ({id}), {cells} cells",
+                if args.brush_erase { "erase" } else { "stroke" },
+                px.0,
+                px.1,
+                edits.brush_radius(),
+            ),
+            _ => {
+                return Err(format!(
+                    "the brush painted nothing at ({}, {}){}",
+                    px.0,
+                    px.1,
+                    edits.last_error().map_or_else(String::new, |e| format!(": {e}"))
+                ))
+            }
+        }
+        if args.brush_undo {
+            edits.undo_once();
+            eprintln!("brush stroke undone: the frame must now match a run with no --brush");
+        }
+        edits.apply(&mut renderer)?;
     }
 
     // `--sam-box` / `--sam-point`: the headless twin of the SAM tool's own

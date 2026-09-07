@@ -22,7 +22,13 @@
 //! Related docs: `docs/EDITOR.md`; `docs/decisions/ADR-0007-viewer-editing.md`.
 
 pub mod apply;
+/// The `brush` region kind: a sparse voxel set painted with spheres.
+/// See `docs/EDITOR.md` §1 "brush".
+pub mod brush;
 pub mod cluster;
+/// The 3D drag gizmos' maths (translate / resize / rotate a region).
+/// See `docs/EDITOR.md` §6's E1/E3 rows.
+pub mod gizmo;
 pub mod model;
 /// The SAM tool's geometry: render pixels -> the capture view's pixel grid.
 /// See `docs/EDITOR.md` §3 "4. SAM 3 lift (E5)".
@@ -31,8 +37,13 @@ pub mod shade;
 pub mod weights;
 
 pub use apply::{edited_points, gaussian_opacity_scale, EditedPoints, COVERAGE_EPS};
+pub use brush::{depth_anchor, BrushCells};
 pub use cluster::{click_to_cluster, ClickCamera, ClickParams, ClickSelection, PointGrid};
-pub use model::{EditDocument, Kind, LidParams, Op, Params, Region, EDITS_FILENAME};
+pub use gizmo::{Drag, GizmoScreen};
+pub use model::{
+    auto_name_for, auto_region_name, EditDocument, Kind, LidParams, Op, Params, Region,
+    EDITS_FILENAME,
+};
 pub use sam::{is_box_drag, nearest_view, render_pixel, view_box_from_render, view_pixel_from_render};
 pub use weights::{compose_gaussian_weights, compose_trips_weights, ComposedWeights};
 
@@ -46,12 +57,42 @@ pub const DEFAULT_REGION_SCENE_FRACTION: f32 = 0.08;
 
 /// Fraction of the scene diameter one keyboard nudge moves a region.
 ///
-/// The 3D drag gizmos are not built (`docs/EDITOR.md` §6, E1); the Inspector's
-/// numeric fields plus arrow-key nudging are what E1 ships instead.
+/// The keyboard nudges are kept now that the 3D drag gizmos exist
+/// (`docs/EDITOR.md` §4's key table): a gizmo needs a visible handle and a
+/// mouse, and an exact 2 %-of-the-scene step needs neither.
 pub const NUDGE_SCENE_FRACTION: f32 = 0.02;
 
 /// Multiplier one `[`/`]` press applies to the selected region's size.
+///
+/// With the Brush tool focused the same two keys shrink/grow the BRUSH instead
+/// (`BRUSH_RADIUS_STEP`) — there is no selected region to resize while
+/// painting, and a brush without a radius key is unusable.
 pub const RESIZE_STEP: f32 = 1.25;
+
+/// Default brush radius as a fraction of the scene's own diameter.
+///
+/// The same scale a new box/sphere is born at, halved: a brush stroke is meant
+/// to touch part of an object, not swallow it.
+pub const DEFAULT_BRUSH_SCENE_FRACTION: f32 = 0.04;
+
+/// Multiplier one `[`/`]` press applies to the brush radius.
+pub const BRUSH_RADIUS_STEP: f64 = 1.25;
+
+/// Voxel cells across one brush radius, fixing a new brush region's `cell_size`.
+///
+/// The grid is fixed when the region is born (painting into a region whose
+/// cells were measured on a different grid would be meaningless), so this is
+/// the one number that decides how blocky a brush edit can be. Two cells per
+/// radius keeps a stroke's own shape recognisable while keeping the cell count
+/// — and the `edits.json` it is written into — small.
+pub const BRUSH_CELLS_PER_RADIUS: f64 = 2.0;
+
+/// How far the pointer must travel (render pixels) before a drag paints again.
+///
+/// A stroke is a path of spheres; sampling every frame would paint hundreds of
+/// overlapping spheres at the same place while the pointer sits still, and each
+/// sample costs one depth-anchor scan over the cloud.
+pub const BRUSH_SAMPLE_PX: f64 = 4.0;
 
 #[cfg(test)]
 mod golden {
@@ -218,6 +259,130 @@ mod golden {
                 found.warning.is_some(),
                 !want["warning"].is_null(),
                 "click case {name:?}: warning"
+            );
+        }
+    }
+
+    /// `brush.json`, replayed stroke for stroke.
+    ///
+    /// Not "does the committed cell list give the committed weights" — that
+    /// would pass with a completely different voxelisation. The fixture records
+    /// the three AUTHORING calls (`trippy.edit.golden._BRUSH_STROKES`), this
+    /// replays them into an empty region, and the resulting cells, their
+    /// weights, their ORDER and the per-point membership must all match what
+    /// Python wrote.
+    #[test]
+    fn the_viewer_paints_the_same_brush_python_does() {
+        let fixture = read("brush.json");
+        assert_eq!(
+            fixture["format"].as_str(),
+            Some(brush::BRUSH_FIXTURE_FORMAT),
+            "brush.json format"
+        );
+
+        // The empty region the strokes start from, with its own grid.
+        let initial = Region::from_json(&fixture["initial"]).expect("fixture initial region");
+        let Params::Brush {
+            origin,
+            cell_size,
+            cells,
+        } = initial.params.clone()
+        else {
+            panic!("the fixture's initial region must be a brush")
+        };
+        assert!(cells.is_empty(), "the strokes start from an empty brush");
+
+        let mut painted = cells;
+        let strokes = fixture["strokes"].as_array().expect("strokes");
+        assert_eq!(strokes.len(), 3, "paint_sphere, paint_along and erase");
+        for stroke in strokes {
+            brush::apply_stroke_json(&mut painted, origin, cell_size, stroke)
+                .expect("the fixture's strokes replay");
+        }
+
+        // The cells Python painted, in Python's own order.
+        let expected = Region::from_json(&fixture["region"]).expect("fixture region");
+        let Params::Brush {
+            cells: want_cells, ..
+        } = expected.params.clone()
+        else {
+            panic!("the fixture's region must be a brush")
+        };
+        assert_eq!(
+            painted.len(),
+            want_cells.len(),
+            "cell count: viewer {} vs python {}",
+            painted.len(),
+            want_cells.len()
+        );
+        assert_eq!(painted.cells(), want_cells.cells(), "cells, in order");
+        for (i, (a, b)) in painted.weights().iter().zip(want_cells.weights()).enumerate() {
+            assert!((a - b).abs() <= 1e-12, "cell weight[{i}]: viewer {a} vs python {b}");
+        }
+        assert!(
+            painted.weights().iter().any(|w| *w < 1.0),
+            "the erase must leave graded cells behind, or this tests nothing"
+        );
+
+        // And the membership those cells produce, point by point.
+        let xyz = floats(&fixture, "xyz");
+        let want_weight = floats(&fixture, "expected_weight");
+        let want_contains: Vec<bool> = fixture["expected_contains"]
+            .as_array()
+            .expect("expected_contains")
+            .iter()
+            .map(|v| v.as_bool().expect("bools"))
+            .collect();
+        assert_eq!(xyz.len() / 3, want_weight.len(), "query point count");
+        for i in 0..want_weight.len() {
+            let p = [xyz[3 * i], xyz[3 * i + 1], xyz[3 * i + 2]];
+            let got = model::region_weight(&expected, i, p);
+            assert!(
+                (got - want_weight[i]).abs() <= 1e-12,
+                "brush weight[{i}]: viewer {got} vs python {}",
+                want_weight[i]
+            );
+            assert_eq!(
+                model::region_contains(&expected, i, p),
+                want_contains[i],
+                "brush contains[{i}]"
+            );
+        }
+        assert!(
+            want_weight.iter().any(|w| *w > 0.0) && want_weight.iter().any(|w| *w == 0.0),
+            "the query grid must straddle the brush"
+        );
+    }
+
+    /// `names.json`: the Named Objects panel numbers a region the way `trippy
+    /// edits` does, case for case.
+    #[test]
+    fn the_viewer_auto_names_a_region_the_way_python_does() {
+        let fixture = read("names.json");
+        assert_eq!(
+            fixture["format"].as_str(),
+            Some(model::NAMES_FIXTURE_FORMAT),
+            "names.json format"
+        );
+        let cases = fixture["cases"].as_array().expect("cases");
+        assert!(!cases.is_empty(), "the fixture must carry at least one case");
+        for case in cases {
+            let name = case["name"].as_str().expect("case name");
+            let existing: Vec<&str> = case["existing_names"]
+                .as_array()
+                .expect("existing_names")
+                .iter()
+                .map(|v| v.as_str().expect("names are strings"))
+                .collect();
+            let got = model::auto_region_name(
+                existing.iter().copied(),
+                case["tool"].as_str().expect("tool"),
+                case["detail"].as_str(),
+            );
+            assert_eq!(
+                got,
+                case["expected"].as_str().expect("expected"),
+                "name case {name:?}"
             );
         }
     }

@@ -1,0 +1,89 @@
+{
+  "format": "trippy-edit-names-1",
+  "cases": [
+    {
+      "name": "first",
+      "existing_names": [],
+      "tool": "click",
+      "detail": null,
+      "expected": "click-1"
+    },
+    {
+      "name": "across_tools",
+      "existing_names": [
+        "click-1"
+      ],
+      "tool": "shade-clouds",
+      "detail": null,
+      "expected": "shade-clouds-2"
+    },
+    {
+      "name": "with_detail",
+      "existing_names": [
+        "click-1",
+        "shade-clouds-2"
+      ],
+      "tool": "sam-box",
+      "detail": "IMG_3703",
+      "expected": "sam-box-IMG_3703-3"
+    },
+    {
+      "name": "no_counters",
+      "existing_names": [
+        "pool lid",
+        "fence"
+      ],
+      "tool": "brush",
+      "detail": null,
+      "expected": "brush-1"
+    },
+    {
+      "name": "highest_not_last",
+      "existing_names": [
+        "click-10",
+        "click-2"
+      ],
+      "tool": "brush",
+      "detail": null,
+      "expected": "brush-11"
+    },
+    {
+      "name": "interior_digits",
+      "existing_names": [
+        "thing-7-alpha"
+      ],
+      "tool": "brush",
+      "detail": null,
+      "expected": "brush-1"
+    },
+    {
+      "name": "no_hyphen",
+      "existing_names": [
+        "12",
+        "abc12"
+      ],
+      "tool": "click",
+      "detail": null,
+      "expected": "click-1"
+    },
+    {
+      "name": "bare_counter",
+      "existing_names": [
+        "-5"
+      ],
+      "tool": "brush",
+      "detail": null,
+      "expected": "brush-6"
+    },
+    {
+      "name": "self_healing",
+      "existing_names": [
+        "click-1",
+        "brush-2"
+      ],
+      "tool": "brush",
+      "detail": null,
+      "expected": "brush-3"
+    }
+  ]
+}
