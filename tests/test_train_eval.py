@@ -50,6 +50,31 @@ def test_evaluate_checkpoint_writes_eval_manual_dir_not_eval_ep(tmp_path: Path) 
     assert metrics["n_images"] == len(metrics["names"])
 
 
+def test_evaluate_checkpoint_with_edits_deletes_points(tmp_path: Path) -> None:
+    """`--edits` (docs/EDITOR.md Sec 5): a delete-op region shrinks the point cloud before scoring."""
+    from trippy.edit.model import EditDocument, Region
+    from trippy.train.eval import build_trainer_from_checkpoint
+
+    ckpt_path = _build_and_checkpoint(tmp_path)
+    n_before = len(build_trainer_from_checkpoint(ckpt_path, device="cpu").point_params)
+
+    edits = EditDocument.new()
+    edits.add_region(
+        Region(id="r-del", name="del", kind="pointset", params={"point_ids": list(range(20))}, op="delete")
+    )
+    edits_path = tmp_path / "edits.json"
+    edits.save(edits_path)
+
+    metrics = evaluate_checkpoint(ckpt_path, device="cpu", edits_path=edits_path)
+    assert metrics["edits"] == {
+        "n_points_before": n_before,
+        "n_removed": 20,
+        "n_points_after": n_before - 20,
+        "n_regions": 1,
+        "gate_suppression_active": False,
+    }
+
+
 def test_evaluate_checkpoint_appends_eval_row_with_shade_split(tmp_path: Path) -> None:
     ckpt_path = _build_and_checkpoint(tmp_path, forced_heldout=["IMG_1.jpg"], heldout_k=8)
     run_dir = ckpt_path.parent.parent

@@ -1575,3 +1575,21 @@ EDIT_KAREKARE_LID_CENTER = (-0.00683348, -0.74759695, 3.95994345)
 EDIT_KAREKARE_LID_RADIUS = 2.5
 EDIT_KAREKARE_LID_FALLOFF = 1.0
 EDIT_KAREKARE_LID_BAND = 0.05
+
+# `trippy apply-edits --target`: which artefact(s) to publish (docs/EDITOR.md Sec 5).
+# "trips" = filtered points.npz/blend_weights.npy/splat_ply (if named) + a filtered
+# 3DGS-style export.ply of the TRIPS points; "distilled" = re-apply box/sphere/lid
+# regions directly to an already-distilled Gaussian PLY (--distilled-ply); "both"
+# does the trips half always and the distilled half when --distilled-ply is given.
+EDIT_APPLY_TARGETS = ("trips", "distilled", "both")
+EDIT_APPLY_DEFAULT_TARGET = "both"
+
+# Checkpoint-side gate suppression (docs/EDITOR.md Sec 5, `trippy candidate-report
+# --edits`/`trippy eval --edits`): per-pixel weight rendering has no first-class output
+# in the Python renderer today, so the per-point edit weight rides through
+# `render_pyramid` as an auxiliary feature channel and is read back from level 0
+# (the documented fallback). Padded to a `RASTER_SUPPORTED_CHANNELS` width (8) with
+# the weight the only nonzero channel, at index 4 (the "5th channel"), so the call
+# stays MPS-kernel-shape-valid even though this path is not exercised on MPS today.
+EDIT_GATE_WEIGHT_CHANNEL_INDEX = 4
+EDIT_GATE_WEIGHT_NUM_CHANNELS = 8

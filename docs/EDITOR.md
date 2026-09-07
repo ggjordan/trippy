@@ -1,12 +1,15 @@
 # Editing: turning `trips-viewer` into an edit tool
 
-Status: **Python side implemented** (`trippy/edit/`: `model.py`,
-`weights.py`, `shade_finder.py`, `apply.py`; `trippy apply-edits` and
-`trippy edits shade-find/add-box/add-sphere/add-lid` in `trippy/cli.py`;
-see `docs/EXPERIMENTS.md` "Edits" for the worked run and test list). The
-Rust viewer (§0/§2's render integration, §3's selection tools, §4's UI) is
-**not implemented** -- this document remains the spec for that work.
-Two implementation notes, both explained where they matter below:
+Status: **Python side implemented, including the publish path** (`trippy/edit/`:
+`model.py`, `weights.py`, `shade_finder.py`, `apply.py`, `checkpoint.py`;
+`trippy apply-edits --target trips|distilled|both`, `trippy edits
+shade-find/add-box/add-sphere/add-lid`, and `--edits` on `trippy
+candidate-report`/`trippy eval`/`trippy distill --stage render` in
+`trippy/cli.py`; see `docs/EXPERIMENTS.md` "Edits" for the worked run and
+test list). The Rust viewer (§0/§2's render integration, §3's selection
+tools, §4's UI) is **not implemented** -- this document remains the spec
+for that work. Three implementation notes, all explained where they matter
+below:
 
 - **`box`'s schema is `center`/`half_extents`/`quat`** (an oriented box),
   not this section's axis-aligned `min`/`max` -- a rotated box is testable
@@ -16,6 +19,14 @@ Two implementation notes, both explained where they matter below:
   (`op="delete"`/`"fade"`, `trippy.edit.model.lid_membership`); its 3D
   gizmo (drag the plane/radius in the viewer) is not built. See §1's `lid`
   entry and §6's E3 row.
+- **The checkpoint-side gate-suppression multiply (§5) is a documented
+  simplification, not the full per-pixel override §2 describes** -- it
+  multiplies the trained blend gate by the editor's own per-point weight
+  (1 = unedited, ramping down inside a `blend`/`fade` region), which only
+  ever pulls the gate towards TRIPS, never towards splat. See §5's own
+  paragraph for why (there is no live-editable per-point splat channel on
+  a checkpoint-only path) and `trippy.edit.checkpoint`'s module docstring
+  for the exact reasoning.
 
 `docs/decisions/ADR-0007-viewer-editing.md` is still accurate to the
 sections below; this document is the detailed spec the milestones in §6
@@ -456,49 +467,86 @@ Two artefacts an edit needs to reach, and a CLI that drives both:
 
 ```
 trippy apply-edits --bundle <dir> [--edits <dir>/edits.json] \
-                    --out <dir> [--target trips|distilled|both]
+                    --out <dir> [--target trips|distilled|both] \
+                    [--distilled-ply <path>]
 ```
 
-**Implemented today** (`trippy/edit/apply.py`, E6): `trippy apply-edits
---bundle <dir> [--edits edits.json] --out <dir>` — no `--target` flag yet.
-It always publishes the bundle's own TRIPS `points.npz` (filtered
-`points.npz` + `blend_weights.npy` + `edits_applied.json` + an updated
-`bundle.json` into `--out`) and, in the SAME run, filters `bundle.json`'s
-`blend.splat_ply` PLY if one is named — i.e. today's single target is "this
-bundle's TRIPS points and (if present) its already-associated Gaussian
-PLY", not a choice between the TRIPS export and a *distilled* splat. The
-`export.ply`/`Trainer._apply_keep_mask` wiring and the `trippy distill`
-edit-then-distil ordering below are **not implemented** — `--target` stays
-documented here as the target shape once they land.
+**Implemented** (`trippy/edit/apply.py`, `trippy/edit/checkpoint.py`, E6).
+`--target` defaults to `both`:
 
-- **TRIPS `export.ply`**: `trippy.train.export.write_gaussian_ply` gains an
-  optional keep-mask parameter, built from `edits.json`'s `delete`-op
-  regions tested against the checkpoint's own live `xyz` — the identical
-  `index_select`-and-rebuild pattern `Trainer._apply_keep_mask` already
-  implements for training-time removal (`docs/ARCHITECTURE.md` "train/"),
-  reused here at export time instead of at an epoch boundary. `blend`/`fade`
-  regions do not change what is exported to a 3DGS-shaped PLY (that format
-  has no TRIPS-vs-splat mix concept); they only affect the live viewer
-  render and the distilled splat's *training data* (next bullet).
-- **The distilled splat** (`trippy distill`, design B,
-  `trippy/distill/brush_runner.py`): per
-  `docs/decisions/ADR-0007-viewer-editing.md` §"Publish order is
-  edit-TRIPS-first, then distil", `pointset` regions must be applied
-  *before* `trippy distill --stage render` generates the image set Brush
-  trains on — deleted/faded content simply never appears in those renders,
-  so the distilled Gaussians never learn it. `box`/`sphere`/`lid` regions
-  (pure world-space geometry, not point-ID-based) can *additionally* be
-  re-applied directly to the finished distilled PLY, by testing the same
-  region geometry against the distilled cloud's own `xyz` — safe because
-  these regions never depended on the TRIPS point cloud's row order in the
-  first place.
-- `--target both` runs both paths from one `edits.json`, so a single save
-  in the viewer produces a consistent TRIPS export and a consistent
-  distilled-splat publish without Jordan re-specifying the same edits twice.
+- **TRIPS `points.npz` + `export.ply`** (`target=trips`/`both`):
+  `apply_edits` writes the filtered `points.npz` + `blend_weights.npy` (as
+  before) and, in the SAME run, a filtered 3DGS-style `export.ply` of the
+  kept TRIPS points via `trippy.train.export.write_gaussian_ply` — the
+  identical writer `Trainer.export_ply` calls at training time, so Splats'
+  audits and Brush can open the edited TRIPS point set directly, with no
+  bundle loader involved. `bundle.json`'s own `blend.splat_ply`, if named,
+  is filtered in the same run exactly as before (`filter_gaussian_ply`).
+  `blend`/`fade` regions do not change what is exported to a 3DGS-shaped
+  PLY (that format has no TRIPS-vs-splat mix concept); they only affect
+  `blend_weights.npy` and the checkpoint-side gate suppression below.
+- **The distilled splat** (`target=distilled`/`both`, design B,
+  `trippy/distill/render_set.py`): per `docs/decisions/
+  ADR-0007-viewer-editing.md` §"Publish order is edit-TRIPS-first, then
+  distil", `--edits` on `trippy distill --stage render/all` applies
+  `delete`-op regions to the checkpoint's own point cloud (via
+  `trippy.edit.checkpoint.apply_edits_to_trainer`, the SAME
+  `Trainer._apply_keep_mask` surgery training uses) *before* any camera is
+  rendered — deleted content never appears in the image set Brush trains
+  on, not merely in the finished PLY. Separately, `trippy apply-edits
+  --target distilled --distilled-ply <path>` re-applies `box`/`sphere`/
+  `lid` regions (pure world-space geometry, not point-ID-based) directly to
+  an *already-distilled* PLY's own `xyz`, no re-distillation needed — safe
+  because these regions never depended on the TRIPS point cloud's row
+  order. `delete` removes rows (`trippy.edit.apply.apply_gaussian_ply_edits`,
+  a single-pass header-preserving PLY filter like `filter_gaussian_ply`);
+  `fade` instead SCALES the surviving row's own alpha
+  (`sigmoid(opacity)`) by the region's graded weight and writes it back as
+  `opacity = logit(...)` — the "fade → opacity scaling" this PLY-only path
+  uses in place of a TRIPS-vs-splat mix it has no channel for. `pointset`
+  regions are skipped here (they do not survive distillation by
+  construction, §1) and produce a `summary["distilled"]["warning"]` note if
+  an enabled one exists.
+- `--target both` (the CLI default) always runs the `trips` half and runs
+  the `distilled` half only when `--distilled-ply` is given, so a single
+  save in the viewer produces a consistent TRIPS export and (once a
+  distillation exists) a consistent distilled-splat publish without Jordan
+  re-specifying the same edits twice; omitting `--distilled-ply` is
+  recorded as `summary["distilled"] = {"skipped": ...}` rather than
+  silently doing nothing (§7's own "not discovered by Jordan after the
+  fact" risk).
 
-`apply-edits` is additive to the pipeline order that already exists
-(train → export/distill), not a new stage inserted into training — nothing
-here changes `Trainer.fit`'s loop or `maybe_prune_points`'s schedule.
+**Checkpoint-side keep mask** (`--edits edits.json` on `trippy
+candidate-report`/`trippy eval`, `trippy.edit.checkpoint.
+apply_edits_to_trainer`): the same `edits.json` can run directly against a
+trained checkpoint, without first publishing a bundle, so a candidate
+report or held-out eval reflects an edit immediately. It loads the doc,
+computes the keep mask + per-point weights (`trippy.edit.weights.
+compose_trips_weights`), and applies the keep mask via the identical
+`Trainer._apply_keep_mask` index-select surgery the trainer uses at a
+training epoch boundary — permanently, on the in-memory `Trainer` only,
+never written back to the `.pt` file. On a gate hybrid checkpoint
+(`trippy.hybrid.gate`), the trained gate is additionally multiplied, per
+pixel, by the per-point weight's projection wherever a `blend`/`fade`
+region touches a surviving point — suppressing the gate towards TRIPS
+there so an un-edited, live-rendered splat cannot leak back into a region
+the edit asked to hide (there is no live per-point splat channel to move
+on a checkpoint-only path, §7). Per-pixel weight rendering has no
+first-class output in the Python renderer today, so the per-point weight
+is splatted as an auxiliary feature channel through `render_pyramid` and
+read back from level 0 — the exact same alpha-compositing trick §2
+documents for colour, applied to one more channel instead of a new kernel.
+This gate-suppression step only runs inside `trippy.render.candidate.
+render_candidate` (`candidate-report`, and by extension `trippy distill
+--stage render`'s own per-pose renders); `trippy eval`'s render path
+(`Trainer.evaluate`) applies the keep-mask deletion but not the gate
+multiply — a documented gap (`trippy.edit.checkpoint`'s own module
+docstring), not a silent one.
+
+`apply-edits` and `--edits` are additive to the pipeline order that already
+exists (train → export/distill), not a new stage inserted into training —
+nothing here changes `Trainer.fit`'s loop or `maybe_prune_points`'s
+schedule.
 
 ## 6. Milestones
 
@@ -509,7 +557,7 @@ here changes `Trainer.fit`'s loop or `maybe_prune_points`'s schedule.
 | **E3** | `lid` region kind + 3D gizmo (plane/radius drag) + hard-clip delete semantics | 2 d | Loading the Karekare pool bundle with a `lid` region seeded from `SURFACE_LID.md`'s numbers removes the haze from every angle at every `mix`/exposure; dragging the radius ring changes the affected point count live | **Region kind + hard-clip semantics done** (`trippy.edit.model.lid_membership`, `trippy edits add-lid`); the 3D gizmo is not built. |
 | **E4** | Click-to-cluster: ray cast + k-d tree + k-NN growth in world+colour space, radius slider | 3 d | Clicking a point-cloud cluster selects a `pointset` region that visibly matches the clicked object's extent, without needing a depth buffer | Not started. |
 | **E5** | SAM 3 lift: photo segmentation, multi-view projection + majority vote, `pointset` region output | 2–3 wk | Segmenting an object in 2–3 registered views of the same scene produces one `pointset` region that, previewed, highlights that object and not its neighbours; runs entirely local (no image leaves the machine) | Not started. |
-| **E6** | Publish path: `trippy apply-edits`, TRIPS `export.ply` mask wiring, distilled-splat publish order (edit-then-distil for pointset regions, geometry-reapply for box/sphere/lid) | 3 d | `trippy apply-edits --target both` on a bundle with a mix of region kinds produces a TRIPS PLY with the deleted points absent and, after a `trippy distill` run on the same edited bundle, a distilled PLY that also lacks them; a box/sphere/lid region re-applied directly to an already-distilled PLY (no re-distillation) also removes the matching geometry | **`trippy apply-edits` done** for the TRIPS points + Gaussian PLY publish path (`trippy/edit/apply.py`) — no `--target` flag (TRIPS-only; a splat PLY named by `bundle.json` is filtered the same run), and no `export.ply`/`trippy distill` wiring yet. |
+| **E6** | Publish path: `trippy apply-edits`, TRIPS `export.ply` mask wiring, distilled-splat publish order (edit-then-distil for pointset regions, geometry-reapply for box/sphere/lid) | 3 d | `trippy apply-edits --target both` on a bundle with a mix of region kinds produces a TRIPS PLY with the deleted points absent and, after a `trippy distill` run on the same edited bundle, a distilled PLY that also lacks them; a box/sphere/lid region re-applied directly to an already-distilled PLY (no re-distillation) also removes the matching geometry | **Done** (`trippy/edit/apply.py`, `trippy/edit/checkpoint.py`): `--target trips\|distilled\|both` (default `both`); `trips`/`both` write the filtered TRIPS `points.npz`/`blend_weights.npy`/`export.ply` and, if named, a filtered `blend.splat_ply`; `distilled`/`both` (with `--distilled-ply`) re-apply box/sphere/lid regions to an already-distilled PLY as delete/opacity-scale-fade; `--edits` wired into `trippy distill --stage render` (edit-then-distil ordering) and into `trippy candidate-report`/`trippy eval` (checkpoint-side keep mask + gate suppression on gate-hybrid checkpoints, `candidate-report` only — see §5's own paragraph for the `eval` gap). |
 
 E1 already includes undo/save per the brief; E2–E5 add tool-specific
 selection UI on top of the E1 data model and do not need to repeat undo/save
@@ -553,13 +601,24 @@ plumbing. `brush`-kind (voxel) regions and splat-side weight compositing
   call) so a future change accidentally routing through a hosted API would
   be conspicuous, not silent.
 - **`pointset` regions do not survive distillation, by construction.** §5
-  documents the edit-then-distil ordering as the fix, but it means a
-  `pointset` edit made *after* a distilled publish already exists requires
-  either accepting the box/sphere/lid-only re-apply path or re-running
-  `trippy distill` from the edited TRIPS bundle. This should be surfaced in
-  the Publish UI (a warning when `--target distilled` is requested with an
-  enabled `pointset` region that was never present at the distilled PLY's
-  own render step), not discovered by Jordan after the fact.
+  documents the edit-then-distil ordering as the fix (`trippy distill
+  --stage render --edits` applies `delete`-op regions, `pointset` included,
+  before rendering), but a `pointset` edit made *after* a distilled publish
+  already exists requires either accepting the box/sphere/lid-only re-apply
+  path or re-running `trippy distill` from the edited TRIPS checkpoint.
+  **Implemented**: `trippy apply-edits --target distilled/both` records
+  `summary["distilled"]["warning"]` when an enabled `pointset` region
+  exists alongside a `--distilled-ply` re-apply, so this is visible in the
+  CLI's own JSON output rather than only discoverable by Jordan opening
+  the result; a Publish-UI-level warning (surfacing the same condition
+  before the command even runs) is still a viewer-side task, not built.
+- **The checkpoint-side gate-suppression multiply is a simplification, not
+  the full per-pixel override §2 describes** (see the new note after the
+  status header, and §5's own paragraph) — it can only ever pull the gate
+  towards TRIPS, never manufacture splat presence a `blend`/`fade` region
+  asked for. Fixing this properly needs the splat-side weight compositing
+  in the bullet above (`brush-render` accepting a substituted-colour second
+  pass), still unbuilt/unverified.
 
 ## Related
 

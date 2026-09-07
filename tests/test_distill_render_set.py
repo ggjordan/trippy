@@ -26,7 +26,9 @@ from test_train_helpers import N_IMAGES, build_synthetic_ply, build_synthetic_sc
 
 from trippy.distill.cameras import image_filename
 from trippy.distill.render_set import render_distill_set
+from trippy.edit.model import EditDocument, Region
 from trippy.scene import colmap_io
+from trippy.train.eval import build_trainer_from_checkpoint
 from trippy.train.trainer import Trainer
 
 
@@ -82,6 +84,48 @@ def test_render_distill_set_caps_init_points(tmp_path: Path) -> None:
     assert report["n_interpolated_images"] == 0
     assert report["n_points_written"] == 5
     assert report["n_points_source"] > 5
+
+
+def test_render_distill_set_with_edits_removes_points_before_rendering(tmp_path: Path) -> None:
+    """`--edits` (docs/EDITOR.md Sec 5, ADR-0007 edit-then-distil): deleted points never render.
+
+    The checkpoint's own point cloud shrinks BEFORE `trips_export.ply`/
+    `points3D.txt` are written and before any pose is rendered -- assert
+    both the exported point count and the written COLMAP points3D count
+    drop relative to an un-edited run on the identical checkpoint.
+    """
+    checkpoint = _build_untrained_checkpoint(tmp_path)
+    n_before = len(build_trainer_from_checkpoint(checkpoint, device="cpu").point_params)
+    delete_ids = list(range(n_before // 2))
+
+    edits = EditDocument.new()
+    edits.add_region(
+        Region(id="r-del", name="del", kind="pointset", params={"point_ids": delete_ids}, op="delete")
+    )
+    edits_path = tmp_path / "edits.json"
+    edits.save(edits_path)
+
+    baseline_out = tmp_path / "distill_baseline"
+    baseline_report = render_distill_set(checkpoint, baseline_out, device="cpu", interp_k=0)
+
+    edited_out = tmp_path / "distill_edited"
+    edited_report = render_distill_set(checkpoint, edited_out, device="cpu", interp_k=0, edits_path=edits_path)
+
+    assert edited_report["edits"] == {
+        "path": str(edits_path),
+        "n_points_before": n_before,
+        "n_removed": len(delete_ids),
+        "n_points_after": n_before - len(delete_ids),
+        "n_regions": 1,
+        "gate_suppression_active": False,
+    }
+    # The exported TRIPS point cloud (the source for points3D.txt) is smaller.
+    assert edited_report["n_points_source"] == n_before - len(delete_ids)
+    assert edited_report["n_points_source"] < baseline_report["n_points_source"]
+
+    baseline_scene = colmap_io.load_colmap_model(Path(baseline_report["sparse_dir"]))
+    edited_scene = colmap_io.load_colmap_model(Path(edited_report["sparse_dir"]))
+    assert len(edited_scene.points3D) < len(baseline_scene.points3D)
 
 
 def test_render_distill_set_raises_on_missing_scene(tmp_path: Path) -> None:

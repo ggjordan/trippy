@@ -28,6 +28,20 @@ SPEC.md D10 requires (export PLY -> Splats' shade/extent audits ->
 dolly video -> off-path honesty sheet -> report.json + README.md); see
 docs/EXPERIMENTS.md "Candidate report". It never opens an image itself
 (AGENTS.md privacy rule) -- only metrics and file paths are printed/written.
+`--edits edits.json` (docs/EDITOR.md Sec 5) loads the doc, deletes the
+checkpoint's own points wherever a `delete`-op region contains them (the
+same `Trainer._apply_keep_mask` index-select surgery training uses), and,
+on a gate-hybrid checkpoint, suppresses the blend gate towards TRIPS per
+pixel wherever a `blend`/`fade` region applies (`trippy.edit.checkpoint`)
+-- the report's `report.json`/README note the edit under an `"edits"` key.
+
+`eval --edits edits.json` applies the same keep-mask deletion to the
+checkpoint before scoring it (so held-out PSNR/SSIM/LPIPS reflect the
+edited point cloud) -- but NOT the gate-suppression multiply above, which
+needs `trippy.render.candidate.render_candidate`'s own render loop and is
+out of `Trainer.evaluate`'s reach here (see `trippy.edit.checkpoint`'s
+module docstring). The applied-edits summary prints alongside the usual
+metrics when `--edits` is given.
 
 `train --report` runs that same pipeline against the just-finished run's
 final checkpoint (`trippy.render.report.run_train_report`), plus a cached
@@ -58,7 +72,15 @@ publish path, Quest) can open. `--stage render` renders the checkpoint's
 network output at the training cameras plus near-path interpolated cameras
 and writes a Brush-trainable COLMAP image set (`trippy.distill.render_set`,
 MPS-capable, same "only via --device mps inside a GPU-queue job" rule as
-`train`/`render`); `--stage brush-cmd` resolves/prints the Brush CLI
+`train`/`render`). `--edits edits.json` on `--stage render/all`
+(docs/decisions/ADR-0007-viewer-editing.md "Publish order is
+edit-TRIPS-first, then distil") deletes the same points from the
+checkpoint's point cloud BEFORE any camera is rendered, so deleted content
+never appears in the image set Brush trains on -- `trippy apply-edits
+--target distilled --distilled-ply <path>` re-applies `box`/`sphere`/`lid`
+regions directly to the finished distilled PLY afterwards (deletion/fade),
+for edits made after a distillation already exists. `--stage brush-cmd`
+resolves/prints the Brush CLI
 command and writes a queue-ready job script without running it
 (`trippy.distill.brush_runner` -- Brush's trainer must only run via
 `scripts/gpu_submit.sh --train`, never from this process); `--stage
@@ -115,13 +137,23 @@ functions) against a bundle's `points.npz` and a scene's shade frames;
 `add-box`/`add-sphere`/`add-lid` take the region's geometry straight from
 flags (`add-lid`'s defaults are the Karekare pool's already-fitted numbers,
 `~/Splats/tools/SURFACE_LID.md` Sec 3). `apply-edits --bundle <dir> --edits
-edits.json --out <dir>` (`trippy.edit.apply.apply_edits`) composes the
-edits' regions (`trippy.edit.weights`) against the bundle's TRIPS points,
-writes a filtered `points.npz` + `blend_weights.npy` + `edits_applied.json`
-into `--out`, and, when `bundle.json` names a `blend.splat_ply`, writes a
-filtered copy of that Gaussian PLY with the same regions' deleted splats
-removed (single-pass, header-preserving -- every original PLY property,
-including SH `f_rest_*`, survives). CPU-only; never touches MPS or Rust.
+edits.json --out <dir> [--target trips|distilled|both] [--distilled-ply
+<path>]` (`trippy.edit.apply.apply_edits`, default target "both") composes
+the edits' regions (`trippy.edit.weights`) against the bundle's TRIPS
+points: `trips`/`both` write a filtered `points.npz` + `blend_weights.npy`
++ a filtered 3DGS-style `export.ply` of the TRIPS points + `edits_applied.
+json` into `--out`, and, when `bundle.json` names a `blend.splat_ply`, a
+filtered copy of that Gaussian PLY (single-pass, header-preserving -- every
+original PLY property, including SH `f_rest_*`, survives). `distilled`/
+`both` re-apply `box`/`sphere`/`lid` regions directly to an already-
+distilled Gaussian PLY named by `--distilled-ply` (no re-distillation),
+applying `delete` as removal and `fade` as an opacity-scale rewrite of that
+PLY's own `opacity` property (`pointset` regions do not survive
+distillation and are skipped). `--edits` on `trippy candidate-report`/
+`trippy eval`/`trippy distill --stage render` (below) runs the same
+`edits.json` against a checkpoint's own in-memory point cloud instead of a
+bundle -- see those commands' own notes. CPU-only; never touches MPS or
+Rust.
 """
 
 from __future__ import annotations
@@ -158,6 +190,8 @@ from trippy.constants import (
     DISTILL_MAX_JUMP_MULTIPLIER,
     DISTILL_SPARSE_DIRNAME,
     DOLLY_DEFAULT_POSE_NAME,
+    EDIT_APPLY_DEFAULT_TARGET,
+    EDIT_APPLY_TARGETS,
     EDIT_JSON_FILENAME,
     EDIT_KAREKARE_LID_BAND,
     EDIT_KAREKARE_LID_CENTER,
@@ -359,6 +393,15 @@ def _cmd_eval(args: argparse.Namespace) -> int:
     `optimize_eval_camera`, cut down to the photometric scalars (see
     `Trainer.calibrate_frame` for why that is legitimate and what it does
     NOT prove). Either way, a per-image diagnostics table is printed last.
+
+    `--edits edits.json` (docs/EDITOR.md Sec 5) deletes the checkpoint's own
+    points wherever a `delete`-op region contains them before this eval
+    renders anything (`trippy.edit.checkpoint.apply_edits_to_trainer`, the
+    same `Trainer._apply_keep_mask` surgery training uses) -- held-out
+    PSNR/SSIM/LPIPS above reflect the edited point cloud. `blend`/`fade`
+    regions' gate-suppression multiply is NOT applied here (see
+    `trippy.train.eval.build_trainer_from_checkpoint`'s own docstring for
+    why); use `trippy candidate-report --edits` for that.
     """
     metrics = evaluate_checkpoint(
         args.checkpoint,
@@ -368,6 +411,7 @@ def _cmd_eval(args: argparse.Namespace) -> int:
         calibrate_white_balance=True if args.calibrate_wb else None,
         exposure_mode=args.exposure_mode,
         gate_scale=args.gate_scale,
+        edits_path=args.edits,
     )
     shade, other = metrics.get("shade") or {}, metrics.get("other") or {}
     shade_eval, other_eval = metrics.get("shade_eval") or {}, metrics.get("other_eval") or {}
@@ -401,6 +445,13 @@ def _cmd_eval(args: argparse.Namespace) -> int:
             f"mean={gate['mean']:.3f} {spread}"
         )
         print(f"gate heatmaps: <eval dir>/{gate['heatmaps']}/")
+    edits_summary = metrics.get("edits")
+    if edits_summary:
+        print(
+            f"edits: {edits_summary['n_removed']} point(s) deleted "
+            f"({edits_summary['n_points_before']} -> {edits_summary['n_points_after']}), "
+            f"{edits_summary['n_regions']} region(s) from {args.edits}"
+        )
     print(_per_image_diagnostics_table(metrics))
     return 0
 
@@ -826,7 +877,7 @@ def _load_or_create_edits(edits_path: Path, bundle_dir: str | None):
 
 
 def _cmd_apply_edits(args: argparse.Namespace) -> int:
-    """`trippy apply-edits --bundle <dir> [--edits edits.json] --out <dir>`: publish `edits.json`.
+    """`trippy apply-edits --bundle <dir> [--edits edits.json] --out <dir> [--target ...]`: publish `edits.json`.
 
     See `trippy.edit.apply.apply_edits` for what gets written; exit 2 (not
     a traceback) on a missing edits file or a validation/geometry error, so
@@ -840,7 +891,9 @@ def _cmd_apply_edits(args: argparse.Namespace) -> int:
         print(f"trippy apply-edits: no edits file at {edits_path}", file=sys.stderr)
         return 2
     try:
-        summary = apply_edits(bundle_dir, edits_path, args.out)
+        summary = apply_edits(
+            bundle_dir, edits_path, args.out, target=args.target, distilled_ply=args.distilled_ply
+        )
     except (ValueError, KeyError, FileNotFoundError) as exc:
         print(f"trippy apply-edits: {exc}", file=sys.stderr)
         return 2
@@ -1080,6 +1133,15 @@ def _candidate_report_readme(report: dict) -> str:
         f"- Device: {report['device']}",
         f"- Scene: `{report['scene_root']}`",
         f"- Export PLY: `{report['export_ply']}`",
+    ]
+    edits_summary = report.get("edits")
+    if edits_summary:
+        lines.append(
+            f"- Edits applied: `{edits_summary['path']}` -- {edits_summary['n_removed']} point(s) "
+            f"deleted ({edits_summary['n_points_before']} -> {edits_summary['n_points_after']}), "
+            f"{edits_summary['n_regions']} region(s)"
+        )
+    lines += [
         "",
         "## Dolly (shade camera path)",
         f"- Frames: {dolly['n_frames']}",
@@ -1158,10 +1220,11 @@ def _cmd_candidate_report(args: argparse.Namespace) -> int:
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    trainer = build_trainer_from_checkpoint(args.checkpoint, device=str(device))
+    trainer = build_trainer_from_checkpoint(args.checkpoint, device=str(device), edits_path=args.edits)
     export_path = trainer.export_ply(out_dir / TRAIN_EXPORT_FILENAME)
     scene_root = Path(trainer.cfg.scene_root)
     width = trainer.cfg.width
+    edit_summary = trainer.edit_summary
     del trainer  # render_candidate below rebuilds its own Trainer from the checkpoint.
 
     offpath_names = (
@@ -1178,6 +1241,7 @@ def _cmd_candidate_report(args: argparse.Namespace) -> int:
         write_video_files=True,
         stop_at_low_coverage=True,
         gate_scale=args.gate_scale,
+        edits_path=args.edits,
     )
     offpath_metrics = render_candidate(
         args.checkpoint,
@@ -1186,6 +1250,7 @@ def _cmd_candidate_report(args: argparse.Namespace) -> int:
         device=str(device),
         write_video_files=False,
         gate_scale=args.gate_scale,
+        edits_path=args.edits,
     )
 
     audits = audit_report([str(export_path)], scene_root / "sparse_txt", frames=None)
@@ -1199,6 +1264,8 @@ def _cmd_candidate_report(args: argparse.Namespace) -> int:
         "offpath": offpath_metrics,
         "audits": audits,
     }
+    if edit_summary is not None:
+        report["edits"] = {"path": str(args.edits), **edit_summary}
     if dolly_metrics.get("gate") or offpath_metrics.get("gate"):
         # The mix these renders were made at, so a report read months later is not
         # ambiguous about which slider position produced its pictures.
@@ -1250,7 +1317,14 @@ def _cmd_distill(args: argparse.Namespace) -> int:
             interp_k=args.interp_k,
             max_jump_multiplier=args.max_jump_multiplier,
             max_init_points=max_init_points,
+            edits_path=args.edits,
         )
+        if report.get("edits"):
+            print(
+                f"trippy distill: edits {report['edits']['path']} removed "
+                f"{report['edits']['n_removed']} point(s) before rendering "
+                f"({report['edits']['n_points_before']} -> {report['edits']['n_points_after']})"
+            )
         print(
             f"trippy distill: rendered {report['n_anchor_images']} anchor + "
             f"{report['n_interpolated_images']} interpolated cameras "
@@ -1398,6 +1472,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "blend-gate scale (hybrid runs trained with hybrid.gate.enabled only): multiply the trained per-pixel splat weight g by this and clamp back into [0, 1]. 0 = pure TRIPS, 1 = the mix training chose, 2 = pushed all the way to the splat wherever the gate already leaned that way. Default: the checkpoint's own hybrid.gate_scale. Silently ignored on a checkpoint with no gate."
+        ),
+    )
+    ev.add_argument(
+        "--edits",
+        default=None,
+        help=(
+            "edits.json path (docs/EDITOR.md Sec 5): delete the checkpoint's own points wherever "
+            "a delete-op region contains them before evaluating (Trainer._apply_keep_mask surgery); "
+            "does not apply the gate-suppression multiply (see trippy candidate-report --edits)"
         ),
     )
     ev.set_defaults(func=_cmd_eval)
@@ -1592,8 +1675,24 @@ def build_parser() -> argparse.ArgumentParser:
     apply_edits_p.add_argument(
         "--out",
         required=True,
-        help="output directory (bundle.json + points.npz + blend_weights.npy + edits_applied.json"
-        "[, filtered splat ply]; may equal --bundle for an in-place publish)",
+        help="output directory (bundle.json + points.npz + blend_weights.npy + export.ply + "
+        "edits_applied.json[, filtered splat ply]; may equal --bundle for an in-place publish)",
+    )
+    apply_edits_p.add_argument(
+        "--target",
+        choices=EDIT_APPLY_TARGETS,
+        default=EDIT_APPLY_DEFAULT_TARGET,
+        help=(
+            "which artefact(s) to publish: 'trips' (filtered points.npz/blend_weights.npy/"
+            "export.ply[, splat ply]), 'distilled' (re-apply box/sphere/lid regions directly to "
+            "--distilled-ply, no re-distillation), or 'both' (default; the distilled half only "
+            "runs when --distilled-ply is given, else it is noted as skipped)"
+        ),
+    )
+    apply_edits_p.add_argument(
+        "--distilled-ply",
+        default=None,
+        help="an already-distilled Gaussian PLY to re-apply box/sphere/lid edits to (--target distilled/both)",
     )
     apply_edits_p.set_defaults(func=_cmd_apply_edits)
 
@@ -1729,6 +1828,16 @@ def build_parser() -> argparse.ArgumentParser:
             "hybrid.gate_scale. Silently ignored on a checkpoint with no gate."
         ),
     )
+    candidate_report.add_argument(
+        "--edits",
+        default=None,
+        help=(
+            "edits.json path (docs/EDITOR.md Sec 5): delete the checkpoint's own points wherever "
+            "a delete-op region contains them (Trainer._apply_keep_mask surgery) before exporting "
+            "or rendering anything, and (gate-hybrid checkpoints only) suppress the blend gate "
+            "towards TRIPS per pixel wherever a blend/fade region applies; noted in report.json/README"
+        ),
+    )
     candidate_report.set_defaults(func=_cmd_candidate_report)
 
     distill = sub.add_parser(
@@ -1744,6 +1853,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="which pipeline step(s) to run (see trippy.cli module docstring)",
     )
     distill.add_argument("--device", choices=["cpu", "mps"], default=None, help="--stage render/all only")
+    distill.add_argument(
+        "--edits",
+        default=None,
+        help=(
+            "edits.json path (docs/EDITOR.md Sec 5, --stage render/all only): delete the "
+            "checkpoint's own points wherever a delete-op region contains them BEFORE any camera "
+            "is rendered, so deleted content never appears in the image set Brush trains on"
+        ),
+    )
     distill.add_argument("--interp-k", type=int, default=DISTILL_DEFAULT_INTERP_K, help="near-path cameras per consecutive pair")
     distill.add_argument(
         "--max-jump-multiplier",

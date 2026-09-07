@@ -50,7 +50,13 @@ import numpy as np
 from trippy.constants import EDIT_GATE_DEFAULT_WEIGHT
 from trippy.edit.model import EditDocument, region_contains, region_weight
 
-__all__ = ["ComposedWeights", "compose_gaussian_weights", "compose_point_weights", "compose_trips_weights"]
+__all__ = [
+    "ComposedWeights",
+    "compose_gaussian_opacity_scale",
+    "compose_gaussian_weights",
+    "compose_point_weights",
+    "compose_trips_weights",
+]
 
 
 @dataclass(frozen=True)
@@ -75,6 +81,7 @@ def compose_point_weights(
     xyz: np.ndarray,
     default: float | np.ndarray = EDIT_GATE_DEFAULT_WEIGHT,
     skip_pointset: bool = False,
+    ops: tuple[str, ...] | None = None,
 ) -> ComposedWeights:
     """Compose `edits.order`'s enabled regions against `xyz`, starting from `default`.
 
@@ -88,6 +95,14 @@ def compose_point_weights(
             gate, once `feat/blend-gate` lands).
         skip_pointset: when True, `pointset` regions are ignored entirely
             (see module docstring; used by `compose_gaussian_weights`).
+        ops: when given, a region whose `op` is not in this tuple is
+            skipped entirely (as if disabled) -- used by
+            `compose_gaussian_opacity_scale` to honour `delete`/`fade`
+            against an already-distilled Gaussian PLY while ignoring
+            `blend` (a splat-only artifact has no TRIPS-vs-splat mix for
+            `blend` to target, docs/EDITOR.md Sec 5). `None` (default)
+            honours every op, matching `compose_trips_weights`/
+            `compose_gaussian_weights`'s existing behaviour exactly.
 
     Returns:
         `ComposedWeights` over the same `N` rows as `xyz`.
@@ -110,6 +125,8 @@ def compose_point_weights(
         if region is None or not region.enabled:
             continue
         if skip_pointset and region.kind == "pointset":
+            continue
+        if ops is not None and region.op not in ops:
             continue
         active = ~delete_mask
 
@@ -147,3 +164,27 @@ def compose_gaussian_weights(
 ) -> ComposedWeights:
     """Gaussian splat centres: `pointset` regions skipped (different row order, see module docstring)."""
     return compose_point_weights(edits, xyz, default=default, skip_pointset=True)
+
+
+def compose_gaussian_opacity_scale(edits: EditDocument, xyz: np.ndarray) -> ComposedWeights:
+    """`delete`/`fade` regions re-applied directly to an already-distilled Gaussian PLY.
+
+    docs/EDITOR.md Sec 5: a `box`/`sphere`/`lid` region is pure world-space
+    geometry (never `pointset`, which does not survive distillation, see
+    `compose_gaussian_weights`'s own skip), so it can be re-applied straight
+    to a finished distilled PLY's own `xyz` -- no re-distillation needed.
+    Only `delete` (hard removal, `.delete_mask`) and `fade` (opacity
+    scaling, `.weight` in `[0, 1]`, 1 = unchanged) make sense against a
+    plain Gaussian artifact with no TRIPS-vs-splat mix to `blend` towards;
+    `blend`-op regions are skipped entirely here (`ops=("delete", "fade")`)
+    rather than silently doing nothing useful with `region.mix`.
+
+    Returns:
+        `ComposedWeights`: `.delete_mask` as usual, `.weight` starting from
+        `1.0` (full opacity) and multiplied down by every enabled `fade`
+        region's own graded membership exactly as
+        `compose_point_weights`'s `fade` branch already does -- the caller
+        (`trippy.edit.apply.apply_gaussian_ply_edits`) reads `.weight` as a
+        per-surviving-row opacity multiplier, not a TRIPS/splat mix.
+    """
+    return compose_point_weights(edits, xyz, default=1.0, skip_pointset=True, ops=("delete", "fade"))

@@ -1694,8 +1694,76 @@ PLY round-trips through `GaussianPlySource` with an unrelated extra vertex
 property preserved byte-for-byte; CLI exit codes (0 on success, 2 on a
 missing edits file / bad geometry / argparse usage error).
 
-**Splat-side weight compositing and the Rust viewer wiring are not done
-here** -- this task is the Python side only (`docs/EDITOR.md` E1/E2/E3/E6's
-data model, weights, shade finder, and publish path); `docs/EDITOR.md` Sec 7
-already flags splat-side per-Gaussian weight rendering as unproven/
-unscheduled, and this work does not change that.
+**Publish path completion (E6, `docs/EDITOR.md` Sec 5)**: `trippy apply-edits
+--target trips|distilled|both` (default `both`), the TRIPS-side `export.ply`
+mask wiring, the distilled-splat re-apply path, and `--edits` on `trippy
+candidate-report`/`trippy eval`/`trippy distill --stage render`.
+
+- `--target trips`/`both` additionally writes a filtered 3DGS-style
+  `export.ply` of the kept TRIPS points (via `trippy.train.export.
+  write_gaussian_ply`, the same writer `Trainer.export_ply` calls), so
+  Splats' audits and Brush can open the edited TRIPS point set with no
+  bundle loader involved.
+- `--target distilled`/`both` (with `--distilled-ply <path>`) re-applies
+  `box`/`sphere`/`lid` regions directly to an already-distilled Gaussian
+  PLY (`trippy.edit.apply.apply_gaussian_ply_edits`, a header-preserving
+  single-`np.fromfile` filter like `filter_gaussian_ply`): `delete` removes
+  rows, `fade` instead scales the surviving row's own `sigmoid(opacity)` by
+  the region's graded weight and writes it back as `logit(...)` -- "fade →
+  opacity scaling", the PLY-only stand-in for a TRIPS-vs-splat mix a plain
+  Gaussian artifact has no channel for. `blend`-op and `pointset` regions
+  are skipped (no meaning here / do not survive distillation); an enabled
+  `pointset` region triggers a `summary["distilled"]["warning"]`.
+- `trippy distill --stage render/all --edits edits.json` applies
+  `delete`-op regions to the checkpoint's own point cloud (`trippy.edit.
+  checkpoint.apply_edits_to_trainer`, the same `Trainer._apply_keep_mask`
+  surgery training uses) BEFORE any camera renders -- the edit-then-distil
+  ordering ADR-0007 requires, so deleted content never reaches the images
+  Brush trains on. Both the exported `trips_export.ply`/`points3D.txt` and
+  the rendered image set reflect the deletion.
+- `trippy candidate-report`/`trippy eval --edits edits.json` run the same
+  keep-mask surgery directly against a checkpoint, no bundle required. On a
+  gate-hybrid checkpoint, `candidate-report`'s renders (`trippy.render.
+  candidate.render_candidate`) additionally multiply the trained blend gate,
+  per pixel, by the per-point weight's projection wherever a `blend`/`fade`
+  region touches a surviving point -- splatted as an auxiliary
+  `render_pyramid` feature channel and read back from level 0 (per-pixel
+  weight rendering has no first-class output in the Python renderer today;
+  this is the documented fallback, `docs/EDITOR.md` Sec 5). `trippy eval`
+  applies the keep-mask deletion only, not the gate multiply (`Trainer.
+  evaluate`'s own render path is out of `trippy.edit.checkpoint`'s reach --
+  a documented gap, not a silent one).
+
+A CPU end-to-end on the synthetic bundle/checkpoint above (`n=300` TRIPS
+points, half deleted by a `pointset` region): `apply-edits --target both`
+prints `{"n_in": 300, "n_deleted": 150, "n_kept": 150}` for the TRIPS side
+and a `"distilled": {"skipped": ...}` note (no `--distilled-ply` given);
+`trippy distill --stage render --edits` on the same checkpoint prints
+`removed 150 point(s) before rendering (300 -> 150)` and writes a
+correspondingly smaller `points3D.txt`.
+
+Tests (`tests/test_edit_checkpoint.py`, `tests/test_edit_apply.py`,
+`tests/test_edit_weights.py`, `tests/test_cli_candidate_report.py`,
+`tests/test_cli_distill.py`, `tests/test_distill_render_set.py`,
+`tests/test_train_eval.py`, `tests/test_train_cli.py`; CPU, synthetic
+fixtures only): `export.ply` round-trips through `GaussianPlySource`/
+`read_back_check`; `apply_gaussian_ply_edits` deletes and opacity-fades the
+right rows on a synthetic distilled PLY, ignores `blend`, and warns on an
+enabled `pointset` region; `apply_edits_to_trainer` shrinks a live gate
+-hybrid `Trainer`'s point count and optimizer state together, and correctly
+marks `gate_suppression_active` (False for delete-only, True when a
+`fade`/`blend` region survives); `render_edit_weight_map` returns `None`
+when inactive and a `[0, 1]`-valued per-pixel map otherwise;
+`render_candidate`/`render_distill_set`/`evaluate_checkpoint` with `--edits`
+all record an `"edits"` summary and actually shrink the rendered/evaluated
+point cloud (`render_distill_set`'s own COLMAP `points3D.txt` count drops
+relative to an un-edited run on the identical checkpoint); CLI end-to-end
+(`candidate-report`/`eval`/`distill --stage render`/`apply-edits
+--target ...`) exit 0 and the applied-edits summary shows up in
+`report.json`/README/stdout.
+
+**Splat-side weight compositing and the Rust viewer wiring are still not
+done** -- `docs/EDITOR.md` Sec 7 already flags splat-side per-Gaussian
+weight rendering as unproven/unscheduled, and this work does not change
+that; the checkpoint-side gate-suppression multiply above is a documented,
+TRIPS-only-direction simplification of it, not the real thing.

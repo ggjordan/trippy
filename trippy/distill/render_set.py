@@ -25,7 +25,17 @@ Invariants:
       explicitly (the same rule as every other MPS-capable entry point in
       this repo, AGENTS.md); it must only ever be invoked with `mps` from
       inside a `scripts/gpu_submit.sh` job.
-Related docs: docs/EXPERIMENTS.md "Distillation (design B)"; docs/SPEC.md D2.
+    - `edits_path` (docs/EDITOR.md Sec 5, ADR-0007 "Publish order is
+      edit-TRIPS-first, then distil") is applied BEFORE anything is
+      rendered: the same `edits.json` shrinks both the `Trainer` this
+      function exports `trips_export.ply`/`points3D.txt` from, and (via
+      `render_candidate`'s own `edits_path` forwarding) the `Trainer` every
+      per-pose image is rendered from. A `delete`-op region's points are
+      therefore absent from every "photo" Brush will train on -- deleted
+      content never appears in the distilled image set at all, rather than
+      being deleted from the distilled PLY after the fact.
+Related docs: docs/EXPERIMENTS.md "Distillation (design B)"; docs/SPEC.md D2;
+    docs/EDITOR.md Sec 5 "Publish".
 """
 
 from __future__ import annotations
@@ -61,11 +71,19 @@ def render_distill_set(
     interp_k: int = DISTILL_DEFAULT_INTERP_K,
     max_jump_multiplier: float = DISTILL_MAX_JUMP_MULTIPLIER,
     max_init_points: int | None = DISTILL_DEFAULT_MAX_INIT_POINTS,
+    edits_path: str | Path | None = None,
 ) -> dict:
     """Render `checkpoint_path`'s network output into a Brush-ready COLMAP image set.
 
     Args:
         checkpoint_path: a `.pt` file written by `Trainer.save_checkpoint`.
+        edits_path: an `edits.json` path (docs/EDITOR.md Sec 5). When given,
+            `delete`-op regions are removed from the point cloud BEFORE
+            `trips_export.ply`/`points3D.txt` are written and before any
+            pose is rendered (forwarded to `render_candidate`), so deleted
+            content never appears in the image set Brush trains on -- the
+            edit-then-distil ordering ADR-0007 requires. None (default)
+            distils the checkpoint exactly as before this parameter existed.
         out_dir: output directory (created if missing). Writes:
             `<out_dir>/{DISTILL_TRIPS_EXPORT_FILENAME}` (the checkpoint's own
             trained point cloud, `Trainer.export_ply`'s exact output -- also
@@ -89,7 +107,8 @@ def render_distill_set(
         "n_points_source", "n_points_written", "n_cameras",
         "n_anchor_images", "n_interpolated_images", "n_skipped_pairs",
         "skipped_pairs", "median_consecutive_distance", "jump_threshold",
-        "mean_coverage_full"}`.
+        "mean_coverage_full"}`, plus `"edits"` (the applied-edits summary)
+        when `edits_path` was given.
 
     Raises:
         ValueError: the checkpoint's scene has no registered images.
@@ -100,7 +119,9 @@ def render_distill_set(
     # Mirrors trippy.cli._cmd_candidate_report's own pattern: build one Trainer to
     # export the checkpoint's trained point cloud, then let render_candidate below
     # rebuild its own Trainer from the checkpoint for the actual per-pose renders.
-    trainer = build_trainer_from_checkpoint(checkpoint_path, device=device)
+    # `edits_path` is applied to THIS trainer too, so trips_export.ply/points3D.txt
+    # already reflect the deletion (ADR-0007 "edit-TRIPS-first, then distil").
+    trainer = build_trainer_from_checkpoint(checkpoint_path, device=device, edits_path=edits_path)
     scene_root = Path(trainer.cfg.scene_root)
     width = trainer.cfg.width
     export_path = trainer.export_ply(out_dir / DISTILL_TRIPS_EXPORT_FILENAME)
@@ -108,6 +129,7 @@ def render_distill_set(
     rgb = np.clip(trainer.point_params.feat[:, :3].detach().cpu().numpy(), 0.0, 1.0).astype(np.float64)
     n_points_source = int(xyz.shape[0])
     resolved_device = str(trainer.device)
+    edit_summary = trainer.edit_summary
     del trainer
 
     camera_plan = build_distill_camera_plan(
@@ -125,6 +147,7 @@ def render_distill_set(
         device=resolved_device,
         write_video_files=False,
         stop_at_low_coverage=False,
+        edits_path=edits_path,
     )
 
     images_dir = out_dir / DISTILL_IMAGES_DIRNAME
@@ -158,5 +181,7 @@ def render_distill_set(
         "jump_threshold": camera_plan.jump_threshold,
         "mean_coverage_full": render_metrics["mean_coverage_full"],
     }
+    if edit_summary is not None:
+        report["edits"] = {"path": str(edits_path), **edit_summary}
     (out_dir / DISTILL_REPORT_FILENAME).write_text(json.dumps(report, indent=2) + "\n")
     return report

@@ -22,7 +22,11 @@ from __future__ import annotations
 import numpy as np
 
 from trippy.edit.model import EditDocument, Region
-from trippy.edit.weights import compose_gaussian_weights, compose_trips_weights
+from trippy.edit.weights import (
+    compose_gaussian_opacity_scale,
+    compose_gaussian_weights,
+    compose_trips_weights,
+)
 
 
 def _box(rid: str, mix: float, op: str = "blend", enabled: bool = True, half=1.0) -> Region:
@@ -117,3 +121,42 @@ def test_compose_gaussian_weights_ignores_pointset_regions() -> None:
 
     trips = compose_trips_weights(edits, xyz, default=1.0)
     assert trips.delete_mask.tolist() == [True, False]  # pointset applies to TRIPS points
+
+
+# --- compose_gaussian_opacity_scale: the distilled-ply reapply path (docs/EDITOR.md Sec 5) ---
+
+
+def test_opacity_scale_deletes_and_fades_but_ignores_blend() -> None:
+    edits = EditDocument.new()
+    edits.add_region(_box("del", mix=1.0, op="delete", half=1.0))
+    edits.add_region(_box("fade", mix=0.25, op="fade", half=1.0))
+    edits.add_region(_box("blend", mix=0.0, op="blend", half=1.0))  # ignored: no meaning for a plain PLY
+    xyz = np.array(
+        [
+            [0.0, 0.0, 0.0],  # inside every region: delete wins (it fires first, hard removal)
+            [10.0, 0.0, 0.0],  # outside every region: untouched, opacity_scale == 1.0
+        ]
+    )
+    result = compose_gaussian_opacity_scale(edits, xyz)
+    assert result.delete_mask.tolist() == [True, False]
+    np.testing.assert_allclose(result.weight, [0.0, 1.0])  # delete zeroes; untouched point stays 1.0
+
+
+def test_opacity_scale_fade_only_region_ramps_down() -> None:
+    edits = EditDocument.new()
+    edits.add_region(_box("fade", mix=0.25, op="fade", half=1.0))
+    xyz = np.array([[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]])
+    result = compose_gaussian_opacity_scale(edits, xyz)
+    assert not result.delete_mask.any()
+    # Inside the fade region: 1.0 * (1 - 1.0*(1-0.25)) = 0.25. Outside: untouched at 1.0.
+    np.testing.assert_allclose(result.weight, [0.25, 1.0])
+
+
+def test_compose_point_weights_ops_filter_skips_regions_outside_the_set() -> None:
+    from trippy.edit.weights import compose_point_weights
+
+    edits = EditDocument.new()
+    edits.add_region(_box("blend", mix=0.0, op="blend", half=1.0))
+    xyz = np.array([[0.0, 0.0, 0.0]])
+    result = compose_point_weights(edits, xyz, default=1.0, ops=("delete", "fade"))
+    assert result.weight.tolist() == [1.0]  # the blend region is invisible to this call
