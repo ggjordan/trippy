@@ -24,6 +24,7 @@
 mod app;
 mod blit;
 mod edit_ui;
+mod sam_child;
 
 // The platform-neutral half lives in this package's library target (`src/lib.rs`)
 // so `rust/crates/trips-web` can compile the identical bundle loader, camera and
@@ -108,6 +109,26 @@ Editing (docs/EDITOR.md; press M in the window for the panels):
   --click-max-radius <f>  growth cap from the seed centroid, world units
                        (default: the bundle's median camera spacing)
   --click-max-points <n>  hard cap on the selection (default 200000)
+  --sam-box <X0> <Y0> <X1> <Y1>
+                       SAM 3 lift (E5): run `trippy edits sam` as a child on
+                       the chosen view with this box, in that VIEW's own pixels
+                       (what a drag on the render maps to), import the region
+                       it returns and tint it into the --screenshot. Needs
+                       bundle.json's `scene_root`, and $TRIPPY_ROOT or
+                       $TRIPPY_PYTHON if it records no `trippy_root`
+  --sam-point <U> <V>  the same with a point prompt (the window's ALT-CLICK)
+  --sam-views-around <n>  neighbouring views that also segment and vote
+                       (default 0 = the prompted view alone)
+  --sam-op <op>        blend | fade | delete for the imported region (fade)
+  --sam-mix <f>        its mix, 0 = splat, 1 = TRIPS (default 0)
+  --sam-device <d>     cpu | mps, passed straight to `trippy edits sam` (cpu)
+  --sam-fake           synthesise the mask instead of loading SAM 3: proves the
+                       whole path -- child, progress, region, tint -- with no
+                       checkpoint and no GPU. This is what the screenshot proof
+                       and the tests use
+  --sam-undo           after importing, undo it. The frame must then be
+                       identical to a run with no --sam-box at all, which is
+                       the undo-restores-it half of the E5 proof
 
 Headless (no window; used by the acceptance check and the perf table):
   --screenshot <o.png> render one frame to a PNG and exit
@@ -131,6 +152,7 @@ Keys:
   B          cycle the blend mode (hybrid bundles)
   M          edit mode: Regions / Inspector / Tools (docs/EDITOR.md)
   shift-click  in edit mode: select the object under the pointer (E4)
+  drag / alt-click  with the SAM tool: box / point prompt for the lift (E5)
   V          cycle network / raw level-0 / coverage
   X          cycle the exposure the tone mapper applies
   - / =      render scale        TAB  hide the panel
@@ -221,6 +243,22 @@ struct Args {
     click_max_radius: Option<f64>,
     /// See [`Self::click_radius_px`].
     click_max_points: Option<usize>,
+    /// `--sam-box X0 Y0 X1 Y1`: the SAM prompt, in the chosen VIEW's pixels.
+    sam_box: Option<[f64; 4]>,
+    /// `--sam-point U V`: the same, as a point.
+    sam_point: Option<(f64, f64)>,
+    /// `--sam-views-around`.
+    sam_views_around: usize,
+    /// `--sam-op`.
+    sam_op: trips_viewer::edit::Op,
+    /// `--sam-mix`.
+    sam_mix: f64,
+    /// `--sam-device`.
+    sam_device: &'static str,
+    /// `--sam-fake`.
+    sam_fake: bool,
+    /// `--sam-undo`.
+    sam_undo: bool,
 }
 
 /// Parse `1920x1080`.
@@ -335,6 +373,14 @@ fn parse_args() -> Result<Args, String> {
         click_colour_tol: None,
         click_max_radius: None,
         click_max_points: None,
+        sam_box: None,
+        sam_point: None,
+        sam_views_around: 0,
+        sam_op: trips_viewer::edit::Op::Fade,
+        sam_mix: 0.0,
+        sam_device: "cpu",
+        sam_fake: false,
+        sam_undo: false,
     };
     let mut argv = std::env::args().skip(1);
     while let Some(flag) = argv.next() {
@@ -436,6 +482,38 @@ fn parse_args() -> Result<Args, String> {
                 args.click_max_radius =
                     Some(value()?.parse().map_err(|e| format!("--click-max-radius: {e}"))?);
             }
+            "--sam-box" => {
+                let mut box_px = [0.0_f64; 4];
+                for (index, slot) in box_px.iter_mut().enumerate() {
+                    *slot = value()?
+                        .parse()
+                        .map_err(|e| format!("--sam-box value {}: {e}", index + 1))?;
+                }
+                args.sam_box = Some(box_px);
+            }
+            "--sam-point" => {
+                let u: f64 = value()?.parse().map_err(|e| format!("--sam-point U: {e}"))?;
+                let v: f64 = value()?.parse().map_err(|e| format!("--sam-point V: {e}"))?;
+                args.sam_point = Some((u, v));
+            }
+            "--sam-views-around" => {
+                args.sam_views_around = value()?
+                    .parse()
+                    .map_err(|e| format!("--sam-views-around: {e}"))?;
+            }
+            "--sam-op" => args.sam_op = trips_viewer::edit::Op::parse(&value()?)?,
+            "--sam-mix" => {
+                args.sam_mix = value()?.parse().map_err(|e| format!("--sam-mix: {e}"))?;
+            }
+            "--sam-device" => {
+                args.sam_device = match value()?.as_str() {
+                    "cpu" => "cpu",
+                    "mps" => "mps",
+                    other => return Err(format!("--sam-device wants cpu or mps, got {other:?}")),
+                };
+            }
+            "--sam-fake" => args.sam_fake = true,
+            "--sam-undo" => args.sam_undo = true,
             "--click-max-points" => {
                 args.click_max_points =
                     Some(value()?.parse().map_err(|e| format!("--click-max-points: {e}"))?);
@@ -759,6 +837,8 @@ fn run_headless(args: &Args, bundle: Bundle) -> Result<(), String> {
     let bundle_dir = bundle.dir.clone();
     let bundle_format = bundle.manifest.format.clone();
     let blend_manifest = bundle.manifest.blend.clone();
+    let trippy_root = bundle.manifest.trippy_root.clone();
+    let has_scene_root = bundle.manifest.scene_root.is_some();
     // Resolved before the bundle moves into the renderer: the default
     // `max_radius` needs every view's camera centre.
     let click_params = args.click.map(|_| click_params_for(&bundle, args));
@@ -773,6 +853,7 @@ fn run_headless(args: &Args, bundle: Bundle) -> Result<(), String> {
         &bundle_format,
         args.edits.as_deref(),
     );
+    edits.set_bundle_paths(trippy_root.as_deref(), has_scene_root);
     edits.apply(&mut renderer)?;
     if let Some((deleted, touched)) = renderer.edit_summary() {
         eprintln!(
@@ -828,6 +909,56 @@ fn run_headless(args: &Args, bundle: Bundle) -> Result<(), String> {
                 .as_ref()
                 .map_or_else(String::new, |w| format!(" -- {w}"))
         );
+    }
+
+    // `--sam-box` / `--sam-point`: the headless twin of the SAM tool's own
+    // gesture. Same session, same child process, same import through the undo
+    // log -- only the gesture is a flag instead of a drag. With `--sam-fake`
+    // the child synthesises its mask, which is what makes this runnable in a
+    // test and in the screenshot proof (`docs/EDITOR.md` §6's E5 row).
+    if let Some(prompt) = sam_prompt(args) {
+        edits.set_sam_settings(
+            args.sam_views_around,
+            args.sam_op,
+            args.sam_mix,
+            args.sam_device,
+            args.sam_fake,
+        );
+        edits.set_sam_prompt(&camera_view.name, prompt);
+        edits.start_sam(&bundle_dir)?;
+        // Blocking is right HERE and wrong in the window: there is no Cancel
+        // button in a headless run and nothing else for this thread to do.
+        edits.wait_for_sam();
+        edits.poll_sam();
+        let ids = edits.sam_selection().len();
+        if ids == 0 {
+            return Err(format!(
+                "the SAM lift on {} returned no points{}",
+                camera_view.name,
+                edits.last_error().map_or_else(String::new, |e| format!(": {e}"))
+            ));
+        }
+        let counts = edits.sam_summary().map_or_else(
+            || "no summary".to_owned(),
+            |s| {
+                format!(
+                    "{} of {} points, {} in the prompted view, {} view(s) voted",
+                    s["n_points"], s["n_points_total"], s["n_points_primary_view"],
+                    s["vote"]["n_views"]
+                )
+            },
+        );
+        eprintln!(
+            "SAM {} on view {}: {counts}",
+            prompt.label(),
+            camera_view.name
+        );
+        if args.sam_undo {
+            edits.undo_once();
+            edits.set_sam_preview(false);
+            eprintln!("SAM region undone: the frame must now match a run with no --sam-box");
+        }
+        edits.apply(&mut renderer)?;
     }
 
     // `--camera-yaw-deg` unpins the controller, so `ExposureMode::Auto` here
@@ -975,6 +1106,17 @@ fn run_headless(args: &Args, bundle: Bundle) -> Result<(), String> {
     Ok(())
 }
 
+/// The `--sam-box` / `--sam-point` prompt for this run, if either was given.
+///
+/// Both are in the chosen VIEW's own pixel grid, which is what a drag on the
+/// render maps to (`trips_viewer::edit::sam`) and what `trippy edits sam
+/// --prompt-space view` expects.
+fn sam_prompt(args: &Args) -> Option<crate::sam_child::SamPrompt> {
+    args.sam_box.map(crate::sam_child::SamPrompt::Box).or_else(|| {
+        args.sam_point.map(crate::sam_child::SamPrompt::Point)
+    })
+}
+
 /// The device a finished frame's buffer lives on.
 fn frame_device(frame: &crate::renderer::RenderedFrame) -> &WgpuDevice {
     &frame.buffer.device
@@ -1004,6 +1146,10 @@ fn run() -> Result<(), String> {
         || args.dump_weights.is_some()
         || args.dump_shade.is_some()
         || args.dump_click.is_some()
+        // `--sam-box` on its own runs the lift and prints the counts; it does
+        // not need a window, and a queue job has no display to open one on.
+        || args.sam_box.is_some()
+        || args.sam_point.is_some()
         || args.settings.profile;
     let dir = resolve_bundle(args.bundle.clone(), headless)?;
     let bundle = Bundle::load(&dir)?;

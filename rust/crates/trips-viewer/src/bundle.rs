@@ -129,6 +129,27 @@ pub struct Manifest {
     /// still parses -- which is why [`BUNDLE_FORMAT`] does not change.
     #[serde(default)]
     pub blend: Option<BlendManifest>,
+    /// The scene directory the views were captured in, when the exporter
+    /// recorded one (`trippy.render.bundle.bundle_document`'s `scene_root`).
+    ///
+    /// The viewer never opens a photograph (`AGENTS.md` §6) and nothing in the
+    /// render path reads this. It exists for the SAM tool, which spawns
+    /// `trippy edits sam` and lets the CHILD find the photographs from here
+    /// rather than being told twice — which is why `--scene` is optional on
+    /// that command and absent from `crate::sam_child`'s argument list.
+    /// `#[serde(default)]`: a bundle exported before 2026-09-07 has no such key
+    /// and the SAM panel says so instead of guessing.
+    #[serde(default)]
+    pub scene_root: Option<String>,
+    /// The trippy checkout that wrote this bundle, when the exporter recorded
+    /// one (`trippy.render.bundle.trippy_repo_root`).
+    ///
+    /// `crate::sam_child` resolves the interpreter it spawns as
+    /// `<trippy_root>/.venv/bin/python`; `$TRIPPY_ROOT` and `$TRIPPY_PYTHON`
+    /// override it, which is what makes a bundle copied off this machine
+    /// usable. `#[serde(default)]` for the same reason as `scene_root`.
+    #[serde(default)]
+    pub trippy_root: Option<String>,
     /// Index **into `views`** (not a dataset image index) the viewer opens at.
     #[serde(default)]
     pub default_view: usize,

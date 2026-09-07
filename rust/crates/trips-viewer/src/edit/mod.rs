@@ -24,12 +24,16 @@
 pub mod apply;
 pub mod cluster;
 pub mod model;
+/// The SAM tool's geometry: render pixels -> the capture view's pixel grid.
+/// See `docs/EDITOR.md` §3 "4. SAM 3 lift (E5)".
+pub mod sam;
 pub mod shade;
 pub mod weights;
 
 pub use apply::{edited_points, gaussian_opacity_scale, EditedPoints, COVERAGE_EPS};
 pub use cluster::{click_to_cluster, ClickCamera, ClickParams, ClickSelection, PointGrid};
 pub use model::{EditDocument, Kind, LidParams, Op, Params, Region, EDITS_FILENAME};
+pub use sam::{is_box_drag, nearest_view, render_pixel, view_box_from_render, view_pixel_from_render};
 pub use weights::{compose_gaussian_weights, compose_trips_weights, ComposedWeights};
 
 /// Default region size as a fraction of the scene's own diameter.

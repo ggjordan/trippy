@@ -289,3 +289,64 @@ def test_default_view_is_an_array_position_not_a_dataset_index() -> None:
     assert default_view_position(views, 5) == 0
     # A scene with fewer/other views must still name a loadable entry.
     assert default_view_position(views, 999) == 0
+
+
+def test_bundle_json_records_where_the_photos_and_the_code_live(
+    native_bundle: tuple[Path, dict],
+) -> None:
+    """`scene_root` + `trippy_root`: what `trippy edits sam` needs from a bundle.
+
+    `trips-viewer`'s SAM tool spawns `trippy edits sam` with NO `--scene`
+    (docs/EDITOR.md Sec 3 "4. SAM 3 lift (E5)"), so the bundle has to say
+    where the photographs are; and it resolves the interpreter it spawns as
+    `<trippy_root>/.venv/bin/python`, so the bundle has to say where the code
+    that wrote it lives.
+    """
+    from trippy.render.bundle import trippy_repo_root
+
+    _, doc = native_bundle
+    scene_root = Path(doc["scene_root"])
+    assert scene_root.is_dir(), "scene_root must name a directory that exists"
+    assert (scene_root / "images").is_dir(), "the photographs live under scene_root/images"
+
+    trippy_root = Path(doc["trippy_root"])
+    assert trippy_root == trippy_repo_root()
+    assert (trippy_root / "trippy" / "cli.py").is_file(), (
+        "trippy_root must be the checkout `python -m trippy.cli` runs from"
+    )
+
+
+def test_a_bundle_source_without_a_scene_leaves_scene_root_out() -> None:
+    """No `scene_root` key at all rather than a null: an older bundle parses the same.
+
+    `trips_viewer::bundle::Manifest` reads it as `Option<String>` with a serde
+    default, and `trippy edits sam` then insists on `--scene` -- both of which
+    need "absent" to be a real state.
+    """
+    from trippy.render.bundle import BundleParams, BundleSource, bundle_document
+
+    net = MultiScaleUnet2dDecOnlySmallFixed(NetworkConfig(num_input_channels=BUNDLE_TEST_CHANNELS))
+    source = BundleSource(
+        name="no-scene",
+        xyz=np.zeros((1, 3), dtype=np.float32),
+        size=np.ones(1, dtype=np.float32),
+        feat=np.zeros((1, BUNDLE_TEST_CHANNELS), dtype=np.float32),
+        conf=np.full(1, 0.5, dtype=np.float32),
+        background=np.zeros(BUNDLE_TEST_CHANNELS, dtype=np.float32),
+        net=net,
+        camera=None,
+        params=BundleParams(
+            mode="broadcast",
+            num_layers=BUNDLE_TEST_LAYERS,
+            pixel_center="half",
+            halving="floor",
+            max_frags=8,
+            t_cutoff=0.001,
+            alpha_min=0.0,
+            znear=0.01,
+        ),
+        views=[_view(0)],
+    )
+    document = bundle_document(source)
+    assert "scene_root" not in document
+    assert document["trippy_root"]

@@ -30,6 +30,7 @@ Fixture: a synthetic bundle + synthetic noise "photographs" built here.
 from __future__ import annotations
 
 import json
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -114,6 +115,7 @@ def build_fixture(tmp_path: Path, camera_xs: tuple[float, ...] = (0.0, 0.15, -0.
 
     bundle_dir = tmp_path / "bundle"
     bundle_dir.mkdir()
+    scene_root = tmp_path / "scene"
     names = [f"IMG_{i:04d}.png" for i in range(len(camera_xs))]
     doc = {
         "format": "trippy-bundle-1",
@@ -126,6 +128,9 @@ def build_fixture(tmp_path: Path, camera_xs: tuple[float, ...] = (0.0, 0.15, -0.
         "params": {"mode": "broadcast", "num_layers": 2},
         "up": [0.0, -1.0, 0.0],
         "default_view": 0,
+        # `trippy.render.bundle.bundle_document` writes this so a tool that has
+        # a bundle does not also have to be told where the photographs are.
+        "scene_root": str(scene_root),
         "views": [_view(name, x, i) for i, (name, x) in enumerate(zip(names, camera_xs, strict=True))],
     }
     (bundle_dir / "bundle.json").write_text(json.dumps(doc))
@@ -136,7 +141,6 @@ def build_fixture(tmp_path: Path, camera_xs: tuple[float, ...] = (0.0, 0.15, -0.
         conf=np.full(xyz.shape[0], 0.5, dtype=np.float32),
     )
 
-    scene_root = tmp_path / "scene"
     images = scene_root / "images"
     images.mkdir(parents=True)
     from PIL import Image
@@ -155,6 +159,18 @@ def build_fixture(tmp_path: Path, camera_xs: tuple[float, ...] = (0.0, 0.15, -0.
         "wall_ids": wall_ids,
         "distractor_ids": distractor_ids,
     }
+
+
+def last_json_line(stdout: str) -> dict[str, Any]:
+    """`trippy edits sam`'s output contract: the LAST stdout line is the summary.
+
+    Everything before it is a `sam: ...` progress line, which is what
+    `trips_viewer::sam_child` streams into the SAM panel while the child
+    runs (docs/EDITOR.md Sec 3 "4. SAM 3 lift (E5)").
+    """
+    lines = [line for line in stdout.splitlines() if line.strip()]
+    assert lines, "no output at all"
+    return json.loads(lines[-1])
 
 
 def brute_force_project(view: LiftView, xyz: np.ndarray, scale: float) -> np.ndarray:
@@ -518,7 +534,11 @@ def test_cli_edits_sam_with_mask_files(tmp_path: Path, capsys: pytest.CaptureFix
         ]
     )
     assert rc == 0
-    summary = json.loads(capsys.readouterr().out)
+    out = capsys.readouterr().out
+    assert any(line.startswith("sam: segmenting ") for line in out.splitlines()), (
+        "the viewer shows the child's progress lines while it waits"
+    )
+    summary = last_json_line(out)
     assert summary["n_points"] == len(fixture["object_ids"])
     assert summary["per_view"][0]["segmenter"]["segmenter"] == "mask-file"
     assert Path(summary["preview"]).exists()
@@ -584,3 +604,273 @@ def test_lift_survives_points_almost_in_the_pinhole(tmp_path: Path) -> None:
     # of cells is mostly wall, and the gate erodes it (docs/LIMITATIONS.md
     # "The depth gate can drop an object's edge cells").
     assert lifted["selected"][fixture["object_ids"]].mean() > 0.99
+
+
+# --- the fake segmenter: the viewer's child process, without SAM 3 ---------
+
+
+def test_fake_segmenter_draws_the_prompt_and_never_claims_sam_ran(tmp_path: Path) -> None:
+    from trippy.edit.sam_runner import FakeSegmenter
+
+    fixture = build_fixture(tmp_path)
+    photo = fixture["scene_root"] / "images" / fixture["names"][0]
+    fake = FakeSegmenter()
+
+    mask, info = fake(photo, SamPrompt(kind="box", box=(50.0, 60.0, 110.0, 130.0)))
+    assert mask.shape == (PHOTO_H, PHOTO_W)
+    assert mask.dtype == bool
+    assert info["segmenter"] == "fake"
+    assert mask[60:130, 50:110].all()
+    assert not mask[0:59, :].any()
+    assert fake.seen == [(fixture["names"][0], SamPrompt(kind="box", box=(50.0, 60.0, 110.0, 130.0)))]
+
+    disc, _info = fake(photo, SamPrompt(kind="point", point=(100.0, 100.0)))
+    assert disc[100, 100]
+    assert disc[100, 100 + int(fake.point_radius_px) - 1]
+    assert not disc[100, 100 + int(fake.point_radius_px) + 2]
+
+
+def test_fake_requested_reads_the_env_switch(monkeypatch: pytest.MonkeyPatch) -> None:
+    from trippy.constants import SAM_FAKE_ENV
+    from trippy.edit.sam_runner import fake_requested
+
+    monkeypatch.delenv(SAM_FAKE_ENV, raising=False)
+    assert not fake_requested()
+    assert fake_requested(True)
+    monkeypatch.setenv(SAM_FAKE_ENV, "1")
+    assert fake_requested()
+    monkeypatch.setenv(SAM_FAKE_ENV, "0")
+    assert not fake_requested()
+
+
+def test_cli_edits_sam_fake_takes_scene_root_from_the_bundle(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`--fake` with NO `--scene`: exactly the command the viewer spawns."""
+    from trippy.cli import main
+
+    fixture = build_fixture(tmp_path)
+    x0, y0, x1, y1 = object_box()
+    edits_path = tmp_path / "edits.json"
+    rc = main(
+        [
+            "edits", "sam",
+            "--bundle", str(fixture["bundle_dir"]),
+            "--view", fixture["names"][0],
+            "--box", str(x0), str(y0), str(x1), str(y1),
+            "--views-around", "0",
+            "--out", str(edits_path),
+            "--op", "fade",
+            "--mix", "0.0",
+            "--fake",
+        ]
+    )  # fmt: skip
+    assert rc == 0
+    summary = last_json_line(capsys.readouterr().out)
+    assert summary["per_view"][0]["segmenter"]["segmenter"] == "fake"
+    assert summary["scene_root"] == str(fixture["scene_root"])
+    assert summary["settings"]["prompt_space"] == "photo"
+    assert summary["n_points"] == len(fixture["object_ids"])
+
+    doc = EditDocument.load(edits_path)
+    assert len(doc.regions) == 1
+    assert sorted(doc.regions[0].params["point_ids"]) == fixture["object_ids"].tolist()
+
+
+def test_cli_edits_sam_env_switch_needs_no_flag(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from trippy.cli import main
+    from trippy.constants import SAM_FAKE_ENV
+
+    monkeypatch.setenv(SAM_FAKE_ENV, "1")
+    fixture = build_fixture(tmp_path)
+    x0, y0, x1, y1 = object_box()
+    rc = main(
+        [
+            "edits", "sam",
+            "--bundle", str(fixture["bundle_dir"]),
+            "--view", fixture["names"][0],
+            "--box", str(x0), str(y0), str(x1), str(y1),
+            "--views-around", "0",
+            "--out", str(tmp_path / "edits.json"),
+        ]
+    )  # fmt: skip
+    assert rc == 0
+    assert last_json_line(capsys.readouterr().out)["per_view"][0]["segmenter"]["segmenter"] == "fake"
+
+
+def test_cli_edits_sam_without_scene_or_scene_root_says_so(tmp_path: Path) -> None:
+    from trippy.cli import main
+
+    fixture = build_fixture(tmp_path)
+    manifest = fixture["bundle_dir"] / "bundle.json"
+    document = json.loads(manifest.read_text())
+    del document["scene_root"]
+    manifest.write_text(json.dumps(document))
+    rc = main(
+        [
+            "edits", "sam",
+            "--bundle", str(fixture["bundle_dir"]),
+            "--view", fixture["names"][0],
+            "--point", "100", "100",
+            "--out", str(tmp_path / "edits.json"),
+            "--fake",
+        ]
+    )  # fmt: skip
+    assert rc == 2
+
+
+# --- prompt spaces: the viewer measures VIEW pixels, SAM wants PHOTO pixels --
+
+
+def test_scale_prompt_scales_points_and_boxes_but_not_text() -> None:
+    from trippy.edit.sam_lift import scale_prompt
+
+    point = scale_prompt(SamPrompt(kind="point", point=(10.0, 20.0)), 2.0)
+    assert point.point == (20.0, 40.0)
+    box = scale_prompt(SamPrompt(kind="box", box=(1.0, 2.0, 3.0, 4.0)), 2.5)
+    assert box.box == (2.5, 5.0, 7.5, 10.0)
+    text = SamPrompt(kind="text", text="a rock")
+    assert scale_prompt(text, 3.0) is text
+
+
+def test_sam_lift_view_space_prompt_matches_the_photo_space_one(tmp_path: Path) -> None:
+    """A box in VIEW pixels selects what the same box in PHOTO pixels does.
+
+    The photo is 2x the view here (`PHOTO_W / VIEW_W`), so the view-space box
+    is the photo-space one halved -- which is exactly the conversion the
+    viewer relies on `--prompt-space view` to make for it.
+    """
+    from trippy.edit.sam_runner import FakeSegmenter
+
+    fixture = build_fixture(tmp_path)
+    x0, y0, x1, y1 = object_box()
+    photo_region, photo_summary = sam_lift(
+        fixture["bundle_dir"], fixture["scene_root"], fixture["names"][0],
+        SamPrompt(kind="box", box=(x0, y0, x1, y1)), FakeSegmenter(), views_around=0,
+    )  # fmt: skip
+    scale = PHOTO_W / VIEW_W
+    view_region, view_summary = sam_lift(
+        fixture["bundle_dir"], fixture["scene_root"], fixture["names"][0],
+        SamPrompt(kind="box", box=(x0 / scale, y0 / scale, x1 / scale, y1 / scale)),
+        FakeSegmenter(), views_around=0, prompt_space="view",
+    )  # fmt: skip
+    assert view_region.params["point_ids"] == photo_region.params["point_ids"]
+    assert view_summary["settings"]["prompt_space"] == "view"
+    assert view_summary["prompt_as_given"]["box"] == [x0 / scale, y0 / scale, x1 / scale, y1 / scale]
+    assert view_summary["prompt"] == photo_summary["prompt"]
+
+
+def test_sam_lift_rejects_an_unknown_prompt_space(tmp_path: Path) -> None:
+    from trippy.edit.sam_runner import FakeSegmenter
+
+    fixture = build_fixture(tmp_path)
+    with pytest.raises(ValueError, match="prompt_space"):
+        sam_lift(
+            fixture["bundle_dir"], fixture["scene_root"], fixture["names"][0],
+            SamPrompt(kind="point", point=(100.0, 100.0)), FakeSegmenter(),
+            views_around=0, prompt_space="render",
+        )  # fmt: skip
+
+
+def test_sam_lift_reports_progress_for_every_view(tmp_path: Path) -> None:
+    from trippy.edit.sam_runner import FakeSegmenter
+
+    fixture = build_fixture(tmp_path)
+    x0, y0, x1, y1 = object_box()
+    lines: list[str] = []
+    sam_lift(
+        fixture["bundle_dir"], fixture["scene_root"], fixture["names"][0],
+        SamPrompt(kind="box", box=(x0, y0, x1, y1)), FakeSegmenter(),
+        views_around=2, progress=lines.append,
+    )  # fmt: skip
+    assert any(line.startswith(f"segmenting {fixture['names'][0]}") for line in lines)
+    assert any("neighbour 1/2" in line for line in lines)
+    assert lines[-1].startswith("vote over 3 view(s)")
+
+
+# --- the SAM 3 shims (rebindings of SAM 3's own code, no SAM 3 needed) ------
+
+
+def _stub_module(name: str, **attributes: Any) -> Any:
+    """A throwaway module object standing in for one of SAM 3's."""
+    import types
+
+    module = types.ModuleType(name)
+    for key, value in attributes.items():
+        setattr(module, key, value)
+    return module
+
+
+def test_install_fp32_addmm_rebinds_both_bindings_and_keeps_the_dtype(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`sam3.model.vitdet` imports `addmm_act` by value, so both must be patched.
+
+    Patching only the definition site would leave the ONLY caller
+    (`vitdet.Mlp.forward`) on the bfloat16 version -- the bug this whole shim
+    exists to prevent (docs/LIMITATIONS.md "SAM-3 mask lift").
+    """
+    import torch
+
+    from trippy.edit.sam_runner import _install_fp32_addmm
+
+    def original(_activation: Any, _linear: Any, _mat1: Any) -> Any:
+        raise AssertionError("the original addmm_act must not be reachable")
+
+    fused = _stub_module("sam3.perflib.fused", addmm_act=original)
+    vitdet = _stub_module("sam3.model.vitdet", addmm_act=original)
+    monkeypatch.setitem(sys.modules, "sam3.perflib.fused", fused)
+    monkeypatch.setitem(sys.modules, "sam3.model.vitdet", vitdet)
+
+    assert _install_fp32_addmm()
+    assert fused.addmm_act is vitdet.addmm_act
+    assert fused.addmm_act is not original
+
+    linear = torch.nn.Linear(3, 2)
+    x = torch.ones(1, 3, dtype=torch.float32)
+    with torch.no_grad():
+        got = vitdet.addmm_act(torch.nn.GELU, linear, x)
+        want = torch.nn.functional.gelu(linear(x))
+    assert got.dtype == torch.float32, "no bfloat16 anywhere"
+    assert torch.allclose(got, want, atol=1e-6)
+
+    with torch.no_grad():
+        relu = vitdet.addmm_act(torch.nn.functional.relu, linear, x)
+        assert torch.allclose(relu, torch.nn.functional.relu(linear(x)), atol=1e-6)
+        with pytest.raises(ValueError, match="Unexpected activation"):
+            vitdet.addmm_act(torch.nn.Sigmoid, linear, x)
+
+
+def test_install_fp32_addmm_reports_when_there_is_nothing_to_patch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from trippy.edit.sam_runner import _install_fp32_addmm
+
+    monkeypatch.delitem(sys.modules, "sam3.perflib.fused", raising=False)
+    monkeypatch.delitem(sys.modules, "sam3.model.vitdet", raising=False)
+    assert not _install_fp32_addmm()
+
+
+def test_install_real_rope_forces_the_flag_the_builder_never_passes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """MPS has no `torch.view_as_complex`; SAM 3's real-valued RoPE is exact."""
+    from trippy.edit.sam_runner import _install_real_rope
+
+    seen: list[dict[str, Any]] = []
+
+    def create_vit_backbone(**kwargs: Any) -> str:
+        seen.append(dict(kwargs))
+        return "vit"
+
+    builder = _stub_module("sam3.model_builder", _create_vit_backbone=create_vit_backbone)
+    monkeypatch.setitem(sys.modules, "sam3.model_builder", builder)
+
+    assert _install_real_rope()
+    assert builder._create_vit_backbone(compile_mode=None) == "vit"
+    assert seen == [{"compile_mode": None, "use_rope_real": True}]
+
+    monkeypatch.delitem(sys.modules, "sam3.model_builder")
+    assert not _install_real_rope()

@@ -104,6 +104,7 @@ __all__ = [
     "photo_size",
     "project_to_photo",
     "sam_lift",
+    "scale_prompt",
     "scene_distortions",
     "write_selection_preview",
 ]
@@ -239,6 +240,37 @@ def photo_scale(view: LiftView, photo_wh: tuple[int, int]) -> float:
             f"have different aspect ratios (scale {sx:.4f} vs {sy:.4f})"
         )
     return sx
+
+
+#: The two coordinate systems a prompt can arrive in. `"photo"` is the
+#: as-captured image's own pixel grid (what `trippy edits sam` has always
+#: taken, and what SAM 3 is prompted in); `"view"` is the BUNDLE view's
+#: smaller raster, which is what the Rust viewer measures a drag-box in --
+#: it renders `bundle.json`'s views and never opens a photograph, so it
+#: cannot know the photo's size (docs/EDITOR.md Sec 3 "4. SAM 3 lift").
+PROMPT_SPACES = ("photo", "view")
+
+
+def scale_prompt(prompt: SamPrompt, scale: float) -> SamPrompt:
+    """The same prompt with its pixel coordinates multiplied by `scale`.
+
+    Args:
+        prompt: a point or box prompt (a `text` prompt has no pixels and is
+            returned unchanged).
+        scale: view pixels -> photo pixels, from `photo_scale`.
+
+    Returns:
+        A new `SamPrompt`; the input is frozen and never mutated.
+    """
+    if prompt.kind == "point":
+        u, v = prompt.point  # type: ignore[misc]
+        return SamPrompt(kind="point", point=(u * scale, v * scale))
+    if prompt.kind == "box":
+        x0, y0, x1, y1 = prompt.box  # type: ignore[misc]
+        return SamPrompt(
+            kind="box", box=(x0 * scale, y0 * scale, x1 * scale, y1 * scale)
+        )
+    return prompt
 
 
 def scene_distortions(scene_root: str | Path) -> dict[str, tuple[float, float, float, float]]:
@@ -653,6 +685,8 @@ def sam_lift(
     vote_fraction: float = SAM_LIFT_VOTE_FRACTION,
     apply_scene_distortion: bool = True,
     preview: str | Path | None = None,
+    prompt_space: str = "photo",
+    progress: Callable[[str], None] | None = None,
 ) -> tuple[Region, dict[str, Any]]:
     """Segment one photo, lift it onto the bundle's points, vote across views.
 
@@ -680,6 +714,15 @@ def sam_lift(
             bundle's own optics only.
         preview: optional PNG path for a from-scratch selection heatmap in
             the prompted view (`write_selection_preview`).
+        prompt_space: which pixel grid `prompt` is measured in -- "photo"
+            (the default, the as-captured image) or "view" (the bundle
+            view's own smaller raster, which is what the Rust viewer can
+            measure; see `PROMPT_SPACES`). A "view" prompt is multiplied by
+            this view's `photo_scale` before SAM ever sees it.
+        progress: optional one-line-at-a-time callback, called before and
+            after every segmented view. The viewer's SAM tool runs this
+            command as a child process and shows these lines while it waits
+            (docs/EDITOR.md Sec 3 "4. SAM 3 lift (E5)").
 
     Returns:
         `(region, summary)`. `region` is a `pointset` Region over
@@ -688,11 +731,15 @@ def sam_lift(
         segmenter `info` for every view -- enough to reproduce the run.
 
     Raises:
-        ValueError: `view_name` is not in the bundle, the photo and the
-            view disagree about aspect, a mask has the wrong shape, or no
-            point survived the lift in the prompted view.
+        ValueError: `view_name` is not in the bundle, `prompt_space` is not
+            one of `PROMPT_SPACES`, the photo and the view disagree about
+            aspect, a mask has the wrong shape, or no point survived the
+            lift in the prompted view.
         FileNotFoundError: missing bundle, points, or photograph.
     """
+    if prompt_space not in PROMPT_SPACES:
+        raise ValueError(f"prompt_space must be one of {PROMPT_SPACES}, got {prompt_space!r}")
+    note = progress if progress is not None else (lambda _message: None)
     bundle_dir = Path(bundle_dir)
     scene_root = Path(scene_root)
     _doc, views, xyz = load_lift_inputs(bundle_dir)
@@ -727,9 +774,23 @@ def sam_lift(
 
     primary_photo = photo_path(primary)
     primary_wh = photo_size(primary_photo)
+    view_prompt = prompt
+    if prompt_space == "view":
+        # The viewer measures its drag-box on the RENDER, whose pixel grid is
+        # the bundle view's, so the photo scale is applied here rather than in
+        # a caller that would have to open the photograph to learn it.
+        prompt = scale_prompt(prompt, photo_scale(primary, primary_wh))
+    note(
+        f"segmenting {primary.name} ({prompt.kind} prompt) at "
+        f"{primary_wh[0]}x{primary_wh[1]}"
+    )
     mask, info = segmenter(primary_photo, prompt)
     lifted = lift_mask_in_view(
         primary, xyz, mask, primary_wh, distortion_for(primary), cell_px, depth_tol
+    )
+    note(
+        f"{primary.name}: {lifted['stats']['n_in_mask']} points inside the mask, "
+        f"{int(lifted['selected'].sum())} after the depth gate"
     )
     votes += lifted["selected"].astype(np.int64)
     eligible += lifted["visible"].astype(np.int64)
@@ -748,7 +809,8 @@ def sam_lift(
 
     centroid = np.median(xyz[lifted["selected"]], axis=0)
     neighbours = neighbour_views(views, primary, centroid, views_around)
-    for view in neighbours:
+    note(f"{len(neighbours)} neighbour view(s) will vote")
+    for position, view in enumerate(neighbours, start=1):
         try:
             neighbour_wh = photo_size(photo_path(view))
         except FileNotFoundError:
@@ -767,6 +829,10 @@ def sam_lift(
         n_stats["segmenter"] = {k: v for k, v in n_info.items() if k != "command"}
         n_stats["command"] = n_info.get("command")
         per_view.append(n_stats)
+        note(
+            f"neighbour {position}/{len(neighbours)} {view.name}: "
+            f"{int(n_lift['selected'].sum())} points"
+        )
 
     # STRICT majority: more than `vote_fraction` of the eligible views, not
     # "at least". With two eligible views, `ceil(0.5 * 2) = 1` would let a
@@ -775,6 +841,9 @@ def sam_lift(
     needed = np.floor(vote_fraction * eligible).astype(np.int64) + 1
     final = (eligible > 0) & (votes >= needed)
     point_ids = np.flatnonzero(final).tolist()
+    note(
+        f"vote over {len(per_view)} view(s): {len(point_ids)} of {xyz.shape[0]} points selected"
+    )
 
     region = Region(
         id=region_id or new_region_id(),
@@ -807,8 +876,11 @@ def sam_lift(
             "apply_scene_distortion": bool(apply_scene_distortion),
             "op": op,
             "mix": float(mix),
+            "prompt_space": prompt_space,
         },
     }
+    if prompt_space == "view":
+        summary["prompt_as_given"] = view_prompt.to_json()
 
     if preview is not None:
         summary["preview"] = str(

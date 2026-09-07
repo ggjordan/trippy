@@ -414,6 +414,12 @@ class BundleSource:
             "depth": (H, W)}}` for the views `blend.splat_views` lists -- the
             Gaussian block's own channels, in the block's own normalisation.
             Held out of `BlendInfo` because it is pixels, not schema.
+        scene_root: the scene directory the views were captured in, written
+            into `bundle.json` as `scene_root`. Tools that need the
+            PHOTOGRAPHS -- only `trippy edits sam` so far -- then need the
+            bundle and nothing else, which is what lets `trips-viewer`'s SAM
+            tool spawn that command with no `--scene` (docs/EDITOR.md Sec 3
+            "4. SAM 3 lift (E5)"). None leaves the key out entirely.
     """
 
     name: str
@@ -430,6 +436,7 @@ class BundleSource:
     metadata: dict[str, str] | None = None
     blend: BlendInfo | None = None
     splat_renders: dict[int, dict[str, np.ndarray]] = field(default_factory=dict)
+    scene_root: str | None = None
 
     @property
     def num_points(self) -> int:
@@ -613,6 +620,21 @@ def _to_u8(array: np.ndarray) -> np.ndarray:
     )
 
 
+def trippy_repo_root() -> Path:
+    """The checkout this `trippy` package lives in.
+
+    `bundle.json`'s `trippy_root`. `trips-viewer` resolves the interpreter it
+    spawns `trippy edits sam` with as `<trippy_root>/.venv/bin/python`, so a
+    bundle carries the path back to the code that wrote it (overridable in
+    the viewer with `TRIPPY_ROOT` / `TRIPPY_PYTHON` -- see
+    `rust/crates/trips-viewer/src/sam_child.rs`). It is `trippy/render/` ->
+    `trippy/` -> the repo root; a bundle exported from a git worktree
+    therefore names that worktree, which is correct: that is where the code
+    that produced it lives.
+    """
+    return Path(__file__).resolve().parent.parent.parent
+
+
 def bundle_document(source: BundleSource) -> dict[str, Any]:
     """Build `bundle.json`'s document for `source` (no file is written).
 
@@ -643,6 +665,9 @@ def bundle_document(source: BundleSource) -> dict[str, Any]:
         "default_view": default_view_position(source.views, default_index),
         "views": [view.to_json() for view in source.views],
     }
+    if source.scene_root:
+        document["scene_root"] = str(source.scene_root)
+    document["trippy_root"] = str(trippy_repo_root())
     if source.blend is not None:
         document["blend"] = source.blend.to_json()
     return document
@@ -987,6 +1012,7 @@ def load_trips_bundle(
         params=trips_params(num_layers),
         views=views,
         default_view_index=TRIPS_DEFAULT_VIEW_INDEX,
+        scene_root=str(scene),
         metadata={
             "checkpoint": str(checkpoint / resolved_epoch),
             "scene": str(scene),
@@ -1278,6 +1304,7 @@ def load_native_bundle(checkpoint: Path, name: str | None = None) -> BundleSourc
         params=native_params(trainer.cfg),
         views=views,
         default_view_index=NATIVE_DEFAULT_VIEW_INDEX,
+        scene_root=str(trainer.cfg.scene_root),
         metadata={"checkpoint": str(path), "scene": str(trainer.cfg.scene_root), "kind": "native"},
         blend=blend,
         splat_renders=splat_renders,

@@ -29,9 +29,13 @@ Status: **E1, E2 and E4 shipped on both sides** (2026-09-07).
   run the same comparison against a real bundle
   (`tests/test_edit_viewer_parity.py`).
 
+Status: **E1, E2, E4 and E5 shipped on both sides** (2026-09-07). E5's viewer
+half is `src/edit/sam.rs` (the render-pixel -> view-pixel mapping),
+`src/sam_child.rs` (the `trippy edits sam` child process) and the `SAM 3
+lift` tool in `src/edit_ui.rs`; see §3's "5. The SAM tool in the viewer".
+
 Not built: the 3D drag gizmos (E1 shipped Inspector fields + keyboard
-nudge/resize instead), the SAM-3 lift (E5), and the `brush`-kind voxel
-region.
+nudge/resize instead), E3's lid gizmo, and the `brush`-kind voxel region.
 
 Three implementation notes, all explained where they matter below:
 tools' UI/ray-cast half, §4's UI) is **not implemented** -- this document
@@ -78,10 +82,11 @@ where they matter below:
   against camera centres instead of `xyz`. See `trippy.edit.cluster`'s
   module docstring for the full algorithm and every constant's reasoning.
 
-E5's SAM-3 lift landed on the Python side too (`trippy edits sam`,
-`trippy/edit/{sam_lift,sam_runner}.py`); see §3's "4. SAM 3 lift (E5)"
-for the exact SAM 3 API and command, and §6's E5 row for what is left
-(the viewer-side picker).
+E5's SAM-3 lift is complete on both sides: `trippy edits sam` /
+`trippy/edit/{sam_lift,sam_runner}.py` on the Python side (§3's "4. SAM 3
+lift (E5)" has the SAM 3 API and the command) and the viewer's own SAM tool
+(§3's "5. The SAM tool in the viewer (E5, viewer half)"). §6's E5 row lists
+what is still open.
 
 `docs/decisions/ADR-0007-viewer-editing.md` is still accurate to the
 sections below; this document is the detailed spec the milestones in §6
@@ -608,12 +613,24 @@ trippy edits sam --bundle <dir> --scene <root> --view IMG.jpg \
   them). Two host-specific details, both trippy's own shim code and
   neither copied from SAM 3: a `torch._dynamo` stub (no `triton` wheel
   exists for macOS/arm64, and `torch._inductor` imports one
-  unconditionally — `~/Splats/research/sam3-person.md`), and a
-  `torch.autocast(bfloat16)` region around inference, because
-  `sam3.perflib.fused.addmm_act` casts its own inputs to bfloat16 and
-  hands them to the next fp32 `Linear`, which only type-checks inside an
-  autocast (measured: fp32 and autocast give the same masks to ±0.01
-  probability, so this is a dtype fix, not a precision trade).
+  unconditionally — `~/Splats/research/sam3-person.md`), and an **fp32
+  rebinding of `sam3.perflib.fused.addmm_act`**, which casts its own inputs
+  to bfloat16 unconditionally and hands them to the next fp32 layer.
+
+  This document first said that second shim was a `torch.autocast(bfloat16)`
+  region. **That was wrong and it has been removed** (2026-09-07). It made
+  the CPU run work but 6x slower (58.8 s against 9.2 s for the same lift
+  with `addmm_act` rebound and no autocast, for the same mask — 129,712
+  mask pixels, 74,007 points), because bfloat16 on CPU is emulated; and on
+  MPS it did not work at all, because the MPS autocast policy casts a
+  convolution's input but not its weight. The shipped fix takes bfloat16 out
+  of the graph at its source and runs with no autocast on either device;
+  fp32 is strictly more accurate than the bf16 path CUDA takes.
+  `--device mps` needs two more rebindings of SAM 3's own code — the model
+  is moved to the device (`build_sam3_image_model` only does that for CUDA)
+  and the ViT is forced onto its own real-valued rotary embedding (MPS has
+  no `torch.view_as_complex`). `docs/LIMITATIONS.md`'s "SAM-3 mask lift"
+  section has all four, with the job names that found them.
 - **The mask is depth-gated before it becomes a selection.** A mask is 2D:
   everything behind the object along the same ray is inside it too. Points
   are binned into 16 px cells and each cell's *nearest supported* depth
@@ -624,8 +641,8 @@ trippy edits sam --bundle <dir> --scene <root> --view IMG.jpg \
   usually contains more background than object (a distant wall projects
   many more points per pixel), so the plain mode would lock onto the
   background and select exactly the wrong thing. Measured on the
-  `exp0010-shade-prune` bundle: 102,385 points project inside the mask,
-  72,455 survive the gate.
+  `exp0010-shade-prune` bundle: 104,218 points project inside the mask,
+  74,007 survive the gate (fp32, `--views-around 0`, ~9 s on CPU).
 - **Neighbour views are prompted with the selection's centroid, and the
   vote is strict.** `--views-around N` takes the N nearest capture views
   (by camera centre) in which the primary selection's centroid actually
@@ -635,9 +652,10 @@ trippy edits sam --bundle <dir> --scene <root> --view IMG.jpg \
   would let one sloppy mask carry a point past a neighbour that rejected
   it, which is the failure the vote exists to prevent. The corollary is
   that `--views-around 1` is an *intersection*, not a consensus (two
-  eligible views, both must agree): measured on kk-coherent, 72,455 points
-  from the prompted view and 15,476 from one neighbour left 15,111. Use 0
-  or >= 2.
+  eligible views, both must agree): measured on kk-coherent (under the
+  since-removed bf16 autocast; the fp32 path selects 74,007 from the
+  prompted view), 72,455 points from the prompted view and 15,476 from one
+  neighbour left 15,111. Use 0 or >= 2.
 
 Two more things the design did not say and the implementation had to
 decide. The photographs under `--scene` are as-captured, while a
@@ -649,6 +667,98 @@ distortion` turns that off; ~19 px at the frame edge on kk-coherent's
 photograph: only the SAM child decodes pixels, masks are arrays, and
 `--preview` draws a from-scratch heatmap of *projected point counts* — no
 photographic content, so it is safe to look at under `AGENTS.md` §6.
+
+### 5. The SAM tool in the viewer (E5, viewer half)
+
+**Implemented** (`rust/crates/trips-viewer/src/edit/sam.rs`, `src/sam_child.rs`,
+the `Tool::Sam` panel in `src/edit_ui.rs`, the gestures in `src/app.rs`, the
+`--sam-*` flags in `src/main.rs`).
+
+The viewer does not segment anything. It is a **process supervisor** for the
+command above: SAM 3 is never imported into trippy's process (§3) and it is
+never imported into the viewer's either. What the tool adds is the gesture,
+the pixel mapping, one child process, and the import.
+
+- **The gesture.** With the SAM tool selected (`T` cycles to it), a primary
+  **drag** on the render draws a marquee and becomes a `--box`; **Alt-click**
+  becomes a `--point`. Orbit is not lost: Shift-drag still orbits, right- and
+  middle-drag still pan, and outside this one tool the primary drag is
+  untouched. A drag shorter than `MIN_BOX_PX` (8 render px) is treated as a
+  click, not a 2 px box.
+- **The camera must be pinned to a capture view.** The lift needs the
+  PHOTOGRAPH, and a free-flying frame corresponds to no photograph at all. If
+  the camera has been moved off a view the gesture is **discarded** and the
+  camera snaps to the nearest capture view by camera centre
+  (`edit::sam::nearest_view`), with the panel saying which one and asking for
+  the drag again. Re-using the pixels after the snap would segment the wrong
+  part of the image while looking like it worked.
+- **The pixel mapping is the one piece of arithmetic here, and it is
+  unit-tested** (`edit::sam::view_pixel_from_render`). A render pixel is not a
+  view pixel: `camera::Controller::render_camera` re-fits the view to the
+  window and to the render-scale lever, and it scales `fy` by the WIDTH ratio
+  while scaling `cy` by the HEIGHT ratio — so on a window-shaped render a
+  plain `height` ratio in `v` is wrong. The mapping goes through normalised
+  image coordinates instead, `(u - cx_r)/fx_r · fx_v + cx_v`, which is exact
+  for every camera that shares the view's `R`, `t` and distortion (the tests
+  check it by projecting world points through both cameras and comparing).
+  Distortion cancels for the same reason and none is applied.
+- **The viewer sends VIEW pixels, not photo pixels.** It never opens a
+  photograph (`AGENTS.md` §6), so it cannot know the photo's size; the child
+  applies that scene's own `photo_scale` when it is told
+  `--prompt-space view`. That flag exists solely for this.
+- **`--scene` is not passed at all.** `bundle.json` now records `scene_root`
+  (`trippy.render.bundle.bundle_document`) and the child reads it from there.
+  A bundle exported before 2026-09-07 has no such key, and the panel says so
+  and disables the run button rather than guessing where the photographs are.
+- **One child, only when Jordan asks.** This is his interactive use of his own
+  GPU, which `AGENTS.md` §6 allows outside the queue; a tool that could fan
+  out into several SAM runs would not be. `SamJob::spawn` is the only place a
+  process is created, `EditSession` holds at most one, and it is killed on
+  Cancel **and on drop** so closing the window cannot leave a run holding the
+  GPU. The interpreter is `<trippy_root>/.venv/bin/python`, from
+  `bundle.json`'s own `trippy_root`, overridable with `$TRIPPY_ROOT` (a
+  checkout) or `$TRIPPY_PYTHON` (an interpreter).
+- **Progress and Cancel.** Two reader threads drain the child's stdout and
+  stderr into the panel (a child that fills its stderr pipe while the parent
+  reads only stdout deadlocks). The `sam: ` lines appear as they arrive;
+  stderr appears prefixed `! ` and is never parsed as JSON. Exit 0 with **no**
+  JSON summary line is a failure, not a silent success — the region file might
+  exist but the counts would be invented.
+- **The import is one undo step.** The child writes its region into a
+  throwaway `edits.json` under `TMPDIR` (never the session's own file); the
+  viewer reads the last region out of it, gives it a fresh id, and adds it
+  through `EditDocument::add_region` like every other edit. `Cmd-Z` removes
+  it. The imported points are tinted immediately (the same magenta the other
+  two selection tools use); `H` toggles that tint while the SAM tool has
+  focus.
+- **The default device is `cpu`.** A CPU lift is ~9 s per view since the
+  bfloat16 shim was replaced (§3); `mps` is a radio button next to it.
+- **`--fake` is how this is tested and screenshotted.** `trippy edits sam
+  --fake` (or `TRIPPY_SAM_FAKE=1`) synthesises the mask from the prompt — a
+  box fills its rectangle, a point fills a disc — and runs the entire rest of
+  the shipped path: projection, depth gate, vote, region, summary. It loads no
+  checkpoint and touches no GPU, so the viewer's child-process state machine
+  and the region import are testable in CI and in `--screenshot`. The summary
+  says `"segmenter": "fake"` and never claims SAM ran.
+
+Headless twin, and the E5 screenshot proof:
+
+```
+trips-viewer <bundle> --sam-box X0 Y0 X1 Y1 --sam-fake [--sam-op delete]
+             [--sam-point U V] [--sam-views-around N] [--sam-mix M]
+             [--sam-device cpu|mps] [--sam-undo] --screenshot out.png
+```
+
+Measured on the generated `synthetic-splat` bundle (`tools/make_synthetic_
+splat_bundle.py`; 4000 points, 48x36 views), box `12 9 36 27` on `IMG_0.jpg`,
+`--sam-fake --sam-views-around 0`:
+
+| run | result |
+|---|---|
+| no `--sam-box` | 4000 points rendered — the baseline frame |
+| `--sam-op delete` | 530 of 4000 points lifted and removed; 1719 of 1728 pixels differ from the baseline, mean abs difference 6.15/255 |
+| `--sam-op fade --sam-mix 0` | nothing deleted, the tint alone: 1717 pixels differ, mean 12.50/255 |
+| `--sam-op delete --sam-undo` | **byte-identical to the baseline** (max abs difference 0) |
 
 ## 4. UI sketch
 
@@ -674,7 +784,10 @@ Jordan can hide edit chrome while still flying around:
 │     lum <  [0.25]                │
 │     conf < [0.50]                │
 │     inside shade region  [x]     │
-│ ( ) SAM-3 lift (pick a view...)  │
+│ (x) SAM 3 lift: drag a box on    │
+│     the render, or alt-click     │
+│     op/mix, views around, device │
+│     [run SAM lift] [cancel]      │
 │ ( ) lid gizmo (drag in 3D view)  │
 └───────────────────────────────────┘
 ```
@@ -688,14 +801,16 @@ already binds — `V X Tab - = F R N P W A S D Q E` and drag/scroll):
 |---|---|
 | `M` | toggle edit mode (shows Regions/Inspector/Tools). `--edit` opens straight into it. Click-drag on the canvas still orbits: with no gizmos to hit, swapping the drag would only take navigation away |
 | **Shift-click** | E4's selection gesture: cluster the object under the pointer. Read from the scene `Response` like every drag, and scoped to `clicked()` rather than `dragged()`, so a Shift-DRAG still orbits and navigation loses nothing |
-| `T` | cycle the active tool (Regions → shade-cloud finder → click-to-cluster) |
+| **drag** | E5's box prompt, **only while the SAM tool has focus**. Shift-drag still orbits and right/middle-drag still pans, so the gesture is borrowed for one tool rather than taken |
+| **Alt-click** | E5's point prompt. Alt is bound to nothing else in this viewer, so this costs no existing gesture |
+| `T` | cycle the active tool (Regions → shade-cloud finder → click-to-cluster → SAM 3 lift) |
 | arrows, `PageUp`/`PageDown` | nudge the selected region along world X/Z and Y by `NUDGE_SCENE_FRACTION` of the scene diameter — **E1's replacement for the 3D drag gizmo** |
 | `[` / `]` | shrink/grow the selected region by `RESIZE_STEP` |
 | `Delete` / `Backspace` | remove the selected region (its `op` is a separate field in the Inspector) |
 | `Cmd`/`Ctrl` + `Z` | undo |
 | `Cmd`/`Ctrl` + `Shift` + `Z` | redo |
 | `Cmd`/`Ctrl` + `S` | save `edits.json` |
-| `H` | toggle the preview highlight of whichever tool has focus (a tinted point cloud, not a new `ViewMode` — see §6). Where both tools have a live preview, the union is tinted the one colour |
+| `H` | toggle the preview highlight of whichever tool has focus (a tinted point cloud, not a new `ViewMode` — see §6). Where several tools have a live preview, the union is tinted the one colour |
 | `Cmd`/`Ctrl` + `N` | *not built*, and not needed: "new region from the current selection" is the **add as region** button next to each tool's own selection (E2's shade finder, E4's click-to-cluster), where the op and mix for it are chosen |
 
 Left-click behaviour while in edit mode: **unchanged from viewing**. A plain
@@ -811,7 +926,7 @@ schedule.
 | **E4** | Click-to-cluster: ray cast + k-d tree + k-NN growth in world+colour space, radius slider | 3 d | Clicking a point-cloud cluster selects a `pointset` region that visibly matches the clicked object's extent, without needing a depth buffer | **Done** (2026-09-07), on both sides. Python: `trippy.edit.cluster`, `trippy edits click` (`tests/test_edit_cluster.py`). Rust: `edit/cluster.rs` (the projection, the depth-mode seed, an exact k-NN spatial hash in place of the unavailable k-d tree, the colour/radius/point gates), the **Selection panel** with the four sliders + op/mix + "add as region" + "clear" in `edit_ui.rs`, and **Shift-click** on the render in `app.rs`. Parity is exact, not approximate: the committed `click.json`/`expected_click.json` fixture replays four clicks (depth-mode seeding, the colour gate, the `max_points` cut-off, a miss) and both languages return the identical id list; `--click U V --dump-click` reproduces it against a real bundle. Measured on the synthetic bundle at 480x360: a click at (240, 180) selects 261 of 4000 points, the tint changes **71.55 %** of the frame's pixels (3.81 % of them turning magenta, the rest dimmed by the preview) with a max channel diff of 79, and a run without `--click` reproduces the untinted frame **bit for bit** (0.0000 % of pixels differ, max channel diff 0). Not built: an Inspector-side gizmo for a committed `pointset` region (there is no shape to drag). |
 | **E5** | SAM 3 lift: photo segmentation, multi-view projection + majority vote, `pointset` region output | 2–3 wk | Segmenting an object in 2–3 registered views of the same scene produces one `pointset` region that, previewed, highlights that object and not its neighbours; runs entirely local (no image leaves the machine) | Not started. |
 | **E4** | Click-to-cluster: ray cast + k-d tree + k-NN growth in world+colour space, radius slider | 3 d | Clicking a point-cloud cluster selects a `pointset` region that visibly matches the clicked object's extent, without needing a depth buffer | Not started. |
-| **E5** | SAM 3 lift: photo segmentation, multi-view projection + majority vote, `pointset` region output | 2–3 wk | Segmenting an object in 2–3 registered views of the same scene produces one `pointset` region that, previewed, highlights that object and not its neighbours; runs entirely local (no image leaves the machine) | **Python side done** (`trippy/edit/sam_lift.py`, `trippy/edit/sam_runner.py`, `trippy edits sam`; §3's own "Implemented" note has the exact command and the depth-gate/vote rules). SAM 3 runs locally in a subprocess under Splats' SAM venv, on CPU or (inside a queue job) MPS; the whole lift is CPU-testable with an injected fake segmenter (`tests/test_edit_sam.py`). The viewer-side "pick a view, click in it" UI is not built. |
+| **E5** | SAM 3 lift: photo segmentation, multi-view projection + majority vote, `pointset` region output | 2–3 wk | Segmenting an object in 2–3 registered views of the same scene produces one `pointset` region that, previewed, highlights that object and not its neighbours; runs entirely local (no image leaves the machine) | **Shipped, both sides.** Python: `trippy/edit/sam_lift.py`, `trippy/edit/sam_runner.py`, `trippy edits sam` (§3's "Implemented" note has the command, the depth-gate and the vote rules). Viewer: the `SAM 3 lift` tool — drag a box or Alt-click on the render while pinned to a capture view, one `trippy edits sam` child with live progress and a Cancel button, and the region imported through the undo log and tinted (§3's "5. The SAM tool in the viewer"). SAM 3 runs locally in a subprocess under Splats' SAM venv, on CPU (~9 s/view) or MPS; the whole path is CPU-testable and screenshottable with `--fake` / `TRIPPY_SAM_FAKE=1`, which needs no checkpoint and no GPU (`tests/test_edit_sam.py`, `trips-viewer --sam-box`). Not built: batching several views into ONE child (each view still pays a model load, `docs/LIMITATIONS.md`), and any per-point clean-up of the returned selection. |
 | **E6** | Publish path: `trippy apply-edits`, TRIPS `export.ply` mask wiring, distilled-splat publish order (edit-then-distil for pointset regions, geometry-reapply for box/sphere/lid) | 3 d | `trippy apply-edits --target both` on a bundle with a mix of region kinds produces a TRIPS PLY with the deleted points absent and, after a `trippy distill` run on the same edited bundle, a distilled PLY that also lacks them; a box/sphere/lid region re-applied directly to an already-distilled PLY (no re-distillation) also removes the matching geometry | **Done** (`trippy/edit/apply.py`, `trippy/edit/checkpoint.py`): `--target trips\|distilled\|both` (default `both`); `trips`/`both` write the filtered TRIPS `points.npz`/`blend_weights.npy`/`export.ply` and, if named, a filtered `blend.splat_ply`; `distilled`/`both` (with `--distilled-ply`) re-apply box/sphere/lid regions to an already-distilled PLY as delete/opacity-scale-fade; `--edits` wired into `trippy distill --stage render` (edit-then-distil ordering) and into `trippy candidate-report`/`trippy eval` (checkpoint-side keep mask + gate suppression on gate-hybrid checkpoints, `candidate-report` only — see §5's own paragraph for the `eval` gap). |
 
 **Three deviations worth naming.** (1) The preview highlight is not a fourth

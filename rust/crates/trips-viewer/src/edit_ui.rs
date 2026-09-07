@@ -36,10 +36,16 @@ use trips_viewer::edit::cluster::{
     self, ClickCamera, ClickParams, ClickSelection, PointGrid, DEFAULT_MAX_POINTS,
 };
 use trips_viewer::edit::model::{new_region_id, LidParams, Op, Params, Region, KAREKARE_LID};
+use trips_viewer::edit::sam::{self as sam_geom, nearest_view};
 use trips_viewer::edit::shade::{self, ShadeSelection, ShadeViews, Thresholds};
 use trips_viewer::edit::weights::{compose_gaussian_weights, compose_trips_weights, widen};
 use trips_viewer::edit::{EditDocument, DEFAULT_REGION_SCENE_FRACTION, EDITS_FILENAME, NUDGE_SCENE_FRACTION, RESIZE_STEP};
 use trips_viewer::renderer::Renderer;
+
+use crate::sam_child::{
+    build_command, command_line, imported_region, resolve_interpreter_from_env, SamJob, SamPrompt,
+    SamRequest, SamState,
+};
 
 /// The editor's key bindings, shown in the panel and in `docs/USER_GUIDE.md`.
 ///
@@ -47,6 +53,7 @@ use trips_viewer::renderer::Renderer;
 /// (`V X B Tab - = F R N P W A S D Q E`), per `docs/EDITOR.md` §4.
 pub const KEYS_HELP: &str = "\
 M edit mode | T cycle tool | H preview highlight | SHIFT-CLICK the render to select\n\
+SAM tool: DRAG a box on the render (SHIFT-drag still orbits) or ALT-CLICK a point\n\
 arrows + PageUp/PageDown nudge the selected region | [ / ] shrink / grow\n\
 Delete removes the selected region | Cmd-Z undo | Cmd-Shift-Z redo | Cmd-S save";
 
@@ -60,6 +67,9 @@ pub enum Tool {
     ShadeFinder,
     /// Shift-click the render; grow a `pointset` region from what was clicked.
     ClickCluster,
+    /// Drag a box (or Alt-click) on the render; the local SAM 3 segments that
+    /// photograph and the mask is lifted onto the points (E5).
+    Sam,
 }
 
 impl Tool {
@@ -68,7 +78,8 @@ impl Tool {
         match self {
             Self::Regions => Self::ShadeFinder,
             Self::ShadeFinder => Self::ClickCluster,
-            Self::ClickCluster => Self::Regions,
+            Self::ClickCluster => Self::Sam,
+            Self::Sam => Self::Regions,
         }
     }
 
@@ -77,6 +88,7 @@ impl Tool {
             Self::Regions => "regions",
             Self::ShadeFinder => "shade-cloud finder",
             Self::ClickCluster => "click-to-cluster",
+            Self::Sam => "SAM 3 lift",
         }
     }
 }
@@ -220,6 +232,85 @@ impl Default for ClickUi {
     }
 }
 
+/// A gesture on the render, waiting for the frame's camera to resolve it.
+///
+/// Recorded in `app.rs` while the pointer is still in egui's coordinates and
+/// consumed by [`EditSession::resolve_sam`] once the frame's camera exists —
+/// exactly the two-step the Shift-click already uses, and for the same reason.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SamGesture {
+    /// A drag rectangle, both corners in RENDER pixels.
+    Box((f64, f64), (f64, f64)),
+    /// An Alt-click, in RENDER pixels.
+    Point((f64, f64)),
+}
+
+/// The SAM tool's own state: the prompt, the child process, and what it found.
+///
+/// `docs/EDITOR.md` §3's "4. SAM 3 lift (E5)". The lift itself is Python and
+/// runs as a child process ([`crate::sam_child`]); everything here is the
+/// gesture, the settings that become its flags, and the region it hands back.
+pub struct SamUi {
+    /// The gesture waiting for a camera, set by `app.rs`.
+    pending: Option<SamGesture>,
+    /// The resolved prompt, in the capture VIEW's pixels, with its view name.
+    prompt: Option<(String, SamPrompt)>,
+    /// `--views-around`. 0 = the prompted view alone; `docs/EDITOR.md` §3 says
+    /// to use 0 or >= 2, because 1 neighbour makes the vote an intersection.
+    views_around: usize,
+    /// The op the imported region gets.
+    op: Op,
+    /// The mix it gets (ignored by `delete`).
+    mix: f64,
+    /// `--device`. `mps` is Jordan's own interactive GPU use, which
+    /// `AGENTS.md` §6 allows outside the queue; it is not the default.
+    device: &'static str,
+    /// `--fake`: synthesise the mask instead of loading SAM 3. The screenshot
+    /// proof and the tests use it; the panel exposes it so a broken SAM
+    /// install can be told apart from a broken lift.
+    fake: bool,
+    /// The running (or just-finished) child, if any.
+    job: Option<SamJob>,
+    /// The command line the last run used, shown so it can be re-run by hand.
+    command: String,
+    /// The temporary directory holding the child's throwaway `edits.json`.
+    /// Kept alive for the run and replaced on the next one.
+    work_dir: Option<PathBuf>,
+    /// The point ids of the last imported region, for the tint.
+    selection: Vec<u32>,
+    /// Whether the render tints that selection (`H`).
+    preview: bool,
+    /// The finished run's own counts, for the panel.
+    summary: Option<serde_json::Value>,
+    /// A view position `app.rs` should snap the camera to, because the SAM
+    /// lift needs a photograph and the camera was not on one.
+    snap_request: Option<usize>,
+    /// A one-line "what just happened".
+    note: String,
+}
+
+impl Default for SamUi {
+    fn default() -> Self {
+        Self {
+            pending: None,
+            prompt: None,
+            views_around: 0,
+            op: Op::Fade,
+            mix: 0.0,
+            device: "cpu",
+            fake: false,
+            job: None,
+            command: String::new(),
+            work_dir: None,
+            selection: Vec::new(),
+            preview: true,
+            summary: None,
+            snap_request: None,
+            note: String::new(),
+        }
+    }
+}
+
 /// Everything the editor holds for one open bundle.
 pub struct EditSession {
     /// The document, and the only place regions live.
@@ -238,6 +329,16 @@ pub struct EditSession {
     shade: ShadeUi,
     /// The click-to-cluster tool.
     click: ClickUi,
+    /// The SAM 3 lift (E5).
+    sam: SamUi,
+    /// The directory holding `bundle.json`. NOT `self.path`'s parent: `--edits`
+    /// can put the edit document anywhere, and the SAM child is given a bundle.
+    bundle_dir: PathBuf,
+    /// `bundle.json`'s own `trippy_root`, for resolving the child's python.
+    trippy_root: Option<String>,
+    /// Whether `bundle.json` records a `scene_root`. Without one the child
+    /// cannot find the photographs and the SAM tool refuses to run.
+    has_scene_root: bool,
     /// Set by any widget that changed the document; consumed by [`Self::apply`].
     needs_apply: bool,
     /// Milliseconds the last [`Self::apply`] took — `docs/EDITOR.md` §7's budget
@@ -305,6 +406,10 @@ impl EditSession {
             tool: Tool::default(),
             shade: ShadeUi::new(shade_views, bundle_dir),
             click: ClickUi::default(),
+            sam: SamUi::default(),
+            bundle_dir: bundle_dir.to_path_buf(),
+            trippy_root: None,
+            has_scene_root: false,
             // The first apply is unconditional: a bundle reopened with a saved
             // `edits.json` must render edited on its very first frame.
             needs_apply: true,
@@ -328,6 +433,9 @@ impl EditSession {
         }
         if self.click.preview {
             ids.extend_from_slice(&self.click.selection.point_ids);
+        }
+        if self.sam.preview {
+            ids.extend_from_slice(&self.sam.selection);
         }
         (!ids.is_empty()).then_some(ids)
     }
@@ -475,6 +583,292 @@ impl EditSession {
     pub fn set_click_params(&mut self, params: ClickParams) {
         self.click.params = params;
         self.click.dirty = self.click.last.is_some();
+    }
+
+    // --- the SAM 3 lift (E5) -------------------------------------------------
+
+    /// Tell the session what `bundle.json` says about where things live.
+    ///
+    /// Called once at open, from `app.rs` and from the headless path, because
+    /// [`Self::open_with_path`] takes a directory rather than a whole
+    /// [`trips_viewer::bundle::Manifest`] and the SAM tool is the only thing
+    /// that needs more of it than the format string.
+    ///
+    /// # Arguments
+    /// - `trippy_root`: `bundle.json`'s `trippy_root`, if it has one.
+    /// - `has_scene_root`: whether it records a `scene_root`.
+    pub fn set_bundle_paths(&mut self, trippy_root: Option<&str>, has_scene_root: bool) {
+        self.trippy_root = trippy_root.map(str::to_owned);
+        self.has_scene_root = has_scene_root;
+    }
+
+    /// Whether the SAM tool has focus (so `app.rs` knows to draw a marquee).
+    #[must_use]
+    pub fn sam_tool_active(&self) -> bool {
+        self.active && self.tool == Tool::Sam
+    }
+
+    /// Whether a child is running right now.
+    #[must_use]
+    pub fn sam_running(&self) -> bool {
+        self.sam.job.as_ref().is_some_and(|j| j.state().is_running())
+    }
+
+    /// Record a gesture made on the render. Consumed by [`Self::resolve_sam`].
+    pub fn request_sam(&mut self, gesture: SamGesture) {
+        self.sam.pending = Some(gesture);
+        self.tool = Tool::Sam;
+    }
+
+    /// The view position `app.rs` should snap to, taken once.
+    pub fn take_sam_snap(&mut self) -> Option<usize> {
+        self.sam.snap_request.take()
+    }
+
+    /// The point ids of the last imported SAM region (tests, headless dump).
+    #[must_use]
+    pub fn sam_selection(&self) -> &[u32] {
+        &self.sam.selection
+    }
+
+    /// The finished run's summary object, if there is one.
+    #[must_use]
+    pub const fn sam_summary(&self) -> Option<&serde_json::Value> {
+        self.sam.summary.as_ref()
+    }
+
+    /// Show or hide the imported region's tint.
+    pub fn set_sam_preview(&mut self, on: bool) {
+        if self.sam.preview != on {
+            self.sam.preview = on;
+            self.needs_apply = true;
+        }
+    }
+
+    /// Override the SAM tool's settings (the `--sam-*` headless flags).
+    pub fn set_sam_settings(
+        &mut self,
+        views_around: usize,
+        op: Op,
+        mix: f64,
+        device: &'static str,
+        fake: bool,
+    ) {
+        self.sam.views_around = views_around;
+        self.sam.op = op;
+        self.sam.mix = mix;
+        self.sam.device = device;
+        self.sam.fake = fake;
+    }
+
+    /// Turn a pending gesture into a prompt in `view`'s own pixel grid.
+    ///
+    /// The lift needs a PHOTOGRAPH, so it needs a capture view. When the camera
+    /// is not pinned to one the gesture is DISCARDED and the camera snaps to
+    /// the nearest capture view instead: the pixels were measured against a
+    /// free-flying frame and mean nothing in any photo, so re-using them would
+    /// segment the wrong part of the image while looking like it worked.
+    ///
+    /// # Arguments
+    /// - `camera`: this frame's render camera.
+    /// - `view`: the view the controller is pinned (or last snapped) to.
+    /// - `pinned`: whether the camera really is reproducing `view`.
+    /// - `views`: every capture view, for the snap.
+    /// - `position`: the camera centre, world units, for the snap.
+    pub fn resolve_sam(
+        &mut self,
+        camera: &brush_pyramid::scene::Camera,
+        view: &trips_viewer::bundle::BundleView,
+        pinned: bool,
+        views: &[trips_viewer::bundle::BundleView],
+        position: glam::Vec3,
+    ) {
+        let Some(gesture) = self.sam.pending.take() else {
+            return;
+        };
+        if !pinned {
+            let nearest = nearest_view(views, position);
+            self.sam.snap_request = nearest;
+            self.sam.note = match nearest.and_then(|i| views.get(i)) {
+                Some(v) => format!(
+                    "the SAM lift needs a photograph and the camera was not on one -- \
+                     snapped to {}; drag the box again",
+                    v.name
+                ),
+                None => "the SAM lift needs a capture view and this bundle has none".to_owned(),
+            };
+            return;
+        }
+        let prompt = match gesture {
+            SamGesture::Box(a, b) => {
+                SamPrompt::Box(sam_geom::view_box_from_render(camera, view, a, b))
+            }
+            SamGesture::Point(px) => {
+                SamPrompt::Point(sam_geom::view_pixel_from_render(camera, view, px))
+            }
+        };
+        self.sam.note = format!("{} on {} -- press run", prompt.label(), view.name);
+        self.sam.prompt = Some((view.name.clone(), prompt));
+    }
+
+    /// Set the prompt directly, in VIEW pixels (the headless `--sam-box` path).
+    pub fn set_sam_prompt(&mut self, view_name: &str, prompt: SamPrompt) {
+        self.sam.prompt = Some((view_name.to_owned(), prompt));
+        self.tool = Tool::Sam;
+    }
+
+    /// Spawn `trippy edits sam` for the current prompt.
+    ///
+    /// One child, only when asked, and never a second one while the first is
+    /// alive (`crate::sam_child`'s invariants).
+    ///
+    /// # Arguments
+    /// - `bundle_dir`: the bundle to segment against.
+    ///
+    /// # Errors
+    /// Returns `Err` when there is no prompt, when the bundle records no
+    /// `scene_root`, when no interpreter can be resolved, when the working
+    /// directory cannot be made, or when the process will not start. Every one
+    /// of those is shown in the panel rather than logged and swallowed.
+    pub fn start_sam(&mut self, bundle_dir: &Path) -> Result<(), String> {
+        if self.sam_running() {
+            return Err("a SAM run is already going; cancel it first".to_owned());
+        }
+        let Some((view_name, prompt)) = self.sam.prompt.clone() else {
+            return Err("drag a box (or Alt-click) on the render first".to_owned());
+        };
+        if !self.has_scene_root {
+            return Err(format!(
+                "{} records no `scene_root`, so `trippy edits sam` cannot find the \
+                 photographs; re-export the bundle with `trippy export-bundle`",
+                bundle_dir.join("bundle.json").display()
+            ));
+        }
+        let interpreter = resolve_interpreter_from_env(self.trippy_root.as_deref())?;
+        // A fresh directory per run: the child appends to whatever `--out`
+        // names, and reading "the last region" only means "this run's" when the
+        // file started empty.
+        let work_dir = std::env::temp_dir().join(format!(
+            "trips-sam-{}-{}",
+            std::process::id(),
+            new_region_id()
+        ));
+        std::fs::create_dir_all(&work_dir).map_err(|e| format!("{}: {e}", work_dir.display()))?;
+        let request = SamRequest {
+            bundle_dir: bundle_dir.to_path_buf(),
+            view_name,
+            prompt,
+            views_around: self.sam.views_around,
+            op: self.sam.op,
+            mix: self.sam.mix,
+            out: work_dir.join(EDITS_FILENAME),
+            device: self.sam.device.to_owned(),
+            fake: self.sam.fake,
+        };
+        self.sam.command = command_line(&interpreter, &request);
+        let job = SamJob::spawn(build_command(&interpreter, &request))?;
+        self.sam.job = Some(job);
+        self.sam.work_dir = Some(work_dir);
+        self.sam.summary = None;
+        self.sam.note = format!("running {}...", prompt.label());
+        Ok(())
+    }
+
+    /// Block until the child exits (the headless `--sam-box` path only).
+    ///
+    /// The window never calls this: blocking the UI thread is exactly what the
+    /// Cancel button exists to make unnecessary. A headless run has no Cancel
+    /// button and nothing else for the thread to do.
+    pub fn wait_for_sam(&mut self) {
+        if let Some(job) = self.sam.job.as_mut() {
+            job.wait();
+        }
+    }
+
+    /// The last error the panel would be showing, if any.
+    #[must_use]
+    pub fn last_error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
+    /// Undo one step (the headless `--sam-undo` proof; `Cmd-Z` in the window).
+    pub fn undo_once(&mut self) {
+        self.undo();
+    }
+
+    /// Kill the running child, if there is one.
+    pub fn cancel_sam(&mut self) {
+        if let Some(job) = self.sam.job.as_mut() {
+            job.cancel();
+            self.sam.note = format!("cancelled after {:.1} s", job.elapsed());
+        }
+    }
+
+    /// Advance the child's state machine, importing its region when it lands.
+    ///
+    /// A no-op on every frame with no child, exactly as [`Self::refresh_shade`]
+    /// is. Call it once per frame, before [`Self::apply`].
+    pub fn poll_sam(&mut self) {
+        let Some(job) = self.sam.job.as_mut() else {
+            return;
+        };
+        match job.poll().clone() {
+            SamState::Running => {}
+            SamState::Finished => {
+                let summary = job.summary().cloned();
+                let elapsed = job.elapsed();
+                let out = self
+                    .sam
+                    .work_dir
+                    .as_ref()
+                    .map(|d| d.join(EDITS_FILENAME))
+                    .unwrap_or_default();
+                self.sam.job = None;
+                self.sam.summary = summary;
+                match self.import_sam_region(&out, elapsed) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        self.error = Some(e);
+                        self.sam.note = "the run finished but its region could not be read".to_owned();
+                    }
+                }
+            }
+            SamState::Failed(message) => {
+                self.sam.job = None;
+                self.error = Some(message);
+                self.sam.note = "the SAM run failed -- see the log below".to_owned();
+            }
+            SamState::Cancelled => {
+                self.sam.job = None;
+            }
+        }
+    }
+
+    /// Add the child's region to the document and light it up.
+    ///
+    /// Through [`EditDocument::add_region`] like every other edit, so Cmd-Z
+    /// takes it straight back out (`docs/EDITOR.md` §6's E5 row).
+    fn import_sam_region(&mut self, out: &Path, elapsed: f64) -> Result<(), String> {
+        let mut region = imported_region(out)?;
+        // The child chose its own id in its own throwaway file; a fresh one here
+        // keeps ids unique within THIS document, which is what undo keys off.
+        region.id = new_region_id();
+        let ids = match &region.params {
+            Params::Pointset { point_ids } => point_ids.clone(),
+            other => {
+                return Err(format!(
+                    "the SAM child wrote a {} region, not a pointset",
+                    other.kind().as_str()
+                ))
+            }
+        };
+        let count = ids.len();
+        self.sam.selection = ids;
+        self.sam.preview = true;
+        self.add(region);
+        self.needs_apply = true;
+        self.sam.note = format!("imported {count} points in {elapsed:.1} s -- Cmd-Z removes it");
+        Ok(())
     }
 
     /// Recompose the per-point weights and hand the renderer its point sets.
@@ -818,10 +1212,10 @@ impl EditSession {
             // `H` belongs to whichever tool has focus: both produce a tinted
             // `pointset` preview and there is no second highlight colour to
             // tell two of them apart with.
-            if self.tool == Tool::ClickCluster {
-                self.click.preview = !self.click.preview;
-            } else {
-                self.shade.preview = !self.shade.preview;
+            match self.tool {
+                Tool::ClickCluster => self.click.preview = !self.click.preview,
+                Tool::Sam => self.sam.preview = !self.sam.preview,
+                Tool::Regions | Tool::ShadeFinder => self.shade.preview = !self.shade.preview,
             }
             self.needs_apply = true;
         }
@@ -1115,7 +1509,7 @@ impl EditSession {
         ui.label(egui::RichText::new("Tools (T)").strong());
         let previous = self.tool;
         ui.horizontal(|ui| {
-            for tool in [Tool::Regions, Tool::ShadeFinder, Tool::ClickCluster] {
+            for tool in [Tool::Regions, Tool::ShadeFinder, Tool::ClickCluster, Tool::Sam] {
                 ui.selectable_value(&mut self.tool, tool, tool.label());
             }
         });
@@ -1131,6 +1525,10 @@ impl EditSession {
             }
             Tool::ClickCluster => {
                 self.click_panel(ui, num_points);
+                return;
+            }
+            Tool::Sam => {
+                self.sam_panel(ui, num_points);
                 return;
             }
             Tool::ShadeFinder => {}
@@ -1200,6 +1598,151 @@ impl EditSession {
                 self.add_shade_region(Op::Delete);
             }
         });
+    }
+
+    /// The SAM panel: the prompt, the run/cancel buttons, the child's own output.
+    ///
+    /// `docs/EDITOR.md` §3's "4. SAM 3 lift (E5)". Everything here either
+    /// becomes a flag on the one child process or reports what that child said;
+    /// no segmentation, projection or voting happens in this process.
+    #[allow(clippy::too_many_lines)]
+    fn sam_panel(&mut self, ui: &mut egui::Ui, num_points: usize) {
+        ui.label(
+            "DRAG a box on the render to segment the object inside it, or ALT-CLICK a point. \
+             SHIFT-drag still orbits. The camera must be pinned to a capture view -- the lift \
+             needs the photograph, not the render.",
+        );
+        if !self.has_scene_root {
+            ui.colored_label(
+                egui::Color32::from_rgb(255, 200, 120),
+                "this bundle.json records no `scene_root`, so the lift cannot find the \
+                 photographs -- re-export it with `trippy export-bundle`",
+            );
+        }
+
+        match &self.sam.prompt {
+            Some((view, prompt)) => ui.label(format!("prompt: {} on {view}", prompt.label())),
+            None => ui.label("prompt: none yet"),
+        };
+
+        ui.horizontal(|ui| {
+            ui.label("op:");
+            for op in Op::ALL {
+                ui.selectable_value(&mut self.sam.op, op, op.as_str());
+            }
+        });
+        if self.sam.op == Op::Delete {
+            ui.label("delete ignores mix: the lifted points are removed");
+        } else {
+            ui.add(
+                egui::Slider::new(&mut self.sam.mix, 0.0..=1.0)
+                    .text("mix (0 = splat, 1 = TRIPS)"),
+            );
+        }
+        let mut views_around = self.sam.views_around as f64;
+        if ui
+            .add(
+                egui::Slider::new(&mut views_around, 0.0..=8.0)
+                    .integer()
+                    .text("views around (0 = this view alone; 1 is an INTERSECTION, use 0 or >= 2)"),
+            )
+            .changed()
+        {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            {
+                self.sam.views_around = views_around.round() as usize;
+            }
+        }
+        ui.horizontal(|ui| {
+            ui.label("device:");
+            for device in ["cpu", "mps"] {
+                ui.selectable_value(&mut self.sam.device, device, device);
+            }
+            ui.checkbox(&mut self.sam.fake, "fake (no SAM 3)")
+                .on_hover_text(
+                    "synthesise the mask from the prompt: proves the plumbing without \
+                     loading the checkpoint",
+                );
+        });
+        if self.sam.device == "mps" {
+            ui.label(
+                "mps is your own interactive GPU use, which is allowed outside the queue; \
+                 a batch of lifts is not",
+            );
+        }
+
+        let running = self.sam_running();
+        let bundle_dir = self.bundle_dir.clone();
+        ui.horizontal(|ui| {
+            let can_run = !running && self.sam.prompt.is_some() && self.has_scene_root;
+            if ui
+                .add_enabled(can_run, egui::Button::new("run SAM lift"))
+                .on_hover_text("spawns `trippy edits sam` once; this is the only child it starts")
+                .clicked()
+            {
+                if let Err(e) = self.start_sam(&bundle_dir) {
+                    self.error = Some(e);
+                }
+            }
+            if ui
+                .add_enabled(running, egui::Button::new("cancel"))
+                .on_hover_text("kill the child process")
+                .clicked()
+            {
+                self.cancel_sam();
+            }
+            if ui
+                .add_enabled(
+                    !self.sam.selection.is_empty(),
+                    egui::Button::new("clear highlight"),
+                )
+                .clicked()
+            {
+                self.sam.selection.clear();
+                self.needs_apply = true;
+            }
+        });
+        if ui
+            .checkbox(&mut self.sam.preview, "preview highlight (H)")
+            .changed()
+        {
+            self.needs_apply = true;
+        }
+
+        if let Some(job) = &self.sam.job {
+            ui.label(format!("running for {:.1} s", job.elapsed()));
+            // The child is alive: the panel has to keep asking for frames or
+            // its progress would only update when something else moved.
+            ui.ctx().request_repaint();
+        }
+        if let Some(summary) = &self.sam.summary {
+            ui.label(format!(
+                "{} of {num_points} points lifted ({} in the prompted view, {} view(s) voted)",
+                summary["n_points"].as_u64().unwrap_or(0),
+                summary["n_points_primary_view"].as_u64().unwrap_or(0),
+                summary["vote"]["n_views"].as_u64().unwrap_or(0),
+            ));
+        }
+        if !self.sam.note.is_empty() {
+            ui.label(&self.sam.note);
+        }
+        if let Some(job) = &self.sam.job {
+            let lines = job.lines();
+            egui::ScrollArea::vertical()
+                .id_salt("sam-log")
+                .max_height(120.0)
+                .stick_to_bottom(true)
+                .show(ui, |ui| {
+                    for line in &lines {
+                        ui.label(egui::RichText::new(line).monospace().size(11.0));
+                    }
+                });
+        }
+        if !self.sam.command.is_empty() {
+            ui.collapsing("command", |ui| {
+                ui.label(egui::RichText::new(&self.sam.command).monospace().size(11.0));
+            });
+        }
     }
 
     /// The Selection panel: what the last Shift-click found, and what to do with it.
@@ -1476,6 +2019,8 @@ mod tests {
         tool = tool.next();
         assert_eq!(tool, Tool::ClickCluster);
         tool = tool.next();
+        assert_eq!(tool, Tool::Sam);
+        tool = tool.next();
         assert_eq!(tool, Tool::Regions);
     }
 
@@ -1653,6 +2198,184 @@ mod tests {
             session.doc.region("r-a").unwrap().params,
             Params::Sphere { center, .. } if center[0] == 0.0
         ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- the SAM tool (E5) --------------------------------------------------
+
+    /// A session in its own throwaway directory, named after the test.
+    fn a_session(tag: &str) -> (PathBuf, EditSession) {
+        let dir = std::env::temp_dir().join(format!("trips-edit-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let session = EditSession::open_with_path(&dir, "trippy-bundle-1", None);
+        (dir, session)
+    }
+
+    /// A view the mapping is the identity on, so these tests are about the
+    /// SESSION's behaviour and not about the arithmetic `edit::sam` already
+    /// has its own tests for.
+    fn a_view() -> trips_viewer::bundle::BundleView {
+        trips_viewer::bundle::BundleView {
+            index: 0,
+            name: "IMG_0000.jpg".to_owned(),
+            width: 200,
+            height: 100,
+            fx: 100.0,
+            fy: 100.0,
+            cx: 100.0,
+            cy: 50.0,
+            r: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+            t: [0.0, 0.0, 0.0],
+            distortion: [0.0; 8],
+        }
+    }
+
+    #[test]
+    fn the_tool_cycle_reaches_the_sam_tool_and_returns() {
+        let mut tool = Tool::ClickCluster;
+        tool = tool.next();
+        assert_eq!(tool, Tool::Sam);
+        assert_eq!(tool.next(), Tool::Regions);
+    }
+
+    #[test]
+    fn a_pinned_gesture_becomes_a_prompt_in_the_views_own_pixels() {
+        let (dir, mut session) = a_session("sam-resolve");
+        let view = a_view();
+        session.request_sam(SamGesture::Box((10.0, 20.0), (110.0, 80.0)));
+        assert_eq!(session.tool, Tool::Sam, "the gesture picks its tool");
+        session.resolve_sam(&view.camera(), &view, true, &[view.clone()], glam::Vec3::ZERO);
+
+        match &session.sam.prompt {
+            Some((name, SamPrompt::Box(b))) => {
+                assert_eq!(name, "IMG_0000.jpg");
+                assert_eq!(*b, [10.0, 20.0, 110.0, 80.0]);
+            }
+            other => panic!("expected a box prompt, got {other:?}"),
+        }
+        assert!(session.take_sam_snap().is_none(), "a pinned camera needs no snap");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_unpinned_gesture_is_dropped_and_asks_for_a_snap_instead() {
+        // The lift needs the PHOTOGRAPH: pixels measured against a free-flying
+        // frame mean nothing in any photo, so re-using them would segment the
+        // wrong thing while looking like it worked.
+        let (dir, mut session) = a_session("sam-unpinned");
+        let mut near = a_view();
+        near.t = [0.0, 0.0, 0.0];
+        let mut far = a_view();
+        far.index = 1;
+        far.name = "IMG_0001.jpg".to_owned();
+        // `c = -R^T t`, so this camera's CENTRE is (50, 0, 0).
+        far.t = [-50.0, 0.0, 0.0];
+        let views = [near.clone(), far];
+
+        session.request_sam(SamGesture::Point((10.0, 20.0)));
+        session.resolve_sam(
+            &near.camera(),
+            &near,
+            false,
+            &views,
+            glam::Vec3::new(40.0, 0.0, 0.0),
+        );
+        assert!(session.sam.prompt.is_none(), "the gesture is discarded, not reused");
+        assert_eq!(session.take_sam_snap(), Some(1), "snapped to the nearer camera");
+        assert!(session.take_sam_snap().is_none(), "the request is taken once");
+        assert!(session.sam.note.contains("IMG_0001.jpg"), "{}", session.sam.note);
+        assert!(session.sam.note.contains("snapped"), "{}", session.sam.note);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_run_without_a_prompt_or_a_scene_root_refuses_with_a_reason() {
+        let (dir, mut session) = a_session("sam-refuse");
+        let message = session.start_sam(&dir).unwrap_err();
+        assert!(message.contains("drag a box"), "{message}");
+
+        session.set_sam_prompt("IMG_0000.jpg", SamPrompt::Point((1.0, 2.0)));
+        let message = session.start_sam(&dir).unwrap_err();
+        assert!(message.contains("scene_root"), "{message}");
+        assert!(!session.sam_running());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_imported_region_is_one_undo_step_and_lights_up() {
+        // The import itself, without a child: what `poll_sam` does once the
+        // process has landed. The child half is tested in `sam_child`.
+        let (dir, mut session) = a_session("sam-import");
+        let child_out = dir.join("child-edits.json");
+        let mut child_doc = EditDocument::new("trippy-bundle-1".to_owned());
+        child_doc
+            .add_region(
+                &Region::new(
+                    "r-child".to_owned(),
+                    "sam: box".to_owned(),
+                    Params::Pointset {
+                        point_ids: vec![2, 3, 5, 8],
+                    },
+                    0.0,
+                    Op::Fade,
+                ),
+                None,
+            )
+            .unwrap();
+        child_doc.save(&child_out).unwrap();
+
+        session.import_sam_region(&child_out, 1.5).expect("imported");
+        assert_eq!(session.sam_selection(), [2, 3, 5, 8]);
+        assert_eq!(session.preview_ids(), Some(vec![2, 3, 5, 8]), "the tint is on");
+        assert_eq!(session.doc.regions().len(), 1);
+        assert!(session.dirty, "an imported region is an unsaved change");
+        assert!(session.needs_apply, "the tint has to reach the render");
+
+        // One undo step, exactly like every other edit.
+        session.undo_once();
+        assert!(session.doc.regions().is_empty(), "Cmd-Z takes it back out");
+        assert!(session.doc.can_redo());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn importing_something_that_is_not_a_pointset_is_refused() {
+        let (dir, mut session) = a_session("sam-badkind");
+        let child_out = dir.join("child-edits.json");
+        let mut child_doc = EditDocument::new("trippy-bundle-1".to_owned());
+        child_doc
+            .add_region(
+                &Region::new(
+                    "r-child".to_owned(),
+                    "a sphere".to_owned(),
+                    Params::Sphere {
+                        center: [0.0, 0.0, 0.0],
+                        radius: 1.0,
+                    },
+                    0.0,
+                    Op::Fade,
+                ),
+                None,
+            )
+            .unwrap();
+        child_doc.save(&child_out).unwrap();
+
+        let message = session.import_sam_region(&child_out, 0.1).unwrap_err();
+        assert!(message.contains("not a pointset"), "{message}");
+        assert!(session.doc.regions().is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn h_toggles_the_sam_tint_when_the_sam_tool_has_focus() {
+        let (dir, mut session) = a_session("sam-h");
+        session.sam.selection = vec![7];
+        session.tool = Tool::Sam;
+        assert_eq!(session.preview_ids(), Some(vec![7]));
+        session.set_sam_preview(false);
+        assert_eq!(session.preview_ids(), None);
+        session.set_sam_preview(true);
+        assert_eq!(session.preview_ids(), Some(vec![7]));
         std::fs::remove_dir_all(&dir).ok();
     }
 

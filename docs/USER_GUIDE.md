@@ -324,9 +324,11 @@ A/B-checked, so the pool lid is one click plus one save.
 | key | action |
 |---|---|
 | `M` | show/hide the editor |
-| `T` | cycle the Tools panel: Regions → shade-cloud finder → click-to-cluster |
+| `T` | cycle the Tools panel: Regions → shade-cloud finder → click-to-cluster → SAM 3 lift |
 | `H` | preview highlight on/off (for whichever tool has focus) |
 | **Shift-click** on the render | select the object under the pointer (click-to-cluster) |
+| **drag** on the render | draw a box for the SAM 3 lift — *only* while the SAM tool has focus. Shift-drag still orbits |
+| **Alt-click** on the render | point prompt for the SAM 3 lift |
 | arrows, `PageUp`/`PageDown` | nudge the selected region along world X/Z and Y |
 | `[` / `]` | shrink / grow the selected region |
 | `Delete` / `Backspace` | remove the selected region |
@@ -409,6 +411,46 @@ write_shade_views('<bundle>', views, 0.05, 0.5)
 Without it the panel says so and the finder is unavailable, rather than quietly
 guessing.
 
+### Cut an object out with SAM 3
+
+This is the tool for "get rid of that", "make just this bit splat", or "select
+that whole thing" when a colour-based click cannot tell the object from its
+background. It segments a **photograph** with the SAM 3 model already on this
+machine and lifts the mask onto the scene's points.
+
+1. Press **`N`** / **`P`** until you are looking through the capture view that
+   shows the object best. (You must be *on* a view — the tool needs the
+   photograph. If you have flown off one, it snaps you to the nearest view and
+   says so; then drag again.)
+2. Press **`T`** until the Tools panel says **SAM 3 lift**.
+3. **Drag a box** round the object on the render. Or **Alt-click** it. A pink
+   rectangle follows the drag.
+4. Choose **op** (fade / blend / delete) and **mix**, then press **run SAM
+   lift**.
+5. Watch the log. It prints a line per stage; **cancel** kills it at any point.
+   About 9 seconds per view on the CPU.
+6. When it lands, the selected points light up magenta and the region is in the
+   Regions list. **`Cmd-Z`** takes it straight back out if it grabbed the wrong
+   thing; **`Cmd-S`** keeps it.
+
+Two settings worth knowing:
+
+- **views around** — how many neighbouring photographs also get segmented, so a
+  point is only kept if a majority of the views that can see it agree. Use **0**
+  (trust the one view) or **2 or more**. One neighbour is not a vote, it is an
+  intersection, and it will throw away most of the selection.
+- **device** — `cpu` by default and that is usually the right answer. `mps` is
+  your own interactive use of your own GPU, which is fine; a batch of lifts is
+  not, and should go through the queue.
+
+Nothing here sends a photograph anywhere. The image is opened by one local
+child process, the mask is an array, and the viewer itself never decodes a
+pixel of it.
+
+If the panel says the bundle **records no `scene_root`**, it was exported before
+this feature existed and cannot find its own photographs — re-run
+`trippy export-bundle` for that run and the tool lights up.
+
 ### Checking an edit without opening a window
 
 ```
@@ -422,6 +464,13 @@ rust/target/release/trips-viewer <bundle> --dump-shade shade.json \
 # what would a click at pixel (240, 180) of the default view select?
 rust/target/release/trips-viewer <bundle> --click 240 180 --dump-click ids.json \
     --click-radius-px 12 --click-colour-tol 0.15
+
+# run the SAM lift without a window (--sam-fake needs no SAM 3 and no GPU;
+# the box is in the chosen view's own pixels, which is what a drag maps to)
+rust/target/release/trips-viewer <bundle> --sam-box 12 9 36 27 --sam-op delete \
+    --screenshot lifted.png
+rust/target/release/trips-viewer <bundle> --sam-box 12 9 36 27 --sam-fake \
+    --sam-undo --screenshot back-to-normal.png
 
 # a picture of the edited scene, same code path as the window
 rust/target/release/trips-viewer <bundle> --screenshot edited.png
@@ -445,7 +494,10 @@ alongside, and (if the bundle names a Gaussian `.ply`) a filtered copy of it.
 ### What is not built yet
 
 - No 3D drag handles on a region — use the arrow keys or type the numbers.
-- No SAM-3 object selection (E5).
+- The SAM lift starts a fresh process per view, so `views around 4` loads the
+  3.4 GB model five times. Use 0 unless a vote is really wanted.
+- No per-point tidy-up of what SAM returned: if the selection is slightly wrong
+  at the edges, the answer today is a different box, not a brush.
 - A region with `mix < 1` needs a Gaussian splat to mix *with*. On a bundle with no
   `blend.splat_ply`, the panel says the frame is showing unedited TRIPS there
   rather than pretending.
