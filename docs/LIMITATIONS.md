@@ -1191,3 +1191,82 @@ A browser has no filesystem to open a multi-gigabyte `.ply` from, and fetching o
 over loopback on top of the 80 MB `points.npz` it already pulls is a different
 feature. `trips-web` passes a constant `BlendMode::Trips`, which is a hard no-op in
 `Renderer::compose`, so its frame is byte-for-byte the one v0.5.0 shipped.
+
+## SAM-3 mask lift (E5, `trippy edits sam`, 2026-09-07)
+
+- **SAM 3 runs in a foreign interpreter, one model load per view.** trippy's
+  `.venv` cannot import `sam3` (none of einops / timm / iopath / ftfy /
+  pycocotools is a trippy dependency, and adding them would pull a second
+  torch build into this repo's dependency set), so `trippy/edit/sam_runner.py`
+  shells out to `~/Splats/tools/sam3/.venv/bin/python` with the Splats
+  checkout on `sys.path` and the local `sam3.pt` as `checkpoint_path`
+  (`load_from_HF=False`, so nothing is ever downloaded). One consequence is
+  structural: **each view is a fresh process, so the 3.4 GB checkpoint is
+  loaded once per view** (measured 4.7 s warm, on a machine that has already
+  page-cached the file; a cold load is slower). `--views-around 4` therefore
+  pays five model loads. Batching all views into one child process is the
+  obvious fix and is not built; it matters much more for an interactive
+  viewer than for a queue job.
+- **Two host-specific shims are required and are trippy's, not SAM 3's.**
+  (a) A `torch._dynamo` stub, because no `triton` wheel exists for
+  macOS/arm64 and `torch._inductor.runtime.hints` imports
+  `triton.backends.compiler` unconditionally (the same wall
+  `~/Splats/research/sam3-person.md` documents; the Splats venv already
+  carries a `triton` shim, and this stub is what makes `torchvision.ops`
+  import on top of it). (b) A `torch.autocast(bfloat16)` region around
+  inference, because `sam3.perflib.fused.addmm_act` casts its own inputs to
+  bfloat16 and hands the result to the next fp32 `Linear` — without an
+  autocast the first ViT MLP raises "mat1 and mat2 must have the same dtype".
+  Both are in `trippy/edit/sam_runner.py` with the reason inline. If the
+  Splats SAM checkout is updated, re-check both.
+- **The mask threshold is a real knob, not a formality.** `Sam3Processor`
+  hardcodes "inside = probability > 0.5"; `sam_runner` reproduces that but
+  thresholds the probability map itself so `--mask-threshold` can move it.
+  On a *synthetic* flat-colour disc SAM 3 was confidently right about where
+  the object was while peaking at ≈0.42, which at 0.5 returns only the
+  object's **outline** — measured identically in fp32 and under autocast, so
+  it is the model's calibration on out-of-distribution input, not a numerics
+  bug. On the real kk-coherent photo the same prompt peaked at 0.90 and the
+  mask was solid, so the default is right for photographs; be suspicious of
+  a lift whose `mask_area_fraction` is tiny and whose `mask_prob_max` is just
+  under the threshold.
+- **The depth gate can drop an object's edge cells.** The gate keeps points
+  near their 16 px cell's nearest *supported* depth mode ("supported" = 25% of
+  the cell's fullest bin). In a cell straddling the object's silhouette, the
+  object may fall below that support fraction against a dense background and
+  be discarded — the selection can be slightly eroded at the boundary. The
+  levers are `--depth-cell-px` (smaller cells = less mixing, noisier modes)
+  and `--depth-tol`. There is no per-point clean-up UI yet; `docs/EDITOR.md`
+  §7 already flags manual `pointset` clean-up as the expected follow-on.
+- **The photo/bundle geometry link is a uniform scale plus a re-applied
+  lens.** The lift assumes the photograph is the bundle view's own camera at
+  a larger raster (true for every bundle trippy writes: kk-coherent's view
+  `fx=757.36, cx=504` at 1008×756 is COLMAP's `fx=3029.46, cx=2016` at
+  4032×3024 ÷ 4) and refuses (`ValueError`) if the two aspect ratios
+  disagree by more than 1%. Because a trippy-native bundle's views are
+  undistorted and the photos are not, the COLMAP camera's `(k1, k2, p1, p2)`
+  is re-applied when projecting into the photo (`--no-scene-distortion`
+  disables it). A scene whose COLMAP camera model is not one
+  `trippy.scene.colmap_io.distortion` understands silently falls back to no
+  distortion (~19 px at the frame edge on kk-coherent, ~0 at the centre).
+  The mask is indexed with COLMAP's own half-open corner-origin convention
+  (`0 <= u < W`, pixel = `floor(u)`, the same test `trippy.train.prune.
+  in_region` uses). A bundle exported from a TRIPS/ADOP checkpoint carries
+  that engine's centre-at-integer intrinsics instead, so on such a bundle
+  every projected pixel is half a pixel off — accepted, not corrected: it is
+  0.5 px on a 4000 px photograph, far below the mask's own boundary error.
+- **`--views-around 1` degenerates into an intersection.** The vote is a
+  STRICT majority of the views that can see a point (`floor(f·n) + 1`), so
+  with exactly two eligible views a point needs BOTH of them — the result is
+  the intersection of the two lifts, not a consensus. Measured on
+  kk-coherent (`IMG_3703.jpg` box prompt + one neighbour, CPU): 72,455 points
+  from the prompted view alone, 15,476 from the neighbour (whose own mask was
+  tighter: 0.164% of its frame vs 1.044%), 15,111 after the vote. That is the
+  honest behaviour of a two-view majority and it is why the neighbour count
+  should be 0 (trust one view) or >= 2 (a real vote); `--vote-fraction` below
+  0.5 relaxes it if a union-ish result is what is wanted.
+- **`--text` prompts union every instance above threshold.** SAM 3's whole
+  point is exhaustive open-vocabulary instances, so a text prompt selects all
+  of them; `--point`/`--box` select one (highest-scoring instance containing
+  the click / overlapping the box). There is no "the second-best instance"
+  selector, and the neighbour views are always prompted with a point.

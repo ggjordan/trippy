@@ -78,6 +78,11 @@ where they matter below:
   against camera centres instead of `xyz`. See `trippy.edit.cluster`'s
   module docstring for the full algorithm and every constant's reasoning.
 
+E5's SAM-3 lift landed on the Python side too (`trippy edits sam`,
+`trippy/edit/{sam_lift,sam_runner}.py`); see §3's "4. SAM 3 lift (E5)"
+for the exact SAM 3 API and command, and §6's E5 row for what is left
+(the viewer-side picker).
+
 `docs/decisions/ADR-0007-viewer-editing.md` is still accurate to the
 sections below; this document is the detailed spec the milestones in §6
 implement, in order.
@@ -554,6 +559,97 @@ Everything in this path runs on Jordan's machine: SAM 3's weights are local,
 the photograph never leaves it, and no step here calls a hosted API — the
 same privacy posture `AGENTS.md` §6 already requires project-wide.
 
+**Implemented** (`trippy/edit/sam_lift.py`, `trippy/edit/sam_runner.py`,
+CLI `trippy edits sam`). What actually got built, and the three places it
+differs from the paragraph above:
+
+```
+trippy edits sam --bundle <dir> --scene <root> --view IMG.jpg \
+                 (--point U V | --box X0 Y0 X1 Y1 | --text "a phrase") \
+                 [--views-around N] [--device cpu|mps] \
+                 --out edits.json [--op fade|delete|blend] [--mix M] \
+                 [--preview heat.png] [--summary-out summary.json] \
+                 [--sam-work-dir <dir>] [--mask NAME=PATH] \
+                 [--mask-threshold 0.5] [--no-scene-distortion] \
+                 [--depth-cell-px 16] [--depth-tol 0.15] [--vote-fraction 0.5]
+```
+
+- **SAM 3 is never imported into trippy's process.** `trippy/edit/
+  sam_runner.py` is both halves of a subprocess pipe: imported, it builds
+  and runs the command; executed by *Splats'* SAM venv python, it imports
+  `sam3` by `sys.path` from the Splats checkout and writes a mask `.npy`.
+  trippy's own `.venv` has none of SAM 3's dependencies (einops / timm /
+  iopath / ftfy / pycocotools) and cannot get them without changing this
+  repo's dependency set. The exact command (all three paths overridable
+  with `TRIPPY_SAM3_PYTHON` / `TRIPPY_SAM3_REPO` / `TRIPPY_SAM3_WEIGHTS`):
+
+  ```
+  /Users/nzbirdranch/Splats/tools/sam3/.venv/bin/python \
+      <trippy>/trippy/edit/sam_runner.py \
+      --repo    /Users/nzbirdranch/Splats/tools/sam3/repo \
+      --weights /Users/nzbirdranch/Splats/tools/sam3-weights/sam3.pt \
+      --image <photo> --device cpu|mps \
+      --resolution 1008 --threshold 0.5 --mask-threshold 0.5 \
+      --kind box --box X0 Y0 X1 Y1 \
+      --out-mask <dir>/mask.npy --out-json <dir>/info.json
+  ```
+
+  The SAM 3 API used is the image processor's own documented one:
+  `build_sam3_image_model(device=..., checkpoint_path=<local sam3.pt>,
+  load_from_HF=False)` → `Sam3Processor(model, resolution=1008,
+  device=..., confidence_threshold=0.5)` → `set_image(PIL image)` →
+  `set_text_prompt(phrase, state)` for `--text`,
+  `add_geometric_prompt([cx, cy, w, h] normalised, True, state)` for
+  `--box`, and — for `--point`, which the processor does not expose —
+  `state["geometric_prompt"].append_points(xy_normalised, labels)` followed
+  by the same `_forward_grounding(state)` that `add_geometric_prompt` ends
+  with (`sam3/model/geometry_encoders.py`'s `Prompt` carries points as
+  first-class prompts; only the processor's convenience wrapper omits
+  them). Two host-specific details, both trippy's own shim code and
+  neither copied from SAM 3: a `torch._dynamo` stub (no `triton` wheel
+  exists for macOS/arm64, and `torch._inductor` imports one
+  unconditionally — `~/Splats/research/sam3-person.md`), and a
+  `torch.autocast(bfloat16)` region around inference, because
+  `sam3.perflib.fused.addmm_act` casts its own inputs to bfloat16 and
+  hands them to the next fp32 `Linear`, which only type-checks inside an
+  autocast (measured: fp32 and autocast give the same masks to ±0.01
+  probability, so this is a dtype fix, not a precision trade).
+- **The mask is depth-gated before it becomes a selection.** A mask is 2D:
+  everything behind the object along the same ray is inside it too. Points
+  are binned into 16 px cells and each cell's *nearest supported* depth
+  mode (log bins of relative width `--depth-tol`, a bin counting as a
+  surface at 25% of the cell's fullest bin) is the surface there;
+  candidates survive within a relative band of it. Nearest-**with-support**
+  rather than the plain mode is load-bearing: a mask over a near object
+  usually contains more background than object (a distant wall projects
+  many more points per pixel), so the plain mode would lock onto the
+  background and select exactly the wrong thing. Measured on the
+  `exp0010-shade-prune` bundle: 102,385 points project inside the mask,
+  72,455 survive the gate.
+- **Neighbour views are prompted with the selection's centroid, and the
+  vote is strict.** `--views-around N` takes the N nearest capture views
+  (by camera centre) in which the primary selection's centroid actually
+  projects in-frame, prompts SAM there with that projected pixel (a point
+  prompt), and keeps a point when **more** than `--vote-fraction` of the
+  views that can *see* it voted for it (`floor(f·n) + 1`). "At least half"
+  would let one sloppy mask carry a point past a neighbour that rejected
+  it, which is the failure the vote exists to prevent. The corollary is
+  that `--views-around 1` is an *intersection*, not a consensus (two
+  eligible views, both must agree): measured on kk-coherent, 72,455 points
+  from the prompted view and 15,476 from one neighbour left 15,111. Use 0
+  or >= 2.
+
+Two more things the design did not say and the implementation had to
+decide. The photographs under `--scene` are as-captured, while a
+trippy-native bundle's views are undistorted (`distortion` all zeros,
+`trippy.scene.dataset` undistorts on ingest), so projecting into the photo
+re-applies the COLMAP camera's own `(k1, k2, p1, p2)` (`--no-scene-
+distortion` turns that off; ~19 px at the frame edge on kk-coherent's
+`k1 = 0.057`, ~0 at the centre). And nothing in the lift ever opens the
+photograph: only the SAM child decodes pixels, masks are arrays, and
+`--preview` draws a from-scratch heatmap of *projected point counts* — no
+photographic content, so it is safe to look at under `AGENTS.md` §6.
+
 ## 4. UI sketch
 
 Three egui panels, added the same way the existing HUD window is built
@@ -714,6 +810,8 @@ schedule.
 | **E3** | `lid` region kind + 3D gizmo (plane/radius drag) + hard-clip delete semantics | 2 d | Loading the Karekare pool bundle with a `lid` region seeded from `SURFACE_LID.md`'s numbers removes the haze from every angle at every `mix`/exposure; dragging the radius ring changes the affected point count live | **Region kind + hard-clip semantics done** (`trippy.edit.model.lid_membership`, `trippy edits add-lid`); the 3D gizmo is not built. |
 | **E4** | Click-to-cluster: ray cast + k-d tree + k-NN growth in world+colour space, radius slider | 3 d | Clicking a point-cloud cluster selects a `pointset` region that visibly matches the clicked object's extent, without needing a depth buffer | **Done** (2026-09-07), on both sides. Python: `trippy.edit.cluster`, `trippy edits click` (`tests/test_edit_cluster.py`). Rust: `edit/cluster.rs` (the projection, the depth-mode seed, an exact k-NN spatial hash in place of the unavailable k-d tree, the colour/radius/point gates), the **Selection panel** with the four sliders + op/mix + "add as region" + "clear" in `edit_ui.rs`, and **Shift-click** on the render in `app.rs`. Parity is exact, not approximate: the committed `click.json`/`expected_click.json` fixture replays four clicks (depth-mode seeding, the colour gate, the `max_points` cut-off, a miss) and both languages return the identical id list; `--click U V --dump-click` reproduces it against a real bundle. Measured on the synthetic bundle at 480x360: a click at (240, 180) selects 261 of 4000 points, the tint changes **71.55 %** of the frame's pixels (3.81 % of them turning magenta, the rest dimmed by the preview) with a max channel diff of 79, and a run without `--click` reproduces the untinted frame **bit for bit** (0.0000 % of pixels differ, max channel diff 0). Not built: an Inspector-side gizmo for a committed `pointset` region (there is no shape to drag). |
 | **E5** | SAM 3 lift: photo segmentation, multi-view projection + majority vote, `pointset` region output | 2–3 wk | Segmenting an object in 2–3 registered views of the same scene produces one `pointset` region that, previewed, highlights that object and not its neighbours; runs entirely local (no image leaves the machine) | Not started. |
+| **E4** | Click-to-cluster: ray cast + k-d tree + k-NN growth in world+colour space, radius slider | 3 d | Clicking a point-cloud cluster selects a `pointset` region that visibly matches the clicked object's extent, without needing a depth buffer | Not started. |
+| **E5** | SAM 3 lift: photo segmentation, multi-view projection + majority vote, `pointset` region output | 2–3 wk | Segmenting an object in 2–3 registered views of the same scene produces one `pointset` region that, previewed, highlights that object and not its neighbours; runs entirely local (no image leaves the machine) | **Python side done** (`trippy/edit/sam_lift.py`, `trippy/edit/sam_runner.py`, `trippy edits sam`; §3's own "Implemented" note has the exact command and the depth-gate/vote rules). SAM 3 runs locally in a subprocess under Splats' SAM venv, on CPU or (inside a queue job) MPS; the whole lift is CPU-testable with an injected fake segmenter (`tests/test_edit_sam.py`). The viewer-side "pick a view, click in it" UI is not built. |
 | **E6** | Publish path: `trippy apply-edits`, TRIPS `export.ply` mask wiring, distilled-splat publish order (edit-then-distil for pointset regions, geometry-reapply for box/sphere/lid) | 3 d | `trippy apply-edits --target both` on a bundle with a mix of region kinds produces a TRIPS PLY with the deleted points absent and, after a `trippy distill` run on the same edited bundle, a distilled PLY that also lacks them; a box/sphere/lid region re-applied directly to an already-distilled PLY (no re-distillation) also removes the matching geometry | **Done** (`trippy/edit/apply.py`, `trippy/edit/checkpoint.py`): `--target trips\|distilled\|both` (default `both`); `trips`/`both` write the filtered TRIPS `points.npz`/`blend_weights.npy`/`export.ply` and, if named, a filtered `blend.splat_ply`; `distilled`/`both` (with `--distilled-ply`) re-apply box/sphere/lid regions to an already-distilled PLY as delete/opacity-scale-fade; `--edits` wired into `trippy distill --stage render` (edit-then-distil ordering) and into `trippy candidate-report`/`trippy eval` (checkpoint-side keep mask + gate suppression on gate-hybrid checkpoints, `candidate-report` only — see §5's own paragraph for the `eval` gap). |
 
 **Three deviations worth naming.** (1) The preview highlight is not a fourth

@@ -1657,3 +1657,102 @@ CLICK_DEFAULT_NAME = "click cluster"
 # for "does this look like the right blob", not a delivered image, and capping
 # it keeps a debug artifact from a multi-thousand-pixel view unreasonably large.
 CLICK_PREVIEW_MAX_DIM = 512
+# --- edit/sam_lift.py + edit/sam_runner.py: the E5 SAM-3 mask lift ---
+# SAM 3 lives in Jordan's Splats checkout, never inside trippy (docs/EDITOR.md
+# Sec 3 "4. SAM 3 lift (E5)"): trippy imports it by sys.path from a subprocess
+# wrapper run with Splats' own SAM venv python, because trippy's .venv has none
+# of SAM 3's dependencies (einops/timm/iopath/ftfy/pycocotools) and SAM 3's
+# import chain additionally needs the `torch._dynamo` stub `sam_runner` installs
+# (~/Splats/research/sam3-person.md "Fixes applied": no triton wheel exists for
+# macOS/arm64, so torch._inductor cannot be imported here). Every path below is
+# overridable by the matching TRIPPY_SAM3_* environment variable so a moved
+# checkout is a config change, not a code change.
+SAM3_REPO_DIR = "/Users/nzbirdranch/Splats/tools/sam3/repo"
+SAM3_VENV_PYTHON = "/Users/nzbirdranch/Splats/tools/sam3/.venv/bin/python"
+SAM3_WEIGHTS_PATH = "/Users/nzbirdranch/Splats/tools/sam3-weights/sam3.pt"
+SAM3_ENV_REPO_DIR = "TRIPPY_SAM3_REPO"
+SAM3_ENV_PYTHON = "TRIPPY_SAM3_PYTHON"
+SAM3_ENV_WEIGHTS = "TRIPPY_SAM3_WEIGHTS"
+
+# `Sam3Processor(model, resolution=..., confidence_threshold=...)`'s own defaults
+# (sam3/model/sam3_image_processor.py); repeated here so a trippy run records the
+# numbers it used instead of inheriting whatever a future SAM checkout defaults to.
+SAM3_RESOLUTION = 1008
+SAM3_CONFIDENCE_THRESHOLD = 0.5
+
+# Prompt kinds `trippy edits sam` accepts. "point" and "box" are pixel prompts in
+# the photo's own pixel coordinates; "text" is SAM 3's open-vocabulary phrase.
+SAM3_PROMPT_KINDS = ("point", "box", "text")
+
+# Device the SAM 3 subprocess runs on. "mps" is GPU work and is only ever reached
+# inside a gpu_queue job (AGENTS.md Sec 6); "cpu" is the always-available path the
+# CPU test suite and any non-queue run use.
+SAM3_DEVICES = ("cpu", "mps")
+SAM3_DEFAULT_DEVICE = "cpu"
+
+# How long the parent waits for the SAM subprocess (seconds). A cold MPS run loads
+# a 3.4 GB checkpoint and runs a ViT-L at 1008x1008 per view; 4 neighbour views on
+# a cold cache measured well under this, and a hang inside the queue is worse than
+# a failed job.
+SAM3_SUBPROCESS_TIMEOUT_S = 1800.0
+
+# --- the lift itself (docs/EDITOR.md Sec 3 "4. SAM 3 lift (E5)") ---
+# Depth gate: points are binned into square cells of this many PHOTO pixels, and
+# each cell's modal depth (log-spaced bins of relative width SAM_LIFT_DEPTH_TOL) is
+# taken as that cell's nearest supported surface. A cell of this size holds ~75
+# projected points on a 3.5M-point / 12 MPix bundle -- enough for a mode to mean
+# something, small enough that one cell is one surface.
+SAM_LIFT_DEPTH_CELL_PX = 16
+
+# Relative depth tolerance around a cell's modal depth: a point is kept when its
+# depth is within [mode/(1+tol), mode*(1+tol)]. This is what rejects points BEHIND
+# the segmented object (the mask says nothing about depth) and, symmetrically,
+# floaters in front of it.
+SAM_LIFT_DEPTH_TOL = 0.15
+
+# Camera-space depth below which a projected point is treated as not visible
+# (behind, or in, the pinhole). Matches the bundle's own `params.znear` default.
+SAM_LIFT_MIN_DEPTH = 1e-3
+
+# `--views-around N`: how many additional capture views the lift repeats itself in
+# by default. EDITOR.md Sec 3's "several registered views ... combined by majority
+# vote"; 4 keeps a queue job's SAM cost at 5 forward passes.
+SAM_LIFT_DEFAULT_VIEWS_AROUND = 4
+
+# A neighbour view only votes on a point if that point projects inside its frame
+# with positive depth; the point is selected when MORE than this fraction of its
+# eligible views voted for it (`floor(f * n) + 1` votes -- a strict majority at
+# 0.5, so two eligible views must both agree, not just one of them).
+SAM_LIFT_VOTE_FRACTION = 0.5
+
+# Region defaults for a SAM lift: `op="fade", mix=0.0` -- the same conservative
+# pair `trippy.edit.shade_finder` uses, so a fresh selection never hard-deletes
+# anything until Jordan asks for it.
+SAM_LIFT_DEFAULT_OP = "fade"
+SAM_LIFT_DEFAULT_MIX = 0.0
+
+# Preview heatmap (`--preview OUT.png`): a FROM-SCRATCH image of where the selected
+# points project in the prompted view -- counts per cell, never the photograph and
+# never the mask rendered as a picture (AGENTS.md Sec 6 "never send scene imagery
+# to a model"). This is its cell size in photo pixels and its colour ramp's two
+# endpoints (RGB); a cell with no selected point stays at the low end.
+SAM_LIFT_PREVIEW_CELL_PX = 8
+SAM_LIFT_PREVIEW_LOW_RGB = (12, 12, 24)
+SAM_LIFT_PREVIEW_HIGH_RGB = (255, 232, 96)
+
+# A depth bin counts as a "surface" in its cell when it holds at least this
+# fraction of the fullest bin's points. The lift then takes the NEAREST such
+# bin, not the fullest one: a mask over a near object usually contains more
+# background than object (a distant wall projects many more points per pixel),
+# so the plain mode would lock onto the background and delete the object. This
+# fraction is what still rejects a lone floater in front -- one point is not a
+# surface. See `trippy.edit.sam_lift.depth_mode_keep`.
+SAM_LIFT_DEPTH_SUPPORT_FRAC = 0.25
+
+# Per-pixel probability above which a SAM 3 mask pixel counts as "the object".
+# `Sam3Processor` hardcodes 0.5 (`state["masks"] = masks_logits > 0.5`) and
+# `sam_runner` reproduces that by default, but thresholds the probability map
+# itself so the number is tunable: on a low-contrast subject SAM 3 can be right
+# about WHERE the object is while peaking near 0.4, which at 0.5 returns only
+# the object's outline (measured on a synthetic flat-colour disc, 2026-09-07).
+SAM3_MASK_THRESHOLD = 0.5

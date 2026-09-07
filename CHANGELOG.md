@@ -88,6 +88,41 @@ All notable changes to trippy. Format: Keep a Changelog. Versions: semver tags `
     round-trips through `EditDocument.load`. Synthetic point clouds only.
   - The viewer's own click handler (casting a ray from `camera.rs::Controller`
     and calling this) is a later, Rust-side task — not built here.
+- **SAM-3 mask lift (`docs/EDITOR.md` §3 "4. SAM 3 lift", E5): `trippy edits
+  sam --bundle <dir> --scene <root> --view IMG.jpg (--point U V | --box X0 Y0
+  X1 Y1 | --text "...") [--views-around N] --out edits.json`.** Segments ONE
+  registered photograph with the local SAM 3 and lifts the mask onto the
+  bundle's own TRIPS points as a `pointset` region (same shape the shade-cloud
+  finder produces). New `trippy/edit/sam_runner.py` — both halves of a
+  subprocess pipe: imported it builds/runs the command, executed by *Splats'*
+  SAM venv python it imports `sam3` by `sys.path` from
+  `~/Splats/tools/sam3/repo`, builds the image model from the local
+  `sam3.pt` (`load_from_HF=False`, nothing is ever downloaded) and writes a
+  mask `.npy` + `info.json`. Masks are arrays; no photo, mask or overlay is
+  ever rendered as an image. New `trippy/edit/sam_lift.py` — projection,
+  depth gate and cross-view vote, all pure numpy with the segmenter injected,
+  so the whole pipeline is CPU-testable with a fake (`tests/test_edit_sam.py`,
+  19 tests).
+  - Depth gate: points are binned into 16 px cells and kept within a relative
+    band of their cell's NEAREST SUPPORTED depth mode (log bins of width
+    `--depth-tol`, a bin counting as a surface at 25% of the cell's fullest
+    bin) — nearest-with-support, not the plain mode, because a mask over a
+    near object usually contains more background than object.
+  - Cross-view vote: `--views-around N` re-segments the N nearest capture
+    views that can see the selection's centroid, prompting SAM there with that
+    centroid's own projected pixel, and keeps a point when MORE than
+    `--vote-fraction` of the views that can see it voted for it.
+  - `--preview` writes a from-scratch heatmap of the projected selection
+    (counts per cell, two flat colours — no photographic content);
+    `--sam-work-dir` keeps each view's `mask.npy`/`info.json`; `--mask
+    NAME=PATH` re-lifts an existing mask array instead of running SAM and
+    records `segmenter: "mask-file"` rather than claiming SAM ran.
+  - `--mask-threshold` exposes the per-pixel probability cutoff
+    `Sam3Processor` hardcodes at 0.5, because on a low-contrast subject SAM 3
+    can be right about where the object is while peaking below it and return
+    only the outline (`docs/LIMITATIONS.md` has the measurement).
+  - `--device mps` is GPU work and only ever runs inside a
+    `scripts/gpu_submit.sh` job; the default is `cpu`.
 - **Viewer editor publish path finished (`docs/EDITOR.md` Sec 5, E6): `trippy
   apply-edits --target trips|distilled|both`, `export.ply`, distilled-PLY
   reapply, and `--edits` on `trippy candidate-report`/`trippy eval`/`trippy
