@@ -188,7 +188,6 @@ from trippy.constants import (
     CLICK_DEFAULT_DEPTH_GAP_FACTOR,
     CLICK_DEFAULT_MAX_POINTS,
     CLICK_DEFAULT_MIX,
-    CLICK_DEFAULT_NAME,
     CLICK_DEFAULT_OP,
     CLICK_DEFAULT_RADIUS_PX,
     CLICK_GROW_KNN_K,
@@ -931,6 +930,9 @@ def _cmd_edits_shade_find(args: argparse.Namespace) -> int:
     """`trippy edits shade-find --bundle <dir> --scene <root> --frames a.jpg,b.jpg --out edits.json`."""
     from trippy.edit.shade_finder import find_shade_pointset_in_bundle
 
+    edits_path = Path(args.out)
+    edits = _load_or_create_edits(edits_path, args.bundle)
+
     frames = [name.strip() for name in args.frames.split(",") if name.strip()]
     try:
         region, summary = find_shade_pointset_in_bundle(
@@ -944,13 +946,12 @@ def _cmd_edits_shade_find(args: argparse.Namespace) -> int:
             mode=args.mode,
             rel_factor=args.rel_factor,
             name=args.name,
+            existing_names=[r.name for r in edits.regions],
         )
     except (ValueError, FileNotFoundError) as exc:
         print(f"trippy edits shade-find: {exc}", file=sys.stderr)
         return 2
 
-    edits_path = Path(args.out)
-    edits = _load_or_create_edits(edits_path, args.bundle)
     edits.add_region(region)
     edits.save(edits_path)
     print(json.dumps(summary, indent=2))
@@ -1043,6 +1044,9 @@ def _cmd_edits_sam(args: argparse.Namespace) -> int:
         """One progress line, flushed: the viewer reads these while it waits."""
         print(f"sam: {message}", flush=True)
 
+    edits_path = _resolve_edits_path(args.out, args.bundle)
+    edits = _load_or_create_edits(edits_path, args.bundle)
+
     try:
         region, summary = sam_lift(
             args.bundle,
@@ -1054,6 +1058,7 @@ def _cmd_edits_sam(args: argparse.Namespace) -> int:
             op=args.op,
             mix=args.mix,
             name=args.name,
+            existing_names=[r.name for r in edits.regions],
             cell_px=args.depth_cell_px,
             depth_tol=args.depth_tol,
             vote_fraction=args.vote_fraction,
@@ -1066,8 +1071,6 @@ def _cmd_edits_sam(args: argparse.Namespace) -> int:
         print(f"trippy edits sam: {exc}", file=sys.stderr)
         return 2
 
-    edits_path = _resolve_edits_path(args.out, args.bundle)
-    edits = _load_or_create_edits(edits_path, args.bundle)
     edits.add_region(region)
     edits.save(edits_path)
     summary["region_id"] = region.id
@@ -1182,6 +1185,9 @@ def _cmd_edits_click(args: argparse.Namespace) -> int:
     """
     from trippy.edit.cluster import click_to_cluster_in_bundle
 
+    edits_path = Path(args.out)
+    edits = _load_or_create_edits(edits_path, args.bundle)
+
     try:
         region, summary = click_to_cluster_in_bundle(
             args.bundle,
@@ -1196,17 +1202,135 @@ def _cmd_edits_click(args: argparse.Namespace) -> int:
             op=args.op,
             mix=args.mix,
             name=args.name,
+            existing_names=[r.name for r in edits.regions],
             preview_path=args.preview,
         )
     except (ValueError, FileNotFoundError, KeyError) as exc:
         print(f"trippy edits click: {exc}", file=sys.stderr)
         return 2
 
-    edits_path = Path(args.out)
-    edits = _load_or_create_edits(edits_path, args.bundle)
     edits.add_region(region)
     edits.save(edits_path)
     print(json.dumps(summary, indent=2))
+    return 0
+
+
+def _cmd_edits_add_brush(args: argparse.Namespace) -> int:
+    """`trippy edits add-brush --edits edits.json --cell-size C --center x y z --radius r`.
+
+    Creates a fresh `brush`-kind region (docs/EDITOR.md Sec 1) at `--origin`/
+    `--cell-size` and paints one sphere stroke into it
+    (`trippy.edit.model.paint_sphere`) -- the CLI-level equivalent of a
+    single brush-tool stroke, for scripting/testing without the viewer.
+    """
+    from trippy.edit.model import Region, auto_region_name, new_region_id, paint_sphere
+
+    edits_path = Path(args.edits)
+    edits = _load_or_create_edits(edits_path, args.bundle)
+    try:
+        region = Region(
+            id=new_region_id(),
+            name=args.name if args.name is not None else auto_region_name(
+                [r.name for r in edits.regions], "brush"
+            ),
+            kind="brush",
+            params={"origin": list(args.origin), "cell_size": args.cell_size, "cells": []},
+            mix=args.mix,
+            op=args.op,
+            source={"tool": "brush", "params": {"center": list(args.center), "radius": args.radius}},
+        )
+        region = paint_sphere(region, center=args.center, radius=args.radius, weight=args.weight)
+    except ValueError as exc:
+        print(f"trippy edits add-brush: {exc}", file=sys.stderr)
+        return 2
+    edits.add_region(region)
+    edits.save(edits_path)
+    print(json.dumps(region.to_json(), indent=2))
+    return 0
+
+
+def _cmd_edits_list(args: argparse.Namespace) -> int:
+    """`trippy edits list --edits edits.json`: print every region (Named Objects panel data)."""
+    from trippy.edit.model import EditDocument
+
+    edits_path = Path(args.edits)
+    if not edits_path.exists():
+        print(f"trippy edits list: no edits file at {edits_path}", file=sys.stderr)
+        return 2
+    edits = EditDocument.load(edits_path)
+    rows = [
+        {
+            "id": r.id,
+            "name": r.name,
+            "kind": r.kind,
+            "op": r.op,
+            "mix": r.mix,
+            "enabled": r.enabled,
+            "source": r.source,
+        }
+        for r in edits.regions
+    ]
+    print(json.dumps(rows, indent=2))
+    return 0
+
+
+def _cmd_edits_rename(args: argparse.Namespace) -> int:
+    """`trippy edits rename --edits edits.json --id r-XXXX --name "new name"`."""
+    from trippy.edit.model import EditDocument
+
+    edits_path = Path(args.edits)
+    if not edits_path.exists():
+        print(f"trippy edits rename: no edits file at {edits_path}", file=sys.stderr)
+        return 2
+    edits = EditDocument.load(edits_path)
+    try:
+        edits.update_region(args.region_id, name=args.name)
+    except KeyError as exc:
+        print(f"trippy edits rename: {exc}", file=sys.stderr)
+        return 2
+    edits.save(edits_path)
+    print(json.dumps(edits.regions_by_id[args.region_id].to_json(), indent=2))
+    return 0
+
+
+def _cmd_edits_toggle(args: argparse.Namespace) -> int:
+    """`trippy edits toggle --edits edits.json --id r-XXXX [--enabled on|off]`.
+
+    With no `--enabled`, flips the region's current state.
+    """
+    from trippy.edit.model import EditDocument
+
+    edits_path = Path(args.edits)
+    if not edits_path.exists():
+        print(f"trippy edits toggle: no edits file at {edits_path}", file=sys.stderr)
+        return 2
+    edits = EditDocument.load(edits_path)
+    region = edits.regions_by_id.get(args.region_id)
+    if region is None:
+        print(f"trippy edits toggle: no region {args.region_id!r}", file=sys.stderr)
+        return 2
+    new_enabled = (args.enabled == "on") if args.enabled is not None else (not region.enabled)
+    edits.update_region(args.region_id, enabled=new_enabled)
+    edits.save(edits_path)
+    print(json.dumps(edits.regions_by_id[args.region_id].to_json(), indent=2))
+    return 0
+
+
+def _cmd_edits_remove(args: argparse.Namespace) -> int:
+    """`trippy edits remove --edits edits.json --id r-XXXX`."""
+    from trippy.edit.model import EditDocument
+
+    edits_path = Path(args.edits)
+    if not edits_path.exists():
+        print(f"trippy edits remove: no edits file at {edits_path}", file=sys.stderr)
+        return 2
+    edits = EditDocument.load(edits_path)
+    if args.region_id not in edits.regions_by_id:
+        print(f"trippy edits remove: no region {args.region_id!r}", file=sys.stderr)
+        return 2
+    edits.remove_region(args.region_id)
+    edits.save(edits_path)
+    print(f"removed {args.region_id}")
     return 0
 
 
@@ -1906,7 +2030,7 @@ def build_parser() -> argparse.ArgumentParser:
     shade_find.add_argument("--conf-threshold", type=float, default=SHADE_PRUNE_DEFAULT_CONF_THRESHOLD)
     shade_find.add_argument("--mode", choices=POINT_REMOVAL_MODES, default=POINT_REMOVAL_DEFAULT_MODE)
     shade_find.add_argument("--rel-factor", type=float, default=POINT_REMOVAL_DEFAULT_REL_FACTOR)
-    shade_find.add_argument("--name", default="shade cloud", help="region name")
+    shade_find.add_argument("--name", default=None, help="region name (default: auto-numbered 'shade-clouds-<n>')")
     shade_find.add_argument("--out", required=True, help="edits.json to update (created if missing)")
     shade_find.set_defaults(func=_cmd_edits_shade_find)
 
@@ -1938,7 +2062,10 @@ def build_parser() -> argparse.ArgumentParser:
     sam.add_argument("--out", required=True, help="edits.json to update (created if missing)")
     sam.add_argument("--op", choices=EDIT_REGION_OPS, default=SAM_LIFT_DEFAULT_OP)
     sam.add_argument("--mix", type=float, default=SAM_LIFT_DEFAULT_MIX)
-    sam.add_argument("--name", default=None, help="region name (default: 'sam: <prompt>')")
+    sam.add_argument(
+        "--name", default=None,
+        help="region name (default: auto-numbered 'sam-<kind>[-<view stem>]-<n>')",
+    )  # fmt: skip
     sam.add_argument(
         "--device", choices=SAM3_DEVICES, default=SAM3_DEFAULT_DEVICE,
         help="SAM 3 device; mps is GPU work and only ever runs inside a scripts/gpu_submit.sh job",
@@ -2041,7 +2168,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--depth-gap-factor", type=float, default=CLICK_DEFAULT_DEPTH_GAP_FACTOR,
         help="multiplies max-radius to get the depth-mode gap threshold (nearest-surface seeding)",
     )  # fmt: skip
-    click.add_argument("--name", default=CLICK_DEFAULT_NAME, help="region name")
+    click.add_argument("--name", default=None, help="region name (default: auto-numbered 'click-<n>')")
     click.add_argument("--op", choices=EDIT_REGION_OPS, default=CLICK_DEFAULT_OP)
     click.add_argument("--mix", type=float, default=CLICK_DEFAULT_MIX)
     click.add_argument("--out", required=True, help="edits.json to update (created if missing)")
@@ -2051,6 +2178,51 @@ def build_parser() -> argparse.ArgumentParser:
         "(no photo content)",
     )  # fmt: skip
     click.set_defaults(func=_cmd_edits_click)
+
+    add_brush = edits_sub.add_parser(
+        "add-brush",
+        help="create a brush region and paint one sphere stroke into it",
+    )
+    add_brush.add_argument("--edits", required=True, help="edits.json to update (created if missing)")
+    add_brush.add_argument("--bundle", default=None, help="bundle dir, to stamp bundle_format if edits.json is new")
+    add_brush.add_argument("--origin", type=float, nargs=3, default=[0.0, 0.0, 0.0], metavar=("X", "Y", "Z"))
+    add_brush.add_argument("--cell-size", type=float, required=True, help="voxel edge length, world units")
+    add_brush.add_argument(
+        "--center", type=float, nargs=3, required=True, metavar=("X", "Y", "Z"),
+        help="centre of the first painted sphere stroke",
+    )  # fmt: skip
+    add_brush.add_argument("--radius", type=float, required=True, help="painted sphere radius, world units")
+    add_brush.add_argument("--weight", type=float, default=1.0, help="painted cell weight, in [0, 1]")
+    add_brush.add_argument("--name", default=None, help="region name (default: auto-numbered 'brush-<n>')")
+    add_brush.add_argument("--mix", type=float, default=1.0)
+    add_brush.add_argument("--op", choices=EDIT_REGION_OPS, default="delete")
+    add_brush.set_defaults(func=_cmd_edits_add_brush)
+
+    edits_list = edits_sub.add_parser(
+        "list", help="print every region in edits.json (id/name/kind/op/mix/enabled/source)"
+    )
+    edits_list.add_argument("--edits", required=True, help="edits.json to read")
+    edits_list.set_defaults(func=_cmd_edits_list)
+
+    edits_rename = edits_sub.add_parser("rename", help="rename a region")
+    edits_rename.add_argument("--edits", required=True, help="edits.json to update")
+    edits_rename.add_argument("--id", dest="region_id", required=True, help="region id (see 'trippy edits list')")
+    edits_rename.add_argument("--name", required=True, help="new name")
+    edits_rename.set_defaults(func=_cmd_edits_rename)
+
+    edits_toggle = edits_sub.add_parser("toggle", help="enable/disable a region")
+    edits_toggle.add_argument("--edits", required=True, help="edits.json to update")
+    edits_toggle.add_argument("--id", dest="region_id", required=True, help="region id (see 'trippy edits list')")
+    edits_toggle.add_argument(
+        "--enabled", choices=["on", "off"], default=None,
+        help="set explicitly; default: flip the region's current state",
+    )  # fmt: skip
+    edits_toggle.set_defaults(func=_cmd_edits_toggle)
+
+    edits_remove = edits_sub.add_parser("remove", help="remove a region")
+    edits_remove.add_argument("--edits", required=True, help="edits.json to update")
+    edits_remove.add_argument("--id", dest="region_id", required=True, help="region id (see 'trippy edits list')")
+    edits_remove.set_defaults(func=_cmd_edits_remove)
 
     leaderboard = sub.add_parser(
         "leaderboard",

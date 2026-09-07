@@ -26,7 +26,8 @@
           0.0,
           0.3826834323650898
         ]
-      }
+      },
+      "source": null
     },
     {
       "id": "r-sph0002",
@@ -42,7 +43,8 @@
           3.5
         ],
         "radius": 1.1
-      }
+      },
+      "source": null
     },
     {
       "id": "r-lid0003",
@@ -66,7 +68,8 @@
         "radius": 1.6,
         "falloff": 0.8,
         "band": 0.9
-      }
+      },
+      "source": null
     },
     {
       "id": "r-pts0004",
@@ -102,7 +105,8 @@
           374,
           391
         ]
-      }
+      },
+      "source": null
     },
     {
       "id": "r-off0006",
@@ -118,7 +122,8 @@
           4.0
         ],
         "radius": 10.0
-      }
+      },
+      "source": null
     },
     {
       "id": "r-del0005",
@@ -138,7 +143,8 @@
           1.5,
           1.4
         ]
-      }
+      },
+      "source": null
     }
   ],
   "order": [
@@ -178,7 +184,8 @@
               0.0,
               0.3826834323650898
             ]
-          }
+          },
+          "source": null
         },
         "index": null
       },
@@ -198,7 +205,8 @@
               3.5
             ],
             "radius": 1.1
-          }
+          },
+          "source": null
         },
         "index": null
       },
@@ -226,7 +234,8 @@
             "radius": 1.6,
             "falloff": 0.8,
             "band": 0.9
-          }
+          },
+          "source": null
         },
         "index": null
       },
@@ -266,7 +275,8 @@
               374,
               391
             ]
-          }
+          },
+          "source": null
         },
         "index": null
       },
@@ -290,7 +300,8 @@
               1.5,
               1.4
             ]
-          }
+          },
+          "source": null
         },
         "index": null
       },
@@ -310,7 +321,8 @@
               4.0
             ],
             "radius": 10.0
-          }
+          },
+          "source": null
         },
         "index": null
       },

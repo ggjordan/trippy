@@ -9,7 +9,12 @@ Purpose: the E1/E2 acceptance check that `trippy apply-edits` and the Rust
     `trippy.edit.weights` composes from them, a shade-frame sidecar plus
     the selection `trippy.train.prune`'s own rule makes from it, and (E4)
     a structured click scene plus the `pointset` `trippy.edit.cluster.
-    click_to_cluster` grows from three clicks in it.
+    click_to_cluster` grows from three clicks in it. `brush.json`
+    (`build_brush_fixture`) is a SEPARATE, self-contained fixture for the
+    `brush` region kind (Python-side only today, docs/EDITOR.md Sec 1) --
+    recorded now so a future Rust `edit::brush` module has a parity target
+    from day one, the same "write it before the twin exists" posture the
+    click fixture's own history follows.
 Invariants:
     - SYNTHETIC ONLY. Every array comes from a seeded
       `numpy.random.Generator`; nothing here reads a photograph, a
@@ -63,15 +68,25 @@ from trippy.constants import (
     SHADE_PRUNE_DEFAULT_ZNEAR_FRAC,
 )
 from trippy.edit.cluster import CameraView, click_to_cluster
-from trippy.edit.model import EditDocument, Region
+from trippy.edit.model import (
+    EditDocument,
+    Region,
+    erase,
+    paint_along,
+    paint_sphere,
+    region_contains,
+    region_weight,
+)
 from trippy.edit.weights import compose_gaussian_weights, compose_trips_weights
 from trippy.render.bundle import BUNDLE_FORMAT
 from trippy.train import prune
 
 __all__ = [
+    "BRUSH_FIXTURE_FORMAT",
     "CLICK_FIXTURE_FORMAT",
     "GOLDEN_FIXTURE_DIR",
     "SHADE_VIEWS_FORMAT",
+    "build_brush_fixture",
     "build_click_fixture",
     "build_golden_fixture",
     "write_golden_fixture",
@@ -112,6 +127,19 @@ _CLICK_SEED = 20260908
 #: Points per blob in the click scene, and in the scatter around them.
 _CLICK_BLOB_POINTS = 100
 _CLICK_SCATTER_POINTS = 120
+
+#: `"format"` of the brush fixture, matching `trips_viewer::edit::brush::
+#: BRUSH_FIXTURE_FORMAT` (the future Rust twin -- brush is Python-side only
+#: today, docs/EDITOR.md Sec 1 "brush").
+BRUSH_FIXTURE_FORMAT = "trippy-edit-brush-1"
+
+#: Seed for the brush query-point grid. Deliberately its own seed (like the
+#: click fixture's `_CLICK_SEED`): a small deterministic grid unrelated to
+#: the weight/shade fixture's uniform cloud.
+_BRUSH_SEED = 20260909
+_BRUSH_QUERY_POINTS = 60
+_BRUSH_ORIGIN = (0.0, 0.0, 0.0)
+_BRUSH_CELL_SIZE = 0.5
 
 
 def _floats(array: np.ndarray) -> list[float]:
@@ -571,6 +599,76 @@ def build_click_fixture() -> dict[str, dict[str, Any]]:
     }
 
 
+def _brush_region() -> Region:
+    """A `brush` Region built through `paint_sphere`/`paint_along`/`erase` -- never a hand-written cell list.
+
+    Exercises all three authoring helpers in sequence (paint a sphere, paint
+    a 3-point stroke at a lower weight, erase part of the result), so a Rust
+    twin has to reproduce the SAME box-sphere voxelisation and "erase wins
+    outright" rule those helpers implement, not merely replay a fixed set of
+    occupied cells.
+    """
+    region = Region(
+        id="r-brush01",
+        name="brush test",
+        kind="brush",
+        params={"origin": list(_BRUSH_ORIGIN), "cell_size": _BRUSH_CELL_SIZE, "cells": []},
+        mix=1.0,
+        op="delete",
+    )
+    region = paint_sphere(region, center=(1.0, 0.0, 4.0), radius=0.9)
+    region = paint_along(
+        region, points=[(1.0, 0.0, 4.0), (1.6, 0.0, 4.0), (2.2, 0.0, 4.0)], radius=0.4, weight=0.6
+    )
+    # Erases only PART of the stroke's own graded (0.6-weight) cells, so the fixture's
+    # final region still carries a real `weights` array (not all-1.0, which `paint_sphere`'s
+    # own "omit an all-ones array" canonicalisation would otherwise collapse to `None`)
+    # -- a Rust twin must reproduce the graded lookup, not just a plain occupied set.
+    region = erase(region, center=(2.1, 0.0, 4.0), radius=0.15)
+    return region
+
+
+def _brush_query_points() -> np.ndarray:
+    """A small deterministic grid spanning inside/edge/outside the painted brush."""
+    rng = np.random.default_rng(_BRUSH_SEED)
+    grid = np.stack(
+        [
+            rng.uniform(-0.5, 3.0, _BRUSH_QUERY_POINTS),
+            rng.uniform(-1.0, 1.0, _BRUSH_QUERY_POINTS),
+            rng.uniform(3.0, 5.0, _BRUSH_QUERY_POINTS),
+        ],
+        axis=1,
+    )
+    return grid.astype(np.float32).astype(np.float64)
+
+
+def build_brush_fixture() -> dict[str, dict[str, Any]]:
+    """The brush half of the fixture: a painted/erased region, and its own per-point weights.
+
+    A single self-contained file (`brush.json`), independent of the
+    weight/click fixtures above -- the brush region kind is Python-side only
+    today (docs/EDITOR.md Sec 1), so this is recorded for the Rust twin to
+    match LATER rather than merged into the main `edits.json`/
+    `expected_weights.json` pair.
+
+    Returns:
+        `{"brush.json": {...}}`.
+    """
+    region = _brush_region()
+    xyz = _brush_query_points()
+    weight = region_weight(region, xyz)
+    contains = region_contains(region, xyz)
+    return {
+        "brush.json": {
+            "format": BRUSH_FIXTURE_FORMAT,
+            "region": region.to_json(),
+            "xyz": _floats(xyz),
+            "expected_weight": _floats(weight),
+            "expected_contains": [bool(v) for v in contains],
+        }
+    }
+
+
 def build_golden_fixture() -> dict[str, dict[str, Any]]:
     """Compute every file of the fixture, without writing anything.
 
@@ -633,6 +731,7 @@ def build_golden_fixture() -> dict[str, dict[str, Any]]:
             "dark_mass_fraction": float(stats["dark_mass_fraction"]),
         },
         **build_click_fixture(),
+        **build_brush_fixture(),
     }
 
 

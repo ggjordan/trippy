@@ -35,7 +35,22 @@ half is `src/edit/sam.rs` (the render-pixel -> view-pixel mapping),
 lift` tool in `src/edit_ui.rs`; see §3's "5. The SAM tool in the viewer".
 
 Not built: the 3D drag gizmos (E1 shipped Inspector fields + keyboard
-nudge/resize instead), E3's lid gizmo, and the `brush`-kind voxel region.
+nudge/resize instead), E3's lid gizmo, and the viewer's own brush tool /
+Named Objects panel (see the next Status line -- the `brush`-kind region
+and the naming convention it needs are now Python-side implemented).
+
+Status: **brush regions, named regions, and the `trippy eval --edits` gate
+gap are done on the Python side** (2026-09-07). `trippy/edit/model.py`
+adds `brush`-kind regions (`brush_membership`, `paint_sphere`/
+`paint_along`/`erase`, an `.npz` sidecar for a large brush -- §1's `brush`
+entry) and `Region.source` + `auto_region_name` (§1's "Named regions");
+`shade_finder.py`/`cluster.py`/`sam_lift.py` fill both on every region they
+produce; `trippy edits add-brush` and `edits list/rename/toggle/remove`
+are the new CLI. `trippy.train.trainer.Trainer.evaluate` now applies the
+gate-suppression multiply too, closing §5's own documented gap. The Rust
+viewer's brush tool and Named Objects panel are not built -- this document
+remains the spec for that work; `tests/fixtures/synthetic/edit_golden/
+brush.json` is the parity fixture waiting for it.
 
 Three implementation notes, all explained where they matter below:
 tools' UI/ray-cast half, §4's UI) is **not implemented** -- this document
@@ -210,6 +225,27 @@ ADR-0006-viewer-integration.md` "Performance levers are render parameters").
 | `mix` | float `[0,1]` | `0` = pure splat, `1` = pure TRIPS, per the brief's convention |
 | `op` | `blend \| delete \| fade` | see below |
 | `enabled` | bool | soft "off" without deleting the region |
+| `source` | `{"tool": str, ...}` or `null` | which tool made this region and with what prompt/parameters (`trippy.edit.model.Region.source`, "Named regions" below); `null` for a hand-authored region |
+
+**Named regions.** A tool-authored region (the shade-cloud finder,
+click-to-cluster, the SAM-3 lift, the brush) that receives no explicit
+`name` from its caller is auto-named `"<tool>[-<detail>]-<n>"`
+(`trippy.edit.model.auto_region_name`): `click-1`, `sam-box-IMG_3703-2`,
+`shade-clouds-3`, `brush-4`. `n` is one more than the highest `-<digits>`
+suffix among the document's OWN region names (from ANY tool, not just this
+one), so a session's tool-authored regions read as one continuously
+numbered list in a future Named Objects panel regardless of which tool
+made each one — and the scheme is stateless (no counter stored anywhere),
+so it self-heals after a region is renamed, removed, or the edit undone.
+`source` is the companion field: it never affects membership or
+composition, only display/provenance, and is filled by
+`trippy.edit.shade_finder`/`trippy.edit.cluster`/`trippy.edit.sam_lift`
+alongside the name. `trippy edits list/rename/toggle/remove --edits
+edits.json` is the CLI a Named Objects panel can already script against
+(`list` prints every region's `id`/`name`/`kind`/`op`/`mix`/`enabled`/
+`source`; `rename`/`toggle`/`remove` mutate one by `id`, through the same
+undo-logged `EditDocument` mutation methods the viewer will eventually
+call directly).
 
 `kind`-specific `params`:
 
@@ -225,8 +261,39 @@ ADR-0006-viewer-integration.md` "Performance levers are render parameters").
 - `brush`: a sparse voxel grid — `origin: [x,y,z]`, `cell_size: f32`,
   `cells: [[i,j,k], ...]` (occupied cell indices; a set, not a dense array,
   because a brushed region is typically a tiny fraction of the scene's
-  bounding volume). Painted incrementally by the brush tool (§3); not one of
-  E1's two shipped kinds (box/sphere) — tracked for later.
+  bounding volume), and an optional `weights: [f32, ...]` parallel to
+  `cells` (one weight per occupied cell, default `1.0` for every cell when
+  omitted — a plain, ungraded brush is the common case). **Python side
+  implemented** (`trippy.edit.model.brush_membership`: a point's own voxel,
+  `floor((p - origin) / cell_size)`, looked up in the occupied set;
+  `region_weight`/`region_contains` dispatch to it exactly like every other
+  kind, so `trippy.edit.weights`/`apply`/`checkpoint` needed no
+  brush-specific code at all — "it is just another membership"). Painted by
+  `paint_sphere(region, center, radius, weight=1.0)` and
+  `paint_along(region, points, radius, weight=1.0)` (a stroke: the union of
+  `paint_sphere` at every point of a path) — both a box-sphere intersection
+  test against every voxel in the sphere's bounding box, so a stroke paints
+  every cell the sphere actually OVERLAPS, not merely voxels whose centre
+  falls inside it; repeated painting only ever strengthens a cell
+  (`max(existing, weight)`). `erase(region, center, radius)` is the inverse,
+  dropping every touched cell outright. All three are pure functions
+  (return a NEW `Region`, never mutate their input), matching every other
+  membership test in `trippy.edit.model`. `EditDocument.save` externalises
+  a brush region's `cells`/`weights` into an `.npz` sidecar
+  (`edits_brush_<id>.npz`) once it exceeds
+  `EDIT_BRUSH_NPZ_CELL_THRESHOLD` cells — in the WRITTEN copy of
+  `regions[]` only; Python's own loader never reads the sidecar back (it
+  always reconstructs a region by replaying `undo_stack.log`, which is
+  never externalised), so this only matters to an external reader (the Rust
+  viewer) loading the materialised region list directly. CLI:
+  `trippy edits add-brush` (one region + one sphere stroke).
+  `tests/fixtures/synthetic/edit_golden/brush.json`
+  (`trippy.edit.golden.build_brush_fixture`) exercises `paint_sphere`,
+  `paint_along` and `erase` in sequence and records the resulting per-point
+  weights, as the parity target for a future Rust `edit::brush`. **Not
+  built**: the viewer's own brush tool (drag-to-paint on the render) and
+  its Inspector affordances — this is the Rust follow-up §3/§4 still spec,
+  not implemented.
 - `lid`: `up`, `height`, `center`, `radius`, `falloff`, `band` — **the same
   six numbers as `~/Splats/tools/SURFACE_LID.md`'s `--lid-*` flags**, so the
   Karekare pool's already-fitted values
@@ -906,12 +973,22 @@ first-class output in the Python renderer today, so the per-point weight
 is splatted as an auxiliary feature channel through `render_pyramid` and
 read back from level 0 — the exact same alpha-compositing trick §2
 documents for colour, applied to one more channel instead of a new kernel.
-This gate-suppression step only runs inside `trippy.render.candidate.
+This gate-suppression step runs inside `trippy.render.candidate.
 render_candidate` (`candidate-report`, and by extension `trippy distill
---stage render`'s own per-pose renders); `trippy eval`'s render path
-(`Trainer.evaluate`) applies the keep-mask deletion but not the gate
-multiply — a documented gap (`trippy.edit.checkpoint`'s own module
-docstring), not a silent one.
+--stage render`'s own per-pose renders) AND inside `Trainer.evaluate`
+itself (`trippy eval --edits`, `trippy.train.eval.evaluate_checkpoint`) —
+**previously a documented gap** (`trippy eval`'s render path applied the
+keep-mask deletion but not the gate multiply), **closed 2026-09-07**:
+`Trainer.evaluate` now calls `trippy.edit.checkpoint.render_edit_weight_map`
+itself, right after splitting the gate off the network output and before
+`apply_gate`, exactly where `render_candidate` already did. The non-edit
+path is unchanged bit-for-bit — `render_edit_weight_map` returns `None`
+whenever `apply_edits_to_trainer` was never called or found nothing to
+suppress, so an unedited `trippy eval` takes the exact code path it always
+did (`tests/test_train_eval.py`: an empty `edits.json` reproduces the
+baseline metrics exactly; a `delete` region still changes PSNR by removing
+points; a `fade`/`blend` region now ALSO measurably lowers the reported
+gate mean).
 
 `apply-edits` and `--edits` are additive to the pipeline order that already
 exists (train → export/distill), not a new stage inserted into training —
@@ -929,7 +1006,7 @@ schedule.
 | **E5** | SAM 3 lift: photo segmentation, multi-view projection + majority vote, `pointset` region output | 2–3 wk | Segmenting an object in 2–3 registered views of the same scene produces one `pointset` region that, previewed, highlights that object and not its neighbours; runs entirely local (no image leaves the machine) | Not started. |
 | **E4** | Click-to-cluster: ray cast + k-d tree + k-NN growth in world+colour space, radius slider | 3 d | Clicking a point-cloud cluster selects a `pointset` region that visibly matches the clicked object's extent, without needing a depth buffer | Not started. |
 | **E5** | SAM 3 lift: photo segmentation, multi-view projection + majority vote, `pointset` region output | 2–3 wk | Segmenting an object in 2–3 registered views of the same scene produces one `pointset` region that, previewed, highlights that object and not its neighbours; runs entirely local (no image leaves the machine) | **Shipped, both sides.** Python: `trippy/edit/sam_lift.py`, `trippy/edit/sam_runner.py`, `trippy edits sam` (§3's "Implemented" note has the command, the depth-gate and the vote rules). Viewer: the `SAM 3 lift` tool — drag a box or Alt-click on the render while pinned to a capture view, one `trippy edits sam` child with live progress and a Cancel button, and the region imported through the undo log and tinted (§3's "5. The SAM tool in the viewer"). SAM 3 runs locally in a subprocess under Splats' SAM venv, on CPU (~9 s/view) or MPS; the whole path is CPU-testable and screenshottable with `--fake` / `TRIPPY_SAM_FAKE=1`, which needs no checkpoint and no GPU (`tests/test_edit_sam.py`, `trips-viewer --sam-box`). Not built: batching several views into ONE child (each view still pays a model load, `docs/LIMITATIONS.md`), and any per-point clean-up of the returned selection. |
-| **E6** | Publish path: `trippy apply-edits`, TRIPS `export.ply` mask wiring, distilled-splat publish order (edit-then-distil for pointset regions, geometry-reapply for box/sphere/lid) | 3 d | `trippy apply-edits --target both` on a bundle with a mix of region kinds produces a TRIPS PLY with the deleted points absent and, after a `trippy distill` run on the same edited bundle, a distilled PLY that also lacks them; a box/sphere/lid region re-applied directly to an already-distilled PLY (no re-distillation) also removes the matching geometry | **Done** (`trippy/edit/apply.py`, `trippy/edit/checkpoint.py`): `--target trips\|distilled\|both` (default `both`); `trips`/`both` write the filtered TRIPS `points.npz`/`blend_weights.npy`/`export.ply` and, if named, a filtered `blend.splat_ply`; `distilled`/`both` (with `--distilled-ply`) re-apply box/sphere/lid regions to an already-distilled PLY as delete/opacity-scale-fade; `--edits` wired into `trippy distill --stage render` (edit-then-distil ordering) and into `trippy candidate-report`/`trippy eval` (checkpoint-side keep mask + gate suppression on gate-hybrid checkpoints, `candidate-report` only — see §5's own paragraph for the `eval` gap). |
+| **E6** | Publish path: `trippy apply-edits`, TRIPS `export.ply` mask wiring, distilled-splat publish order (edit-then-distil for pointset regions, geometry-reapply for box/sphere/lid) | 3 d | `trippy apply-edits --target both` on a bundle with a mix of region kinds produces a TRIPS PLY with the deleted points absent and, after a `trippy distill` run on the same edited bundle, a distilled PLY that also lacks them; a box/sphere/lid region re-applied directly to an already-distilled PLY (no re-distillation) also removes the matching geometry | **Done** (`trippy/edit/apply.py`, `trippy/edit/checkpoint.py`): `--target trips\|distilled\|both` (default `both`); `trips`/`both` write the filtered TRIPS `points.npz`/`blend_weights.npy`/`export.ply` and, if named, a filtered `blend.splat_ply`; `distilled`/`both` (with `--distilled-ply`) re-apply box/sphere/lid regions to an already-distilled PLY as delete/opacity-scale-fade; `--edits` wired into `trippy distill --stage render` (edit-then-distil ordering) and into `trippy candidate-report`/`trippy eval` (checkpoint-side keep mask + gate suppression on gate-hybrid checkpoints, BOTH commands as of 2026-09-07 — see §5's own paragraph). |
 
 **Three deviations worth naming.** (1) The preview highlight is not a fourth
 `ViewMode`: it is a copy of the point cloud with the selection's first three
@@ -947,8 +1024,12 @@ from the bundle's own points and **says so in the panel**.
 
 E1 already includes undo/save per the brief; E2–E5 add tool-specific
 selection UI on top of the E1 data model and do not need to repeat undo/save
-plumbing. `brush`-kind (voxel) regions and splat-side weight compositing
-(§2's "splat side" bullet) are not in any milestone above — see §7.
+plumbing. `brush`-kind (voxel) regions are Python-side implemented (§1's
+`brush` entry) but not in any milestone above — the viewer's own brush tool
+(drag-to-paint on the render) is Rust follow-up work, tracked here rather
+than given its own "E" number since it is additive to E1's data model in
+the same way E2–E5 are. Splat-side weight compositing (§2's "splat side"
+bullet) is also not in any milestone above — see §7.
 
 ## 7. Risks
 

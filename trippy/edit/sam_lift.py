@@ -91,7 +91,7 @@ from trippy.constants import (
     SAM_LIFT_PREVIEW_LOW_RGB,
     SAM_LIFT_VOTE_FRACTION,
 )
-from trippy.edit.model import Region, new_region_id
+from trippy.edit.model import Region, auto_region_name, new_region_id
 from trippy.edit.sam_runner import SamPrompt
 
 __all__ = [
@@ -679,6 +679,7 @@ def sam_lift(
     op: str = SAM_LIFT_DEFAULT_OP,
     mix: float = SAM_LIFT_DEFAULT_MIX,
     name: str | None = None,
+    existing_names: Any = (),
     region_id: str | None = None,
     cell_px: int = SAM_LIFT_DEPTH_CELL_PX,
     depth_tol: float = SAM_LIFT_DEPTH_TOL,
@@ -703,7 +704,13 @@ def sam_lift(
         views_around: how many neighbouring capture views also get
             segmented and vote (0 = the prompted view alone).
         op, mix: the Region's action (docs/EDITOR.md Sec 1).
-        name: Region name; defaults to "sam: <prompt>".
+        name: Region name. `None` (the default) auto-names the region
+            `"sam-<prompt kind>-<view stem>-<n>"` (`trippy.edit.model.
+            auto_region_name`, docs/EDITOR.md Sec 1 "Named regions"), e.g.
+            `"sam-box-IMG_3703-2"`.
+        existing_names: the target document's current region names, used
+            ONLY to number the auto name above; ignored when `name` is
+            given explicitly.
         region_id: stable id (default: a fresh `new_region_id()`).
         cell_px, depth_tol: the depth gate (`depth_mode_keep`).
         vote_fraction: fraction of a point's *eligible* views that must
@@ -845,14 +852,24 @@ def sam_lift(
         f"vote over {len(per_view)} view(s): {len(point_ids)} of {xyz.shape[0]} points selected"
     )
 
+    resolved_name = name if name is not None else auto_region_name(
+        existing_names, f"sam-{prompt.kind}", detail=Path(primary.name).stem
+    )
     region = Region(
         id=region_id or new_region_id(),
-        name=name or f"sam: {prompt.text or prompt.kind}",
+        name=resolved_name,
         kind="pointset",
         params={"point_ids": point_ids},
         mix=float(mix),
         op=op,
         enabled=True,
+        source={
+            "tool": "sam",
+            "prompt": prompt.to_json(),
+            "view": primary.name,
+            "views_around": int(views_around),
+            "vote_fraction": float(vote_fraction),
+        },
     )
 
     summary: dict[str, Any] = {

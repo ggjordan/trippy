@@ -25,6 +25,13 @@ Invariants:
       and `from_json` cross-checks the two agree -- "closing and reopening
       the bundle preserves undo history" (docs/EDITOR.md Sec 1) means both
       halves of the file must actually agree, not merely both be present.
+      ONE exception: `save()` externalises a large `brush` region's `cells`/
+      `weights` into an `.npz` sidecar in the WRITTEN copy of `regions[]`
+      only (`EditDocument._externalize_brush`, see `EDIT_BRUSH_NPZ_CELL_
+      THRESHOLD`'s comment) -- `self.log`/`self.regions` in memory, and
+      therefore `to_json()` itself, stay fully literal; only a caller that
+      re-parses the WRITTEN FILE's `regions[]` (the Rust viewer; Python's own
+      `load()` does not, see below) ever sees the reference form.
     - `box`'s `params` are `center`/`half_extents`/`quat` (an oriented box),
       a superset of docs/EDITOR.md Sec 1's axis-aligned `min`/`max`
       (identity quat recovers an axis-aligned box exactly) -- the task
@@ -41,6 +48,36 @@ Invariants:
       `~/Splats/tools/SURFACE_LID.md`'s training-time penalty uses
       (`band_i`, `region_i`) -- see `lid_membership`'s own docstring for
       the formula and why it is mirrored, not copied verbatim.
+    - `brush`'s membership (`brush_membership`) is a plain voxel lookup: a
+      point's own cell (`floor((p - origin) / cell_size)`) either is or is
+      not in the region's `cells` set, and the returned weight is that
+      cell's own `weights` entry (default `1.0` when the region carries no
+      `weights` at all). `region_weight`/`region_contains` dispatch to it
+      exactly like every other kind (`region_contains` falls back to
+      `region_weight(...) > 0`, brush needs no lid-style hard/graded split)
+      -- `trippy.edit.weights`/`trippy.edit.apply`/`trippy.edit.checkpoint`
+      therefore need NO brush-specific code at all, per this task's brief
+      ("it is just another membership"). `paint_sphere`/`paint_along`/
+      `erase` are the authoring helpers a brush tool calls; each returns a
+      NEW `Region` (this module's functions are pure, like every membership
+      test above) with `cells`/`weights` updated by a box-sphere
+      intersection test against every voxel in the sphere's bounding box
+      (`_sphere_touched_cells`), not merely voxels whose CENTRE falls inside
+      the sphere -- so a brush stroke paints every cell the sphere actually
+      overlaps, matching what a person watching the stroke would expect.
+    - `Region.source` (`{"tool": str, ...}` or `None`) records which tool
+      produced a region and with what prompt/parameters, purely for display
+      (a future Named Objects panel) and provenance -- it plays no part in
+      any membership test or composition. `auto_region_name` is the sibling
+      naming convention (docs/EDITOR.md Sec 1 "Named regions"): a tool that
+      does not receive an explicit name from its caller gets
+      `"<tool>[-<detail>]-<n>"`, `n` one more than the highest existing
+      `-<digits>` suffix among the document's OWN region names -- so a
+      session's tool-authored regions read as one continuously numbered
+      list (`click-1`, `sam-box-IMG_3703-2`, `shade-clouds-3`, `brush-4`)
+      regardless of which tool made each one, and the scheme self-heals
+      after a region is removed or undone (it is derived from whatever
+      names currently exist, never a counter stored anywhere).
 Units: world units (COLMAP world frame, docs/GEOMETRY.md); `mix` is
     dimensionless in [0, 1] (0 = pure splat, 1 = pure TRIPS).
 Related docs: docs/EDITOR.md Sec 1 "Data model"; docs/decisions/
@@ -51,6 +88,7 @@ Related docs: docs/EDITOR.md Sec 1 "Data model"; docs/decisions/
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -59,6 +97,10 @@ from typing import Any
 import numpy as np
 
 from trippy.constants import (
+    EDIT_AUTO_NAME_COUNTER_PATTERN,
+    EDIT_BRUSH_CELL_INT32_ABS_MAX,
+    EDIT_BRUSH_NPZ_CELL_THRESHOLD,
+    EDIT_BRUSH_NPZ_FILENAME_FMT,
     EDIT_FORMAT,
     EDIT_REGION_ID_HEX_LEN,
     EDIT_REGION_KINDS,
@@ -68,9 +110,14 @@ from trippy.constants import (
 __all__ = [
     "EditDocument",
     "Region",
+    "auto_region_name",
     "box_membership",
+    "brush_membership",
+    "erase",
     "lid_membership",
     "new_region_id",
+    "paint_along",
+    "paint_sphere",
     "pointset_membership",
     "region_contains",
     "region_weight",
@@ -148,11 +195,32 @@ def _validate_pointset_params(params: dict[str, Any]) -> None:
         raise ValueError("pointset.point_ids must all be >= 0")
 
 
+def _validate_brush_params(params: dict[str, Any]) -> None:
+    _as_vec(params.get("origin"), 3, "brush.origin")
+    _positive(params.get("cell_size"), "brush.cell_size")
+    cells = params.get("cells")
+    if cells is None or not isinstance(cells, (list, tuple)):
+        raise ValueError(f"brush.cells must be a list, got {cells!r}")
+    cells_arr = _brush_cells_array(cells)
+    if cells_arr.size and np.any(np.abs(cells_arr) > EDIT_BRUSH_CELL_INT32_ABS_MAX):
+        raise ValueError(f"brush.cells must fit in a signed int32 (|i| <= {EDIT_BRUSH_CELL_INT32_ABS_MAX})")
+    weights = params.get("weights")
+    if weights is not None:
+        if not isinstance(weights, (list, tuple)):
+            raise ValueError(f"brush.weights must be a list, got {weights!r}")
+        w = np.asarray(weights, dtype=np.float64) if weights else np.zeros(0, dtype=np.float64)
+        if w.shape != (cells_arr.shape[0],):
+            raise ValueError(f"brush.weights must have one entry per cell ({cells_arr.shape[0]}), got {len(weights)}")
+        if w.size and (np.any(w < 0.0) or np.any(w > 1.0) or not np.all(np.isfinite(w))):
+            raise ValueError("brush.weights must all be finite numbers in [0, 1]")
+
+
 _PARAM_VALIDATORS = {
     "box": _validate_box_params,
     "sphere": _validate_sphere_params,
     "lid": _validate_lid_params,
     "pointset": _validate_pointset_params,
+    "brush": _validate_brush_params,
 }
 
 
@@ -187,10 +255,16 @@ class Region:
             multiplies the running weight rather than replacing it --
             `trippy.edit.weights`).
         enabled: soft "off" without deleting the region.
+        source: `{"tool": str, ...}` or `None` -- which tool produced this
+            region (and, e.g., its prompt/parameters), for a future Named
+            Objects panel; `None` for a hand-authored region (`trippy edits
+            add-box`/`add-sphere`/`add-lid`/`add-brush`). Never read by any
+            membership test or composition (module docstring).
 
     Raises:
         ValueError: `kind`/`op` unrecognised, `mix` outside `[0, 1]`, `id`
-            empty, or `params` fails the kind's own shape/range checks.
+            empty, `source` neither a dict nor `None`, or `params` fails
+            the kind's own shape/range checks.
     """
 
     id: str
@@ -200,6 +274,7 @@ class Region:
     mix: float = 1.0
     op: str = "blend"
     enabled: bool = True
+    source: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if not self.id:
@@ -210,6 +285,8 @@ class Region:
             raise ValueError(f"Region.op must be one of {EDIT_REGION_OPS}, got {self.op!r}")
         if not (0.0 <= float(self.mix) <= 1.0):
             raise ValueError(f"Region.mix must be in [0, 1], got {self.mix!r}")
+        if self.source is not None and not isinstance(self.source, dict):
+            raise ValueError(f"Region.source must be a dict or None, got {self.source!r}")
         self.mix = float(self.mix)
         self.enabled = bool(self.enabled)
         _PARAM_VALIDATORS[self.kind](self.params)
@@ -224,11 +301,13 @@ class Region:
             "mix": float(self.mix),
             "op": self.op,
             "params": dict(self.params),
+            "source": dict(self.source) if self.source is not None else None,
         }
 
     @staticmethod
     def from_json(doc: dict[str, Any]) -> Region:
         """Inverse of `to_json`. Raises `ValueError`/`KeyError` on a malformed entry."""
+        source = doc.get("source")
         return Region(
             id=doc["id"],
             name=doc.get("name", ""),
@@ -237,6 +316,7 @@ class Region:
             mix=float(doc.get("mix", 1.0)),
             op=doc.get("op", "blend"),
             enabled=bool(doc.get("enabled", True)),
+            source=dict(source) if source is not None else None,
         )
 
 
@@ -410,6 +490,306 @@ def pointset_membership(n_points: int, point_ids: Any) -> np.ndarray:
     return weight
 
 
+def _brush_cells_array(cells: Any) -> np.ndarray:
+    """`cells` (a list of `[i, j, k]`) -> `(M, 3)` int64, `(0, 3)` if empty."""
+    if not len(cells):
+        return np.zeros((0, 3), dtype=np.int64)
+    arr = np.asarray(cells, dtype=np.int64).reshape(-1, 3)
+    return arr
+
+
+#: Structured dtype three int64 fields are viewed as to sort/search a voxel-cell
+#: set as ONE key. numpy compares a structured/void array FIELD BY FIELD (like a
+#: Python tuple), not byte-by-byte, so this sorts and searches correctly even
+#: though `i`/`j`/`k` may be negative -- verified directly (`np.sort`/
+#: `np.searchsorted` on a signed structured array agree with sorting the plain
+#: `(i, j, k)` tuples).
+_BRUSH_CELL_KEY_DTYPE = np.dtype([("i", np.int64), ("j", np.int64), ("k", np.int64)])
+
+
+def _brush_cell_key(idx: np.ndarray) -> np.ndarray:
+    """`(N, 3)` int64 -> `(N,)` structured keys, one per row (see `_BRUSH_CELL_KEY_DTYPE`)."""
+    return np.ascontiguousarray(idx, dtype=np.int64).view(_BRUSH_CELL_KEY_DTYPE).reshape(-1)
+
+
+def _brush_voxel_index(xyz: np.ndarray, origin: Any, cell_size: float) -> np.ndarray:
+    """World-space `(N, 3)` -> `(N, 3)` int64 voxel index, `floor((p - origin) / cell_size)`."""
+    xyz = np.asarray(xyz, dtype=np.float64)
+    origin = np.asarray(origin, dtype=np.float64).reshape(3)
+    return np.floor((xyz - origin) / float(cell_size)).astype(np.int64)
+
+
+def _brush_sorted_lookup(cells: Any, weights: Any) -> tuple[np.ndarray, np.ndarray]:
+    """De-duplicated (last entry wins), sorted `(keys, weights)` for `cells`/`weights`.
+
+    A region's `cells` list is a SET in spirit (docs/EDITOR.md Sec 1), but
+    nothing stops a hand-edited file or an authoring helper from repeating a
+    cell; the LAST occurrence wins, matching `EditDocument`'s own
+    "later entries win" ordering convention (Sec 1 "Ordering and overlap").
+    """
+    cells_arr = _brush_cells_array(cells)
+    if cells_arr.shape[0] == 0:
+        return np.zeros(0, dtype=_BRUSH_CELL_KEY_DTYPE), np.zeros(0, dtype=np.float64)
+    w = np.asarray(weights, dtype=np.float64).reshape(-1) if weights is not None else np.ones(cells_arr.shape[0])
+    dedup: dict[tuple[int, int, int], float] = {}
+    for row, wi in zip(cells_arr.tolist(), w.tolist(), strict=True):
+        dedup[(row[0], row[1], row[2])] = float(wi)
+    keys = _brush_cell_key(np.asarray(list(dedup.keys()), dtype=np.int64).reshape(-1, 3))
+    vals = np.asarray(list(dedup.values()), dtype=np.float64)
+    order = np.argsort(keys)
+    return keys[order], vals[order]
+
+
+def brush_membership(xyz: np.ndarray, origin: Any, cell_size: float, cells: Any, weights: Any = None) -> np.ndarray:
+    """Sparse-voxel membership: a point's own cell looked up in the region's occupied set.
+
+    Args:
+        xyz: `(N, 3)` world-frame positions.
+        origin: `(3,)` world-frame corner the voxel grid is measured from.
+        cell_size: voxel edge length, world units, > 0.
+        cells: occupied cell indices, `[[i, j, k], ...]` (a set, not a dense
+            array -- docs/EDITOR.md Sec 1).
+        weights: optional per-cell weight, `[w0, w1, ...]` parallel to
+            `cells`, each in `[0, 1]`; `None` (the common case -- a painted,
+            not graded, brush) means every occupied cell has weight `1.0`.
+
+    Returns:
+        `(N,)` float64 in `[0, 1]`: the occupied cell's own weight at every
+        point whose voxel is in `cells`, else `0.0`.
+    """
+    xyz = np.asarray(xyz, dtype=np.float64)
+    result = np.zeros(xyz.shape[0], dtype=np.float64)
+    sorted_keys, sorted_vals = _brush_sorted_lookup(cells, weights)
+    if sorted_keys.size == 0 or xyz.shape[0] == 0:
+        return result
+    query = _brush_cell_key(_brush_voxel_index(xyz, origin, cell_size))
+    pos = np.clip(np.searchsorted(sorted_keys, query), 0, sorted_keys.size - 1)
+    match = sorted_keys[pos] == query
+    result[match] = sorted_vals[pos[match]]
+    return result
+
+
+def _sphere_touched_cells(origin: Any, cell_size: float, center: Any, radius: float) -> np.ndarray:
+    """Every voxel cell a world-space sphere actually OVERLAPS (box-sphere intersection).
+
+    Not "voxels whose centre is inside the sphere": a cell is touched when
+    the CLOSEST point of its own axis-aligned box (in world space) is within
+    `radius` of `center`, so a brush stroke paints every cell the sphere
+    visibly overlaps, matching what painting it would look like.
+
+    Returns:
+        `(M, 3)` int64 cell indices, `(0, 3)` if the sphere touches nothing
+        (e.g. `radius <= 0`).
+    """
+    origin = np.asarray(origin, dtype=np.float64).reshape(3)
+    center = np.asarray(center, dtype=np.float64).reshape(3)
+    cell_size = float(cell_size)
+    radius = float(radius)
+    if radius <= 0.0:
+        return np.zeros((0, 3), dtype=np.int64)
+
+    lo = np.floor((center - radius - origin) / cell_size).astype(np.int64)
+    hi = np.floor((center + radius - origin) / cell_size).astype(np.int64)
+    ii, jj, kk = np.meshgrid(
+        np.arange(lo[0], hi[0] + 1),
+        np.arange(lo[1], hi[1] + 1),
+        np.arange(lo[2], hi[2] + 1),
+        indexing="ij",
+    )
+    idx = np.stack([ii.ravel(), jj.ravel(), kk.ravel()], axis=1)
+    if idx.shape[0] == 0:
+        return idx
+    cell_min = origin + idx.astype(np.float64) * cell_size
+    cell_max = cell_min + cell_size
+    closest = np.clip(center, cell_min, cell_max)
+    dist2 = np.sum((closest - center) ** 2, axis=1)
+    return idx[dist2 <= radius**2]
+
+
+def _merge_brush_cells(
+    existing_cells: Any, existing_weights: Any, new_cells: np.ndarray, weight: float
+) -> tuple[list[list[int]], list[float] | None]:
+    """`existing_cells`/`existing_weights` with `new_cells` added at `max(existing, weight)`.
+
+    `max`, not "overwrite": repeated strokes over the same cell only ever
+    strengthen it (an `erase` is the only way to reduce a cell's weight),
+    which matches how a paint brush is expected to behave. Returns
+    `weights=None` when every resulting weight is (approximately) `1.0`, so
+    a plain (ungraded) brush never carries a redundant all-ones array.
+    """
+    weight = float(weight)
+    if not (0.0 <= weight <= 1.0):
+        raise ValueError(f"weight must be in [0, 1], got {weight!r}")
+    table: dict[tuple[int, int, int], float] = {}
+    existing_arr = _brush_cells_array(existing_cells)
+    if existing_arr.shape[0]:
+        ew = (
+            np.asarray(existing_weights, dtype=np.float64).reshape(-1)
+            if existing_weights is not None
+            else np.ones(existing_arr.shape[0])
+        )
+        for row, wi in zip(existing_arr.tolist(), ew.tolist(), strict=True):
+            table[(row[0], row[1], row[2])] = float(wi)
+    for row in new_cells.tolist():
+        key = (row[0], row[1], row[2])
+        table[key] = max(table.get(key, 0.0), weight)
+    cells_out = [list(key) for key in table]
+    weights_out = list(table.values())
+    if weights_out and all(abs(w - 1.0) < 1e-12 for w in weights_out):
+        return cells_out, None
+    return cells_out, (weights_out if weights_out else None)
+
+
+def _remove_brush_cells(existing_cells: Any, existing_weights: Any, remove: np.ndarray) -> tuple[list[list[int]], list[float] | None]:
+    """`existing_cells`/`existing_weights` with every cell in `remove` dropped."""
+    drop = {(row[0], row[1], row[2]) for row in remove.tolist()}
+    table: dict[tuple[int, int, int], float] = {}
+    existing_arr = _brush_cells_array(existing_cells)
+    if existing_arr.shape[0]:
+        ew = (
+            np.asarray(existing_weights, dtype=np.float64).reshape(-1)
+            if existing_weights is not None
+            else np.ones(existing_arr.shape[0])
+        )
+        for row, wi in zip(existing_arr.tolist(), ew.tolist(), strict=True):
+            key = (row[0], row[1], row[2])
+            if key not in drop:
+                table[key] = float(wi)
+    cells_out = [list(key) for key in table]
+    weights_out = list(table.values())
+    if weights_out and all(abs(w - 1.0) < 1e-12 for w in weights_out):
+        return cells_out, None
+    return cells_out, (weights_out if weights_out else None)
+
+
+def _with_brush_params(region: Region, cells: list[list[int]], weights: list[float] | None) -> Region:
+    if region.kind != "brush":
+        raise ValueError(f"expected a brush region, got kind={region.kind!r}")
+    params = dict(region.params)
+    params["cells"] = cells
+    if weights is not None:
+        params["weights"] = weights
+    else:
+        params.pop("weights", None)
+    return Region(
+        id=region.id,
+        name=region.name,
+        kind=region.kind,
+        params=params,
+        mix=region.mix,
+        op=region.op,
+        enabled=region.enabled,
+        source=region.source,
+    )
+
+
+def paint_sphere(region: Region, center: Any, radius: float, weight: float = 1.0) -> Region:
+    """A new `brush` `Region` with every voxel cell a sphere touches added (or strengthened).
+
+    Args:
+        region: an existing `brush`-kind Region (its `origin`/`cell_size`
+            define the voxel grid every cell is painted into).
+        center: `(3,)` world-frame sphere centre.
+        radius: sphere radius, world units.
+        weight: the painted cell weight (`_merge_brush_cells`: existing
+            cells only ever get stronger, `max(existing, weight)`).
+
+    Returns:
+        A NEW `Region` (this module's functions are pure); `region` itself
+        is never mutated.
+
+    Raises:
+        ValueError: `region.kind != "brush"`, or `weight` outside `[0, 1]`.
+    """
+    if region.kind != "brush":
+        raise ValueError(f"paint_sphere needs a brush region, got kind={region.kind!r}")
+    p = region.params
+    touched = _sphere_touched_cells(p["origin"], p["cell_size"], center, radius)
+    cells, weights = _merge_brush_cells(p.get("cells", []), p.get("weights"), touched, weight)
+    return _with_brush_params(region, cells, weights)
+
+
+def paint_along(region: Region, points: Any, radius: float, weight: float = 1.0) -> Region:
+    """A brush STROKE: the union of `paint_sphere` at every point of a path.
+
+    Args:
+        region: an existing `brush`-kind Region.
+        points: `(K, 3)` world-frame path the brush was dragged through.
+        radius: sphere radius at every point along the path, world units.
+        weight: forwarded to the merge (see `paint_sphere`).
+
+    Returns:
+        A NEW `Region` with every cell any sphere along the path touches
+        added, in ONE merge (not `K` sequential `Region` rebuilds).
+    """
+    if region.kind != "brush":
+        raise ValueError(f"paint_along needs a brush region, got kind={region.kind!r}")
+    pts = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    p = region.params
+    touched = [_sphere_touched_cells(p["origin"], p["cell_size"], pt, radius) for pt in pts]
+    all_touched = (
+        np.concatenate(touched, axis=0) if touched else np.zeros((0, 3), dtype=np.int64)
+    )
+    cells, weights = _merge_brush_cells(p.get("cells", []), p.get("weights"), all_touched, weight)
+    return _with_brush_params(region, cells, weights)
+
+
+def erase(region: Region, center: Any, radius: float) -> Region:
+    """A new `brush` `Region` with every voxel cell a sphere touches removed.
+
+    The inverse of `paint_sphere`: any cell whose box the sphere overlaps
+    (same `_sphere_touched_cells` test) is dropped entirely, regardless of
+    its current weight.
+
+    Returns:
+        A NEW `Region`; `region` itself is never mutated.
+
+    Raises:
+        ValueError: `region.kind != "brush"`.
+    """
+    if region.kind != "brush":
+        raise ValueError(f"erase needs a brush region, got kind={region.kind!r}")
+    p = region.params
+    touched = _sphere_touched_cells(p["origin"], p["cell_size"], center, radius)
+    cells, weights = _remove_brush_cells(p.get("cells", []), p.get("weights"), touched)
+    return _with_brush_params(region, cells, weights)
+
+
+def auto_region_name(existing_names: Any, tool: str, detail: str | None = None) -> str:
+    """A tool-authored region's auto name, `"<tool>[-<detail>]-<n>"` (docs/EDITOR.md Sec 1).
+
+    `n` is one more than the highest `-<digits>` suffix among
+    `existing_names` (from ANY tool, not just this one), so a session's
+    tool-authored regions read as one continuously numbered list in a Named
+    Objects panel (`click-1`, `sam-box-IMG_3703-2`, `shade-clouds-3`,
+    `brush-4`, ...) no matter which tool created each one. Stateless by
+    design: the counter is derived from whatever names exist right now, so
+    it self-heals after a region is removed, renamed, or the edit is undone
+    -- there is no counter stored anywhere to drift out of sync.
+
+    Args:
+        existing_names: the document's current region names (e.g.
+            `[r.name for r in edits.regions]`).
+        tool: the tool's own label, e.g. `"click"`, `"shade-clouds"`,
+            `"brush"`, or `"sam-box"`/`"sam-point"`/`"sam-text"` (SAM's own
+            prompt kind folded into the label, matching `"sam-box-
+            IMG_3703-2"`).
+        detail: an optional extra slug (e.g. a view's file stem), inserted
+            between `tool` and the counter.
+
+    Returns:
+        `"<tool>-<n>"`, or `"<tool>-<detail>-<n>"` when `detail` is given.
+    """
+    pattern = re.compile(EDIT_AUTO_NAME_COUNTER_PATTERN)
+    highest = 0
+    for name in existing_names:
+        match = pattern.search(str(name))
+        if match:
+            highest = max(highest, int(match.group(1)))
+    label = tool if detail is None else f"{tool}-{detail}"
+    return f"{label}-{highest + 1}"
+
+
 def region_weight(region: Region, xyz: np.ndarray) -> np.ndarray:
     """Per-point membership weight in `[0, 1]`: hard 0/1 for box/sphere/pointset, graded for lid.
 
@@ -429,6 +809,8 @@ def region_weight(region: Region, xyz: np.ndarray) -> np.ndarray:
         return weight
     if region.kind == "pointset":
         return pointset_membership(xyz.shape[0], p["point_ids"])
+    if region.kind == "brush":
+        return brush_membership(xyz, p["origin"], p["cell_size"], p.get("cells", []), p.get("weights"))
     raise ValueError(f"unknown region kind {region.kind!r}")  # pragma: no cover -- guarded by Region.__post_init__
 
 
@@ -632,9 +1014,46 @@ class EditDocument:
         """Read and validate an `edits.json` file."""
         return EditDocument.from_json(json.loads(Path(path).read_text()))
 
+    @staticmethod
+    def _externalize_brush(region_json: dict[str, Any], out_dir: Path) -> dict[str, Any]:
+        """A brush region's `regions[]` entry, cells/weights moved to an `.npz` sidecar if large.
+
+        Only ever applied to the WRITTEN `regions[]` array (see `save`); the
+        module docstring's "ONE exception" invariant explains why this never
+        touches `self.log`/`self.regions`/`to_json()` itself. A region below
+        `EDIT_BRUSH_NPZ_CELL_THRESHOLD` cells (or not a brush at all) is
+        returned unchanged.
+        """
+        if region_json.get("kind") != "brush":
+            return region_json
+        params = region_json.get("params", {})
+        cells = params.get("cells") or []
+        if len(cells) <= EDIT_BRUSH_NPZ_CELL_THRESHOLD:
+            return region_json
+        cells_arr = _brush_cells_array(cells).astype(np.int32)
+        weights = params.get("weights")
+        npz_path = out_dir / EDIT_BRUSH_NPZ_FILENAME_FMT.format(region_id=region_json["id"])
+        if weights is not None:
+            np.savez(npz_path, cells=cells_arr, weights=np.asarray(weights, dtype=np.float32))
+        else:
+            np.savez(npz_path, cells=cells_arr)
+        new_params = {k: v for k, v in params.items() if k not in ("cells", "weights")}
+        new_params["cells_npz"] = npz_path.name
+        new_params["n_cells"] = int(cells_arr.shape[0])
+        return {**region_json, "params": new_params}
+
     def save(self, path: str | Path) -> Path:
-        """Write this document to `path` (parents created if missing)."""
+        """Write this document to `path` (parents created if missing).
+
+        A `brush` region above `EDIT_BRUSH_NPZ_CELL_THRESHOLD` cells is
+        written with its `cells`/`weights` externalised into a sidecar
+        `.npz` next to `path` (`_externalize_brush`) -- this affects only
+        the bytes on disk, never `self`, which keeps holding the literal
+        arrays exactly as before the call.
+        """
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(self.to_json(), indent=2) + "\n")
+        doc = self.to_json()
+        doc["regions"] = [self._externalize_brush(r, path.parent) for r in doc["regions"]]
+        path.write_text(json.dumps(doc, indent=2) + "\n")
         return path

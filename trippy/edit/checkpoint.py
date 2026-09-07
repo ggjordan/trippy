@@ -41,14 +41,16 @@ Invariants:
       channels use -- the documented fallback for "per-pixel weight
       rendering is not yet available in the Python renderer"
       (docs/EDITOR.md Sec 5).
-    - `evaluate_checkpoint`'s own render path (`Trainer.evaluate`, in
-      `trippy.train.trainer`) is NOT wired to the gate-suppression multiply:
-      `Trainer.evaluate` is out of this module's reach without editing
-      `trippy/train/trainer.py`. `trippy eval --edits` therefore applies the
-      keep-mask deletion (real, and reflected in every held-out render) but
-      not the gate multiply -- a documented gap, not a silent one. The
-      `render_candidate` path (`trippy candidate-report`, `trippy distill
-      --stage render`) gets both.
+    - `Trainer.evaluate` (in `trippy.train.trainer`) calls `render_edit_weight_map`
+      itself, right after `split_net_output` and before `apply_gate`, exactly
+      where `trippy.render.candidate.render_candidate` does -- so `trippy eval
+      --edits` gets BOTH the keep-mask deletion and the gate-suppression
+      multiply, closing what used to be a documented gap here. The non-edit
+      path is unchanged bit-for-bit: `render_edit_weight_map` returns `None`
+      whenever `apply_edits_to_trainer` was never called (no `--edits`) or
+      found nothing to suppress, and `gate is None` short-circuits the call
+      entirely on a non-gate run, so an unedited `trippy eval` takes the exact
+      code path it always did.
 Related docs: docs/EDITOR.md Sec 5 "Publish"; trippy.edit.apply (the
     bundle-side sibling of this module); trippy.edit.weights
     (`compose_trips_weights`, the same composition this reuses);

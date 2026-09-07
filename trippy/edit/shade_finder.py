@@ -25,6 +25,13 @@ Invariants:
       the selected points), so it is directly comparable to the audit's
       own headline number -- E2's acceptance: "matches the audit's own
       number for that scene to float precision".
+    - The returned Region is auto-named `"shade-clouds-<n>"`
+      (`trippy.edit.model.auto_region_name`, docs/EDITOR.md Sec 1 "Named
+      regions") unless the caller passes `name` explicitly, and always
+      carries `source={"tool": "shade-clouds", "params": <thresholds>}` --
+      the same dict as `summary["thresholds"]` -- so a saved region's
+      provenance is reproducible from `edits.json` alone, without the
+      summary.
 Units: same as `trippy.train.prune` (COLMAP world units, dimensionless
     luminance/confidence).
 Related docs: docs/EDITOR.md Sec 3 "2. Shade-cloud finder (E2)";
@@ -48,7 +55,7 @@ from trippy.constants import (
     SHADE_PRUNE_DEFAULT_ZFAR_FRAC,
     SHADE_PRUNE_DEFAULT_ZNEAR_FRAC,
 )
-from trippy.edit.model import Region, new_region_id
+from trippy.edit.model import Region, auto_region_name, new_region_id
 from trippy.train import prune
 
 __all__ = ["find_shade_pointset", "find_shade_pointset_in_bundle"]
@@ -68,7 +75,8 @@ def find_shade_pointset(
     rel_factor: float = POINT_REMOVAL_DEFAULT_REL_FACTOR,
     init_conf: np.ndarray | None = None,
     region_id: str | None = None,
-    name: str = "shade cloud",
+    name: str | None = None,
+    existing_names: Any = (),
 ) -> tuple[Region, dict[str, Any]]:
     """Build a `pointset` Region from the shade audit's own dark-mass rule.
 
@@ -87,7 +95,12 @@ def find_shade_pointset(
             identical in meaning to `prune.confidence_drop_mask`.
         region_id: stable id for the new region (default: a fresh one via
             `trippy.edit.model.new_region_id`).
-        name: shown in the Regions panel.
+        name: shown in the Regions panel. `None` (the default) auto-names
+            the region `"shade-clouds-<n>"` (`trippy.edit.model.
+            auto_region_name`, docs/EDITOR.md Sec 1 "Named regions").
+        existing_names: the target document's current region names, used
+            ONLY to number the auto name above (`auto_region_name`);
+            ignored when `name` is given explicitly.
 
     Returns:
         `(region, summary)`. `summary` has `n_points` (selection size),
@@ -115,29 +128,31 @@ def find_shade_pointset(
     point_ids = np.flatnonzero(selected).tolist()
 
     stats = prune.dark_mass_stats(views, xyz, rgb, conf, lum_threshold)
+    thresholds = {
+        "frames": list(frames),
+        "znear_frac": float(znear_frac),
+        "zfar_frac": float(zfar_frac),
+        "lum_threshold": float(lum_threshold),
+        "conf_threshold": float(conf_threshold),
+        "mode": mode,
+        "rel_factor": float(rel_factor),
+    }
 
     region = Region(
         id=region_id or new_region_id(),
-        name=name,
+        name=name if name is not None else auto_region_name(existing_names, "shade-clouds"),
         kind="pointset",
         params={"point_ids": point_ids},
         mix=0.0,
         op="fade",
         enabled=True,
+        source={"tool": "shade-clouds", "params": thresholds},
     )
     summary = {
         "n_points": int(selected.sum()),
         "mass_fraction": stats["dark_mass_fraction"],
         "dark_mass_stats": stats,
-        "thresholds": {
-            "frames": list(frames),
-            "znear_frac": float(znear_frac),
-            "zfar_frac": float(zfar_frac),
-            "lum_threshold": float(lum_threshold),
-            "conf_threshold": float(conf_threshold),
-            "mode": mode,
-            "rel_factor": float(rel_factor),
-        },
+        "thresholds": thresholds,
     }
     return region, summary
 

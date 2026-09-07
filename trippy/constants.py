@@ -1539,11 +1539,41 @@ EDIT_FORMAT = "trippy-edits-1"
 EDIT_JSON_FILENAME = "edits.json"
 
 # Region.kind / Region.op enums, docs/EDITOR.md Sec 1's schema table. `brush` (sparse
-# voxel grid, painted incrementally by a brush tool) is documented but explicitly out
-# of scope for E1 (docs/EDITOR.md Sec 1: "not one of E1's two shipped kinds") -- not
-# included here; adding it later is additive to this tuple, not a breaking change.
-EDIT_REGION_KINDS = ("box", "sphere", "lid", "pointset")
+# voxel grid, painted incrementally by a brush tool -- `trippy.edit.model.
+# brush_membership`/`paint_sphere`/`paint_along`/`erase`) composes through the exact
+# same `region_weight`/`region_contains` dispatch every other kind does, so
+# `trippy.edit.weights`/`trippy.edit.apply`/`trippy.edit.checkpoint` need no brush-
+# specific code at all -- "it is just another membership" (docs/EDITOR.md Sec 1).
+EDIT_REGION_KINDS = ("box", "sphere", "lid", "pointset", "brush")
 EDIT_REGION_OPS = ("blend", "delete", "fade")
+
+# --- brush regions (sparse voxel grid, docs/EDITOR.md Sec 1 "brush") ---------------
+
+# A brush cell index must fit in a signed int32 (the wire format's own "cells as
+# int32 triplets" -- the Rust twin stores them as `[i32; 3]`), so a hand-authored
+# or vastly-oversized brush cannot silently produce a cell no reader can parse.
+EDIT_BRUSH_CELL_INT32_ABS_MAX = 2_147_483_647
+
+# A brush region's `cells` (and, if present, `weights`) are written inline in
+# `edits.json` up to this many cells; above it, `EditDocument.save` externalises
+# them into an `.npz` sidecar next to the edits file (int32 `cells`, float32
+# `weights`) and replaces `params["cells"]`/`params["weights"]` with a
+# `cells_npz`/`n_cells` reference in the WRITTEN copy only -- Python's own loader
+# never reads the sidecar back (it reconstructs every region by replaying
+# `undo_stack.log`, which is never externalised), so this only ever matters to an
+# external reader (the Rust viewer) loading the materialised `regions[]` array
+# directly. 4096 cells is a ~48 KB inline JSON array (int32 triplets) before the
+# indent/formatting overhead -- generous for an interactively-painted region,
+# small enough that a bundle publish never carries a multi-MB edits.json.
+EDIT_BRUSH_NPZ_CELL_THRESHOLD = 4096
+EDIT_BRUSH_NPZ_FILENAME_FMT = "edits_brush_{region_id}.npz"
+
+# `trippy.edit.model.auto_region_name`'s counter suffix, `<label>-<n>`
+# (docs/EDITOR.md Sec 1 "Named regions"): matches a trailing `-<digits>` on any
+# existing region name so a session's tool-authored regions read as one
+# continuously numbered list (`click-1`, `sam-box-IMG_3703-2`, `shade-clouds-3`,
+# `brush-4`) regardless of which tool created each one.
+EDIT_AUTO_NAME_COUNTER_PATTERN = r"-(\d+)$"
 
 # Hex digits of a fresh region id's suffix (`new_region_id()` -> "r-<hex>"), matching
 # docs/EDITOR.md Sec 1's own example ids ("r-3f9a", "r-8b21": 4 hex chars looked
@@ -1650,7 +1680,6 @@ CLICK_FALLBACK_MAX_RADIUS_FACTOR = 50.0
 # hard delete, since the user has not yet confirmed the selection is right).
 CLICK_DEFAULT_OP = "fade"
 CLICK_DEFAULT_MIX = 0.5
-CLICK_DEFAULT_NAME = "click cluster"
 
 # `trippy edits click --preview`: longest edge of the from-scratch heatmap PNG,
 # same reasoning as `trippy.render.bundle.BUNDLE_SPLAT_MAX_DIM` -- a preview is

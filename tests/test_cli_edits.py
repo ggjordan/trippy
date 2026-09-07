@@ -69,6 +69,7 @@ def test_add_box_creates_edits_json(tmp_path: Path) -> None:
         "mix": 1.0,
         "op": "delete",
         "params": {"center": [0.0, 0.0, 0.0], "half_extents": [1.0, 1.0, 1.0], "quat": [1.0, 0.0, 0.0, 0.0]},
+        "source": None,
     }
 
 
@@ -213,3 +214,114 @@ def test_apply_edits_missing_required_flag_is_argparse_exit_2() -> None:
     with pytest.raises(SystemExit) as exc_info:
         cli.main(["apply-edits", "--bundle", "/tmp/nope"])  # no --out
     assert exc_info.value.code == 2
+
+
+# --- edits add-brush / list / rename / toggle / remove (Named Objects panel CLI) -----------
+
+
+def test_add_brush_paints_a_sphere_and_auto_names(tmp_path: Path) -> None:
+    edits_path = tmp_path / "edits.json"
+    rc = cli.main(
+        [
+            "edits", "add-brush",
+            "--edits", str(edits_path),
+            "--cell-size", "0.5",
+            "--center", "1", "0", "4",
+            "--radius", "0.9",
+        ]
+    )  # fmt: skip
+    assert rc == 0
+    doc = json.loads(edits_path.read_text())
+    assert len(doc["regions"]) == 1
+    region = doc["regions"][0]
+    assert region["kind"] == "brush"
+    assert region["name"] == "brush-1"  # auto-named, no --name given
+    assert len(region["params"]["cells"]) > 0
+    assert region["source"] == {"tool": "brush", "params": {"center": [1.0, 0.0, 4.0], "radius": 0.9}}
+
+
+def test_edits_list_prints_every_region(tmp_path: Path) -> None:
+    edits_path = tmp_path / "edits.json"
+    assert cli.main(["edits", "add-box", "--edits", str(edits_path), "--center", "0", "0", "0",
+                      "--half-extents", "1", "1", "1", "--name", "fence"]) == 0  # fmt: skip
+    assert cli.main(["edits", "add-sphere", "--edits", str(edits_path), "--center", "1", "2", "3",
+                      "--radius", "0.5"]) == 0  # fmt: skip
+
+    rc = cli.main(["edits", "list", "--edits", str(edits_path)])
+    assert rc == 0
+
+
+def test_edits_list_missing_file_exits_2(tmp_path: Path, capsys) -> None:
+    rc = cli.main(["edits", "list", "--edits", str(tmp_path / "nope.json")])
+    assert rc == 2
+    assert "no edits file" in capsys.readouterr().err
+
+
+def _region_id(edits_path: Path, index: int = 0) -> str:
+    return json.loads(edits_path.read_text())["regions"][index]["id"]
+
+
+def test_edits_rename_updates_the_name(tmp_path: Path) -> None:
+    edits_path = tmp_path / "edits.json"
+    assert cli.main(["edits", "add-box", "--edits", str(edits_path), "--center", "0", "0", "0",
+                      "--half-extents", "1", "1", "1"]) == 0  # fmt: skip
+    rid = _region_id(edits_path)
+
+    rc = cli.main(["edits", "rename", "--edits", str(edits_path), "--id", rid, "--name", "new name"])
+    assert rc == 0
+    assert json.loads(edits_path.read_text())["regions"][0]["name"] == "new name"
+
+
+def test_edits_rename_unknown_id_exits_2(tmp_path: Path, capsys) -> None:
+    edits_path = tmp_path / "edits.json"
+    assert cli.main(["edits", "add-box", "--edits", str(edits_path), "--center", "0", "0", "0",
+                      "--half-extents", "1", "1", "1"]) == 0  # fmt: skip
+    rc = cli.main(["edits", "rename", "--edits", str(edits_path), "--id", "r-nope", "--name", "x"])
+    assert rc == 2
+    assert "r-nope" in capsys.readouterr().err
+
+
+def test_edits_toggle_flips_by_default_and_sets_explicitly(tmp_path: Path) -> None:
+    edits_path = tmp_path / "edits.json"
+    assert cli.main(["edits", "add-box", "--edits", str(edits_path), "--center", "0", "0", "0",
+                      "--half-extents", "1", "1", "1"]) == 0  # fmt: skip
+    rid = _region_id(edits_path)
+    assert json.loads(edits_path.read_text())["regions"][0]["enabled"] is True
+
+    assert cli.main(["edits", "toggle", "--edits", str(edits_path), "--id", rid]) == 0
+    assert json.loads(edits_path.read_text())["regions"][0]["enabled"] is False
+
+    assert cli.main(["edits", "toggle", "--edits", str(edits_path), "--id", rid, "--enabled", "on"]) == 0
+    assert json.loads(edits_path.read_text())["regions"][0]["enabled"] is True
+
+    assert cli.main(["edits", "toggle", "--edits", str(edits_path), "--id", rid, "--enabled", "off"]) == 0
+    assert json.loads(edits_path.read_text())["regions"][0]["enabled"] is False
+
+
+def test_edits_toggle_unknown_id_exits_2(tmp_path: Path, capsys) -> None:
+    edits_path = tmp_path / "edits.json"
+    assert cli.main(["edits", "add-box", "--edits", str(edits_path), "--center", "0", "0", "0",
+                      "--half-extents", "1", "1", "1"]) == 0  # fmt: skip
+    rc = cli.main(["edits", "toggle", "--edits", str(edits_path), "--id", "r-nope"])
+    assert rc == 2
+    assert "r-nope" in capsys.readouterr().err
+
+
+def test_edits_remove_deletes_the_region(tmp_path: Path) -> None:
+    edits_path = tmp_path / "edits.json"
+    assert cli.main(["edits", "add-box", "--edits", str(edits_path), "--center", "0", "0", "0",
+                      "--half-extents", "1", "1", "1"]) == 0  # fmt: skip
+    rid = _region_id(edits_path)
+
+    rc = cli.main(["edits", "remove", "--edits", str(edits_path), "--id", rid])
+    assert rc == 0
+    assert json.loads(edits_path.read_text())["regions"] == []
+
+
+def test_edits_remove_unknown_id_exits_2(tmp_path: Path, capsys) -> None:
+    edits_path = tmp_path / "edits.json"
+    assert cli.main(["edits", "add-box", "--edits", str(edits_path), "--center", "0", "0", "0",
+                      "--half-extents", "1", "1", "1"]) == 0  # fmt: skip
+    rc = cli.main(["edits", "remove", "--edits", str(edits_path), "--id", "r-nope"])
+    assert rc == 2
+    assert "r-nope" in capsys.readouterr().err

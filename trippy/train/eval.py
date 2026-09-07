@@ -17,11 +17,13 @@ Invariants: a hybrid (design A) checkpoint gets a lazy live-gsrender
     performs at a training epoch boundary), permanently for the life of
     this in-memory `Trainer` object -- never written back to the `.pt`
     file. `evaluate_checkpoint`'s own render path (`Trainer.evaluate`)
-    reflects that deletion in full (fewer points render) but NOT the
-    gate-suppression multiply `trippy.render.candidate.render_candidate`
-    applies for `blend`/`fade` regions -- see `trippy.edit.checkpoint`'s
-    own module docstring for why (`Trainer.evaluate` lives outside this
-    module's editable surface).
+    reflects that deletion in full (fewer points render) AND, on a
+    gate-hybrid checkpoint, the same gate-suppression multiply
+    `trippy.render.candidate.render_candidate` applies for `blend`/`fade`
+    regions -- `Trainer.evaluate` calls `trippy.edit.checkpoint.
+    render_edit_weight_map` itself now, so the two render paths no longer
+    disagree about what an edit does to a gate-hybrid render (previously a
+    documented gap; see `trippy.edit.checkpoint`'s own module docstring).
 Related docs: docs/EXPERIMENTS.md "Training runs", "Held-out PSNR and
     LPIPS"; docs/EXPERIMENTS.md "Dolly camera paths" (the off-path renderer
     here is the API the later dolly-path generator plugs into -- it does
@@ -145,9 +147,9 @@ def evaluate_checkpoint(
         edits_path: forwarded to `build_trainer_from_checkpoint`
             (docs/EDITOR.md Sec 5): `delete`-op regions permanently remove
             their points from this evaluation's `Trainer` before any image
-            is rendered. See `build_trainer_from_checkpoint`'s own
-            docstring for what this does NOT do (the gate-suppression
-            multiply, out of `Trainer.evaluate`'s reach from this module).
+            is rendered, and (on a gate-hybrid checkpoint) `Trainer.evaluate`
+            also applies the gate-suppression multiply for `blend`/`fade`
+            regions -- see `build_trainer_from_checkpoint`'s own docstring.
 
     Returns:
         The `Trainer.evaluate()` metrics dict -- including the "per_image"
