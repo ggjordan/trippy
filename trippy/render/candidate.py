@@ -31,8 +31,19 @@ Invariants:
       expose (see `_tone_map_for_pose`) -- both duplications are built only
       from `Trainer`'s already-public attributes (`point_params`, `net`,
       `cfg`, `background`, `camera`, `dataset.names`).
+    - `edits_path` (docs/EDITOR.md Sec 5) is applied to the internal
+      `Trainer` once, up front (`build_trainer_from_checkpoint`'s own
+      `edits_path` param -- `trippy.edit.checkpoint.apply_edits_to_trainer`):
+      `delete`-op regions permanently shrink the point cloud this whole
+      function renders from, and any `blend`/`fade` region's per-point
+      weight is projected per pose (`trippy.edit.checkpoint.
+      render_edit_weight_map`, the "5th feature channel" fallback) and
+      multiplied into that pose's gate before `Trainer.apply_gate` blends,
+      so an un-edited live splat cannot leak back into a region the edit
+      asked to hide. A no-op (skipped render, zero extra cost) whenever
+      `edits_path` is None or no region actually touches a surviving point.
 Related docs: docs/EXPERIMENTS.md "Mandatory honesty sheet", "Dolly camera
-    paths"; docs/SPEC.md D10.
+    paths"; docs/SPEC.md D10; docs/EDITOR.md Sec 5 "Publish".
 """
 
 from __future__ import annotations
@@ -61,6 +72,7 @@ from trippy.constants import (
     DOLLY_COVERAGE_STOP_THRESHOLD,
     VIDEO_DEFAULT_FPS,
 )
+from trippy.edit.checkpoint import render_edit_weight_map
 from trippy.hybrid import gate as gate_mod
 from trippy.net.camera_model import default_uv_grid
 from trippy.raster.pyramid import render_pyramid
@@ -155,6 +167,21 @@ def _tone_map_for_pose(trainer: Trainer, net_out: torch.Tensor, image_name: str 
     return _fallback_tone_map(trainer, net_out)
 
 
+def _center_crop_like(x: torch.Tensor, target_h: int, target_w: int) -> torch.Tensor:
+    """Centre-crop the last two dims of `x` down to `(target_h, target_w)`; a no-op if already that size.
+
+    Duplicates `trippy.train.trainer._center_crop_like` (private, module
+    docstring's own "no Trainer internals" rule) -- used here to align
+    `render_edit_weight_map`'s auxiliary render (full `image_hw` resolution)
+    with the network's own gate map (which can be a few pixels smaller,
+    same odd-size handling `Trainer.apply_gate` already crops around).
+    """
+    h, w = x.shape[-2], x.shape[-1]
+    dh = max(0, (h - target_h) // 2)
+    dw = max(0, (w - target_w) // 2)
+    return x[..., dh : dh + target_h, dw : dw + target_w]
+
+
 def _to_uint8(arr01: np.ndarray) -> np.ndarray:
     return np.round(np.clip(arr01, 0.0, 1.0) * 255.0).astype(np.uint8)
 
@@ -193,6 +220,7 @@ def render_candidate(
     dolly_stop_threshold: float = DOLLY_COVERAGE_STOP_THRESHOLD,
     gaussian_provider: Callable[..., torch.Tensor | None] | None = None,
     gate_scale: float | None = None,
+    edits_path: str | Path | None = None,
 ) -> dict:
     """Render `poses` through a checkpoint and write every honesty artifact.
 
@@ -242,6 +270,14 @@ def render_candidate(
             everything the gate leaned towards the splat all the way there.
             None keeps the checkpoint's own `hybrid.gate_scale`. Ignored on a
             checkpoint trained without the gate.
+        edits_path: an `edits.json` path (docs/EDITOR.md Sec 5), forwarded to
+            `build_trainer_from_checkpoint` -- `delete`-op regions remove
+            their points from the checkpoint's point cloud before ANY pose
+            here renders, and (on a gate-hybrid checkpoint) any `blend`/
+            `fade` region's per-point weight suppresses the trained gate
+            towards TRIPS, per pixel, at every pose (see module docstring).
+            None (default) renders the checkpoint exactly as before this
+            parameter existed.
 
     Returns:
         The metrics dict also written to `<out_dir>/metrics.json`:
@@ -252,8 +288,10 @@ def render_candidate(
         `stop_at_low_coverage` is True, also includes `"dolly_stop_index"`
         (the last kept frame's index into `"frames"`), `"dolly_stop_threshold"`,
         and `"dolly_stopped_early"` (whether any frames were cut from the video).
+        Includes an `"edits"` key (`trainer.edit_summary`) when `edits_path`
+        was given.
     """
-    trainer = build_trainer_from_checkpoint(checkpoint_path, device=device)
+    trainer = build_trainer_from_checkpoint(checkpoint_path, device=device, edits_path=edits_path)
     trainer.net.eval()
     trainer.camera.eval()
     if gaussian_provider is not None:
@@ -284,6 +322,11 @@ def render_candidate(
             )
             net_rgb, gate = trainer.split_net_output(net_out)
             pred = _tone_map_for_pose(trainer, net_rgb, pose.image_name)
+            if gate is not None:
+                edit_weight_map = render_edit_weight_map(trainer, K, R, t, image_hw)
+                if edit_weight_map is not None:
+                    edit_weight_map = _center_crop_like(edit_weight_map, gate.shape[-2], gate.shape[-1])
+                    gate = gate * edit_weight_map.to(dtype=gate.dtype, device=gate.device)
             pred, gate = trainer.apply_gate(pred, gate, gaussian)
 
             raw01 = layers[0][:3].clamp(0.0, 1.0).permute(1, 2, 0).cpu().numpy()
@@ -342,6 +385,8 @@ def render_candidate(
         ),
         "frames": frame_metrics,
     }
+    if trainer.edit_summary is not None:
+        metrics["edits"] = {"path": str(edits_path), **trainer.edit_summary}
     if gate_rows:
         metrics["gate"] = {
             **gate_mod.merge_gate_stats(gate_rows),

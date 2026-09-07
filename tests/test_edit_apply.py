@@ -215,3 +215,129 @@ def test_filter_gaussian_ply_reads_the_body_exactly_once(tmp_path: Path, monkeyp
     result = edit_apply.filter_gaussian_ply(in_path, tmp_path / "out.ply", lambda a: a[:, 0] > 0.5)
     assert result == {"n_in": 3, "n_deleted": 2, "n_kept": 1}
     assert len(calls) == 1  # the whole vertex body is loaded exactly once
+
+
+# --- --target trips: export.ply (docs/EDITOR.md Sec 5) ---
+
+
+def test_apply_edits_writes_export_ply_that_round_trips(tmp_path: Path) -> None:
+    from trippy.points.gaussian_ply import GaussianPlySource
+    from trippy.train.export import read_back_check
+
+    trips_xyz = np.array([[0.0, 0.0, 0.0], [5.0, 0.0, 0.0], [8.0, 0.0, 0.0]])
+    bundle_dir = tmp_path / "bundle"
+    _write_bundle(bundle_dir, trips_xyz, splat_ply_name=None)
+
+    edits = EditDocument.new(bundle_format="trippy-bundle-1")
+    edits.add_region(
+        Region(
+            id="r-box",
+            name="delete box",
+            kind="box",
+            params={"center": [0.0, 0.0, 0.0], "half_extents": [1.0, 1.0, 1.0]},
+            op="delete",
+        )
+    )
+    edits_path = bundle_dir / "edits.json"
+    edits.save(edits_path)
+
+    out_dir = tmp_path / "out"
+    summary = edit_apply.apply_edits(bundle_dir, edits_path, out_dir)
+
+    export_path = out_dir / "export.ply"
+    assert export_path.exists()
+    assert summary["export_ply"] == str(export_path.resolve())
+
+    # Round-trips: the 2 surviving points (index 0 deleted) read back with the
+    # SAME xyz written into points.npz, through the real 3DGS-PLY reader.
+    assert read_back_check(export_path) == 2
+    reloaded = GaussianPlySource(export_path, min_opacity=0.0).build()
+    np.testing.assert_allclose(sorted(reloaded.xyz[:, 0].tolist()), [5.0, 8.0], atol=1e-4)
+
+
+# --- --target distilled: reapply box/sphere/lid geometry to an already-distilled PLY ---
+
+
+def test_apply_edits_target_distilled_deletes_and_fades_opacity(tmp_path: Path) -> None:
+    bundle_dir = tmp_path / "bundle"
+    _write_bundle(bundle_dir, np.array([[0.0, 0.0, 0.0], [20.0, 0.0, 0.0]]), splat_ply_name=None)
+
+    edits = EditDocument.new(bundle_format="trippy-bundle-1")
+    edits.add_region(
+        Region(
+            id="r-del",
+            name="delete box",
+            kind="box",
+            params={"center": [0.0, 0.0, 0.0], "half_extents": [1.0, 1.0, 1.0]},
+            op="delete",
+        )
+    )
+    edits.add_region(
+        Region(
+            id="r-fade",
+            name="fade sphere",
+            kind="sphere",
+            params={"center": [5.0, 0.0, 0.0], "radius": 1.0},
+            mix=0.25,
+            op="fade",
+        )
+    )
+    edits_path = bundle_dir / "edits.json"
+    edits.save(edits_path)
+
+    # A distilled PLY with its own (different) point layout: index 0 in the delete box,
+    # index 1 in the fade sphere, index 2 untouched.
+    distilled_xyz = np.array([[0.0, 0.0, 0.0], [5.0, 0.0, 0.0], [50.0, 0.0, 0.0]])
+    distilled_in = tmp_path / "distilled.ply"
+    _write_gaussian_ply_with_extra_field(distilled_in, distilled_xyz)
+
+    out_dir = tmp_path / "out"
+    summary = edit_apply.apply_edits(
+        bundle_dir, edits_path, out_dir, target="distilled", distilled_ply=distilled_in
+    )
+
+    assert summary["target"] == "distilled"
+    assert "points" not in summary  # trips half did not run
+    distilled_summary = summary["distilled"]
+    assert distilled_summary["n_in"] == 3
+    assert distilled_summary["n_deleted"] == 1
+    assert distilled_summary["n_kept"] == 2
+    assert distilled_summary["n_faded"] == 1
+
+    distilled_out = Path(distilled_summary["out"])
+    assert distilled_out.exists()
+    raw = PlyData.read(str(distilled_out))["vertex"]
+    assert len(raw) == 2
+    # Surviving order preserved: [5,0,0] (faded) then [50,0,0] (untouched).
+    xyz_out = np.stack([raw["x"], raw["y"], raw["z"]], axis=1)
+    np.testing.assert_allclose(xyz_out, [[5.0, 0.0, 0.0], [50.0, 0.0, 0.0]], atol=1e-4)
+
+    alpha = 1.0 / (1.0 + np.exp(-np.asarray(raw["opacity"], dtype=np.float64)))
+    # Original opacity was logit(5.0) -> sigmoid ~= 0.9933; the fade region scales it by 0.25.
+    original_alpha = 1.0 / (1.0 + np.exp(-5.0))
+    np.testing.assert_allclose(alpha[0], original_alpha * 0.25, atol=1e-3)
+    np.testing.assert_allclose(alpha[1], original_alpha, atol=1e-3)  # untouched
+
+
+def test_apply_edits_target_distilled_requires_distilled_ply(tmp_path: Path) -> None:
+    bundle_dir = tmp_path / "bundle"
+    _write_bundle(bundle_dir, np.zeros((2, 3)), splat_ply_name=None)
+    edits = EditDocument.new(bundle_format="trippy-bundle-1")
+    edits_path = bundle_dir / "edits.json"
+    edits.save(edits_path)
+
+    with pytest.raises(ValueError, match="distilled_ply"):
+        edit_apply.apply_edits(bundle_dir, edits_path, tmp_path / "out", target="distilled")
+
+
+def test_apply_edits_target_both_without_distilled_ply_notes_the_skip(tmp_path: Path) -> None:
+    bundle_dir = tmp_path / "bundle"
+    _write_bundle(bundle_dir, np.array([[0.0, 0.0, 0.0], [10.0, 10.0, 10.0]]), splat_ply_name=None)
+    edits = EditDocument.new(bundle_format="trippy-bundle-1")
+    edits_path = bundle_dir / "edits.json"
+    edits.save(edits_path)
+
+    summary = edit_apply.apply_edits(bundle_dir, edits_path, tmp_path / "out")  # default target="both"
+    assert summary["target"] == "both"
+    assert "skipped" in summary["distilled"]
+    assert "points" in summary  # the trips half still ran

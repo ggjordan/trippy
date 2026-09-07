@@ -25,6 +25,8 @@ from pathlib import Path
 
 from test_train_helpers import build_synthetic_ply, build_synthetic_scene, tiny_train_config
 
+from trippy.edit.model import EditDocument, Region
+from trippy.train.eval import build_trainer_from_checkpoint
 from trippy.train.trainer import Trainer
 
 
@@ -59,6 +61,42 @@ def test_cli_distill_render_stage(tmp_path: Path) -> None:
     assert (out_dir / "sparse_txt" / "cameras.txt").exists()
     report = json.loads((out_dir / "distill_report.json").read_text())
     assert report["n_anchor_images"] > 0
+
+
+def test_cli_distill_render_stage_with_edits_removes_points_first(tmp_path: Path) -> None:
+    """`--edits` (ADR-0007 edit-then-distil): the deleted region's points never reach the render."""
+    checkpoint = _build_untrained_checkpoint(tmp_path)
+    n_before = len(build_trainer_from_checkpoint(checkpoint, device="cpu").point_params)
+    delete_ids = list(range(n_before // 2))
+
+    edits = EditDocument.new()
+    edits.add_region(
+        Region(id="r-del", name="del", kind="pointset", params={"point_ids": delete_ids}, op="delete")
+    )
+    edits_path = tmp_path / "edits.json"
+    edits.save(edits_path)
+
+    out_dir = tmp_path / "distill_out"
+    result = _run(
+        [
+            "distill",
+            "--checkpoint",
+            str(checkpoint),
+            "--out",
+            str(out_dir),
+            "--stage",
+            "render",
+            "--device",
+            "cpu",
+            "--edits",
+            str(edits_path),
+        ]
+    )
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    assert "removed" in result.stdout
+    report = json.loads((out_dir / "distill_report.json").read_text())
+    assert report["edits"]["n_removed"] == len(delete_ids)
+    assert report["n_points_source"] == n_before - len(delete_ids)
 
 
 def test_cli_distill_brush_cmd_stage_reuses_render_report(tmp_path: Path) -> None:

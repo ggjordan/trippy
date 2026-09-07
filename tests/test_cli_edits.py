@@ -171,6 +171,24 @@ def test_apply_edits_end_to_end_exit_0(tmp_path: Path) -> None:
     assert summary["points"] == {"n_in": 2, "n_deleted": 1, "n_kept": 1}
 
 
+def test_apply_edits_target_trips_writes_export_ply(tmp_path: Path) -> None:
+    bundle_dir = tmp_path / "bundle"
+    _write_minimal_bundle(bundle_dir, np.array([[0.0, 0.0, 0.0], [10.0, 10.0, 10.0]]))
+    edits_path = bundle_dir / "edits.json"
+    assert cli.main(["edits", "add-box", "--edits", str(edits_path), "--bundle", str(bundle_dir),
+                      "--center", "0", "0", "0", "--half-extents", "1", "1", "1", "--op", "delete"]) == 0  # fmt: skip
+
+    out_dir = tmp_path / "out"
+    rc = cli.main(
+        ["apply-edits", "--bundle", str(bundle_dir), "--out", str(out_dir), "--target", "trips"]
+    )
+    assert rc == 0
+    assert (out_dir / "export.ply").exists()
+    summary = json.loads((out_dir / "edits_applied.json").read_text())
+    assert summary["target"] == "trips"
+    assert "distilled" not in summary
+
+
 def test_apply_edits_missing_edits_file_exits_2(tmp_path: Path, capsys) -> None:
     bundle_dir = tmp_path / "bundle"
     _write_minimal_bundle(bundle_dir, np.zeros((2, 3)))

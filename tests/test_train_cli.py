@@ -16,6 +16,42 @@ from pathlib import Path
 
 from test_train_helpers import build_synthetic_ply, build_synthetic_scene, tiny_train_config
 
+from trippy.edit.model import EditDocument, Region
+from trippy.train.eval import build_trainer_from_checkpoint
+from trippy.train.trainer import Trainer
+
+
+def test_cli_eval_with_edits_deletes_points_and_prints_summary(tmp_path: Path) -> None:
+    """`trippy eval --edits edits.json` (docs/EDITOR.md Sec 5): applied-edits line prints; exits 0."""
+    scene_root, point_set = build_synthetic_scene(tmp_path)
+    ply_path = build_synthetic_ply(tmp_path, point_set)
+    cfg = tiny_train_config(scene_root, ply_path, tmp_path / "run", tmp_path / "cache")
+    trainer = Trainer(cfg)
+    trainer.train_step()
+    checkpoint = trainer.save_checkpoint(epoch=1)
+    n_before = len(build_trainer_from_checkpoint(checkpoint, device="cpu").point_params)
+
+    edits = EditDocument.new()
+    edits.add_region(
+        Region(id="r-del", name="del", kind="pointset", params={"point_ids": list(range(15))}, op="delete")
+    )
+    edits_path = tmp_path / "edits.json"
+    edits.save(edits_path)
+
+    argv = [
+        sys.executable, "-m", "trippy.cli", "eval",
+        "--checkpoint", str(checkpoint), "--device", "cpu", "--edits", str(edits_path),
+    ]  # fmt: skip
+    result = subprocess.run(
+        argv,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert result.returncode == 0, f"stdout={result.stdout}\nstderr={result.stderr}"
+    assert f"edits: 15 point(s) deleted ({n_before} -> {n_before - 15})" in result.stdout
+
 
 def test_cli_train_then_eval_on_synthetic_scene(tmp_path: Path) -> None:
     scene_root, point_set = build_synthetic_scene(tmp_path)

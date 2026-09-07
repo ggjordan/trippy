@@ -3,6 +3,45 @@ All notable changes to trippy. Format: Keep a Changelog. Versions: semver tags `
 
 ## [Unreleased]
 ### Added
+- **Viewer editor publish path finished (`docs/EDITOR.md` Sec 5, E6): `trippy
+  apply-edits --target trips|distilled|both`, `export.ply`, distilled-PLY
+  reapply, and `--edits` on `trippy candidate-report`/`trippy eval`/`trippy
+  distill --stage render`.** New `trippy/edit/checkpoint.py`
+  (`apply_edits_to_trainer` — the same `Trainer._apply_keep_mask` index-select
+  surgery training uses, applied to a live checkpoint's `Trainer`, plus
+  `render_edit_weight_map` — the per-point edit weight splatted as an
+  auxiliary `render_pyramid` feature channel and read back from level 0, the
+  documented fallback for "per-pixel weight rendering is not yet available in
+  the Python renderer"). On a gate-hybrid checkpoint, `trippy.render.candidate.
+  render_candidate` multiplies the trained blend gate by that per-pixel
+  projection wherever a `blend`/`fade` region touches a surviving point, so an
+  un-edited live splat cannot leak back into a deleted/faded region; `trippy
+  eval` applies the keep-mask deletion only (a documented gap, not a silent
+  one — `Trainer.evaluate`'s own render path is out of reach without editing
+  `trippy/train/trainer.py`).
+  - `trippy apply-edits --target trips` (now also the default half of `both`)
+    additionally writes a filtered 3DGS-style `export.ply` of the kept TRIPS
+    points via `trippy.train.export.write_gaussian_ply`.
+  - `trippy apply-edits --target distilled --distilled-ply <path>` re-applies
+    `box`/`sphere`/`lid` regions directly to an already-distilled Gaussian PLY
+    (`trippy.edit.apply.apply_gaussian_ply_edits`): `delete` removes rows,
+    `fade` scales the surviving row's own alpha and rewrites `opacity`
+    ("fade → opacity scaling", since a plain Gaussian PLY has no TRIPS-vs-splat
+    mix channel); `pointset` regions are skipped (do not survive distillation)
+    and trigger a `summary["distilled"]["warning"]` if enabled.
+  - `trippy distill --stage render/all --edits edits.json` deletes the edited
+    region's points from the checkpoint's cloud BEFORE any camera renders (the
+    edit-then-distil ordering ADR-0007 requires), so deleted content never
+    reaches the images Brush trains on.
+  - `trippy.edit.weights.compose_point_weights` gained an `ops` filter and a
+    new `compose_gaussian_opacity_scale` wrapper for the distilled-PLY reapply
+    path (honours `delete`/`fade` only, ignores `blend`).
+  - 19 new CPU tests across `tests/test_edit_checkpoint.py` (new),
+    `tests/test_edit_apply.py`, `tests/test_edit_weights.py`,
+    `tests/test_cli_edits.py`, `tests/test_cli_candidate_report.py`,
+    `tests/test_cli_distill.py`, `tests/test_distill_render_set.py`,
+    `tests/test_train_eval.py`, `tests/test_train_cli.py`; synthetic fixtures
+    only. See `docs/EXPERIMENTS.md` "Edits" for the worked run and full list.
 - **Viewer editor, Python side (`docs/EDITOR.md`, ADR-0007): `edits.json`, weight
   composition, the shade-cloud finder, and `trippy apply-edits`, ahead of the Rust
   viewer UI.** New `trippy/edit/` package: `model.py` (`Region` — box/sphere/lid/

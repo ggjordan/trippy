@@ -10,10 +10,22 @@ Invariants: a hybrid (design A) checkpoint gets a lazy live-gsrender
     reconstructed identically to how the checkpoint was trained) and then
     loads the trained state into it -- it never re-runs training. This
     module does no optimisation and never writes back to the checkpoint.
+    `edits_path` (docs/EDITOR.md Sec 5) runs `trippy.edit.checkpoint.
+    apply_edits_to_trainer` right after the trained state loads: every
+    `delete`-op region's points are removed from the freshly built
+    `Trainer` (the same index-select surgery `Trainer._apply_keep_mask`
+    performs at a training epoch boundary), permanently for the life of
+    this in-memory `Trainer` object -- never written back to the `.pt`
+    file. `evaluate_checkpoint`'s own render path (`Trainer.evaluate`)
+    reflects that deletion in full (fewer points render) but NOT the
+    gate-suppression multiply `trippy.render.candidate.render_candidate`
+    applies for `blend`/`fade` regions -- see `trippy.edit.checkpoint`'s
+    own module docstring for why (`Trainer.evaluate` lives outside this
+    module's editable surface).
 Related docs: docs/EXPERIMENTS.md "Training runs", "Held-out PSNR and
     LPIPS"; docs/EXPERIMENTS.md "Dolly camera paths" (the off-path renderer
     here is the API the later dolly-path generator plugs into -- it does
-    not itself generate a camera path).
+    not itself generate a camera path); docs/EDITOR.md Sec 5 "Publish".
 """
 
 from __future__ import annotations
@@ -34,7 +46,10 @@ from trippy.train.trainer import Trainer
 
 
 def build_trainer_from_checkpoint(
-    checkpoint_path: str | Path, device: str | None = None, gate_scale: float | None = None
+    checkpoint_path: str | Path,
+    device: str | None = None,
+    gate_scale: float | None = None,
+    edits_path: str | Path | None = None,
 ) -> Trainer:
     """Rebuild a Trainer (dataset, point source, net, camera) from a checkpoint's own config.
 
@@ -49,6 +64,17 @@ def build_trainer_from_checkpoint(
             checkpoint's own `hybrid.gate_scale`; ignored (with no error) on
             a checkpoint trained without the gate, so a caller may always
             pass it.
+        edits_path: an `edits.json` path (docs/EDITOR.md Sec 5). When given,
+            `trippy.edit.checkpoint.apply_edits_to_trainer` runs against the
+            freshly loaded `Trainer` before it is returned: `delete`-op
+            regions permanently remove their points from this in-memory
+            Trainer (never written back to `checkpoint_path`), and any
+            `blend`/`fade` region's per-point weight is stashed for
+            `trippy.render.candidate.render_candidate`'s gate-suppression
+            step to pick up. The summary dict `apply_edits_to_trainer`
+            returns is attached as `trainer.edit_summary` (None when
+            `edits_path` is None). None (default) leaves the checkpoint's
+            point cloud untouched, exactly as before this parameter existed.
 
     Returns:
         A `Trainer` with the checkpoint's trained state loaded (weights,
@@ -70,6 +96,13 @@ def build_trainer_from_checkpoint(
         )
     if gate_scale is not None and trainer.gate_enabled:
         trainer.gate_scale = gate_mod.clamp_scale(gate_scale)
+    trainer.edit_summary = None
+    if edits_path is not None:
+        from trippy.edit.checkpoint import apply_edits_to_trainer
+        from trippy.edit.model import EditDocument
+
+        edits = EditDocument.load(edits_path)
+        trainer.edit_summary = apply_edits_to_trainer(trainer, edits)
     return trainer
 
 
@@ -81,6 +114,7 @@ def evaluate_checkpoint(
     calibrate_white_balance: bool | None = None,
     exposure_mode: str | None = None,
     gate_scale: float | None = None,
+    edits_path: str | Path | None = None,
 ) -> dict:
     """Evaluate a checkpoint on `images` (default: its own held-out split).
 
@@ -108,6 +142,12 @@ def evaluate_checkpoint(
             the same checkpoint at a different splat-vs-TRIPS mix without
             retraining. The gate map itself is unchanged (it is what the
             network learned); only how much of it is applied changes.
+        edits_path: forwarded to `build_trainer_from_checkpoint`
+            (docs/EDITOR.md Sec 5): `delete`-op regions permanently remove
+            their points from this evaluation's `Trainer` before any image
+            is rendered. See `build_trainer_from_checkpoint`'s own
+            docstring for what this does NOT do (the gate-suppression
+            multiply, out of `Trainer.evaluate`'s reach from this module).
 
     Returns:
         The `Trainer.evaluate()` metrics dict -- including the "per_image"
@@ -122,15 +162,21 @@ def evaluate_checkpoint(
         epoch directory) and appended as an `{"eval": True, ...}` row to the
         run's own `metrics.jsonl`, so `trippy leaderboard` picks up the
         shade split for a checkpoint that finished training before this
-        split existed, without retraining it.
+        split existed, without retraining it. Includes an "edits" key
+        (`trainer.edit_summary`) when `edits_path` was given.
     """
-    trainer = build_trainer_from_checkpoint(checkpoint_path, device=device, gate_scale=gate_scale)
+    trainer = build_trainer_from_checkpoint(
+        checkpoint_path, device=device, gate_scale=gate_scale, edits_path=edits_path
+    )
     if calibrate_white_balance is not None:
         trainer.cfg.eval_calibrate_white_balance = bool(calibrate_white_balance)
     eval_dirname = TRAIN_EVAL_MANUAL_DIRNAME_FMT.format(ts=time.strftime("%Y%m%d-%H%M%S"))
-    return trainer.evaluate(
+    metrics = trainer.evaluate(
         names=images, eval_dirname=eval_dirname, calibrate=calibrate, exposure_mode=exposure_mode
     )
+    if trainer.edit_summary is not None:
+        metrics["edits"] = trainer.edit_summary
+    return metrics
 
 
 def render_offpath(

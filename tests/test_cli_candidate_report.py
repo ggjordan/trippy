@@ -30,9 +30,11 @@ from pathlib import Path
 
 from test_train_helpers import build_synthetic_ply, build_synthetic_scene, tiny_train_config
 
+from trippy.edit.model import EditDocument, Region
 from trippy.render.candidate import render_candidate
 from trippy.render.dolly import shade_dolly_poses
 from trippy.render.offpath import offpath_poses
+from trippy.train.eval import build_trainer_from_checkpoint
 from trippy.train.trainer import Trainer
 
 
@@ -144,3 +146,56 @@ def test_cli_candidate_report_end_to_end(tmp_path: Path) -> None:
 
     readme = (out_dir / "README.md").read_text()
     assert "trippy candidate report" in readme
+
+
+def test_cli_candidate_report_with_edits_notes_the_edit(tmp_path: Path) -> None:
+    """`--edits` (docs/EDITOR.md Sec 5): report.json/README note the applied edit; still exits 0."""
+    checkpoint = _build_untrained_checkpoint(tmp_path)
+    n_before = len(build_trainer_from_checkpoint(checkpoint, device="cpu").point_params)
+
+    edits = EditDocument.new()
+    edits.add_region(
+        Region(id="r-del", name="del", kind="pointset", params={"point_ids": list(range(30))}, op="delete")
+    )
+    edits_path = tmp_path / "edits.json"
+    edits.save(edits_path)
+
+    out_dir = tmp_path / "report_out_edited"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "trippy.cli",
+            "candidate-report",
+            "--checkpoint",
+            str(checkpoint),
+            "--out",
+            str(out_dir),
+            "--dolly-pose",
+            "IMG_0.jpg",
+            "--offpath",
+            "IMG_0.jpg",
+            "--device",
+            "cpu",
+            "--edits",
+            str(edits_path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=False,
+    )
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+
+    report = json.loads((out_dir / "report.json").read_text())
+    assert report["edits"] == {
+        "path": str(edits_path),
+        "n_points_before": n_before,
+        "n_removed": 30,
+        "n_points_after": n_before - 30,
+        "n_regions": 1,
+        "gate_suppression_active": False,
+    }
+    readme = (out_dir / "README.md").read_text()
+    assert "Edits applied" in readme
+    assert str(edits_path) in readme
