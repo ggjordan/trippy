@@ -68,7 +68,63 @@ this document was still a spec for:
   translate along that axis, Shift-drag to resize, Ctrl-drag to rotate a box.
   A drag that does not START on a handle still orbits, so navigation loses
   nothing; the keyboard nudges stay, and now share `gizmo::translated` /
-  `gizmo::resized` with the drag so the two cannot disagree.
+  `gizmo::resized` with the drag so the two cannot disagree. A `lid` gets a
+  **4th handle** on its own plane normal (2026-09-08, see below).
+
+Status: **three follow-ups from the 2026-09-08 brush/gizmo session closed**
+(2026-09-08, `fix/editor-followups`, no queue job -- all local/CPU):
+
+- **The brush depth anchor's `O(points)` scan, measured and fixed.**
+  `brush::depth_anchor` cost **47.4 ms/sample on the real `kkv2-1-full-masked`
+  bundle** (7.5M points) -- far past a paintable frame budget for a stroke
+  that samples several times a second. `edit::brush::ScreenGrid` is a
+  screen-space bucket index (cell edge = `ANCHOR_RADIUS_PX`) built ONCE per
+  camera pose (`edit_ui.rs::resolve_brush` rebuilds it only when
+  `ClickCamera` actually changes) and reused for every sample of a stroke and
+  every later stroke from the same viewpoint: **0.011 ms/sample after a
+  325.5 ms one-time build**, ~4300x faster per sample. It is an acceleration
+  structure, not an approximation -- a cell edge `>= radius_px` gives the same
+  3x3-neighbourhood-visits-every-candidate guarantee a uniform spatial hash
+  always has, checked against the brute-force scan on randomised inputs
+  (`edit::brush::tests::the_grid_agrees_with_the_brute_force_scan_on_random_points_and_pixels`,
+  exact equality, not a tolerance). New headless flag `--bench-brush-anchor N`
+  reproduces the before/after numbers on any bundle with no GPU device
+  touched. See `research/trips-metal.md`'s 2026-09-08 entry for the full
+  numbers.
+- **The npz sidecar deviation is closed.** §1's `brush` entry used to note
+  "the viewer keeps a brush's cells INLINE when it saves ... adding an npz
+  WRITER to the viewer would buy nothing a reader can see" -- true for either
+  loader (both replay `undo_stack.log`, never the sidecar), but the brief
+  asked for byte-for-byte parity with the CLI's own writer regardless, so it
+  now exists: `edit::npz_write` (a from-scratch `.npz` writer -- CRC-32,
+  ZIP "stored", `.npy` v1.0 headers, no new dependency; `brush_pyramid::npz`
+  already had the matching reader), wired into `EditDocument::save` via
+  `externalize_brush`, the exact twin of `trippy.edit.model.
+  EditDocument._externalize_brush`. A region above
+  `EDIT_BRUSH_NPZ_CELL_THRESHOLD` (4096) cells now gets the SAME
+  `edits_brush_<id>.npz` (`cells` int32, `weights` float32 when graded) from
+  either language, pinned by the SAME synthetic recipe on both sides
+  (`tests/test_edit_model.py::test_brush_npz_sidecar_written_above_threshold`,
+  `edit::model::tests::a_brush_above_the_npz_threshold_is_externalised_on_save`)
+  and cross-checked with plain `numpy.load` against a Rust-written file via a
+  new `--brush-npz-selftest <dir>` flag
+  (`tests/test_edit_viewer_parity.py::test_brush_npz_sidecar_the_viewer_writes_loads_with_plain_numpy`).
+- **The lid's plane normal now has its own gizmo handle.** A 4th handle,
+  `edit::gizmo::NormalHandle`, projected along `up` the same way the three
+  world-axis arms are projected along X/Y/Z; dragging it tilts `up` by
+  decomposing the screen drag onto two in-plane basis directions captured at
+  projection time (`orthonormal_basis`, no further camera calls needed once
+  the drag starts, same contract every other handle keeps), then
+  re-normalising. `Drag::Tilt` is the gesture (Shift/Ctrl are ignored on this
+  ONE handle -- there is no axis to resize or rotate about), coalesced into
+  one undo entry like every other drag. The Inspector's typed `up`
+  (`vec3_row`, unchanged) and the handle share nothing but the same
+  `Region.params.up` field, so either can follow the other. Tests:
+  `edit::gizmo::tests::{a_lid_gets_a_fourth_handle_for_its_normal,
+  picking_the_normal_handle_returns_normal_axis,
+  dragging_the_normal_handle_tilts_up_and_stays_unit_length}` (maths) and
+  `edit_ui::tests::dragging_the_lids_normal_handle_tilts_up_as_one_undo_step_and_typing_still_works`
+  (a drag, then a typed edit, then two undos, session-level).
 
 Four implementation notes, all explained where they matter below:
 
@@ -80,8 +136,10 @@ Four implementation notes, all explained where they matter below:
   (`op="delete"`/`"fade"`, `trippy.edit.model.lid_membership`). Its 3D gizmo
   is E1's general one (`src/edit/gizmo.rs`, shipped 2026-09-08): a lid is
   moved by dragging a handle and its `radius` scaled by Shift-dragging one,
-  rather than by a ring of its own. `up`/`height` are still typed in the
-  Inspector. See §1's `lid` entry and §6's E3 row.
+  rather than by a ring of its own, and (2026-09-08) its plane normal `up`
+  has its own 4th handle to drag-tilt. `height` is still typed in the
+  Inspector, and `up` can be either dragged or typed. See §1's `lid` entry
+  and §6's E3 row.
 - **The checkpoint-side gate-suppression multiply (§5) is a documented
   simplification, not the full per-pixel override §2 describes** -- it
   multiplies the trained blend gate by the editor's own per-point weight
@@ -316,13 +374,22 @@ call directly).
   CENTRE inside it" would reproduce a smaller cell set that still passed
   every membership lookup. **Shipped on the viewer side too** (2026-09-08):
   the `brush` tool paints on the render (§4), and one stroke is one undo
-  entry. The one deviation from the Python: the viewer keeps a brush's
-  cells INLINE when it saves, rather than externalising them into the
-  `.npz` sidecar above `EDIT_BRUSH_NPZ_CELL_THRESHOLD` cells. Neither
-  loader ever reads that sidecar (both reconstruct every region by
-  replaying `undo_stack.log`, which is never externalised), so the two
-  files differ only in size, and adding an npz WRITER to the viewer would
-  buy nothing a reader can see.
+  entry. **The npz sidecar writer is also shipped on the viewer side**
+  (2026-09-08, closing what used to be the one deviation from the Python
+  here): `EditDocument::save` externalises a brush region's `cells`/
+  `weights` into `edits_brush_<id>.npz` above `EDIT_BRUSH_NPZ_CELL_THRESHOLD`
+  cells, the exact array shapes/dtypes `trippy.edit.model.
+  EditDocument._externalize_brush` writes (`edit::npz_write`, a from-scratch
+  writer — no ZIP crate, matching `brush_pyramid::npz`'s own from-scratch
+  reader). Neither loader ever reads that sidecar back (both reconstruct
+  every region by replaying `undo_stack.log`, which is never externalised),
+  so this still buys nothing either loader can see — the parity is for an
+  EXTERNAL reader, and for keeping the written `edits.json` small, both of
+  which the brief asked for regardless. Pinned by the same synthetic
+  over-threshold stroke on both sides (`tests/test_edit_model.py`,
+  `edit::model.rs`'s own unit test) and cross-checked with plain
+  `numpy.load` against a Rust-written sidecar
+  (`tests/test_edit_viewer_parity.py`, via `--brush-npz-selftest`).
 - `lid`: `up`, `height`, `center`, `radius`, `falloff`, `band` — **the same
   six numbers as `~/Splats/tools/SURFACE_LID.md`'s `--lid-*` flags**, so the
   Karekare pool's already-fitted values
@@ -1097,7 +1164,11 @@ now **shipped on both sides** (2026-09-08):
   110 of 4 000 points and changes **4.21 %** of the frame (max channel diff
   50); a two-pixel stroke to (300, 210) removes 299 and changes **8.51 %**;
   `--brush-undo` reproduces the unedited frame **byte for byte** (0.00 % of
-  pixels differ, max channel diff 0).
+  pixels differ, max channel diff 0). **2026-09-08:** the per-sample depth
+  anchor (`brush::depth_anchor`) went from **47.4 ms/sample brute force to
+  0.011 ms/sample** via `edit::ScreenGrid` on the real `kkv2-1-full-masked`
+  bundle (7.5M points), and the sidecar writer described in §1's `brush`
+  entry landed on the viewer side.
 - **Named Objects.** Every region with its name, source tool, kind, live point
   count, enable toggle, mix slider, rename, remove and **solo**, grouped by
   `Region.source.tool` with hand-authored regions in their own group. Viewer

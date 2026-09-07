@@ -49,6 +49,18 @@ pub const GATE_DEFAULT_WEIGHT: f64 = 1.0;
 /// Mirrors `trippy.constants.EDIT_REGION_ID_HEX_LEN`.
 pub const REGION_ID_HEX_LEN: usize = 8;
 
+/// The most cells a `brush` region's `regions[]` entry carries inline before
+/// [`EditDocument::save`] externalises `cells`/`weights` into an `.npz`
+/// sidecar. Mirrors `trippy.constants.EDIT_BRUSH_NPZ_CELL_THRESHOLD`.
+pub const EDIT_BRUSH_NPZ_CELL_THRESHOLD: usize = 4096;
+
+/// `"edits_brush_<region id>.npz"` — mirrors
+/// `trippy.constants.EDIT_BRUSH_NPZ_FILENAME_FMT`.
+#[must_use]
+pub fn brush_npz_filename(region_id: &str) -> String {
+    format!("edits_brush_{region_id}.npz")
+}
+
 /// `"format"` of `tests/fixtures/synthetic/edit_golden/names.json`, matching
 /// `trippy.edit.golden.NAMES_FIXTURE_FORMAT`.
 pub const NAMES_FIXTURE_FORMAT: &str = "trippy-edit-names-1";
@@ -1178,18 +1190,106 @@ impl EditDocument {
     ///
     /// The trailing newline and two-space indent match `EditDocument.save` in
     /// Python, so a file the viewer writes and one `trippy edits` writes differ
-    /// only where their content differs.
+    /// only where their content differs. A `brush` region above
+    /// [`EDIT_BRUSH_NPZ_CELL_THRESHOLD`] cells has its `cells`/`weights`
+    /// externalised into an `.npz` sidecar next to `path`
+    /// ([`externalize_brush`]) in the WRITTEN copy only — `self.regions`/
+    /// `self.log` (and this method's own `self.to_json()` before the
+    /// externalisation runs) stay fully literal, exactly as `trippy.edit.
+    /// model.EditDocument.save`'s own docstring describes. Neither loader
+    /// reads the sidecar back (both replay `undo_stack.log`, never
+    /// externalised), so this only matters to an external reader of the
+    /// materialised `regions[]` array.
     ///
     /// # Errors
-    /// Returns `Err` when the directory cannot be created or the write fails.
+    /// Returns `Err` when the directory cannot be created, a sidecar cannot be
+    /// written, or the write fails.
     pub fn save(&self, path: &std::path::Path) -> Result<(), String> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+        let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+        std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+        let mut doc = self.to_json();
+        if let Some(regions) = doc.get_mut("regions").and_then(Value::as_array_mut) {
+            for region in regions.iter_mut() {
+                *region = externalize_brush(region, parent)?;
+            }
         }
-        let text = serde_json::to_string_pretty(&self.to_json())
-            .map_err(|e| format!("serialising edits.json: {e}"))?;
+        let text =
+            serde_json::to_string_pretty(&doc).map_err(|e| format!("serialising edits.json: {e}"))?;
         std::fs::write(path, text + "\n").map_err(|e| format!("{}: {e}", path.display()))
     }
+}
+
+/// A `brush` region's `regions[]` entry, `cells`/`weights` moved to an `.npz`
+/// sidecar in `out_dir` if large — the Rust twin of `trippy.edit.model.
+/// EditDocument._externalize_brush`. Only ever applied to the WRITTEN copy of
+/// a region (see [`EditDocument::save`]); a region below
+/// [`EDIT_BRUSH_NPZ_CELL_THRESHOLD`] cells (or not a brush at all) is returned
+/// unchanged.
+///
+/// # Errors
+/// Returns `Err` when the sidecar cannot be written, or when `cells`/
+/// `weights` are shaped in a way [`BrushCells::from_json`] would also refuse
+/// (this function is only ever handed a `Region` this crate itself produced,
+/// so that should not happen in practice).
+fn externalize_brush(region_json: &Value, out_dir: &std::path::Path) -> Result<Value, String> {
+    if region_json.get("kind").and_then(Value::as_str) != Some("brush") {
+        return Ok(region_json.clone());
+    }
+    let empty = Vec::new();
+    let params = region_json.get("params").cloned().unwrap_or_else(|| json!({}));
+    let cells = params
+        .get("cells")
+        .and_then(Value::as_array)
+        .unwrap_or(&empty);
+    if cells.len() <= EDIT_BRUSH_NPZ_CELL_THRESHOLD {
+        return Ok(region_json.clone());
+    }
+
+    let mut cells_i32: Vec<[i32; 3]> = Vec::with_capacity(cells.len());
+    for row in cells {
+        let triplet = row
+            .as_array()
+            .filter(|t| t.len() == 3)
+            .ok_or_else(|| "brush.cells must be a list of [i, j, k] triplets".to_owned())?;
+        let mut cell = [0_i32; 3];
+        for (slot, item) in cell.iter_mut().zip(triplet) {
+            let v = item
+                .as_i64()
+                .ok_or_else(|| "brush.cells must be a list of [i, j, k] triplets".to_owned())?;
+            *slot = i32::try_from(v)
+                .map_err(|_| format!("brush.cells must fit in a signed int32, got {v}"))?;
+        }
+        cells_i32.push(cell);
+    }
+    let weights: Option<Vec<f32>> = match params.get("weights") {
+        Some(Value::Array(array)) => {
+            #[allow(clippy::cast_possible_truncation)]
+            let out = array.iter().map(|v| v.as_f64().unwrap_or(1.0) as f32).collect();
+            Some(out)
+        }
+        _ => None,
+    };
+
+    let id = region_json.get("id").and_then(Value::as_str).unwrap_or("");
+    let filename = brush_npz_filename(id);
+    super::npz_write::write_brush_npz(&out_dir.join(&filename), &cells_i32, weights.as_deref())?;
+
+    let mut new_params = Map::new();
+    if let Value::Object(map) = &params {
+        for (key, value) in map {
+            if key != "cells" && key != "weights" {
+                new_params.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    new_params.insert("cells_npz".to_owned(), json!(filename));
+    new_params.insert("n_cells".to_owned(), json!(cells_i32.len()));
+
+    let mut out = region_json.clone();
+    if let Some(object) = out.as_object_mut() {
+        object.insert("params".to_owned(), Value::Object(new_params));
+    }
+    Ok(out)
 }
 
 /// The counter a name ends with, if it ends with one: `"click-12"` -> `Some(12)`.
@@ -1494,6 +1594,102 @@ mod tests {
         // `delete`'s hard membership is "weight > 0" for every kind but `lid`.
         assert!(region_contains(&region, 0, [0.6, 0.1, 0.1]));
         assert!(!region_contains(&region, 0, [1.6, 0.1, 0.1]));
+    }
+
+    /// A brush region of `n` cells at `[[0,0,0], [1,0,0], ..., [n-1,0,0]]`,
+    /// `cell_size = 1.0` — the exact recipe `tests/test_edit_model.py`'s
+    /// `test_brush_npz_sidecar_written_above_threshold` uses on the Python
+    /// side, so the two tests pin the SAME synthetic stroke.
+    fn brush_region_of_n_cells(id: &str, n: usize) -> Region {
+        let cells: Vec<[i64; 3]> = (0..n).map(|i| [i as i64, 0, 0]).collect();
+        let mut brush_cells = BrushCells::new();
+        brush_cells.paint_cells(&cells, 1.0);
+        Region::new(
+            id.to_owned(),
+            "brush-1".to_owned(),
+            Params::Brush {
+                origin: [0.0, 0.0, 0.0],
+                cell_size: 1.0,
+                cells: brush_cells,
+            },
+            1.0,
+            Op::Delete,
+        )
+    }
+
+    #[test]
+    fn a_brush_above_the_npz_threshold_is_externalised_on_save() {
+        let n = EDIT_BRUSH_NPZ_CELL_THRESHOLD + 10;
+        let region = brush_region_of_n_cells("r-big", n);
+        let mut doc = EditDocument::new(String::new());
+        doc.add_region(&region, None).unwrap();
+
+        let dir = std::env::temp_dir().join(format!("trips-edit-npz-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("edits.json");
+        doc.save(&path).unwrap();
+
+        let written: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let params = &written["regions"][0]["params"];
+        assert!(params.get("cells").is_none(), "cells must not stay inline");
+        assert_eq!(
+            params["cells_npz"].as_str().unwrap(),
+            format!("edits_brush_{}.npz", region.id)
+        );
+        assert_eq!(params["n_cells"].as_u64().unwrap(), n as u64);
+
+        // Readable through the SAME reader the live splat's `.npz` loading
+        // uses (`brush_pyramid::npz`) -- exactly what an external reader (not
+        // either loader, which both replay `undo_stack.log` instead) would do.
+        let sidecar = dir.join(format!("edits_brush_{}.npz", region.id));
+        let members = brush_pyramid::npz::read_npz(&sidecar).unwrap();
+        let cells_arr = members.get("cells").expect("a cells member");
+        assert_eq!(cells_arr.shape, vec![n, 3]);
+        let flat = cells_arr.to_i32().unwrap();
+        for i in 0..n {
+            assert_eq!(&flat[3 * i..3 * i + 3], [i as i32, 0, 0]);
+        }
+        assert!(
+            !members.contains_key("weights"),
+            "an all-1.0 brush writes no weights array, same as the inline case"
+        );
+
+        // In-memory state is untouched by the externalisation: `self.regions`
+        // still holds the literal cells, and reloading (which replays the
+        // log, never the sidecar) reproduces every cell exactly.
+        let Params::Brush { cells, .. } = &doc.region("r-big").unwrap().params else {
+            panic!("still a brush")
+        };
+        assert_eq!(cells.len(), n);
+
+        let reopened = EditDocument::load(&path).unwrap();
+        let Params::Brush { cells, .. } = &reopened.region("r-big").unwrap().params else {
+            panic!("still a brush")
+        };
+        assert_eq!(cells.len(), n, "reload replays the log, not the sidecar");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_brush_at_or_below_the_npz_threshold_stays_inline() {
+        let region = brush_region_of_n_cells("r-small", 2);
+        let mut doc = EditDocument::new(String::new());
+        doc.add_region(&region, None).unwrap();
+
+        let dir = std::env::temp_dir().join(format!("trips-edit-npz-inline-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("edits.json");
+        doc.save(&path).unwrap();
+
+        let written: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let params = &written["regions"][0]["params"];
+        assert_eq!(params["cells"], json!([[0, 0, 0], [1, 0, 0]]));
+        assert!(params.get("cells_npz").is_none());
+        assert!(
+            !dir.join("edits_brush_r-small.npz").exists(),
+            "no sidecar below the threshold"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

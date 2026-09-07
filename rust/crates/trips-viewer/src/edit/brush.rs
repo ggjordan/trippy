@@ -569,6 +569,114 @@ pub fn depth_anchor(
     best
 }
 
+/// A screen-space bucket index over a static cloud's projections through ONE
+/// camera pose, so [`depth_anchor`]'s "nearest point under the cursor" query
+/// costs candidates-in-a-few-buckets instead of every point in the cloud.
+///
+/// `docs/EDITOR.md` §4 flagged `depth_anchor` as an unmeasured `O(points)`
+/// scan on a Karekare-scale cloud (7.5M points, `trippy-brush-anchor-perf-1`);
+/// a drag can sample many times a second (`edit_ui.rs`'s `BRUSH_SAMPLE_PX`
+/// throttles it, not eliminates it), so that scan repeats every sample. This
+/// index amortises the projection: built ONCE per camera pose (the caller
+/// rebuilds it only when the camera changes — `ClickCamera` is `PartialEq`,
+/// so `edit_ui.rs::resolve_brush` compares by value), every later sample is a
+/// handful of bucket lookups.
+///
+/// This is an ACCELERATION structure, not an approximation: with a cell edge
+/// `>= radius_px`, the 3x3 neighbourhood of the query pixel's own cell visits
+/// every point a brute-force `du^2 + dv^2 <= radius_px^2` scan would keep (the
+/// standard uniform-grid range-query guarantee — a point within `radius_px`
+/// of a pixel can only ever land in the cell the pixel is in or one of its
+/// eight neighbours when the cell is at least as wide as the search radius).
+/// [`tests::the_grid_agrees_with_the_brute_force_scan`] checks this against
+/// [`depth_anchor`] directly on randomised inputs, including the exact
+/// [`ANCHOR_RADIUS_PX`] this module ships with.
+pub struct ScreenGrid {
+    /// Cell edge, render pixels. Must be `>=` any `radius_px` a query uses.
+    cell_px: f64,
+    /// `(bucket i, bucket j) -> (u, v, z)` of every point that projects in
+    /// front of the camera with finite screen coordinates. Kept `f64`, the
+    /// same width [`depth_anchor`]'s brute-force scan uses, so the grid's
+    /// answer is bit-identical to it rather than merely close — this is an
+    /// index, not a lower-precision approximation.
+    buckets: HashMap<(i64, i64), Vec<(f64, f64, f64)>>,
+}
+
+impl ScreenGrid {
+    /// Project every point of `xyz` through `camera` once and bucket it by
+    /// its screen position, `cell_px` wide.
+    ///
+    /// `cell_px` should be the largest `radius_px` [`Self::nearest`] will ever
+    /// be called with (see the module doc's exactness argument); passing a
+    /// smaller one is still correct as long as every query also widens its own
+    /// search to the matching number of rings, which [`Self::nearest`] does
+    /// not do — it always searches exactly one ring.
+    #[must_use]
+    pub fn build(camera: &ClickCamera, xyz: &[f64], cell_px: f64) -> Self {
+        let cell_px = if cell_px.is_finite() && cell_px > 0.0 {
+            cell_px
+        } else {
+            1.0
+        };
+        let mut buckets: HashMap<(i64, i64), Vec<(f64, f64, f64)>> = HashMap::new();
+        for i in 0..xyz.len() / 3 {
+            let p = [xyz[3 * i], xyz[3 * i + 1], xyz[3 * i + 2]];
+            let (u, v, z) = camera.project(p);
+            if !(z > 0.0) || !u.is_finite() || !v.is_finite() {
+                continue;
+            }
+            #[allow(clippy::cast_possible_truncation)]
+            let key = ((u / cell_px).floor() as i64, (v / cell_px).floor() as i64);
+            buckets.entry(key).or_default().push((u, v, z));
+        }
+        Self { cell_px, buckets }
+    }
+
+    /// How many buckets are occupied (a diagnostic, not used by the query).
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.buckets.values().map(Vec::len).sum()
+    }
+
+    /// True when the grid holds no points at all.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.buckets.is_empty()
+    }
+
+    /// The depth of the nearest point under `px`, exactly as [`depth_anchor`]
+    /// would find scanning every point — see the module doc for why the 3x3
+    /// neighbourhood is enough as long as `radius_px <= cell_px`.
+    #[must_use]
+    pub fn nearest(&self, px: (f64, f64), radius_px: f64) -> Option<f64> {
+        let r2 = radius_px * radius_px;
+        #[allow(clippy::cast_possible_truncation)]
+        let base = (
+            (px.0 / self.cell_px).floor() as i64,
+            (px.1 / self.cell_px).floor() as i64,
+        );
+        let mut best: Option<f64> = None;
+        for di in -1..=1_i64 {
+            for dj in -1..=1_i64 {
+                let Some(candidates) = self.buckets.get(&(base.0 + di, base.1 + dj)) else {
+                    continue;
+                };
+                for &(u, v, z) in candidates {
+                    let du = u - px.0;
+                    let dv = v - px.1;
+                    if du.mul_add(du, dv * dv) > r2 {
+                        continue;
+                    }
+                    if best.is_none_or(|b| z < b) {
+                        best = Some(z);
+                    }
+                }
+            }
+        }
+        best
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -681,5 +789,91 @@ mod tests {
         assert!(err.contains("sweeps"), "{err}");
         // A zero or negative radius paints nothing, exactly as the Python does.
         assert!(sphere_touched_cells(ORIGIN, 1.0, [0.0, 0.0, 0.0], 0.0).unwrap().is_empty());
+    }
+
+    // --- ScreenGrid: the accelerated depth anchor must agree with brute force ---------
+
+    /// A camera at the world origin looking down `+Z`, matching `gizmo`'s and
+    /// `edit_ui.rs`'s own test camera, so a failure here reads the same units.
+    fn test_camera() -> ClickCamera {
+        ClickCamera {
+            r: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+            t: [0.0, 0.0, 0.0],
+            fx: 400.0,
+            fy: 400.0,
+            cx: 320.0,
+            cy: 240.0,
+        }
+    }
+
+    /// A tiny xorshift generator: deterministic and dependency-free, which is
+    /// all a repeatable property test over "enough" random points needs.
+    struct Xorshift(u64);
+    impl Xorshift {
+        fn next_f64(&mut self) -> f64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            // Top 53 bits -> [0, 1).
+            (self.0 >> 11) as f64 * (1.0 / (1_u64 << 53) as f64)
+        }
+    }
+
+    /// A cloud spread through the camera's own view frustum, so a meaningful
+    /// fraction of query pixels actually land near a point (an empty result on
+    /// every query would let a broken grid pass by vacuous agreement).
+    fn random_cloud(rng: &mut Xorshift, n: usize) -> Vec<f64> {
+        let mut xyz = Vec::with_capacity(n * 3);
+        for _ in 0..n {
+            xyz.push((rng.next_f64() - 0.5) * 6.0); // x in [-3, 3]
+            xyz.push((rng.next_f64() - 0.5) * 4.0); // y in [-2, 2]
+            xyz.push(2.0 + rng.next_f64() * 8.0); // z in [2, 10], in front
+        }
+        xyz
+    }
+
+    #[test]
+    fn the_grid_agrees_with_the_brute_force_scan_on_random_points_and_pixels() {
+        let mut rng = Xorshift(0xC0FF_EE12_3456_789A);
+        let camera = test_camera();
+        let xyz = random_cloud(&mut rng, 5_000);
+        let grid = ScreenGrid::build(&camera, &xyz, ANCHOR_RADIUS_PX);
+
+        let mut agreements = 0;
+        let mut hits = 0;
+        for _ in 0..500 {
+            let px = (rng.next_f64() * 640.0, rng.next_f64() * 480.0);
+            let brute = depth_anchor(&camera, &xyz, px, ANCHOR_RADIUS_PX);
+            let indexed = grid.nearest(px, ANCHOR_RADIUS_PX);
+            match (brute, indexed) {
+                (Some(b), Some(i)) => {
+                    assert_eq!(b, i, "grid must be exact, not approximate, at {px:?}");
+                    hits += 1;
+                    agreements += 1;
+                }
+                (None, None) => agreements += 1,
+                (b, i) => panic!("brute {b:?} vs grid {i:?} disagree on presence at {px:?}"),
+            }
+        }
+        assert_eq!(agreements, 500, "every query must agree with brute force");
+        assert!(hits > 50, "the cloud must actually land under some queries: {hits}");
+    }
+
+    #[test]
+    fn a_grid_built_on_an_empty_cloud_finds_nothing() {
+        let grid = ScreenGrid::build(&test_camera(), &[], ANCHOR_RADIUS_PX);
+        assert!(grid.is_empty());
+        assert!(grid.nearest((320.0, 240.0), ANCHOR_RADIUS_PX).is_none());
+    }
+
+    #[test]
+    fn the_grid_ignores_points_behind_the_camera_exactly_like_brute_force() {
+        let camera = test_camera();
+        // One point behind the camera, one in front, at the same pixel.
+        let xyz = [0.0, 0.0, -5.0, 0.0, 0.0, 5.0];
+        let grid = ScreenGrid::build(&camera, &xyz, ANCHOR_RADIUS_PX);
+        let px = (camera.cx, camera.cy);
+        assert_eq!(grid.nearest(px, ANCHOR_RADIUS_PX), Some(5.0));
+        assert_eq!(depth_anchor(&camera, &xyz, px, ANCHOR_RADIUS_PX), Some(5.0));
     }
 }

@@ -356,6 +356,14 @@ pub struct BrushUi {
     /// first stroke and dropped when the tool loses focus, exactly as
     /// [`ClickCache`] is and for the same reason.
     cache: Option<Vec<f64>>,
+    /// The screen-space bucket index [`brush::depth_anchor`]'s `O(points)` scan
+    /// used to cost every sample of a drag (measured at Karekare scale in
+    /// `research/trips-metal.md`, `trippy-brush-anchor-perf-1`). Rebuilt only
+    /// when the camera changes (`ClickCamera` is `PartialEq`, compared in
+    /// [`EditSession::resolve_brush`]), so a still camera reuses it across
+    /// every sample of a stroke — and across strokes, until the pointer
+    /// actually orbits.
+    screen_grid: Option<(ClickCamera, brush::ScreenGrid)>,
     /// The last depth the anchor found, world units. Kept so a sample that
     /// lands on empty space continues the stroke at the depth it started
     /// rather than inventing one.
@@ -410,6 +418,7 @@ impl Default for BrushUi {
             stroke: None,
             pending: Vec::new(),
             cache: None,
+            screen_grid: None,
             depth: None,
             cursor: None,
             note: String::new(),
@@ -1197,14 +1206,28 @@ impl EditSession {
         let radius = self.brush.radius;
         let weight = self.brush.weight;
 
+        // Rebuild the screen-space anchor index only when the camera actually
+        // moved (`ClickCamera` is `PartialEq`): a still camera during a drag,
+        // or a second stroke from the same viewpoint, reuses it instead of
+        // re-scanning the whole cloud (`brush::ScreenGrid`'s own doc comment).
+        let stale = self
+            .brush
+            .screen_grid
+            .as_ref()
+            .is_none_or(|(built_with, _)| built_with != camera);
+        if stale {
+            self.brush.screen_grid =
+                Some((camera.clone(), brush::ScreenGrid::build(camera, cache, brush::ANCHOR_RADIUS_PX)));
+        }
+        let grid = &self.brush.screen_grid.as_ref().expect("just built").1;
+
         // Every sample becomes a world centre first, so one stroke is ONE
         // `paint_along` over the path rather than N separate spheres — the same
         // shape the Python's own `paint_along` produces for a dragged stroke.
         let mut path: Vec<[f64; 3]> = Vec::with_capacity(samples.len());
         let mut last_pixel = None;
         for px in samples {
-            let depth = brush::depth_anchor(camera, cache, px, brush::ANCHOR_RADIUS_PX)
-                .or(self.brush.depth);
+            let depth = grid.nearest(px, brush::ANCHOR_RADIUS_PX).or(self.brush.depth);
             let Some(depth) = depth else {
                 // Nothing under the cursor and no earlier anchor: painting at an
                 // invented depth would put cells somewhere Jordan cannot see.
@@ -1363,10 +1386,18 @@ impl EditSession {
         else {
             return false;
         };
-        let kind = match (shift, ctrl) {
-            (true, _) => Drag::Resize,
-            (false, true) => Drag::Rotate,
-            (false, false) => Drag::Translate,
+        // The normal handle only ever tilts, whatever modifier is held: there
+        // is no world axis to resize or rotate about, only a direction to
+        // drag — Shift/Ctrl on this ONE handle would be a surprise, not a
+        // feature, so they are ignored rather than refused.
+        let kind = if axis == gizmo::NORMAL_AXIS {
+            Drag::Tilt
+        } else {
+            match (shift, ctrl) {
+                (true, _) => Drag::Resize,
+                (false, true) => Drag::Rotate,
+                (false, false) => Drag::Translate,
+            }
         };
         if kind == Drag::Rotate && !matches!(region.params, Params::Box { .. }) {
             self.note = "only a box has an orientation to rotate".to_owned();
@@ -1412,6 +1443,14 @@ impl EditSession {
                 drag.axis,
                 drag.screen.rotate_angle(drag.axis, drag.start_px, px),
             ),
+            Drag::Tilt => {
+                let Params::Lid(lid) = &drag.base else {
+                    return;
+                };
+                drag.screen
+                    .tilted_up(lid.up, total)
+                    .and_then(|up| gizmo::tilted(&drag.base, up))
+            }
         };
         let Some(params) = params else {
             return;
@@ -1430,6 +1469,7 @@ impl EditSession {
                 Some(Drag::Translate) => format!("moved along {}", axis_name(self.gizmo_axis())),
                 Some(Drag::Resize) => format!("resized on {}", axis_name(self.gizmo_axis())),
                 Some(Drag::Rotate) => format!("rotated about {}", axis_name(self.gizmo_axis())),
+                Some(Drag::Tilt) => "tilted the lid's normal".to_owned(),
                 None => String::new(),
             };
         }
@@ -1601,6 +1641,18 @@ impl EditSession {
             }
             Err(e) => self.error = Some(e),
         }
+    }
+
+    /// Write the document to an EXPLICIT path, sidecar externalisation
+    /// included — `main.rs`'s `--save-edits`, the headless twin of [`Self::save`]
+    /// for a script that wants the result somewhere other than this session's
+    /// own `self.path`.
+    ///
+    /// # Errors
+    /// Returns `Err` when `EditDocument::save` does (the directory cannot be
+    /// created, a brush sidecar cannot be written, or the write itself fails).
+    pub fn save_as(&mut self, path: &std::path::Path) -> Result<(), String> {
+        self.doc.save(path)
     }
 
     /// Re-read `edits.json` from disk, discarding unsaved changes.
@@ -2201,8 +2253,11 @@ impl EditSession {
             self.click.cache = None;
         }
         if previous == Tool::Brush && self.tool != previous {
-            // Same rule for the brush's own widened copy of the cloud.
+            // Same rule for the brush's own widened copy of the cloud, and the
+            // screen-space index built from it (stale the moment the points
+            // it indexed might not be).
             self.brush.cache = None;
+            self.brush.screen_grid = None;
         }
         match self.tool {
             Tool::Regions => {
@@ -2946,7 +3001,10 @@ fn axis_name(axis: usize) -> &'static str {
     match axis {
         0 => "world X",
         1 => "world Y",
-        _ => "world Z",
+        2 => "world Z",
+        // Reachable only if a future caller passes `gizmo::NORMAL_AXIS` here;
+        // `Drag::Tilt`'s own note branch never does (see `gizmo_drag_to`).
+        _ => "the lid's normal",
     }
 }
 
@@ -2987,6 +3045,7 @@ fn scalar_row(ui: &mut egui::Ui, label: &str, value: &mut f64, speed: f64) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use trips_viewer::edit::model::LidParams;
 
     #[test]
     fn the_tool_key_cycles_and_returns() {
@@ -3643,6 +3702,76 @@ mod tests {
         session.update_gizmo(&a_camera());
         let tip = session.gizmo_screen().expect("handles").arms[0].tip;
         assert!(!session.begin_gizmo_drag(tip, false, true));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dragging_the_lids_normal_handle_tilts_up_as_one_undo_step_and_typing_still_works() {
+        let (dir, mut session) = a_session("gizmo-lid-normal");
+        session.active = true;
+        session.add(Region::new(
+            "r-lid".to_owned(),
+            "pool lid".to_owned(),
+            Params::Lid(KAREKARE_LID),
+            1.0,
+            Op::Delete,
+        ));
+        let entries = session.doc.log.len();
+        session.update_gizmo(&a_camera());
+        let screen = session.gizmo_screen().expect("a lid in front has handles");
+        let normal_tip = screen.normal.expect("a lid has a 4th handle").tip;
+
+        // Grab the normal handle (not an arm) and drag it -- one undo step
+        // however many frames the drag took, exactly like a translate/resize.
+        assert!(
+            session.begin_gizmo_drag(normal_tip, false, false),
+            "the normal handle is grabbed"
+        );
+        session.gizmo_drag_to((normal_tip.0 + 6.0, normal_tip.1));
+        session.gizmo_drag_to((normal_tip.0 + 12.0, normal_tip.1));
+        session.end_gizmo_drag();
+
+        let Params::Lid(after_drag) = session.doc.region("r-lid").unwrap().params else {
+            panic!("still a lid")
+        };
+        assert_ne!(after_drag.up, KAREKARE_LID.up, "the drag tilted it");
+        let up_norm: f64 = after_drag.up.iter().map(|v| v * v).sum::<f64>().sqrt();
+        assert!((up_norm - 1.0).abs() < 1e-9, "tilting must keep up unit length: {up_norm}");
+        assert_eq!(after_drag.height, KAREKARE_LID.height, "only up moved");
+        assert_eq!(after_drag.center, KAREKARE_LID.center);
+        assert_eq!(
+            session.doc.log.len(),
+            entries + 1,
+            "however many frames the drag took, it is one entry"
+        );
+
+        // The Inspector's own path (typing a new `up`, `Params::Lid`'s
+        // `vec3_row` branch in `ui()`) goes through `set_params`, not the
+        // gizmo drag machinery -- it must still work after a tilt-drag.
+        let typed = Params::Lid(LidParams {
+            up: [0.0, 1.0, 0.0],
+            ..after_drag
+        });
+        session.set_params("r-lid", &typed);
+        let Params::Lid(after_typing) = session.doc.region("r-lid").unwrap().params else {
+            panic!("still a lid")
+        };
+        assert_eq!(after_typing.up, [0.0, 1.0, 0.0]);
+
+        // One Cmd-Z undoes the TYPED edit (a separate, later step from the
+        // drag), landing back on the tilt the drag produced.
+        session.undo_once();
+        let Params::Lid(after_first_undo) = session.doc.region("r-lid").unwrap().params else {
+            panic!("still a lid")
+        };
+        assert_eq!(after_first_undo.up, after_drag.up, "back to the drag's own result");
+
+        // A second Cmd-Z undoes the drag itself, back to the untouched region.
+        session.undo_once();
+        let Params::Lid(after_second_undo) = session.doc.region("r-lid").unwrap().params else {
+            panic!("still a lid")
+        };
+        assert_eq!(after_second_undo.up, KAREKARE_LID.up, "back to the original, untilted lid");
         std::fs::remove_dir_all(&dir).ok();
     }
 
