@@ -423,6 +423,9 @@ All notable changes to trippy. Format: Keep a Changelog. Versions: semver tags `
     does not implement; SAM 3 ships the real-valued twin
     (`ViT(use_rope_real=True)`) but the builder never passes the flag, and it
     has no learned parameters, so the checkpoint loads identically.
+  - `PositionEmbeddingSine` precomputes its position encodings into a plain
+    `self.cache` dict rather than a buffer, so `nn.Module.to()` left them on
+    the CPU and `_get_img_feats` indexed them with MPS indices.
 - **The `torch.autocast(bfloat16)` region round SAM 3 inference is gone, and
   the CPU lift got 6x faster: 9.2 s against 58.8 s** for the same mask (129,712
   mask pixels, 74,007 of 104,218 in-mask points selected on
