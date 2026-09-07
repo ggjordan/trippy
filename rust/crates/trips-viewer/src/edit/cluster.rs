@@ -231,6 +231,27 @@ impl ClickCamera {
         )
     }
 
+    /// The world point at pixel `(u, v)` and camera-space depth `z`.
+    ///
+    /// The exact inverse of [`Self::project`] (`x_world = R^T (x_cam - t)`).
+    /// Viewer-only — there is no Python twin, because the Python side never
+    /// has a live camera to un-project through — and it exists for the brush
+    /// tool, which turns "this pixel, at the depth of the nearest point under
+    /// it" into the world centre of a stroke (`docs/EDITOR.md` §4, the brush).
+    #[must_use]
+    pub fn unproject(&self, px: (f64, f64), depth: f64) -> [f64; 3] {
+        let cam = [
+            (px.0 - self.cx) * depth / self.fx - self.t[0],
+            (px.1 - self.cy) * depth / self.fy - self.t[1],
+            depth - self.t[2],
+        ];
+        [
+            self.r[0] * cam[0] + self.r[3] * cam[1] + self.r[6] * cam[2],
+            self.r[1] * cam[0] + self.r[4] * cam[1] + self.r[7] * cam[2],
+            self.r[2] * cam[0] + self.r[5] * cam[1] + self.r[8] * cam[2],
+        ]
+    }
+
     /// The camera centre in world coordinates, `C = -R^T t`
     /// (`trippy.edit.cluster.camera_center`).
     #[must_use]

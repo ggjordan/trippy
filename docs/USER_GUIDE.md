@@ -284,8 +284,8 @@ trippy eval --checkpoint <run>/checkpoints/checkpoint_best.pt --gate-scale 2
 
 ## The Editor: regions, mix, delete, undo (press `M`)
 
-Press **`M`** in the viewer (or launch it with `--edit` to start there). Three panels appear on the right: **Regions**,
-**Inspector** and **Tools**. Press `M` again and they are gone; nothing about the
+Press **`M`** in the viewer (or launch it with `--edit` to start there). Four panels appear on the right: **Regions**,
+**Named Objects**, **Inspector** and **Tools**. Press `M` again and they are gone; nothing about the
 scene changes when they are hidden, and a bundle with no edits renders exactly the
 frame it rendered before the editor existed.
 
@@ -311,8 +311,11 @@ never un-delete something.
 2. Press `M`, then click **+ box**, **+ sphere** or **+ lid**. The new region is
    born at the look-at point, about a twelfth of the scene across.
 3. Drag the **mix** slider, or click **delete** for the hard version.
-4. Nudge and resize it with the arrow keys and `[` / `]`, or type exact numbers in
-   the Inspector. (There is no 3D drag handle yet — that is E3.)
+4. **Drag one of the three coloured handles** (red = world X, green = Y, blue = Z)
+   to move it along that axis; **Shift-drag** a handle to resize; **Ctrl-drag**
+   one to rotate a box. A drag anywhere *else* still orbits, so navigation is
+   never taken away. The arrow keys, `PageUp`/`PageDown` and `[` / `]` still
+   nudge and resize by exact steps, and the Inspector still takes typed numbers.
 5. **Cmd-S** writes `edits.json`. Closing and reopening the bundle restores the
    regions, the mixes AND the undo history.
 
@@ -324,19 +327,74 @@ A/B-checked, so the pool lid is one click plus one save.
 | key | action |
 |---|---|
 | `M` | show/hide the editor |
-| `T` | cycle the Tools panel: Regions → shade-cloud finder → click-to-cluster → SAM 3 lift |
+| `T` | cycle the Tools panel: Regions → shade-cloud finder → click-to-cluster → SAM 3 lift → brush |
 | `H` | preview highlight on/off (for whichever tool has focus) |
 | **Shift-click** on the render | select the object under the pointer (click-to-cluster) |
-| **drag** on the render | draw a box for the SAM 3 lift — *only* while the SAM tool has focus. Shift-drag still orbits |
-| **Alt-click** on the render | point prompt for the SAM 3 lift |
+| **drag** on the render | draw a box for the SAM 3 lift, or paint — *only* while that tool has focus. Shift-drag still orbits |
+| **Alt-click / Alt-drag** | point prompt for the SAM 3 lift; erase, with the brush |
+| **drag a handle** | move the selected region along that axis (Shift: resize, Ctrl: rotate a box) |
 | arrows, `PageUp`/`PageDown` | nudge the selected region along world X/Z and Y |
-| `[` / `]` | shrink / grow the selected region |
+| `[` / `]` | shrink / grow the selected region — or the brush radius, while the brush has focus |
 | `Delete` / `Backspace` | remove the selected region |
 | `Cmd-Z` / `Cmd-Shift-Z` | undo / redo |
 | `Cmd-S` | save `edits.json` |
 
 Every key the viewer already used (`V X B Tab - = F R N P W A S D Q E`) still does
 what it did.
+
+### Paint an edit by hand (the brush)
+
+Press `T` until the Tools panel says **brush**, then **drag on the render**. Each
+dab is a sphere of the radius in the panel, placed at the depth of the nearest
+point under your cursor — so you paint *on* the scene, not on the glass. **Alt-drag
+erases**. `[` and `]` change the radius while the tool has focus, and a magenta
+ring on screen shows how big the brush is at the depth it is painting.
+
+- The stroke goes into a **brush region**: a sparse set of voxel cells, painted
+  where you dragged. It behaves like every other region — `delete` removes the
+  points inside it, `blend`/`fade` mix them towards the splat, and the Named
+  Objects panel lists it like any other.
+- **One stroke is one `Cmd-Z`**, however long you dragged.
+- Later strokes go into the **same** region until you press **start a new region**,
+  so an object can be painted in several passes and still be one named thing.
+- The **weight** slider decides how strongly a painted cell claims a point — the
+  brush's own soft edge, independent of the region's `mix`.
+- The region's voxel grid is fixed when it is created (from the radius at that
+  moment), so changing the radius later changes the *stroke*, never the cells you
+  already painted.
+
+Headless, for a script or a check:
+
+```
+rust/target/release/trips-viewer <bundle> --brush 240 180 --brush-radius 0.5 \
+    --brush-op delete --screenshot painted.png
+rust/target/release/trips-viewer <bundle> --brush 240 180 --brush-to 300 210 \
+    --brush-radius 0.5 --brush-op delete --brush-undo --screenshot undone.png
+```
+
+The second run paints the same stroke and undoes it; its frame is byte-identical to
+one with no `--brush` at all, which is how the undo is checked on every test run.
+
+### Name, group and solo your objects
+
+The **Named Objects** panel is the list of everything you have made, grouped by the
+tool that made it (`brush`, `click`, `shade-clouds`, `sam-box`, and
+`hand-authored` for regions you placed by hand). Each row shows the name, kind,
+op, and how many points it is actually claiming right now, and carries:
+
+- a **checkbox** to switch it off without deleting it,
+- a **mix** slider (the whole drag is one undo step),
+- **rename** — the names are the same auto-numbered ones the command line gives
+  (`brush-1`, `click-2`, `sam-box-IMG_3703-3`), counted across every tool so the
+  list reads as one numbered sequence,
+- **remove**,
+- **solo**: render *only* that region's effect, so you can see what one object is
+  doing without turning the others off one at a time. Solo is a way of looking, not
+  an edit — it is never saved into `edits.json`.
+
+Headlessly, `--solo <name-or-id>` does the same thing, and
+`--move-region <name-or-id> <dx> <dy> <dz>` moves a region exactly as dragging its
+translate handle does.
 
 ### Click an object to select it
 

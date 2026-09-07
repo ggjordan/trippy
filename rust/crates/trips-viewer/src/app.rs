@@ -61,6 +61,26 @@ const SAM_MARQUEE_COLOUR: egui::Color32 = egui::Color32::from_rgb(255, 0, 255);
 /// Stroke width of that rectangle, egui points.
 const SAM_MARQUEE_WIDTH: f32 = 1.5;
 
+/// The brush cursor's ring: the same magenta the selection tools tint with, so
+/// "the editor is about to change this" is one colour throughout.
+const BRUSH_CURSOR_COLOUR: egui::Color32 = egui::Color32::from_rgb(255, 0, 255);
+
+/// Stroke width of the brush ring and of a gizmo arm, egui points.
+const OVERLAY_STROKE_WIDTH: f32 = 1.5;
+
+/// The gizmo's three axis arms: world X red, Y green, Z blue — the convention
+/// every 3D tool Jordan already uses draws them in.
+const GIZMO_AXIS_COLOURS: [egui::Color32; 3] = [
+    egui::Color32::from_rgb(235, 90, 90),
+    egui::Color32::from_rgb(110, 210, 110),
+    egui::Color32::from_rgb(110, 150, 245),
+];
+
+/// Radius of a gizmo handle's grab dot, egui points. Drawn small so it hides as
+/// little of the scene as possible; `gizmo::GRAB_PX` is what makes it easy to
+/// hit despite that.
+const GIZMO_HANDLE_RADIUS: f32 = 4.0;
+
 /// The viewer.
 pub struct ViewerApp {
     renderer: Renderer,
@@ -187,6 +207,7 @@ impl ViewerApp {
         // spacing, which needs the views and the cloud -- both of which exist
         // only now (`trippy.edit.cluster.default_max_radius_from_bundle`).
         edit.init_click_defaults(&views, &renderer, controller.scene().diameter());
+        edit.init_brush_defaults(controller.scene().diameter());
         edit.estimate_shade_depths(&renderer);
         edit.refresh_shade(&renderer);
         if let Err(e) = edit.apply(&mut renderer) {
@@ -266,6 +287,41 @@ impl ViewerApp {
         self.last_frame = Some(now);
     }
 
+    /// An egui position on the canvas, in the RENDER's own pixels.
+    ///
+    /// Every gesture in the editor is handed on in these coordinates, because
+    /// that is the pixel space the camera the frame was drawn with is defined
+    /// in (`docs/EDITOR.md` §4's last paragraph).
+    fn render_px(
+        &self,
+        response: &egui::Response,
+        ctx: &egui::Context,
+        pos: egui::Pos2,
+    ) -> (f64, f64) {
+        sam_geom::render_pixel(
+            (pos.x, pos.y),
+            (response.rect.min.x, response.rect.min.y),
+            ctx.pixels_per_point(),
+            self.settings.render_scale,
+        )
+    }
+
+    /// The inverse of [`Self::render_px`]: a render pixel back in egui points,
+    /// for the overlays painted over the finished frame.
+    fn egui_pos(&self, rect: egui::Rect, ppp: f32, px: (f64, f64)) -> egui::Pos2 {
+        let scale = f64::from(ppp) * f64::from(self.settings.render_scale.clamp(0.1, 1.0));
+        #[allow(clippy::cast_possible_truncation)]
+        egui::pos2(
+            rect.min.x + (px.0 / scale) as f32,
+            rect.min.y + (px.1 / scale) as f32,
+        )
+    }
+
+    /// How many egui points one render pixel is (for the brush ring's radius).
+    fn egui_points_per_render_px(&self, ppp: f32) -> f32 {
+        1.0 / (ppp * self.settings.render_scale.clamp(0.1, 1.0))
+    }
+
     /// Consume keyboard and mouse for this frame.
     ///
     /// Drags come from `response`, which egui has already scoped to this
@@ -285,10 +341,48 @@ impl ViewerApp {
         let sam_box_drag = self.edit.sam_tool_active()
             && response.dragged_by(egui::PointerButton::Primary)
             && !ctx.input(|i| i.modifiers.shift);
+        // The Brush tool's stroke takes the primary drag the same way, with
+        // ALT for the erase; SHIFT-drag still orbits, so navigation is one
+        // modifier away here too (`docs/EDITOR.md` §4).
+        let (shift, alt, ctrl) = ctx.input(|i| {
+            (
+                i.modifiers.shift,
+                i.modifiers.alt,
+                i.modifiers.ctrl,
+            )
+        });
+        let brush_drag = self.edit.brush_tool_active()
+            && response.dragged_by(egui::PointerButton::Primary)
+            && !shift;
+        // A gizmo drag is claimed at the moment the button goes down, and only
+        // when it goes down ON a handle: everywhere else the drag still orbits.
+        // The handles it hit-tests against were projected at the END of the
+        // previous frame (`ui` builds the camera after `handle_input`), which is
+        // a frame stale — invisible in practice, because a camera moving fast
+        // enough to matter is a camera being dragged, and that drag is an orbit.
+        if response.drag_started_by(egui::PointerButton::Primary) && !brush_drag && !sam_box_drag {
+            if let Some(pos) = response.interact_pointer_pos() {
+                let px = self.render_px(response, ctx, pos);
+                self.edit.begin_gizmo_drag(px, shift, ctrl);
+            }
+        }
         if sam_box_drag {
             if let Some(pos) = response.interact_pointer_pos() {
                 let start = self.sam_drag.map_or(pos, |(s, _)| s);
                 self.sam_drag = Some((start, pos));
+            }
+        } else if brush_drag {
+            if let Some(pos) = response.interact_pointer_pos() {
+                if !self.edit.brush_stroking() {
+                    self.edit.begin_brush_stroke(alt);
+                }
+                let px = self.render_px(response, ctx, pos);
+                self.edit.brush_sample(px);
+            }
+        } else if self.edit.gizmo_dragging() {
+            if let Some(pos) = response.interact_pointer_pos() {
+                let px = self.render_px(response, ctx, pos);
+                self.edit.gizmo_drag_to(px);
             }
         } else if response.dragged_by(egui::PointerButton::Primary) {
             self.controller.drag(delta.x, delta.y);
@@ -300,6 +394,10 @@ impl ViewerApp {
         // The gesture is finished when the button comes up; only then is it
         // worth converting, and only then is a tiny drag known to be a click.
         if !response.dragged_by(egui::PointerButton::Primary) {
+            // A stroke and a gizmo drag both end with the button, and each is
+            // ONE undo entry however many frames it took.
+            self.edit.end_brush_stroke();
+            self.edit.end_gizmo_drag();
             if let Some((start, end)) = self.sam_drag.take() {
                 let ppp = ctx.pixels_per_point();
                 let scale = self.settings.render_scale;
@@ -338,10 +436,21 @@ impl ViewerApp {
             }
         }
 
+        // A CLICK with the Brush tool paints one dab: a drag is a stroke, and a
+        // click is a stroke of one sample, which is what a paint tool does.
+        if self.edit.brush_tool_active() && response.clicked() && !shift {
+            if let Some(pos) = response.interact_pointer_pos() {
+                let px = self.render_px(response, ctx, pos);
+                self.edit.begin_brush_stroke(alt);
+                self.edit.brush_sample(px);
+            }
+        }
+
         // Alt-click is the SAM tool's point prompt (`docs/EDITOR.md` §3, E5).
         // Alt is bound to nothing else in this viewer, so this costs no
         // existing gesture; and it is a CLICK, so an Alt-drag is still a drag.
         if self.edit.active
+            && !self.edit.brush_tool_active()
             && response.clicked()
             && ctx.input(|i| i.modifiers.alt && !i.modifiers.shift)
         {
@@ -817,6 +926,14 @@ impl eframe::App for ViewerApp {
             self.controller.snap_to_position(&self.views, position);
         }
         self.edit.poll_sam();
+        // The brush's own two-step, in the same place and for the same reason:
+        // the drag was sampled in this frame's render pixels, so it is
+        // un-projected with this frame's camera.
+        let click_camera = ClickCamera::from_render_camera(&camera);
+        self.edit.resolve_brush(&click_camera, &self.renderer);
+        // The handles for the NEXT frame's hit test, and for this frame's
+        // painter: projected once, used twice.
+        self.edit.update_gizmo(&click_camera);
         self.edit.refresh_shade(&self.renderer);
         if let Err(e) = self.edit.apply(&mut self.renderer) {
             self.error = Some(e);
@@ -851,6 +968,41 @@ impl eframe::App for ViewerApp {
                 egui::Stroke::new(SAM_MARQUEE_WIDTH, SAM_MARQUEE_COLOUR),
                 egui::StrokeKind::Middle,
             );
+        }
+
+        // The gizmo handles and the brush ring, drawn the same way and for the
+        // same reason: they are chrome over the finished frame, never part of
+        // the render, so `--screenshot` shows the edit and not the tool
+        // (`docs/EDITOR.md` §4's "screen-space handles drawn with egui").
+        if self.edit.active {
+            let painter = ui.painter_at(rect);
+            if let Some(gizmo) = self.edit.gizmo_screen() {
+                let centre = self.egui_pos(rect, ppp, gizmo.centre);
+                for arm in &gizmo.arms {
+                    if arm.pixel_len() <= f64::EPSILON {
+                        // An axis pointing straight at the camera has no
+                        // direction on screen and cannot be dragged; drawing it
+                        // would be a dot claiming otherwise.
+                        continue;
+                    }
+                    let colour = GIZMO_AXIS_COLOURS[arm.axis.min(2)];
+                    let tip = self.egui_pos(rect, ppp, arm.tip);
+                    painter.line_segment(
+                        [centre, tip],
+                        egui::Stroke::new(OVERLAY_STROKE_WIDTH, colour),
+                    );
+                    painter.circle_filled(tip, GIZMO_HANDLE_RADIUS, colour);
+                }
+            }
+            if let Some((px, radius_px)) = self.edit.brush_cursor() {
+                #[allow(clippy::cast_possible_truncation)]
+                let radius = (radius_px as f32) * self.egui_points_per_render_px(ppp);
+                painter.circle_stroke(
+                    self.egui_pos(rect, ppp, px),
+                    radius.clamp(1.0, rect.width()),
+                    egui::Stroke::new(OVERLAY_STROKE_WIDTH, BRUSH_CURSOR_COLOUR),
+                );
+            }
         }
 
         if self.edit.active {

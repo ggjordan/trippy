@@ -3,6 +3,53 @@ All notable changes to trippy. Format: Keep a Changelog. Versions: semver tags `
 
 ## [Unreleased]
 ### Added
+- **The viewer's brush tool, Named Objects panel and 3D drag gizmos
+  (`docs/EDITOR.md` Sec 1, Sec 4, Sec 6).** The last three viewer pieces that
+  document was still a spec for.
+  - **Brush**: with the `brush` tool focused (`T`), a drag on the render paints
+    spheres of `brush_radius` into a `brush`-kind region, each dab anchored at
+    the depth of the nearest point under the cursor (`edit::brush::depth_anchor`
+    + `ClickCamera::unproject` -- the click tool's own projection, inverted, so
+    no depth buffer is needed here either). **Alt-drag erases**, `[` / `]` change
+    the radius, a weight slider grades the painted cells, and **one stroke is one
+    undo entry** however many frames the drag took
+    (`EditDocument::update_region_coalesced` / `add_region_coalesced`: the
+    gesture's frames replace each other in the log rather than piling up; the
+    file format is unchanged and Python replays them like any other entry).
+    Later strokes go into the same region until "start a new region" is pressed.
+    `rust/crates/trips-viewer/src/edit/brush.rs` is a line-for-line twin of
+    `trippy.edit.model`'s `brush_membership`/`paint_sphere`/`paint_along`/
+    `erase`, down to the box-sphere overlap test and the first-painted cell
+    order.
+  - **Named Objects panel**: every region with its name, source tool, kind, live
+    point count, enable toggle, mix slider, rename, remove and **solo** (render
+    only that region's effect), grouped by `Region.source.tool` with
+    hand-authored regions in their own group. Regions made in the viewer get the
+    same auto-numbered names the CLI gives (`click-1`, `brush-2`,
+    `sam-box-IMG_3703-3`), from `trips_viewer::edit::model::auto_region_name`.
+    Solo is a way of looking and is never written to `edits.json`.
+  - **3D drag gizmos** (`src/edit/gizmo.rs`): three projected world-axis handles
+    (red/green/blue) on the selected box, sphere or lid, drawn by the egui
+    painter over the finished frame -- so `--screenshot` shows the edit and never
+    the tool. Drag a handle to translate along that axis, **Shift-drag** to
+    resize, **Ctrl-drag** to rotate a box. A drag that does not START on a handle
+    still orbits, so navigation loses nothing; the arrow-key nudges and `[`/`]`
+    resize stay and now share `gizmo::translated`/`gizmo::resized` with the drag.
+  - **Parity, pinned by fixtures**: `edit_golden/brush.json` now records the
+    three AUTHORING calls as well as their result, and the Rust twin must replay
+    them to the same cells, in the same order, with the same weights (a port that
+    voxelised by cell-centre would produce a smaller set that still passed every
+    membership lookup); `edit_golden/names.json` is new and pins
+    `auto_region_name` case for case. `trips-viewer --dump-weights` matches
+    `trippy.edit.weights.compose_trips_weights` exactly for a brush region on a
+    real `points.npz` (`tests/test_edit_viewer_parity.py`).
+  - **Headless twins** for scripts and proofs: `--brush U V`, `--brush-to U V`,
+    `--brush-radius/-weight/-op/-mix`, `--brush-erase`, `--brush-undo`,
+    `--move-region <ID|name> DX DY DZ` (the translate gizmo) and
+    `--solo <ID|name>`. Measured on the synthetic bundle at 480x360: a dab with
+    `op = delete` removes 110 of 4 000 points and changes **4.21 %** of the
+    frame, a stroke **8.51 %**, `--brush-undo` is **byte-identical** to the
+    unedited frame, `--move-region` changes **8.22 %**, and `--solo` **3.77 %**.
 - **Brush regions (Python side), named regions, and the `trippy eval --edits`
   gate-suppression gap is closed (`docs/EDITOR.md` Sec 1, Sec 5).**
   - **`brush`-kind regions**: a sparse voxel set (`origin`/`cell_size`/`cells`,
@@ -18,8 +65,8 @@ All notable changes to trippy. Format: Keep a Changelog. Versions: semver tags `
     `weights` into an `.npz` sidecar (`EDIT_BRUSH_NPZ_CELL_THRESHOLD`) in the
     WRITTEN copy only; Python's own loader always replays the (never
     externalised) undo log. `tests/fixtures/synthetic/edit_golden/brush.json`
-    (`trippy.edit.golden.build_brush_fixture`) is the parity fixture for a
-    future Rust `brush` twin.
+    (`trippy.edit.golden.build_brush_fixture`) is the parity fixture the Rust
+    `brush` twin was then built against (see the entry above).
   - **Named regions**: `Region.source` (`{"tool": ..., ...}` or `None`)
     records which tool made a region and with what prompt/parameters;
     `trippy.edit.model.auto_region_name` gives tool-authored regions a

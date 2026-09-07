@@ -11,10 +11,13 @@ Purpose: the E1/E2 acceptance check that `trippy apply-edits` and the Rust
     a structured click scene plus the `pointset` `trippy.edit.cluster.
     click_to_cluster` grows from three clicks in it. `brush.json`
     (`build_brush_fixture`) is a SEPARATE, self-contained fixture for the
-    `brush` region kind (Python-side only today, docs/EDITOR.md Sec 1) --
-    recorded now so a future Rust `edit::brush` module has a parity target
-    from day one, the same "write it before the twin exists" posture the
-    click fixture's own history follows.
+    `brush` region kind: the three AUTHORING calls that build it
+    (`"strokes"`), the region they produce, and its per-point weights, all
+    read back by `trips_viewer::edit::brush`. `names.json`
+    (`build_names_fixture`) is smaller again and has no geometry at all --
+    `auto_region_name`'s answers, case by case, so the Named Objects panel
+    numbers a viewer-made region exactly as `trippy edits` numbers a
+    CLI-made one.
 Invariants:
     - SYNTHETIC ONLY. Every array comes from a seeded
       `numpy.random.Generator`; nothing here reads a photograph, a
@@ -29,6 +32,12 @@ Invariants:
       in a temp directory and diffs against the committed copy, so a drift in
       `trippy.edit.weights` fails the Python suite before it can silently
       re-bless the Rust one.
+    - `brush.json` records the STROKES and not only their result. A Rust
+      port that voxelised a sphere by "is the cell's centre inside it" would
+      produce a strictly smaller cell set that still answered every
+      membership lookup correctly; replaying the authoring calls is what
+      catches that. Both sides also keep a brush's cells in first-painted
+      order, so the comparison is exact rather than set-wise.
     - The click fixture passes `max_radius` EXPLICITLY and never calls
       `trippy.edit.cluster.default_max_radius_from_bundle`: that default runs
       `median_nn_distance`, which draws a seeded numpy subsample when a cloud
@@ -71,6 +80,7 @@ from trippy.edit.cluster import CameraView, click_to_cluster
 from trippy.edit.model import (
     EditDocument,
     Region,
+    auto_region_name,
     erase,
     paint_along,
     paint_sphere,
@@ -85,10 +95,13 @@ __all__ = [
     "BRUSH_FIXTURE_FORMAT",
     "CLICK_FIXTURE_FORMAT",
     "GOLDEN_FIXTURE_DIR",
+    "NAMES_FIXTURE_FORMAT",
     "SHADE_VIEWS_FORMAT",
     "build_brush_fixture",
     "build_click_fixture",
     "build_golden_fixture",
+    "build_names_fixture",
+    "replay_brush_strokes",
     "write_golden_fixture",
     "write_shade_views",
 ]
@@ -129,9 +142,16 @@ _CLICK_BLOB_POINTS = 100
 _CLICK_SCATTER_POINTS = 120
 
 #: `"format"` of the brush fixture, matching `trips_viewer::edit::brush::
-#: BRUSH_FIXTURE_FORMAT` (the future Rust twin -- brush is Python-side only
-#: today, docs/EDITOR.md Sec 1 "brush").
+#: BRUSH_FIXTURE_FORMAT` (the Rust twin, `rust/crates/trips-viewer/src/edit/
+#: brush.rs`; docs/EDITOR.md Sec 1 "brush").
 BRUSH_FIXTURE_FORMAT = "trippy-edit-brush-1"
+
+#: `"format"` of the auto-name fixture, matching
+#: `trips_viewer::edit::model::NAMES_FIXTURE_FORMAT`. Its own file because
+#: `auto_region_name` takes no geometry at all -- it is a string rule, and the
+#: Named Objects panel on both sides has to number a session's regions the same
+#: way (docs/EDITOR.md Sec 1 "Named regions").
+NAMES_FIXTURE_FORMAT = "trippy-edit-names-1"
 
 #: Seed for the brush query-point grid. Deliberately its own seed (like the
 #: click fixture's `_CLICK_SEED`): a small deterministic grid unrelated to
@@ -140,6 +160,28 @@ _BRUSH_SEED = 20260909
 _BRUSH_QUERY_POINTS = 60
 _BRUSH_ORIGIN = (0.0, 0.0, 0.0)
 _BRUSH_CELL_SIZE = 0.5
+
+#: The authoring calls the fixture's brush region is built from, in order, and
+#: recorded in `brush.json` as `"strokes"`. Data rather than code so the Rust
+#: twin REPLAYS the same three calls instead of transcribing their result: a
+#: port that reproduced the committed cell list but voxelised a sphere
+#: differently would still fail, which is the whole point of pinning the
+#: authoring helpers rather than only the membership lookup.
+#:
+#: The `erase` deliberately clips only PART of the stroke's own graded
+#: (0.6-weight) cells, so the final region still carries a real `weights` array
+#: -- `paint_sphere`'s "omit an all-ones array" canonicalisation would otherwise
+#: collapse it to `None` and the graded lookup would go untested.
+_BRUSH_STROKES: tuple[dict[str, Any], ...] = (
+    {"op": "paint_sphere", "center": (1.0, 0.0, 4.0), "radius": 0.9, "weight": 1.0},
+    {
+        "op": "paint_along",
+        "points": ((1.0, 0.0, 4.0), (1.6, 0.0, 4.0), (2.2, 0.0, 4.0)),
+        "radius": 0.4,
+        "weight": 0.6,
+    },
+    {"op": "erase", "center": (2.1, 0.0, 4.0), "radius": 0.15},
+)
 
 
 def _floats(array: np.ndarray) -> list[float]:
@@ -599,16 +641,9 @@ def build_click_fixture() -> dict[str, dict[str, Any]]:
     }
 
 
-def _brush_region() -> Region:
-    """A `brush` Region built through `paint_sphere`/`paint_along`/`erase` -- never a hand-written cell list.
-
-    Exercises all three authoring helpers in sequence (paint a sphere, paint
-    a 3-point stroke at a lower weight, erase part of the result), so a Rust
-    twin has to reproduce the SAME box-sphere voxelisation and "erase wins
-    outright" rule those helpers implement, not merely replay a fixed set of
-    occupied cells.
-    """
-    region = Region(
+def _empty_brush_region() -> Region:
+    """The fixture's brush region before any stroke: an empty cell set on a known grid."""
+    return Region(
         id="r-brush01",
         name="brush test",
         kind="brush",
@@ -616,16 +651,49 @@ def _brush_region() -> Region:
         mix=1.0,
         op="delete",
     )
-    region = paint_sphere(region, center=(1.0, 0.0, 4.0), radius=0.9)
-    region = paint_along(
-        region, points=[(1.0, 0.0, 4.0), (1.6, 0.0, 4.0), (2.2, 0.0, 4.0)], radius=0.4, weight=0.6
-    )
-    # Erases only PART of the stroke's own graded (0.6-weight) cells, so the fixture's
-    # final region still carries a real `weights` array (not all-1.0, which `paint_sphere`'s
-    # own "omit an all-ones array" canonicalisation would otherwise collapse to `None`)
-    # -- a Rust twin must reproduce the graded lookup, not just a plain occupied set.
-    region = erase(region, center=(2.1, 0.0, 4.0), radius=0.15)
+
+
+def replay_brush_strokes(region: Region, strokes: Any) -> Region:
+    """Apply a `brush.json` `"strokes"` list to `region`, in order.
+
+    The one place the fixture's stroke list is turned back into a region, so
+    the committed file, `tests/test_edit_golden.py` and the Rust twin
+    (`trips_viewer::edit::brush`) all replay the identical sequence.
+
+    Args:
+        region: an existing `brush`-kind Region (usually one with no cells).
+        strokes: dicts with `"op"` in `("paint_sphere", "paint_along",
+            "erase")` plus that helper's own arguments.
+
+    Returns:
+        A NEW Region; `region` is never mutated.
+
+    Raises:
+        ValueError: an unknown `"op"`.
+    """
+    for stroke in strokes:
+        op = stroke["op"]
+        if op == "paint_sphere":
+            region = paint_sphere(region, stroke["center"], stroke["radius"], stroke["weight"])
+        elif op == "paint_along":
+            region = paint_along(region, stroke["points"], stroke["radius"], stroke["weight"])
+        elif op == "erase":
+            region = erase(region, stroke["center"], stroke["radius"])
+        else:
+            raise ValueError(f"unknown brush stroke op {op!r}")
     return region
+
+
+def _brush_region() -> Region:
+    """A `brush` Region built through `paint_sphere`/`paint_along`/`erase` -- never a hand-written cell list.
+
+    Exercises all three authoring helpers in sequence (`_BRUSH_STROKES`: paint
+    a sphere, paint a 3-point stroke at a lower weight, erase part of the
+    result), so a Rust twin has to reproduce the SAME box-sphere voxelisation
+    and "erase wins outright" rule those helpers implement, not merely replay a
+    fixed set of occupied cells.
+    """
+    return replay_brush_strokes(_empty_brush_region(), _BRUSH_STROKES)
 
 
 def _brush_query_points() -> np.ndarray:
@@ -643,24 +711,32 @@ def _brush_query_points() -> np.ndarray:
 
 
 def build_brush_fixture() -> dict[str, dict[str, Any]]:
-    """The brush half of the fixture: a painted/erased region, and its own per-point weights.
+    """The brush half of the fixture: the strokes, the region they paint, and its per-point weights.
 
     A single self-contained file (`brush.json`), independent of the
-    weight/click fixtures above -- the brush region kind is Python-side only
-    today (docs/EDITOR.md Sec 1), so this is recorded for the Rust twin to
-    match LATER rather than merged into the main `edits.json`/
-    `expected_weights.json` pair.
+    weight/click fixtures above -- the brush region kind is its own authoring
+    path (docs/EDITOR.md Sec 1) and belongs in its own file rather than merged
+    into the main `edits.json`/`expected_weights.json` pair.
+
+    `"strokes"` is what makes this a parity target for the AUTHORING helpers
+    and not only for the membership lookup: `trips_viewer::edit::brush` replays
+    the same three calls and must arrive at the identical `cells`/`weights`,
+    in the identical order (both sides keep a brush's cells in first-painted
+    order, so the comparison can be exact rather than set-wise).
 
     Returns:
         `{"brush.json": {...}}`.
     """
-    region = _brush_region()
+    initial = _empty_brush_region()
+    region = replay_brush_strokes(initial, _BRUSH_STROKES)
     xyz = _brush_query_points()
     weight = region_weight(region, xyz)
     contains = region_contains(region, xyz)
     return {
         "brush.json": {
             "format": BRUSH_FIXTURE_FORMAT,
+            "initial": initial.to_json(),
+            "strokes": [_stroke_to_json(s) for s in _BRUSH_STROKES],
             "region": region.to_json(),
             "xyz": _floats(xyz),
             "expected_weight": _floats(weight),
@@ -669,13 +745,84 @@ def build_brush_fixture() -> dict[str, dict[str, Any]]:
     }
 
 
+def _stroke_to_json(stroke: dict[str, Any]) -> dict[str, Any]:
+    """One `_BRUSH_STROKES` entry as plain JSON (tuples -> lists, floats -> floats)."""
+    out: dict[str, Any] = {"op": stroke["op"], "radius": float(stroke["radius"])}
+    if "center" in stroke:
+        out["center"] = [float(v) for v in stroke["center"]]
+    if "points" in stroke:
+        out["points"] = [[float(v) for v in p] for p in stroke["points"]]
+    if "weight" in stroke:
+        out["weight"] = float(stroke["weight"])
+    return out
+
+
+#: The auto-name cases, each pinning one branch of `auto_region_name`'s
+#: "highest `-<digits>` suffix among the document's OWN names, from ANY tool"
+#: rule (docs/EDITOR.md Sec 1 "Named regions"). Held here rather than inside
+#: the builder so the reason each case exists can be written next to it.
+_NAME_CASES: tuple[dict[str, Any], ...] = (
+    # An empty document starts at 1.
+    {"name": "first", "existing": (), "tool": "click", "detail": None},
+    # The counter is shared across tools: a shade selection after a click is 2.
+    {"name": "across_tools", "existing": ("click-1",), "tool": "shade-clouds", "detail": None},
+    # `detail` sits between the tool and the counter, SAM's own spelling.
+    {
+        "name": "with_detail",
+        "existing": ("click-1", "shade-clouds-2"),
+        "tool": "sam-box",
+        "detail": "IMG_3703",
+    },
+    # Hand-typed names carry no counter and are simply ignored.
+    {"name": "no_counters", "existing": ("pool lid", "fence"), "tool": "brush", "detail": None},
+    # The HIGHEST suffix wins, not the last or the count of names.
+    {"name": "highest_not_last", "existing": ("click-10", "click-2"), "tool": "brush", "detail": None},
+    # A counter must be at the END: "-7-alpha" is not one.
+    {"name": "interior_digits", "existing": ("thing-7-alpha",), "tool": "brush", "detail": None},
+    # ... and it must follow a hyphen: bare "12" and "abc12" are not counters.
+    {"name": "no_hyphen", "existing": ("12", "abc12"), "tool": "click", "detail": None},
+    # A name that is nothing but a counter still counts (the regex is a search).
+    {"name": "bare_counter", "existing": ("-5",), "tool": "brush", "detail": None},
+    # Removing/renaming a region lowers the counter again -- the rule is stateless.
+    {"name": "self_healing", "existing": ("click-1", "brush-2"), "tool": "brush", "detail": None},
+)
+
+
+def build_names_fixture() -> dict[str, dict[str, Any]]:
+    """The auto-name half of the fixture: `auto_region_name`'s answers, case by case.
+
+    The Named Objects panel numbers a viewer-made region exactly as `trippy
+    edits add-*` numbers a CLI-made one, or a session's list stops reading as
+    one continuously numbered list the moment Jordan uses both. That is a pure
+    string rule with no geometry, so it gets its own small file
+    (`names.json`) rather than riding along with the weight fixture.
+
+    Returns:
+        `{"names.json": {...}}`.
+    """
+    cases = []
+    for case in _NAME_CASES:
+        existing = [str(n) for n in case["existing"]]
+        cases.append(
+            {
+                "name": case["name"],
+                "existing_names": existing,
+                "tool": case["tool"],
+                "detail": case["detail"],
+                "expected": auto_region_name(existing, case["tool"], case["detail"]),
+            }
+        )
+    return {"names.json": {"format": NAMES_FIXTURE_FORMAT, "cases": cases}}
+
+
 def build_golden_fixture() -> dict[str, dict[str, Any]]:
     """Compute every file of the fixture, without writing anything.
 
     Returns:
         `{filename: json-serialisable document}` for `points.json`,
         `edits.json`, `expected_weights.json`, `shade_views.json`,
-        `expected_shade.json`, `click.json` and `expected_click.json`.
+        `expected_shade.json`, `click.json`, `expected_click.json`,
+        `brush.json` and `names.json`.
     """
     clouds = _synthetic_clouds()
     edits = _golden_edits()
@@ -732,6 +879,7 @@ def build_golden_fixture() -> dict[str, dict[str, Any]]:
         },
         **build_click_fixture(),
         **build_brush_fixture(),
+        **build_names_fixture(),
     }
 
 

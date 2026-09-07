@@ -19,6 +19,14 @@ Invariants under test:
   - `write_shade_views` writes a sidecar `trips_viewer::edit::shade` can read
     (format string and per-view field names pinned here, because the Rust
     reader is not importable from Python).
+  - The brush fixture's region is what replaying its own `"strokes"` list
+    through `paint_sphere`/`paint_along`/`erase` produces, so the Rust twin
+    (`trips_viewer::edit::brush`) has to reproduce the AUTHORING helpers and
+    not merely the membership lookup.
+  - `names.json`'s expected names are what `trippy.edit.model.auto_region_name`
+    returns for its own cases, and the cases between them cover every branch of
+    the "-<digits> suffix" rule (the Rust twin numbers a viewer-made region the
+    same way, or a session's Named Objects list stops reading as one list).
   - The click fixture's expected selections are what
     `trippy.edit.cluster.click_to_cluster` returns for its own scene, camera,
     pixels and parameters -- and each of its four cases exercises a different
@@ -36,7 +44,13 @@ import numpy as np
 
 from trippy.edit import golden
 from trippy.edit.cluster import CameraView, click_to_cluster
-from trippy.edit.model import EditDocument, Region, region_contains, region_weight
+from trippy.edit.model import (
+    EditDocument,
+    Region,
+    auto_region_name,
+    region_contains,
+    region_weight,
+)
 from trippy.edit.weights import compose_gaussian_weights, compose_trips_weights
 from trippy.train import prune
 
@@ -53,6 +67,7 @@ EXPECTED_FILES = (
     "click.json",
     "expected_click.json",
     "brush.json",
+    "names.json",
 )
 
 
@@ -336,3 +351,74 @@ def test_the_brush_fixture_exercises_paint_and_erase_and_a_graded_weight() -> No
     assert any(0.0 < w < 1.0 for w in weight), "the erase must leave some graded (< 1.0) cells behind"
     params = doc["region"]["params"]
     assert params["weights"] is not None and len(params["weights"]) == len(params["cells"])
+
+
+def test_the_brush_region_is_what_replaying_its_own_strokes_produces() -> None:
+    """The fixture's `"strokes"` really do build its `"region"`, so the Rust twin can replay them."""
+    doc = _load("brush.json")
+    initial = Region.from_json(doc["initial"])
+    assert initial.params["cells"] == [], "the strokes start from an empty brush"
+
+    replayed = golden.replay_brush_strokes(initial, doc["strokes"])
+    assert replayed.to_json() == doc["region"], "the committed region is the strokes' own result"
+    # Order included: both sides keep cells in first-painted order, which is what
+    # lets the Rust comparison be exact rather than set-wise.
+    assert replayed.params["cells"] == doc["region"]["params"]["cells"]
+
+    ops = [s["op"] for s in doc["strokes"]]
+    assert ops == ["paint_sphere", "paint_along", "erase"], "all three helpers are exercised"
+
+
+def test_the_brush_strokes_paint_cells_a_centre_test_would_miss() -> None:
+    """`_sphere_touched_cells` is a box-sphere OVERLAP test, not a cell-centre test.
+
+    Pinned here because it is the one place a plausible Rust port would differ
+    silently: voxelising by "is the cell's centre inside the sphere" gives a
+    strictly smaller cell set and every membership lookup would still work.
+    """
+    doc = _load("brush.json")
+    params = doc["region"]["params"]
+    origin = np.asarray(params["origin"], dtype=np.float64)
+    cell = float(params["cell_size"])
+    cells = np.asarray(params["cells"], dtype=np.int64)
+    centres = origin + (cells + 0.5) * cell
+
+    first = doc["strokes"][0]
+    d = np.linalg.norm(centres - np.asarray(first["center"], dtype=np.float64), axis=1)
+    assert (d > first["radius"]).any(), (
+        "some painted cell's CENTRE lies outside the sphere that painted it"
+    )
+
+
+# --- the auto-name rule (the Named Objects panel, both sides) -------------------------
+
+
+def test_the_name_fixture_is_derived_not_transcribed() -> None:
+    doc = _load("names.json")
+    assert doc["format"] == "trippy-edit-names-1"
+    assert doc["cases"], "an empty case list would pass vacuously"
+    for case in doc["cases"]:
+        got = auto_region_name(case["existing_names"], case["tool"], case["detail"])
+        assert got == case["expected"], case["name"]
+
+
+def test_each_name_case_pins_a_different_branch() -> None:
+    """A parity fixture is only worth its bytes if its cases disagree."""
+    cases = {c["name"]: c for c in _load("names.json")["cases"]}
+    assert cases["first"]["expected"] == "click-1", "an empty document starts at 1"
+    # The counter is shared across tools, which is the whole point of the rule.
+    assert cases["across_tools"]["expected"].endswith("-2")
+    assert cases["with_detail"]["expected"] == "sam-box-IMG_3703-3"
+    # Names with no counter, an interior counter, or digits with no hyphen are ignored.
+    for name in ("no_counters", "interior_digits", "no_hyphen"):
+        assert cases[name]["expected"].endswith("-1"), name
+    assert cases["highest_not_last"]["expected"].endswith("-11"), "the HIGHEST suffix wins"
+    assert cases["bare_counter"]["expected"].endswith("-6")
+
+
+def test_the_rule_self_heals_after_a_removal() -> None:
+    """Stateless numbering: dropping the highest-numbered region lowers the next name."""
+    names = ["click-1", "brush-2", "sam-box-3"]
+    assert auto_region_name(names, "brush") == "brush-4"
+    names.remove("sam-box-3")
+    assert auto_region_name(names, "brush") == "brush-3"

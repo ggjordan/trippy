@@ -32,6 +32,8 @@
 
 use serde_json::{json, Map, Value};
 
+use super::brush::{self, BrushCells};
+
 /// `edits.json`'s `"format"` field. Mirrors `trippy.constants.EDIT_FORMAT`.
 pub const EDIT_FORMAT: &str = "trippy-edits-1";
 
@@ -46,6 +48,10 @@ pub const GATE_DEFAULT_WEIGHT: f64 = 1.0;
 /// Hex digits in a generated region id (`"r-3f9a1b2c"`).
 /// Mirrors `trippy.constants.EDIT_REGION_ID_HEX_LEN`.
 pub const REGION_ID_HEX_LEN: usize = 8;
+
+/// `"format"` of `tests/fixtures/synthetic/edit_golden/names.json`, matching
+/// `trippy.edit.golden.NAMES_FIXTURE_FORMAT`.
+pub const NAMES_FIXTURE_FORMAT: &str = "trippy-edit-names-1";
 
 /// The Karekare pool lid's already-fitted geometry (`~/Splats/tools/SURFACE_LID.md` §3,
 /// mirrored by `trippy.constants.EDIT_KAREKARE_LID_*`). Seeded by "+ lid" so the
@@ -111,6 +117,9 @@ pub enum Kind {
     Lid,
     /// `point_ids` into `points.npz`'s own row order.
     Pointset,
+    /// A sparse voxel set painted with the brush tool: `origin`, `cell_size`,
+    /// `cells`, optional `weights` (`docs/EDITOR.md` §1 "brush").
+    Brush,
 }
 
 impl Kind {
@@ -122,6 +131,7 @@ impl Kind {
             Self::Sphere => "sphere",
             Self::Lid => "lid",
             Self::Pointset => "pointset",
+            Self::Brush => "brush",
         }
     }
 
@@ -135,8 +145,10 @@ impl Kind {
             "sphere" => Ok(Self::Sphere),
             "lid" => Ok(Self::Lid),
             "pointset" => Ok(Self::Pointset),
+            "brush" => Ok(Self::Brush),
             other => Err(format!(
-                "Region.kind must be one of ('box', 'sphere', 'lid', 'pointset'), got {other:?}"
+                "Region.kind must be one of ('box', 'sphere', 'lid', 'pointset', 'brush'), \
+                 got {other:?}"
             )),
         }
     }
@@ -185,6 +197,15 @@ pub enum Params {
         /// Point indices; may be empty, never negative.
         point_ids: Vec<u32>,
     },
+    /// A sparse voxel set. See [`super::brush`] for the painting helpers.
+    Brush {
+        /// World-frame corner the voxel grid is measured from.
+        origin: [f64; 3],
+        /// Voxel edge length, world units, > 0.
+        cell_size: f64,
+        /// The occupied cells and their weights.
+        cells: BrushCells,
+    },
 }
 
 impl Params {
@@ -196,6 +217,7 @@ impl Params {
             Self::Sphere { .. } => Kind::Sphere,
             Self::Lid(_) => Kind::Lid,
             Self::Pointset { .. } => Kind::Pointset,
+            Self::Brush { .. } => Kind::Brush,
         }
     }
 
@@ -228,6 +250,23 @@ impl Params {
                 "band": l.band,
             }),
             Self::Pointset { point_ids } => json!({ "point_ids": point_ids }),
+            Self::Brush {
+                origin,
+                cell_size,
+                cells,
+            } => {
+                let mut params = json!({
+                    "origin": origin.to_vec(),
+                    "cell_size": cell_size,
+                    "cells": cells.cells_json(),
+                });
+                // An ungraded brush carries no `weights` array at all, exactly
+                // as `trippy.edit.model._merge_brush_cells` canonicalises it.
+                if let Some(weights) = cells.weights_json() {
+                    params["weights"] = weights;
+                }
+                params
+            }
         }
     }
 }
@@ -359,6 +398,11 @@ impl Params {
                 }
                 Ok(Self::Pointset { point_ids })
             }
+            Kind::Brush => Ok(Self::Brush {
+                origin: as_vec::<3>(get("origin"), "brush.origin")?,
+                cell_size: positive(get("cell_size"), "brush.cell_size")?,
+                cells: BrushCells::from_json(get("cells"), get("weights"))?,
+            }),
         }
     }
 }
@@ -385,6 +429,20 @@ pub struct Region {
     pub op: Op,
     /// Soft "off" without deleting the region.
     pub enabled: bool,
+    /// `{"tool": str, ...}`, or `Some(Value::Null)` for an explicit `null`, or
+    /// `None` when the key was absent entirely.
+    ///
+    /// Provenance only: which tool made this region and with what prompt
+    /// (`trippy.edit.model.Region.source`, `docs/EDITOR.md` §1 "Named
+    /// regions"). It never affects membership or composition — the Named
+    /// Objects panel groups by it and nothing else reads it.
+    ///
+    /// The three-state representation exists so a document round-trips
+    /// byte-identically: the Python writes `"source": null` for a
+    /// hand-authored region and omits nothing, while a region written before
+    /// the field existed has no key at all, and the viewer must write back
+    /// what it read (the module's third invariant, extended to this field).
+    pub source: Option<Value>,
 }
 
 impl Region {
@@ -400,7 +458,31 @@ impl Region {
             mix,
             op,
             enabled: true,
+            source: None,
         }
+    }
+
+    /// The same region with a `source` block recording which tool made it.
+    ///
+    /// `tool` is the label [`auto_region_name`] uses (`"brush"`, `"click"`,
+    /// `"shade-clouds"`, `"sam-box"`, ...); `extra` is that tool's own
+    /// parameters, e.g. the radius a stroke was painted at.
+    #[must_use]
+    pub fn with_source(mut self, tool: &str, extra: Value) -> Self {
+        let mut source = json!({ "tool": tool });
+        if let (Some(target), Some(items)) = (source.as_object_mut(), extra.as_object()) {
+            for (key, value) in items {
+                target.insert(key.clone(), value.clone());
+            }
+        }
+        self.source = Some(source);
+        self
+    }
+
+    /// The `source.tool` label, if this region records one.
+    #[must_use]
+    pub fn source_tool(&self) -> Option<&str> {
+        self.source.as_ref()?.get("tool")?.as_str()
     }
 
     /// Replace the geometry, rewriting `raw_params` canonically.
@@ -413,7 +495,7 @@ impl Region {
     /// This region as a `regions[]` entry of `edits.json`.
     #[must_use]
     pub fn to_json(&self) -> Value {
-        json!({
+        let mut doc = json!({
             "id": self.id,
             "name": self.name,
             "kind": self.kind.as_str(),
@@ -421,7 +503,13 @@ impl Region {
             "mix": self.mix,
             "op": self.op.as_str(),
             "params": self.raw_params,
-        })
+        });
+        // Written back only when the region carried one, so a file with no
+        // `source` key round-trips without gaining one.
+        if let (Some(target), Some(source)) = (doc.as_object_mut(), self.source.as_ref()) {
+            target.insert("source".to_owned(), source.clone());
+        }
+        doc
     }
 
     /// Inverse of [`Region::to_json`], with `trippy.edit.model.Region`'s own validation.
@@ -449,6 +537,12 @@ impl Region {
         }
         let raw_params = doc.get("params").cloned().unwrap_or_else(|| json!({}));
         let params = Params::from_json(kind, &raw_params)?;
+        let source = doc.get("source").cloned();
+        if let Some(value) = &source {
+            if !value.is_object() && !value.is_null() {
+                return Err(format!("Region.source must be a dict or None, got {value}"));
+            }
+        }
         Ok(Self {
             id: id.to_owned(),
             name: doc
@@ -462,6 +556,7 @@ impl Region {
             mix,
             op,
             enabled: doc.get("enabled").and_then(Value::as_bool).unwrap_or(true),
+            source,
         })
     }
 
@@ -473,6 +568,7 @@ impl Region {
             Kind::Sphere => "sphere",
             Kind::Lid => "lid",
             Kind::Pointset => "pts",
+            Kind::Brush => "brush",
         }
     }
 }
@@ -608,6 +704,11 @@ pub fn region_weight(region: &Region, index: usize, p: [f64; 3]) -> f64 {
                     .is_some_and(|i| point_ids.contains(&i)),
             )
         }
+        Params::Brush {
+            origin,
+            cell_size,
+            cells,
+        } => brush::membership(cells, *origin, *cell_size, p),
     }
 }
 
@@ -853,6 +954,83 @@ impl EditDocument {
         }))
     }
 
+    /// [`Self::update_region`], optionally REPLACING the previous log entry.
+    ///
+    /// One continuous gesture — a gizmo drag, a brush stroke — has to be one
+    /// undo step, but it also has to show its result while it happens, which
+    /// means writing to the document on every frame of the drag. `coalesce =
+    /// true` truncates the immediately preceding `update_region` entry for the
+    /// same region before appending this one, so a 200-frame drag leaves ONE
+    /// entry in `log` and `Cmd-Z` takes the whole gesture back.
+    ///
+    /// The file format is untouched: the result is an ordinary `update_region`
+    /// entry that `trippy.edit.model.EditDocument` replays like any other. The
+    /// caller owns the gesture boundary (it passes `false` for the first frame
+    /// of a drag and `true` after), because only the caller knows when the
+    /// button went down.
+    ///
+    /// # Errors
+    /// As [`Self::update_region`].
+    pub fn update_region_coalesced(
+        &mut self,
+        region_id: &str,
+        changes: Value,
+        coalesce: bool,
+    ) -> Result<(), String> {
+        if coalesce {
+            self.drop_trailing("update_region", region_id);
+        }
+        self.update_region(region_id, changes)
+    }
+
+    /// [`Self::add_region`], optionally REPLACING the previous log entry.
+    ///
+    /// The same gesture rule [`Self::update_region_coalesced`] implements, for
+    /// the case where the gesture CREATED the region: the first sample of a
+    /// brush stroke on a new region adds it, and every later sample of the same
+    /// stroke replaces that entry with the fuller region, so the whole stroke
+    /// is one undo step rather than one plus a hundred.
+    ///
+    /// # Errors
+    /// As [`Self::add_region`].
+    pub fn add_region_coalesced(
+        &mut self,
+        region: &Region,
+        index: Option<usize>,
+        coalesce: bool,
+    ) -> Result<(), String> {
+        if coalesce {
+            self.drop_trailing("add_region", &region.id);
+        }
+        self.add_region(region, index)
+    }
+
+    /// Drop the entry at `cursor - 1` when it is `entry_type` for `region_id`.
+    ///
+    /// Only ever at the very end of the log (`cursor == log.len()`): coalescing
+    /// into an entry the user has already undone past would rewrite history
+    /// they are looking at.
+    fn drop_trailing(&mut self, entry_type: &str, region_id: &str) {
+        if self.cursor == 0 || self.cursor != self.log.len() {
+            return;
+        }
+        let previous = &self.log[self.cursor - 1];
+        if previous.get("type").and_then(Value::as_str) != Some(entry_type) {
+            return;
+        }
+        let previous_id = match entry_type {
+            "add_region" => previous.pointer("/region/id").and_then(Value::as_str),
+            _ => previous.get("id").and_then(Value::as_str),
+        };
+        if previous_id != Some(region_id) {
+            return;
+        }
+        self.log.truncate(self.cursor - 1);
+        self.cursor = self.log.len();
+        // Dropping a trailing entry cannot make the surviving prefix unreplayable.
+        let _ = self.replay();
+    }
+
     /// Set the paint order to an exact permutation of the current region ids.
     ///
     /// # Errors
@@ -1012,6 +1190,68 @@ impl EditDocument {
             .map_err(|e| format!("serialising edits.json: {e}"))?;
         std::fs::write(path, text + "\n").map_err(|e| format!("{}: {e}", path.display()))
     }
+}
+
+/// The counter a name ends with, if it ends with one: `"click-12"` -> `Some(12)`.
+///
+/// The Python is `re.search(r"-(\d+)$", name)`, whose leftmost match with an
+/// end anchor is exactly "the trailing run of digits, if a hyphen precedes it".
+/// One deliberate narrowing: Python's `\d` also matches non-ASCII digits, and
+/// this only matches ASCII. Every name either side GENERATES is ASCII, and a
+/// hand-typed Devanagari counter is not a case either side promises to number.
+/// A counter too large for `u64` saturates rather than wrapping.
+fn trailing_counter(name: &str) -> Option<u64> {
+    let digits: String = name
+        .chars()
+        .rev()
+        .take_while(char::is_ascii_digit)
+        .collect::<Vec<char>>()
+        .into_iter()
+        .rev()
+        .collect();
+    if digits.is_empty() {
+        return None;
+    }
+    let head = &name[..name.len() - digits.len()];
+    if !head.ends_with('-') {
+        return None;
+    }
+    Some(digits.parse::<u64>().unwrap_or(u64::MAX))
+}
+
+/// A tool-authored region's auto name, `"<tool>[-<detail>]-<n>"`.
+///
+/// The twin of `trippy.edit.model.auto_region_name` (`docs/EDITOR.md` §1 "Named
+/// regions"), pinned by `tests/fixtures/synthetic/edit_golden/names.json`: `n`
+/// is one more than the highest `-<digits>` suffix among `existing_names`
+/// **from any tool**, so a session's regions read as one continuously numbered
+/// list in the Named Objects panel no matter which tool made each one — and the
+/// rule is stateless, so it self-heals after a rename, a removal or an undo.
+///
+/// # Arguments
+/// - `existing_names`: the document's current region names.
+/// - `tool`: the tool's label, e.g. `"brush"`, `"click"`, `"shade-clouds"`,
+///   `"sam-box"`.
+/// - `detail`: an optional slug between the tool and the counter (a view's file
+///   stem, for SAM).
+#[must_use]
+pub fn auto_region_name<'a, I>(existing_names: I, tool: &str, detail: Option<&str>) -> String
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let highest = existing_names
+        .into_iter()
+        .filter_map(trailing_counter)
+        .max()
+        .unwrap_or(0);
+    let label = detail.map_or_else(|| tool.to_owned(), |d| format!("{tool}-{d}"));
+    format!("{label}-{}", highest.saturating_add(1))
+}
+
+/// [`auto_region_name`] over a document's own regions.
+#[must_use]
+pub fn auto_name_for(doc: &EditDocument, tool: &str, detail: Option<&str>) -> String {
+    auto_region_name(doc.regions().iter().map(|r| r.name.as_str()), tool, detail)
 }
 
 /// A fresh, never-reused region id, `"r-<hex>"`.
@@ -1228,6 +1468,118 @@ mod tests {
 
         let bad_ids = json!({"id": "a", "kind": "pointset", "params": {"point_ids": [1, -2]}});
         assert!(Region::from_json(&bad_ids).unwrap_err().contains(">= 0"));
+    }
+
+    #[test]
+    fn a_brush_region_round_trips_and_its_membership_is_its_own_voxel() {
+        let raw = json!({
+            "id": "r-b", "name": "brush-1", "kind": "brush", "enabled": true,
+            "mix": 0.0, "op": "delete",
+            "params": {
+                "origin": [0.0, 0.0, 0.0], "cell_size": 0.5,
+                "cells": [[0, 0, 0], [1, 0, 0]], "weights": [1.0, 0.25],
+            },
+            "source": { "tool": "brush", "radius": 0.3 },
+        });
+        let region = Region::from_json(&raw).unwrap();
+        assert_eq!(region.kind, Kind::Brush);
+        assert_eq!(region.short_kind(), "brush");
+        assert_eq!(region.source_tool(), Some("brush"));
+        assert_eq!(region.to_json(), raw, "a brush round-trips verbatim");
+
+        // The point's own voxel, `floor((p - origin) / cell_size)`.
+        assert_eq!(region_weight(&region, 0, [0.1, 0.1, 0.1]), 1.0);
+        assert_eq!(region_weight(&region, 0, [0.6, 0.1, 0.1]), 0.25);
+        assert_eq!(region_weight(&region, 0, [1.6, 0.1, 0.1]), 0.0);
+        // `delete`'s hard membership is "weight > 0" for every kind but `lid`.
+        assert!(region_contains(&region, 0, [0.6, 0.1, 0.1]));
+        assert!(!region_contains(&region, 0, [1.6, 0.1, 0.1]));
+    }
+
+    #[test]
+    fn a_region_without_a_source_key_does_not_grow_one() {
+        // The Python writes `"source": null`; a file written before the field
+        // existed has no key. Both must survive the viewer unchanged.
+        let explicit = json!({"id": "a", "kind": "sphere", "name": "s", "enabled": true,
+                              "mix": 1.0, "op": "blend", "source": null,
+                              "params": {"center": [0, 0, 0], "radius": 1.0}});
+        assert_eq!(Region::from_json(&explicit).unwrap().to_json(), explicit);
+
+        let absent = json!({"id": "a", "kind": "sphere", "name": "s", "enabled": true,
+                            "mix": 1.0, "op": "blend",
+                            "params": {"center": [0, 0, 0], "radius": 1.0}});
+        let region = Region::from_json(&absent).unwrap();
+        assert_eq!(region.to_json(), absent);
+        assert_eq!(region.source_tool(), None);
+
+        // A non-object source is refused where the Python refuses it.
+        let bad = json!({"id": "a", "kind": "sphere", "source": "brush",
+                         "params": {"center": [0, 0, 0], "radius": 1.0}});
+        assert!(Region::from_json(&bad).unwrap_err().contains("source"));
+    }
+
+    #[test]
+    fn one_gesture_is_one_undo_step_however_many_frames_it_took() {
+        let mut doc = EditDocument::default();
+        doc.add_region(&box_region("r-1", 1.0, Op::Blend), None).unwrap();
+        // A 3-frame drag: the first frame starts the gesture, the rest coalesce.
+        doc.update_region_coalesced("r-1", json!({ "mix": 0.9 }), false).unwrap();
+        doc.update_region_coalesced("r-1", json!({ "mix": 0.5 }), true).unwrap();
+        doc.update_region_coalesced("r-1", json!({ "mix": 0.1 }), true).unwrap();
+        assert_eq!(doc.log.len(), 2, "add + one gesture");
+        assert!((doc.region("r-1").unwrap().mix - 0.1).abs() < 1e-12);
+
+        doc.undo();
+        assert!(
+            (doc.region("r-1").unwrap().mix - 1.0).abs() < 1e-12,
+            "one Cmd-Z takes the whole drag back"
+        );
+
+        // A coalescing add is the same story for a region the gesture created.
+        let mut doc = EditDocument::default();
+        doc.add_region_coalesced(&box_region("r-2", 1.0, Op::Blend), None, false).unwrap();
+        doc.add_region_coalesced(&box_region("r-2", 0.5, Op::Blend), None, true).unwrap();
+        assert_eq!(doc.log.len(), 1);
+        assert_eq!(doc.order(), ["r-2"], "no duplicate in the paint order");
+        assert!((doc.region("r-2").unwrap().mix - 0.5).abs() < 1e-12);
+        doc.undo();
+        assert!(doc.regions().is_empty(), "one Cmd-Z removes the whole stroke");
+    }
+
+    #[test]
+    fn coalescing_never_rewrites_an_entry_the_user_undid_past() {
+        let mut doc = EditDocument::default();
+        doc.add_region(&box_region("r-1", 1.0, Op::Blend), None).unwrap();
+        doc.update_region("r-1", json!({ "mix": 0.5 })).unwrap();
+        doc.undo();
+        // The cursor is before the update: coalescing must append (truncating
+        // the redo future, the ordinary rule), not eat an entry behind it.
+        doc.update_region_coalesced("r-1", json!({ "mix": 0.25 }), true).unwrap();
+        assert_eq!(doc.log.len(), 2);
+        assert!((doc.region("r-1").unwrap().mix - 0.25).abs() < 1e-12);
+        doc.undo();
+        assert!((doc.region("r-1").unwrap().mix - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn auto_names_number_across_tools_and_self_heal() {
+        // The fixture (`names.json`) is the parity check; this is the rule
+        // stated once in Rust's own terms.
+        assert_eq!(auto_region_name(std::iter::empty(), "brush", None), "brush-1");
+        assert_eq!(
+            auto_region_name(["click-1", "shade-clouds-2"], "brush", None),
+            "brush-3"
+        );
+        assert_eq!(
+            auto_region_name(["click-1"], "sam-box", Some("IMG_3703")),
+            "sam-box-IMG_3703-2"
+        );
+        // A document, not a bare list.
+        let mut doc = EditDocument::default();
+        let mut region = box_region("r-1", 1.0, Op::Blend);
+        region.name = "brush-4".to_owned();
+        doc.add_region(&region, None).unwrap();
+        assert_eq!(auto_name_for(&doc, "brush", None), "brush-5");
     }
 
     #[test]
