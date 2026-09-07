@@ -11,25 +11,27 @@ test list). The Rust viewer (§0/§2's render integration, §3's selection
 tools, §4's UI) is **not implemented** -- this document remains the spec
 for that work. Three implementation notes, all explained where they matter
 below:
-Status: **E1 and E2 shipped on both sides** (2026-09-07).
+Status: **E1, E2 and E4 shipped on both sides** (2026-09-07).
 
 - Python: `trippy/edit/` (`model.py`, `weights.py`, `shade_finder.py`,
-  `apply.py`, and `golden.py`, the parity fixture), `trippy apply-edits`
-  and `trippy edits shade-find/add-box/add-sphere/add-lid`.
+  `cluster.py`, `apply.py`, and `golden.py`, the parity fixture), `trippy
+  apply-edits` and `trippy edits shade-find/add-box/add-sphere/add-lid/click`.
 - Rust viewer: `rust/crates/trips-viewer/src/edit/` (the platform-neutral
-  twin: `model.rs`, `weights.rs`, `apply.rs`, `shade.rs`) plus
-  `src/edit_ui.rs` (the Regions/Inspector/Tools panels, `M`) and the render
+  twin: `model.rs`, `weights.rs`, `apply.rs`, `shade.rs`, `cluster.rs`) plus
+  `src/edit_ui.rs` (the Regions/Inspector/Tools panels, `M`; Shift-click on
+  the render selects), the input hook in `src/app.rs` and the render
   integration in `renderer.rs`/`splat.rs`.
 - The two sides are pinned together by `tests/fixtures/synthetic/edit_golden/`
   — written by `trippy.edit.golden`, read by BOTH
   `tests/test_edit_golden.py` and the Rust `edit::golden` tests, which agree
-  to 1e-6. `trips-viewer --dump-weights` / `--dump-shade` run the same
-  comparison against a real bundle
+  to 1e-6 on the weights and **exactly, id for id**, on the shade and click
+  selections. `trips-viewer --dump-weights` / `--dump-shade` / `--dump-click`
+  run the same comparison against a real bundle
   (`tests/test_edit_viewer_parity.py`).
 
 Not built: the 3D drag gizmos (E1 shipped Inspector fields + keyboard
-nudge/resize instead), click-to-cluster (E4), the SAM-3 lift (E5), and the
-`brush`-kind voxel region.
+nudge/resize instead), the SAM-3 lift (E5), and the `brush`-kind voxel
+region.
 
 Three implementation notes, all explained where they matter below:
 tools' UI/ray-cast half, §4's UI) is **not implemented** -- this document
@@ -103,9 +105,15 @@ in `docs/decisions/ADR-0006-viewer-integration.md` and read directly from
   `Renderer::render`, one more `shader_code`).
 - **A world-space camera with a known basis** (`camera.rs::Controller`,
   `docs/GEOMETRY.md`: `+Z` forward, `+X` right, `+Y` down, row-major `R`).
-  Click-to-cluster needs a ray from a clicked pixel; that ray is
-  `Controller`'s own forward/right/down basis plus the pixel's NDC offset —
-  no new camera code, just a new method next to `render_camera`.
+  Click-to-cluster was expected to need a ray from a clicked pixel; **as
+  shipped it needs no ray and no new camera code at all**. Projecting the whole
+  cloud through the camera `render_camera` already returns and keeping what
+  lands near the click answers the same question ("which points did I click"),
+  costs one pass over an array the renderer already holds, and is the SAME
+  arithmetic `trippy/edit/cluster.py` runs — which is what makes the two sides
+  comparable id for id. `edit::cluster::ClickCamera::from_render_camera`
+  widens that camera's `f32` to the `f64` the projection runs in; `camera.rs`
+  was not touched.
 - **A live Gaussian splat at every pose** (added 2026-09-07, after this document
   was first written). `Renderer` now holds an optional `crate::splat::LiveSplat`:
   `bundle.json`'s `blend.splat_ply` loaded once into `brush_render::Splats`
@@ -431,10 +439,48 @@ pattern `trippy.points.knn_size` uses) gated by colour distance
 (`feat[:, :3]`, `trippy.edit.shade_finder`'s own base-colour slice) and a
 hard `max_radius` (world units, defaulting to the bundle's median nearest-
 CAMERA spacing) and `max_points` cap. `--preview` writes a from-scratch
-point-density heatmap PNG of the selection (no photo content). The
-viewer's own ray cast against a live camera and the Inspector's
-size/tightness slider are still Rust-side, unbuilt work — see E4's own row
-in §6.
+point-density heatmap PNG of the selection (no photo content).
+
+**Rust side implemented too** (2026-09-07,
+`rust/crates/trips-viewer/src/edit/cluster.rs` + the Selection panel in
+`src/edit_ui.rs` + the Shift-click hook in `src/app.rs`). Three things about
+that port are worth stating plainly:
+
+- **It projects with the CURRENT camera, not a registered view.** The Python
+  side had no live `camera.rs::Controller` to ask and so needed a named view;
+  the viewer has one, so a Shift-click is projected with exactly the camera
+  that drew the frame the click landed on
+  (`ClickCamera::from_render_camera`, widening the renderer's `f32` to the
+  `f64` the arithmetic runs in). Everything downstream of the projection —
+  the depth-mode seed, the colour gate, the radius and point caps — is the
+  same arithmetic, ported line for line.
+- **The neighbour search is a spatial hash, not a k-d tree.** No k-d tree
+  crate is vendored by either workspace's lock, and `PointGrid::nearest` is
+  an exact k-nearest query (it expands cell rings until the k-th distance
+  found is provably inside the scanned region), so it returns what
+  `cKDTree.query` returns wherever that answer is unambiguous. It sizes its
+  cells from the cloud's **interquartile** extent, not its bounding box,
+  because a TRIPS export's far-field environment sphere would otherwise drop
+  the whole scene into one cell. `edit/cluster.rs`'s own "Tie-breaking"
+  section names the three places the two implementations may legitimately
+  differ (k-th-neighbour distance ties, depth-sort ties, summation order in
+  the seed centroid) and why none of them is reachable in the fixture.
+- **The parity is pinned twice.** `tests/fixtures/synthetic/edit_golden/
+  click.json` + `expected_click.json` carry a structured scene (a red blob,
+  a same-coloured blob behind it, a green blob beside it, and scatter) and
+  four clicks that each pin a different branch — depth-mode seeding, the
+  colour gate, the `max_points` cut-off, and a miss; both sides must return
+  the identical id list. `trips-viewer --click U V --dump-click` runs the
+  same comparison against a real bundle
+  (`tests/test_edit_viewer_parity.py`).
+
+The one deliberate deviation: the viewer never calls
+`default_max_radius_from_bundle`'s point-cloud FALLBACK branch in a way that
+is parity-checked, because `median_nn_distance` draws a seeded *numpy*
+subsample above 20 000 points and has no portable twin. The camera-spacing
+branch (which is what every multi-view bundle takes) is ported exactly; the
+fallback uses a deterministic stride and is only reachable on a single-view
+bundle.
 
 ### 2. Shade-cloud finder (E2)
 
@@ -540,31 +586,37 @@ Jordan can hide edit chrome while still flying around:
 **Keys** (chosen to avoid every key `app.rs::ViewerApp::handle_input`
 already binds — `V X Tab - = F R N P W A S D Q E` and drag/scroll):
 
-**As shipped** (E1/E2). Rows marked *not built* wait on E3/E4.
+**As shipped** (E1/E2/E4). Rows marked *not built* wait on E3.
 
 | key | action |
 |---|---|
 | `M` | toggle edit mode (shows Regions/Inspector/Tools). `--edit` opens straight into it. Click-drag on the canvas still orbits: with no gizmos to hit, swapping the drag would only take navigation away |
-| `T` | cycle the active tool (Regions ↔ shade-cloud finder) |
+| **Shift-click** | E4's selection gesture: cluster the object under the pointer. Read from the scene `Response` like every drag, and scoped to `clicked()` rather than `dragged()`, so a Shift-DRAG still orbits and navigation loses nothing |
+| `T` | cycle the active tool (Regions → shade-cloud finder → click-to-cluster) |
 | arrows, `PageUp`/`PageDown` | nudge the selected region along world X/Z and Y by `NUDGE_SCENE_FRACTION` of the scene diameter — **E1's replacement for the 3D drag gizmo** |
 | `[` / `]` | shrink/grow the selected region by `RESIZE_STEP` |
 | `Delete` / `Backspace` | remove the selected region (its `op` is a separate field in the Inspector) |
 | `Cmd`/`Ctrl` + `Z` | undo |
 | `Cmd`/`Ctrl` + `Shift` + `Z` | redo |
 | `Cmd`/`Ctrl` + `S` | save `edits.json` |
-| `H` | toggle the preview highlight (a tinted point cloud, not a new `ViewMode` — see §6) |
-| `Cmd`/`Ctrl` + `N` | *not built*: "new region from the current selection" belongs with click-to-cluster (E4). The shade finder's own "add as region" buttons are E2's version of it |
+| `H` | toggle the preview highlight of whichever tool has focus (a tinted point cloud, not a new `ViewMode` — see §6). Where both tools have a live preview, the union is tinted the one colour |
+| `Cmd`/`Ctrl` + `N` | *not built*, and not needed: "new region from the current selection" is the **add as region** button next to each tool's own selection (E2's shade finder, E4's click-to-cluster), where the op and mix for it are chosen |
 
-Left-click behaviour while in edit mode: **unchanged from viewing** in E1/E2 —
-there is no gizmo to hit yet, so the canvas keeps orbiting and every region is
-placed at the camera's look-at point and shaped from the Inspector or the
-keyboard. When the gizmos land (E3/E4) the rule is: on empty space with
-click-to-cluster active, seed a new cluster at the ray hit; on an existing
-region's gizmo (lid plane/ring, box corner, sphere radius handle), drag that
-handle instead — the same "response is scoped to what the drag started on"
-discipline `app.rs`'s own module doc already calls out as the fix for the
-`egui_wants_pointer_input` trap (`dragged_by`, not a global "is anything
-active" check).
+Left-click behaviour while in edit mode: **unchanged from viewing**. A plain
+drag orbits; a plain click does nothing. E4 added exactly one gesture on top —
+**Shift-click**, which clusters — rather than taking the plain click away,
+because the click-to-cluster tool is one of three and the other two have no use
+for it. When the lid gizmo lands (E3) the rule stays: a drag is scoped to what
+it started on — the same `dragged_by`, not a global "is anything active"
+check, discipline `app.rs`'s own module doc calls out as the fix for the
+`egui_wants_pointer_input` trap.
+
+The clicked pixel is handed on in the **render's** coordinates (egui points
+times `pixels_per_point` times the render-scale lever), not egui points, because
+that is the pixel space the camera the frame was drawn with is defined in. The
+camera is therefore built *before* the editor's per-frame work in
+`ViewerApp::ui`, so a click made on frame N is projected with frame N's camera
+rather than the next one's.
 
 ## 5. Publish
 
@@ -660,11 +712,11 @@ schedule.
 | **E1** | Region data model (`edits.json` read/write), `box`/`sphere` region kinds, per-point weight compositing (§2's non-depth design) on the TRIPS side only, undo/redo, save/load surviving a bundle close+reopen | 1 wk | Draw a box or sphere region in the viewer, set `mix`, see the TRIPS render change inside it and nothing outside it; undo removes the region; closing and reopening the bundle restores it exactly (region list, mix values, undo history) | **Done** (2026-09-07), except the 3D drag gizmos, which E1 replaced with Inspector fields + arrow-key nudge / `[`-`]` resize. `rust/crates/trips-viewer/src/edit/*` + `src/edit_ui.rs`. Measured on the synthetic bundle: a `blend` sphere at `mix = 0` changes 4.74 % of the pixels in its own half of the frame and **0.00 %** of the other half; a `delete` box changes 63.97 % of its half; undoing it reproduces the unedited frame **bit for bit** (max channel diff 0). |
 | **E2** | Shade-cloud finder: `trippy edit-prep` precompute + live threshold sliders + preview-highlight `ViewMode` + "select" → `pointset` region | 3 d | On a bundle whose scene has registered shade frames, the finder's default thresholds select a `pointset` region whose `dark_mass_fraction` (via `trippy.train.prune.dark_mass_stats` on the selected IDs) matches the audit's own number for that scene to float precision; deleting the region and re-running the audit shows the drop | **Done** (2026-09-07). Four live sliders (lum, conf, znear/zfar fractions) over `shade_views.json`, the precompute written by `trippy.edit.golden.write_shade_views`; "add as region (fade / delete)"; and a preview that **tints** the selection instead of adding a `ViewMode` (see the note under this table). `trips-viewer --dump-shade` selects the same ids and the same `dark_mass_fraction` as `trippy.edit.shade_finder.find_shade_pointset` on the synthetic bundle (`tests/test_edit_viewer_parity.py`). |
 | **E3** | `lid` region kind + 3D gizmo (plane/radius drag) + hard-clip delete semantics | 2 d | Loading the Karekare pool bundle with a `lid` region seeded from `SURFACE_LID.md`'s numbers removes the haze from every angle at every `mix`/exposure; dragging the radius ring changes the affected point count live | **Region kind + hard-clip semantics done** (`trippy.edit.model.lid_membership`, `trippy edits add-lid`); the 3D gizmo is not built. |
-| **E4** | Click-to-cluster: ray cast + k-d tree + k-NN growth in world+colour space, radius slider | 3 d | Clicking a point-cloud cluster selects a `pointset` region that visibly matches the clicked object's extent, without needing a depth buffer | **Python side done** (`trippy.edit.cluster`, `trippy edits click`; synthetic-scene tests: an isolated blob is selected and a same-coloured blob behind it through a depth gap is not, the colour gate separates touching differently-coloured clusters, `max_radius`/`max_points` caps are respected, `tests/test_edit_cluster.py`); the viewer's ray cast against a live camera, the Inspector's size/tightness slider, and the "click on empty space seeds a new cluster" UI wiring (§4) are not built. |
+| **E4** | Click-to-cluster: ray cast + k-d tree + k-NN growth in world+colour space, radius slider | 3 d | Clicking a point-cloud cluster selects a `pointset` region that visibly matches the clicked object's extent, without needing a depth buffer | **Done** (2026-09-07), on both sides. Python: `trippy.edit.cluster`, `trippy edits click` (`tests/test_edit_cluster.py`). Rust: `edit/cluster.rs` (the projection, the depth-mode seed, an exact k-NN spatial hash in place of the unavailable k-d tree, the colour/radius/point gates), the **Selection panel** with the four sliders + op/mix + "add as region" + "clear" in `edit_ui.rs`, and **Shift-click** on the render in `app.rs`. Parity is exact, not approximate: the committed `click.json`/`expected_click.json` fixture replays four clicks (depth-mode seeding, the colour gate, the `max_points` cut-off, a miss) and both languages return the identical id list; `--click U V --dump-click` reproduces it against a real bundle. Measured on the synthetic bundle at 480x360: a click at (240, 180) selects 261 of 4000 points, the tint changes **71.55 %** of the frame's pixels (3.81 % of them turning magenta, the rest dimmed by the preview) with a max channel diff of 79, and a run without `--click` reproduces the untinted frame **bit for bit** (0.0000 % of pixels differ, max channel diff 0). Not built: an Inspector-side gizmo for a committed `pointset` region (there is no shape to drag). |
 | **E5** | SAM 3 lift: photo segmentation, multi-view projection + majority vote, `pointset` region output | 2–3 wk | Segmenting an object in 2–3 registered views of the same scene produces one `pointset` region that, previewed, highlights that object and not its neighbours; runs entirely local (no image leaves the machine) | Not started. |
 | **E6** | Publish path: `trippy apply-edits`, TRIPS `export.ply` mask wiring, distilled-splat publish order (edit-then-distil for pointset regions, geometry-reapply for box/sphere/lid) | 3 d | `trippy apply-edits --target both` on a bundle with a mix of region kinds produces a TRIPS PLY with the deleted points absent and, after a `trippy distill` run on the same edited bundle, a distilled PLY that also lacks them; a box/sphere/lid region re-applied directly to an already-distilled PLY (no re-distillation) also removes the matching geometry | **Done** (`trippy/edit/apply.py`, `trippy/edit/checkpoint.py`): `--target trips\|distilled\|both` (default `both`); `trips`/`both` write the filtered TRIPS `points.npz`/`blend_weights.npy`/`export.ply` and, if named, a filtered `blend.splat_ply`; `distilled`/`both` (with `--distilled-ply`) re-apply box/sphere/lid regions to an already-distilled PLY as delete/opacity-scale-fade; `--edits` wired into `trippy distill --stage render` (edit-then-distil ordering) and into `trippy candidate-report`/`trippy eval` (checkpoint-side keep mask + gate suppression on gate-hybrid checkpoints, `candidate-report` only — see §5's own paragraph for the `eval` gap). |
 
-**Two deviations worth naming.** (1) The preview highlight is not a fourth
+**Three deviations worth naming.** (1) The preview highlight is not a fourth
 `ViewMode`: it is a copy of the point cloud with the selection's first three
 feature channels set to magenta and everything else dimmed
 (`edit::apply::tinted_points`), which rides the existing render with no new

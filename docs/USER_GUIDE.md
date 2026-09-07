@@ -321,8 +321,9 @@ A/B-checked, so the pool lid is one click plus one save.
 | key | action |
 |---|---|
 | `M` | show/hide the editor |
-| `T` | switch between the Regions tool and the shade-cloud finder |
-| `H` | preview highlight on/off |
+| `T` | cycle the Tools panel: Regions → shade-cloud finder → click-to-cluster |
+| `H` | preview highlight on/off (for whichever tool has focus) |
+| **Shift-click** on the render | select the object under the pointer (click-to-cluster) |
 | arrows, `PageUp`/`PageDown` | nudge the selected region along world X/Z and Y |
 | `[` / `]` | shrink / grow the selected region |
 | `Delete` / `Backspace` | remove the selected region |
@@ -331,6 +332,49 @@ A/B-checked, so the pool lid is one click plus one save.
 
 Every key the viewer already used (`V X B Tab - = F R N P W A S D Q E`) still does
 what it did.
+
+### Click an object to select it
+
+Press `T` until the Tools panel says **click-to-cluster**, then **Shift-click**
+whatever you want in the render. A plain drag still orbits; only Shift-click
+selects, so navigation is not taken away from you.
+
+What happens: every point is projected into the camera you are looking through, the
+ones landing within a few pixels of your click are collected, the group **nearest
+the camera** among those becomes the seed (so clicking a tree does not also grab the
+same-coloured hillside glimpsed through a gap behind it), and the selection grows
+outward from there by nearest-neighbour hops in 3D — taking in points of a similar
+colour, and stopping at a hard distance from the seed.
+
+Four sliders steer it, and moving any of them re-runs the *same* click:
+
+| slider | what it does |
+|---|---|
+| **radius (px)** | how far from your click a point may land and still be caught |
+| **colour tol** | how different a colour may be and still join the object |
+| **max radius** | how far, in world units, the selection may reach from the seed. Starts at the scene's own median camera spacing |
+| **max points** | a hard cap, so a mis-click on a wall cannot select millions of points |
+
+The panel shows how many points were caught, how many seeded the nearest depth
+mode, and how long the clustering took. `H` (or the checkbox) tints the selection
+magenta and dims the rest, exactly as the shade finder's preview does.
+
+- **add as region** commits the selection as a `pointset` region with the op
+  (`blend` / `fade` / `delete`) and mix you picked next to the button — undoable,
+  savable and publishable like any other region.
+- **clear** drops the selection, the tint and the neighbour index it built, and the
+  frame goes back to exactly what it was.
+
+Headless, for a script or a check:
+
+```
+rust/target/release/trips-viewer <bundle> --click 240 180 --dump-click ids.json
+rust/target/release/trips-viewer <bundle> --click 240 180 --screenshot selected.png
+```
+
+`--dump-click` writes the selected point ids; it must agree exactly with
+`trippy edits click --bundle <bundle> --view <IMG> --px 240 180`, and that agreement
+is checked on every test run.
 
 ### Find shade clouds
 
@@ -372,6 +416,10 @@ rust/target/release/trips-viewer <bundle> --dump-weights weights.json
 rust/target/release/trips-viewer <bundle> --dump-shade shade.json \
     --shade-lum 0.25 --shade-conf 0.5
 
+# what would a click at pixel (240, 180) of the default view select?
+rust/target/release/trips-viewer <bundle> --click 240 180 --dump-click ids.json \
+    --click-radius-px 12 --click-colour-tol 0.15
+
 # a picture of the edited scene, same code path as the window
 rust/target/release/trips-viewer <bundle> --screenshot edited.png
 rust/target/release/trips-viewer <bundle> --edits nowhere.json --screenshot clean.png
@@ -394,7 +442,7 @@ alongside, and (if the bundle names a Gaussian `.ply`) a filtered copy of it.
 ### What is not built yet
 
 - No 3D drag handles on a region — use the arrow keys or type the numbers.
-- No click-on-a-cloud-to-select (E4) and no SAM-3 object selection (E5).
+- No SAM-3 object selection (E5).
 - A region with `mix < 1` needs a Gaussian splat to mix *with*. On a bundle with no
   `blend.splat_ply`, the panel says the frame is showing unedited TRIPS there
   rather than pretending.

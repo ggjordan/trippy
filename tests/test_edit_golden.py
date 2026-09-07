@@ -19,6 +19,11 @@ Invariants under test:
   - `write_shade_views` writes a sidecar `trips_viewer::edit::shade` can read
     (format string and per-view field names pinned here, because the Rust
     reader is not importable from Python).
+  - The click fixture's expected selections are what
+    `trippy.edit.cluster.click_to_cluster` returns for its own scene, camera,
+    pixels and parameters -- and each of its four cases exercises a different
+    branch (depth-mode seeding, the colour gate, the `max_points` cap, a
+    miss), so the Rust twin cannot pass by reproducing only the easy one.
 All fixtures are synthetic (seeded RNG); nothing here reads a scene.
 """
 
@@ -30,6 +35,7 @@ from pathlib import Path
 import numpy as np
 
 from trippy.edit import golden
+from trippy.edit.cluster import CameraView, click_to_cluster
 from trippy.edit.model import EditDocument
 from trippy.edit.weights import compose_gaussian_weights, compose_trips_weights
 from trippy.train import prune
@@ -44,6 +50,8 @@ EXPECTED_FILES = (
     "expected_weights.json",
     "shade_views.json",
     "expected_shade.json",
+    "click.json",
+    "expected_click.json",
 )
 
 
@@ -222,3 +230,82 @@ def test_write_shade_views_writes_the_schema_the_viewer_reads(tmp_path: Path) ->
         assert key in entry, key
     assert len(entry["r"]) == 9
     assert len(entry["c"]) == 3
+
+
+# --- the click-to-cluster case (E4) ---------------------------------------------------
+
+
+def _click_camera() -> CameraView:
+    """The fixture's camera, rebuilt as a `CameraView` from `click.json`."""
+    doc = _load("click.json")["camera"]
+    return CameraView(
+        R=np.asarray(doc["r"], dtype=np.float64).reshape(3, 3),
+        t=np.asarray(doc["t"], dtype=np.float64),
+        fx=doc["fx"],
+        fy=doc["fy"],
+        cx=doc["cx"],
+        cy=doc["cy"],
+        width=int(doc["width"]),
+        height=int(doc["height"]),
+        name=doc["name"],
+    )
+
+
+def test_the_expected_click_selection_is_derived_not_transcribed() -> None:
+    scene = _load("click.json")
+    expected = _load("expected_click.json")
+    assert scene["format"] == "trippy-edit-click-1"
+    assert expected["format"] == scene["format"]
+
+    xyz = np.asarray(scene["xyz"], dtype=np.float64).reshape(-1, 3)
+    rgb = np.asarray(scene["rgb"], dtype=np.float64).reshape(-1, 3)
+    camera = _click_camera()
+    assert len(scene["cases"]) == len(expected["cases"])
+
+    for case, want in zip(scene["cases"], expected["cases"], strict=True):
+        assert case["name"] == want["name"]
+        region, summary = click_to_cluster(
+            xyz,
+            rgb,
+            camera,
+            (case["px"][0], case["px"][1]),
+            radius_px=case["radius_px"],
+            colour_tol=case["colour_tol"],
+            max_radius=case["max_radius"],
+            max_points=case["max_points"],
+            knn_k=case["knn_k"],
+            depth_gap_factor=case["depth_gap_factor"],
+        )
+        assert region.params["point_ids"] == want["point_ids"], case["name"]
+        assert summary["n_candidates"] == want["n_candidates"], case["name"]
+        assert summary["n_seed"] == want["n_seed"], case["name"]
+        assert summary["hit_max_points"] == want["hit_max_points"], case["name"]
+
+
+def test_each_click_case_pins_a_different_branch() -> None:
+    """A parity fixture is only worth its bytes if its cases disagree."""
+    expected = {c["name"]: c for c in _load("expected_click.json")["cases"]}
+    assert set(expected) == {"default", "capped", "loose_colour", "miss"}
+
+    default = expected["default"]
+    # The depth-mode seed really does discard candidates: the blob behind the
+    # clicked one projects into the same pixels and is dropped before growth.
+    assert 0 < default["n_seed"] < default["n_candidates"]
+    assert default["n_selected"] > default["n_seed"], "growth adds points"
+
+    # The colour gate is load-bearing: opening it swallows the neighbouring blob.
+    loose = set(expected["loose_colour"]["point_ids"])
+    assert set(default["point_ids"]) < loose
+    assert len(loose) > 1.5 * len(default["point_ids"])
+
+    # The cap stops the fill part-way, which is the order-dependent branch.
+    capped = expected["capped"]
+    assert capped["hit_max_points"] is True
+    assert capped["n_selected"] == 94
+    assert set(capped["point_ids"]) < set(default["point_ids"])
+
+    # A miss is an empty selection with a warning, never an exception.
+    miss = expected["miss"]
+    assert miss["point_ids"] == []
+    assert miss["n_candidates"] == 0
+    assert miss["warning"]

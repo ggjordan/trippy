@@ -3,6 +3,61 @@ All notable changes to trippy. Format: Keep a Changelog. Versions: semver tags `
 
 ## [Unreleased]
 ### Added
+- **Click-to-cluster in the viewer (`docs/EDITOR.md` Sec 3 "1.", Sec 4, E4):
+  SHIFT-CLICK the render to select an object.** The Rust half of E4, a port of
+  `trippy/edit/cluster.py` into `rust/crates/trips-viewer/src/edit/cluster.rs`:
+  every point is projected with the camera the frame was actually drawn with
+  (`ClickCamera::from_render_camera`; pinhole, no distortion, exactly as the
+  Python side), the points landing within `radius_px` of the click and in front
+  of the camera are collected, the group NEAREST the camera among them seeds the
+  selection (so a click does not reach through a gap onto a same-coloured
+  surface behind), and the region grows from that seed by k-NN hops in 3D gated
+  by colour distance, a hard `max_radius` from the seed centroid and a
+  `max_points` cap.
+  - **A Selection panel** in `src/edit_ui.rs` (`T` now cycles Regions ->
+    shade-cloud finder -> click-to-cluster): four sliders (radius px, colour
+    tol, max radius, max points) that re-run the SAME click when moved, the
+    magenta preview tint (`H`, reusing the shade finder's tint path), the
+    candidate/seed/selected counts and timings, an op (`blend`/`fade`/`delete`)
+    + mix chooser, **add as region** (commits a `pointset` region through the
+    ordinary undo log) and **clear** (drops the selection, the tint and the
+    neighbour index).
+  - **Shift-click** is read from the scene `Response` in `src/app.rs` and scoped
+    to `clicked()`, so a Shift-DRAG still orbits and no navigation gesture was
+    taken away. The clicked pixel is converted into the render's own
+    coordinates, and the camera is now built before the editor's per-frame work
+    so a click is projected with the frame it was made on.
+  - **An exact k-nearest spatial hash** (`PointGrid`) instead of a k-d tree: no
+    k-d tree crate is vendored by either workspace's lock, so nothing was added
+    to `Cargo.toml`. It expands cell rings until the k-th distance found is
+    provably inside the scanned region (and falls back to a linear scan in a
+    void), and sizes its cells from the cloud's INTERQUARTILE extent so a TRIPS
+    export's far-field environment sphere cannot collapse the scene into one
+    cell. Proved equivalent to a brute-force search in its own unit tests.
+  - **Headless `--click U V`**, plus `--dump-click <o>` (write the selected ids
+    as JSON and exit, no GPU) and `--click-radius-px` / `--click-colour-tol` /
+    `--click-max-radius` / `--click-max-points`. With `--screenshot` the
+    selection is tinted into the frame, which is E4's own screenshot proof.
+  - **Exact Python/Rust parity, pinned twice.**
+    `tests/fixtures/synthetic/edit_golden/click.json` +
+    `expected_click.json` (written by `trippy.edit.golden.build_click_fixture`)
+    carry a structured synthetic scene -- a red blob, a same-coloured blob
+    behind it, a green blob touching it, and scatter -- and four clicks that
+    each pin a different branch: depth-mode seeding, the colour gate, the
+    `max_points` cut-off part-way through a frontier, and a miss. Both languages
+    must return the IDENTICAL id list, not a tolerance;
+    `rust/crates/trips-viewer/src/edit/cluster.rs`'s "Tie-breaking" section
+    names the three places they could legitimately differ (k-th-neighbour
+    distance ties, depth-sort ties, summation order in the seed centroid) and
+    `tests/test_edit_golden.py` pins the fixture's margins so none is reachable.
+    `trips-viewer --click U V --dump-click` runs the same comparison against a
+    real bundle (`tests/test_edit_viewer_parity.py`).
+  - Measured on the synthetic bundle at 480x360 (four sub-10-second local
+    `--screenshot` launches): a click at (240, 180) selects **261 of 4 000
+    points**; the preview tint changes **71.55 %** of the frame's pixels (3.81 %
+    turning magenta, the rest dimmed by the preview) with a max channel diff of
+    **79/255**; and a run without `--click` reproduces the untinted frame **bit
+    for bit** (0.0000 % of pixels differ, max channel diff **0**).
 - **Click-to-cluster, Python side (`docs/EDITOR.md` Sec 3 "1.", E4): `trippy
   edits click`.** New `trippy/edit/cluster.py`: projects every point of a
   bundle's `points.npz` into a named view (`trippy.geom.xform_a`, numbers

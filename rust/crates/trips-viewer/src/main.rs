@@ -94,6 +94,20 @@ Editing (docs/EDITOR.md; press M in the window for the panels):
   --shade-znear <f>    near plane / each frame's median depth (default: the
                        sidecar's own, else 0.05)
   --shade-zfar <f>     far plane / median depth (default: the sidecar's, else 0.50)
+  --click <U> <V>      click-to-cluster at pixel (U, V) of the chosen view, as
+                       SHIFT-CLICK does in the window. With --screenshot the
+                       selection is tinted into the frame; with --dump-click the
+                       selected ids are written out. Both together are the E4
+                       screenshot proof: tint on, then a run without --click
+                       for the clear-restores-it half
+  --dump-click <o>     write the click's selected point ids to <o> as JSON and
+                       exit. No GPU, no window; must select the same ids as
+                       `trippy edits click` at the same view/pixel/parameters
+  --click-radius-px <f>   click catchment radius, pixels (default 12)
+  --click-colour-tol <f>  colour gate, distance in [0,1]^3 (default 0.15)
+  --click-max-radius <f>  growth cap from the seed centroid, world units
+                       (default: the bundle's median camera spacing)
+  --click-max-points <n>  hard cap on the selection (default 200000)
 
 Headless (no window; used by the acceptance check and the perf table):
   --screenshot <o.png> render one frame to a PNG and exit
@@ -116,6 +130,7 @@ Keys:
   N / P      next / previous capture view
   B          cycle the blend mode (hybrid bundles)
   M          edit mode: Regions / Inspector / Tools (docs/EDITOR.md)
+  shift-click  in edit mode: select the object under the pointer (E4)
   V          cycle network / raw level-0 / coverage
   X          cycle the exposure the tone mapper applies
   - / =      render scale        TAB  hide the panel
@@ -192,6 +207,20 @@ struct Args {
     shade_znear: Option<f64>,
     /// See [`Self::shade_lum`].
     shade_zfar: Option<f64>,
+    /// `--click U V`: the pixel to cluster from, in the chosen view's own
+    /// pixel coordinates (the headless twin of a Shift-click).
+    click: Option<(f64, f64)>,
+    /// `--dump-click <o>`: write the click's selection and exit.
+    dump_click: Option<PathBuf>,
+    /// `--click-radius-px`, each `None` for "the shipped default".
+    click_radius_px: Option<f64>,
+    /// See [`Self::click_radius_px`].
+    click_colour_tol: Option<f64>,
+    /// See [`Self::click_radius_px`]; `None` means the bundle's own median
+    /// camera spacing (`trippy.edit.cluster.default_max_radius_from_bundle`).
+    click_max_radius: Option<f64>,
+    /// See [`Self::click_radius_px`].
+    click_max_points: Option<usize>,
 }
 
 /// Parse `1920x1080`.
@@ -300,6 +329,12 @@ fn parse_args() -> Result<Args, String> {
         shade_conf: None,
         shade_znear: None,
         shade_zfar: None,
+        click: None,
+        dump_click: None,
+        click_radius_px: None,
+        click_colour_tol: None,
+        click_max_radius: None,
+        click_max_points: None,
     };
     let mut argv = std::env::args().skip(1);
     while let Some(flag) = argv.next() {
@@ -382,6 +417,28 @@ fn parse_args() -> Result<Args, String> {
             }
             "--shade-zfar" => {
                 args.shade_zfar = Some(value()?.parse().map_err(|e| format!("--shade-zfar: {e}"))?);
+            }
+            "--click" => {
+                let u: f64 = value()?.parse().map_err(|e| format!("--click U: {e}"))?;
+                let v: f64 = value()?.parse().map_err(|e| format!("--click V: {e}"))?;
+                args.click = Some((u, v));
+            }
+            "--dump-click" => args.dump_click = Some(PathBuf::from(value()?)),
+            "--click-radius-px" => {
+                args.click_radius_px =
+                    Some(value()?.parse().map_err(|e| format!("--click-radius-px: {e}"))?);
+            }
+            "--click-colour-tol" => {
+                args.click_colour_tol =
+                    Some(value()?.parse().map_err(|e| format!("--click-colour-tol: {e}"))?);
+            }
+            "--click-max-radius" => {
+                args.click_max_radius =
+                    Some(value()?.parse().map_err(|e| format!("--click-max-radius: {e}"))?);
+            }
+            "--click-max-points" => {
+                args.click_max_points =
+                    Some(value()?.parse().map_err(|e| format!("--click-max-points: {e}"))?);
             }
             "--free" => args.free = true,
             "--frames" => args.warmup = value()?.parse().map_err(|e| format!("--frames: {e}"))?,
@@ -554,6 +611,132 @@ fn dump_shade(bundle: &Bundle, args: &Args, out: &std::path::Path) -> Result<(),
     Ok(())
 }
 
+/// `"format"` of the file `--dump-click` writes.
+const DUMP_CLICK_FORMAT: &str = "trippy-edit-click-dump-1";
+
+/// The click tool's parameters for this run: the flags, over the bundle's own defaults.
+///
+/// `max_radius` defaults to the bundle's median nearest-CAMERA spacing, exactly
+/// as `trippy.edit.cluster.default_max_radius_from_bundle` computes it, so a
+/// `--click` with no `--click-max-radius` and a `trippy edits click` with no
+/// `--max-radius` are the same click.
+fn click_params_for(bundle: &Bundle, args: &Args) -> trips_viewer::edit::ClickParams {
+    use trips_viewer::edit::cluster;
+
+    let defaults = cluster::ClickParams::default();
+    let max_radius = args.click_max_radius.unwrap_or_else(|| {
+        let mut centres = Vec::with_capacity(bundle.manifest.views.len() * 3);
+        for view in &bundle.manifest.views {
+            let c = view.position();
+            centres.extend_from_slice(&[f64::from(c.x), f64::from(c.y), f64::from(c.z)]);
+        }
+        if centres.len() / 3 >= 2 {
+            cluster::default_max_radius(&centres, &[])
+        } else {
+            cluster::default_max_radius(
+                &centres,
+                &trips_viewer::edit::weights::widen(&bundle.points.xyz),
+            )
+        }
+    });
+    cluster::ClickParams {
+        radius_px: args.click_radius_px.unwrap_or(defaults.radius_px),
+        colour_tol: args.click_colour_tol.unwrap_or(defaults.colour_tol),
+        max_radius,
+        max_points: args.click_max_points.unwrap_or(defaults.max_points),
+        ..defaults
+    }
+}
+
+/// Run click-to-cluster headlessly and write its selection.
+///
+/// The Selection panel's Shift-click, without a window: the same
+/// `trips_viewer::edit::cluster::click_to_cluster` the panel calls, projected
+/// with the chosen view's OWN camera at its own resolution (never a
+/// window-shaped one), so "the viewer selects what `trippy edits click`
+/// selects" is checkable without anyone opening a GUI
+/// (`tests/test_edit_viewer_parity.py`, `docs/EDITOR.md` §6's E4 row).
+///
+/// Base colour is `clip(feat[:, :3], 0, 1)`, the slice
+/// `trippy.edit.cluster.click_to_cluster` reads.
+///
+/// # Arguments
+/// - `bundle`: the loaded scene.
+/// - `args`: `--click`, `--view` and the four `--click-*` overrides.
+/// - `out`: destination JSON.
+///
+/// # Errors
+/// Returns `Err` when `--click` was not given, when `--view` names no view, or
+/// when `out` cannot be written.
+fn dump_click(bundle: &Bundle, args: &Args, out: &std::path::Path) -> Result<(), String> {
+    use trips_viewer::edit::cluster;
+
+    let px = args
+        .click
+        .ok_or("--dump-click needs --click <U> <V> (the pixel to cluster from)")?;
+    let position = pick_view_position(bundle, args.view)?;
+    let view = &bundle.manifest.views[position];
+    let camera = cluster::ClickCamera::from_render_camera(&view.camera());
+    let params = click_params_for(bundle, args);
+
+    let points = &bundle.points;
+    let channels = points.num_channels;
+    let mut rgb = Vec::with_capacity(points.len() * 3);
+    for row in 0..points.len() {
+        for c in 0..3 {
+            rgb.push(f64::from(points.feat[row * channels + c].clamp(0.0, 1.0)));
+        }
+    }
+    let xyz = trips_viewer::edit::weights::widen(&points.xyz);
+    let started = std::time::Instant::now();
+    let grid = cluster::PointGrid::build(&xyz);
+    let index_ms = started.elapsed().as_secs_f64() * 1e3;
+    let started = std::time::Instant::now();
+    let found = cluster::click_to_cluster(&grid, &xyz, &rgb, &camera, px, &params);
+    let cluster_ms = started.elapsed().as_secs_f64() * 1e3;
+
+    let document = serde_json::json!({
+        "format": DUMP_CLICK_FORMAT,
+        "bundle": bundle.dir.display().to_string(),
+        "view": view.name,
+        "view_index": view.index,
+        "px": [px.0, px.1],
+        "params": {
+            "radius_px": params.radius_px,
+            "colour_tol": params.colour_tol,
+            "max_radius": params.max_radius,
+            "max_points": params.max_points,
+            "knn_k": params.knn_k,
+            "depth_gap_factor": params.depth_gap_factor,
+        },
+        "n": points.len(),
+        "n_candidates": found.n_candidates,
+        "n_seed": found.n_seed,
+        "n_selected": found.point_ids.len(),
+        "hit_max_points": found.hit_max_points,
+        "seed_depth_mean": found.seed_depth_mean,
+        "warning": found.warning,
+        "index_ms": index_ms,
+        "cluster_ms": cluster_ms,
+        "point_ids": found.point_ids,
+    });
+    let text = serde_json::to_string(&document).map_err(|e| format!("serialising click: {e}"))?;
+    std::fs::write(out, text).map_err(|e| format!("{}: {e}", out.display()))?;
+    eprintln!(
+        "wrote {} ({} of {} points selected from ({}, {}) in view {}; {} candidates, {} seeded; \
+         index {index_ms:.0} ms, cluster {cluster_ms:.0} ms)",
+        out.display(),
+        found.point_ids.len(),
+        points.len(),
+        px.0,
+        px.1,
+        view.name,
+        found.n_candidates,
+        found.n_seed,
+    );
+    Ok(())
+}
+
 /// The headless paths: `--screenshot` and `--bench`.
 ///
 /// Both create their **own** Burn device (there is no window to borrow one
@@ -576,6 +759,9 @@ fn run_headless(args: &Args, bundle: Bundle) -> Result<(), String> {
     let bundle_dir = bundle.dir.clone();
     let bundle_format = bundle.manifest.format.clone();
     let blend_manifest = bundle.manifest.blend.clone();
+    // Resolved before the bundle moves into the renderer: the default
+    // `max_radius` needs every view's camera centre.
+    let click_params = args.click.map(|_| click_params_for(&bundle, args));
     let mut renderer = Renderer::new(bundle, device.clone())?;
     attach_live_splat(&mut renderer, &bundle_dir, blend_manifest.as_ref(), &args.splat);
     // `--screenshot` must draw the picture the WINDOW draws, edits included --
@@ -613,6 +799,37 @@ fn run_headless(args: &Args, bundle: Bundle) -> Result<(), String> {
         eprintln!("camera yawed {degrees} deg off view {}", camera_view.index);
     }
     let camera = controller.render_camera(width, height, &camera_view);
+
+    // `--click U V`: the headless twin of a Shift-click. The selection is
+    // tinted into the frame the screenshot writes -- that tint changing, and
+    // going away again on a run without `--click`, is E4's screenshot proof
+    // (`docs/EDITOR.md` §6). The pixel is in the RENDER's coordinates, which at
+    // `--scale 1.0` on a pinned view are the capture image's own.
+    if let Some(px) = args.click {
+        edits.set_click_params(click_params.expect("built alongside args.click"));
+        edits.run_click(
+            &trips_viewer::edit::cluster::ClickCamera::from_render_camera(&camera),
+            px,
+            &renderer,
+        );
+        edits.set_click_preview(true);
+        edits.apply(&mut renderer)?;
+        let found = edits.click_selection();
+        eprintln!(
+            "click ({}, {}): {} of {} points selected ({} candidates, {} seeded){}",
+            px.0,
+            px.1,
+            found.point_ids.len(),
+            renderer.num_points(),
+            found.n_candidates,
+            found.n_seed,
+            found
+                .warning
+                .as_ref()
+                .map_or_else(String::new, |w| format!(" -- {w}"))
+        );
+    }
+
     // `--camera-yaw-deg` unpins the controller, so `ExposureMode::Auto` here
     // means exactly what it means in the window: the view's own exposure for a
     // frame taken from that view, the scene median for one taken from
@@ -786,6 +1003,7 @@ fn run() -> Result<(), String> {
         || args.splat_bench.is_some()
         || args.dump_weights.is_some()
         || args.dump_shade.is_some()
+        || args.dump_click.is_some()
         || args.settings.profile;
     let dir = resolve_bundle(args.bundle.clone(), headless)?;
     let bundle = Bundle::load(&dir)?;
@@ -807,6 +1025,10 @@ fn run() -> Result<(), String> {
 
     if let Some(out) = &args.dump_shade {
         return dump_shade(&bundle, &args, out);
+    }
+
+    if let Some(out) = &args.dump_click {
+        return dump_click(&bundle, &args, out);
     }
 
     if headless {
