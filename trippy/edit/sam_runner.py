@@ -652,6 +652,50 @@ def _install_real_rope() -> bool:
     return True
 
 
+def _move_module_caches(model: Any, device: str) -> int:
+    """Move every module's plain-`dict` tensor cache onto `device`. **MPS only.**
+
+    `sam3.model.position_encoding.PositionEmbeddingSine` warms a `self.cache`
+    dict at construction time (a `precompute_resolution` optimisation for
+    `torch.compile`), and `forward` returns the cached tensor verbatim when the
+    input's `(H, W)` is a hit. That cache is a plain attribute, not a
+    `register_buffer`, so `nn.Module.to(device)` does not touch it: after the
+    model moves to MPS the visual features are on the GPU while their position
+    encodings are still on the CPU, and `sam3_image.py::_get_img_feats`'s
+    `x[img_ids]` dies with
+
+        RuntimeError: indices should be either on cpu or on the same device as
+        the indexed tensor (cpu)
+
+    (job `trippy-edit-sam-3`, 2026-09-07). This does exactly what `.to()` would
+    have done if the cache had been a buffer -- it moves data and changes no
+    arithmetic. Generic over "any module with a `cache` dict of tensors" rather
+    than hardcoding `PositionEmbeddingSine`, because the trap is the pattern,
+    not the class.
+
+    Args:
+        model: the built SAM 3 model, already `.to(device)`.
+        device: the torch device string.
+
+    Returns:
+        How many cached tensors were moved -- reported in `info.json`, because
+        zero on MPS means SAM 3 stopped precomputing and this shim is no longer
+        doing anything.
+    """
+    import torch
+
+    moved = 0
+    for module in model.modules():
+        cache = getattr(module, "cache", None)
+        if not isinstance(cache, dict):
+            continue
+        for key, value in list(cache.items()):
+            if isinstance(value, torch.Tensor) and str(value.device) != str(device):
+                cache[key] = value.to(device)
+                moved += 1
+    return moved
+
+
 def _child_parser() -> argparse.ArgumentParser:
     """The child process's own arguments (see `sam3_command`)."""
     p = argparse.ArgumentParser(description="segment one photo with the local SAM 3")
@@ -789,6 +833,10 @@ def _child_main(argv: list[str] | None = None) -> int:
     # weight type (torch.FloatTensor) should be the same" (job
     # `trippy-edit-sam-2`, 2026-09-07). A no-op when device is already cpu.
     model = model.to(args.device)
+    # `.to()` moves parameters and buffers; SAM 3's position encoder keeps its
+    # precomputed encodings in a plain dict, which it does not (see
+    # `_move_module_caches`).
+    moved_caches = _move_module_caches(model, args.device) if args.device == "mps" else 0
     processor = Sam3Processor(
         model, resolution=args.resolution, device=args.device, confidence_threshold=args.threshold
     )
@@ -868,6 +916,7 @@ def _child_main(argv: list[str] | None = None) -> int:
             "device": args.device,
             "fp32_addmm": bool(fp32_addmm),
             "real_rope": bool(real_rope),
+            "moved_caches": int(moved_caches),
             "resolution": int(args.resolution),
             "threshold": float(args.threshold),
             "mask_threshold": float(args.mask_threshold),

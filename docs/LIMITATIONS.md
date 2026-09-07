@@ -1287,8 +1287,16 @@ feature. `trips-web` passes a constant `BlendMode::Trips`, which is a hard no-op
   `apply_rotary_enc_real`) and it has no learned parameters of its own, so
   the checkpoint loads identically — `sam3/model_builder.py`'s
   `_create_vit_backbone` simply never passes the flag, and
-  `_install_real_rope` rebinds that factory on MPS. `PYTORCH_ENABLE_MPS_
-  FALLBACK` is untouched by any of this.
+  `_install_real_rope` rebinds that factory on MPS. (c)
+  `PositionEmbeddingSine` warms a plain `self.cache` **dict** of precomputed
+  position encodings at construction — not a `register_buffer`, so
+  `nn.Module.to(device)` does not move it, and after the model goes to MPS
+  `sam3_image.py::_get_img_feats` indexes those CPU tensors with MPS indices
+  (`indices should be either on cpu or on the same device as the indexed
+  tensor (cpu)`, job `trippy-edit-sam-3`). `_move_module_caches` moves any
+  module's `cache` dict of tensors onto the device — exactly what `.to()`
+  would have done had it been a buffer, so it moves data and changes no
+  arithmetic. `PYTORCH_ENABLE_MPS_FALLBACK` is untouched by any of this.
 - **The mask threshold is a real knob, not a formality.** `Sam3Processor`
   hardcodes "inside = probability > 0.5"; `sam_runner` reproduces that but
   thresholds the probability map itself so `--mask-threshold` can move it.

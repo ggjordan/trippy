@@ -874,3 +874,41 @@ def test_install_real_rope_forces_the_flag_the_builder_never_passes(
 
     monkeypatch.delitem(sys.modules, "sam3.model_builder")
     assert not _install_real_rope()
+
+
+def test_move_module_caches_finds_plain_dict_tensor_caches() -> None:
+    """`nn.Module.to()` skips a plain `self.cache` dict; this is what covers it.
+
+    SAM 3's `PositionEmbeddingSine` keeps its precomputed position encodings
+    there, which is why the MPS run died indexing a CPU tensor with MPS
+    indices (docs/LIMITATIONS.md "SAM-3 mask lift").
+    """
+    import torch
+
+    from trippy.edit.sam_runner import _move_module_caches
+
+    class WithCache(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.cache = {(4, 4): torch.zeros(1, 2), (8, 8): torch.zeros(1, 2)}
+
+    class WithJunk(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            # Neither of these is a tensor cache and neither may be touched.
+            self.cache = {"note": "not a tensor"}
+
+    class NotADict(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.cache = torch.zeros(1)
+
+    model = torch.nn.Sequential(WithCache(), WithJunk(), NotADict(), torch.nn.Linear(2, 2))
+    # Every tensor is already on the cpu, so a cpu move is a no-op and the
+    # count is 0; what this pins is that the traversal reaches the right
+    # attributes and refuses the wrong ones.
+    assert _move_module_caches(model, "cpu") == 0
+    assert _move_module_caches(model, "meta") == 2
+    assert all(str(v.device) == "meta" for v in model[0].cache.values())
+    assert model[1].cache == {"note": "not a tensor"}
+    assert str(model[2].cache.device) == "cpu", "a non-dict `cache` is left alone"

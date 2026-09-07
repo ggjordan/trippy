@@ -626,11 +626,13 @@ trippy edits sam --bundle <dir> --scene <root> --view IMG.jpg \
   convolution's input but not its weight. The shipped fix takes bfloat16 out
   of the graph at its source and runs with no autocast on either device;
   fp32 is strictly more accurate than the bf16 path CUDA takes.
-  `--device mps` needs two more rebindings of SAM 3's own code — the model
-  is moved to the device (`build_sam3_image_model` only does that for CUDA)
-  and the ViT is forced onto its own real-valued rotary embedding (MPS has
-  no `torch.view_as_complex`). `docs/LIMITATIONS.md`'s "SAM-3 mask lift"
-  section has all four, with the job names that found them.
+  `--device mps` needs three more repairs to SAM 3's own code — the model is
+  moved to the device (`build_sam3_image_model` only does that for CUDA), the
+  ViT is forced onto its own real-valued rotary embedding (MPS has no
+  `torch.view_as_complex`), and the position encoder's precomputed cache — a
+  plain dict, so `.to()` skips it — is moved with it.
+  `docs/LIMITATIONS.md`'s "SAM-3 mask lift" section has all five, with the
+  job names that found them.
 - **The mask is depth-gated before it becomes a selection.** A mask is 2D:
   everything behind the object along the same ray is inside it too. Points
   are binned into 16 px cells and each cell's *nearest supported* depth
