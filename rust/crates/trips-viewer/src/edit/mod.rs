@@ -9,9 +9,12 @@
 //!     arithmetic out of `app.rs`: this half must stay testable on the CPU and
 //!     compilable for wasm.
 //! Invariants:
-//!     - Nothing here references Burn, wgpu, egui or eframe.
-//!     - [`model`] and [`weights`] are twins of `trippy/edit/model.py` and
-//!       `trippy/edit/weights.py`. The golden test at the bottom of this file
+//!     - Nothing here references Burn, wgpu, egui or eframe. [`cluster`] reads
+//!       `brush_pyramid::scene::Camera` for its numbers only; that type is
+//!       plain data and is available without the `gpu` feature.
+//!     - [`model`], [`weights`] and [`cluster`] are twins of
+//!       `trippy/edit/model.py`, `trippy/edit/weights.py` and
+//!       `trippy/edit/cluster.py`. The golden test at the bottom of this file
 //!     	is the thing that keeps them twins: it replays a synthetic
 //!       `edits.json` against a synthetic point cloud and compares against
 //!       weights Python computed, to 1e-6. If it fails, one side drifted.
@@ -19,11 +22,13 @@
 //! Related docs: `docs/EDITOR.md`; `docs/decisions/ADR-0007-viewer-editing.md`.
 
 pub mod apply;
+pub mod cluster;
 pub mod model;
 pub mod shade;
 pub mod weights;
 
 pub use apply::{edited_points, gaussian_opacity_scale, EditedPoints, COVERAGE_EPS};
+pub use cluster::{click_to_cluster, ClickCamera, ClickParams, ClickSelection, PointGrid};
 pub use model::{EditDocument, Kind, LidParams, Op, Params, Region, EDITS_FILENAME};
 pub use weights::{compose_gaussian_weights, compose_trips_weights, ComposedWeights};
 
@@ -113,6 +118,102 @@ mod golden {
             assert!(
                 (a - b).abs() <= 1e-6,
                 "gaussian weight[{i}]: viewer {a} vs python {b}"
+            );
+        }
+    }
+
+    /// Every case of `click.json`, replayed with the viewer's own clustering.
+    ///
+    /// This asserts an EXACT id-for-id match, not a tolerance: a selection is a
+    /// set of integers, and the three places the two implementations could
+    /// legitimately break a tie (`cluster`'s own "Tie-breaking" section) are
+    /// all unreachable in this fixture — `tests/test_edit_golden.py`'s
+    /// `test_each_click_case_pins_a_different_branch` is what keeps it that
+    /// way.
+    #[test]
+    fn the_viewer_clusters_the_same_click_python_does() {
+        let scene = read("click.json");
+        let expected = read("expected_click.json");
+        assert_eq!(
+            scene["format"].as_str(),
+            Some(cluster::CLICK_FIXTURE_FORMAT),
+            "click.json format"
+        );
+
+        let xyz = floats(&scene, "xyz");
+        let rgb = floats(&scene, "rgb");
+        let camera = cluster::ClickCamera::from_json(&scene["camera"]).expect("fixture camera");
+        let grid = cluster::PointGrid::build(&xyz);
+
+        let cases = scene["cases"].as_array().expect("cases");
+        let want_cases = expected["cases"].as_array().expect("expected cases");
+        assert_eq!(cases.len(), want_cases.len(), "case count");
+        assert!(!cases.is_empty(), "the fixture must carry at least one click");
+
+        for (case, want) in cases.iter().zip(want_cases) {
+            let name = case["name"].as_str().expect("case name");
+            assert_eq!(name, want["name"].as_str().expect("name"), "case order");
+            let params = cluster::ClickParams {
+                radius_px: case["radius_px"].as_f64().expect("radius_px"),
+                colour_tol: case["colour_tol"].as_f64().expect("colour_tol"),
+                max_radius: case["max_radius"].as_f64().expect("max_radius"),
+                max_points: usize::try_from(case["max_points"].as_u64().expect("max_points"))
+                    .expect("fits"),
+                knn_k: usize::try_from(case["knn_k"].as_u64().expect("knn_k")).expect("fits"),
+                depth_gap_factor: case["depth_gap_factor"].as_f64().expect("depth_gap_factor"),
+            };
+            let px = case["px"].as_array().expect("px");
+            let found = cluster::click_to_cluster(
+                &grid,
+                &xyz,
+                &rgb,
+                &camera,
+                (
+                    px[0].as_f64().expect("u"),
+                    px[1].as_f64().expect("v"),
+                ),
+                &params,
+            );
+
+            let want_ids: Vec<u32> = want["point_ids"]
+                .as_array()
+                .expect("point_ids")
+                .iter()
+                .map(|v| u32::try_from(v.as_u64().expect("ids")).expect("fits"))
+                .collect();
+            assert_eq!(found.point_ids, want_ids, "click case {name:?}: selection");
+            assert_eq!(
+                found.n_candidates,
+                usize::try_from(want["n_candidates"].as_u64().expect("n_candidates")).expect("fits"),
+                "click case {name:?}: candidates"
+            );
+            assert_eq!(
+                found.n_seed,
+                usize::try_from(want["n_seed"].as_u64().expect("n_seed")).expect("fits"),
+                "click case {name:?}: seed"
+            );
+            assert_eq!(
+                found.hit_max_points,
+                want["hit_max_points"].as_bool().expect("hit_max_points"),
+                "click case {name:?}: cap"
+            );
+            match want["seed_depth_mean"].as_f64() {
+                Some(depth) => {
+                    let got = found.seed_depth_mean.expect("a hit reports a seed depth");
+                    assert!(
+                        (got - depth).abs() <= 1e-9,
+                        "click case {name:?}: seed depth {got} vs python {depth}"
+                    );
+                }
+                None => assert!(
+                    found.seed_depth_mean.is_none(),
+                    "click case {name:?}: a miss has no seed depth"
+                ),
+            }
+            assert_eq!(
+                found.warning.is_some(),
+                !want["warning"].is_null(),
+                "click case {name:?}: warning"
             );
         }
     }

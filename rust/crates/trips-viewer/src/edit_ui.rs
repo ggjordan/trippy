@@ -32,6 +32,9 @@ use eframe::egui;
 use serde_json::json;
 
 use trips_viewer::edit::apply::{edited_points, gaussian_opacity_scale, tinted_points};
+use trips_viewer::edit::cluster::{
+    self, ClickCamera, ClickParams, ClickSelection, PointGrid, DEFAULT_MAX_POINTS,
+};
 use trips_viewer::edit::model::{new_region_id, LidParams, Op, Params, Region, KAREKARE_LID};
 use trips_viewer::edit::shade::{self, ShadeSelection, ShadeViews, Thresholds};
 use trips_viewer::edit::weights::{compose_gaussian_weights, compose_trips_weights, widen};
@@ -43,7 +46,7 @@ use trips_viewer::renderer::Renderer;
 /// Chosen to avoid every key `app.rs::ViewerApp::handle_input` already binds
 /// (`V X B Tab - = F R N P W A S D Q E`), per `docs/EDITOR.md` §4.
 pub const KEYS_HELP: &str = "\
-M edit mode | T cycle tool | H preview highlight\n\
+M edit mode | T cycle tool | H preview highlight | SHIFT-CLICK the render to select\n\
 arrows + PageUp/PageDown nudge the selected region | [ / ] shrink / grow\n\
 Delete removes the selected region | Cmd-Z undo | Cmd-Shift-Z redo | Cmd-S save";
 
@@ -55,6 +58,8 @@ pub enum Tool {
     Regions,
     /// Threshold the shade audit's own numbers into a `pointset` region.
     ShadeFinder,
+    /// Shift-click the render; grow a `pointset` region from what was clicked.
+    ClickCluster,
 }
 
 impl Tool {
@@ -62,7 +67,8 @@ impl Tool {
     const fn next(self) -> Self {
         match self {
             Self::Regions => Self::ShadeFinder,
-            Self::ShadeFinder => Self::Regions,
+            Self::ShadeFinder => Self::ClickCluster,
+            Self::ClickCluster => Self::Regions,
         }
     }
 
@@ -70,6 +76,7 @@ impl Tool {
         match self {
             Self::Regions => "regions",
             Self::ShadeFinder => "shade-cloud finder",
+            Self::ClickCluster => "click-to-cluster",
         }
     }
 }
@@ -120,6 +127,99 @@ impl ShadeUi {
     }
 }
 
+/// The neighbour index one click needs, and the widened arrays it queries.
+///
+/// Built on the first click and kept while the click tool has a live selection,
+/// so moving a slider re-runs in milliseconds instead of rebuilding the index.
+/// Dropped by [`EditSession::clear_click`] and whenever the Tools panel leaves
+/// this tool — a `f64` copy of a multi-million-point cloud is not something to
+/// hold onto for a tool nobody is using. The panel reports its size.
+struct ClickCache {
+    /// Flat `(N, 3)` world positions, widened from the renderer's `f32`.
+    xyz: Vec<f64>,
+    /// Flat `(N, 3)` base colour, `clip(feat[:, :3], 0, 1)`.
+    rgb: Vec<f64>,
+    /// The spatial hash over `xyz`.
+    grid: PointGrid,
+    /// Milliseconds the build took.
+    build_ms: f64,
+}
+
+impl ClickCache {
+    /// Widen the renderer's own cloud and index it.
+    fn build(points: &brush_pyramid::scene::PointSet) -> Self {
+        let started = std::time::Instant::now();
+        let xyz = widen(&points.xyz);
+        let channels = points.num_channels;
+        let mut rgb = Vec::with_capacity(points.len() * 3);
+        for row in 0..points.len() {
+            for c in 0..3 {
+                rgb.push(f64::from(points.feat[row * channels + c].clamp(0.0, 1.0)));
+            }
+        }
+        let grid = PointGrid::build(&xyz);
+        Self {
+            xyz,
+            rgb,
+            grid,
+            build_ms: started.elapsed().as_secs_f64() * 1e3,
+        }
+    }
+
+    /// Roughly how much host memory this holds, mebibytes — the panel says so.
+    fn megabytes(&self) -> f64 {
+        #[allow(clippy::cast_precision_loss)]
+        let bytes = (self.xyz.len() * 8 + self.rgb.len() * 8 + self.grid.len() * 8) as f64;
+        bytes / (1024.0 * 1024.0)
+    }
+}
+
+/// The click tool's own state: the sliders, the last click, and what it selected.
+pub struct ClickUi {
+    /// The four sliders (`docs/EDITOR.md` §4's "size/tightness slider", grown
+    /// into the same four numbers `trippy edits click` takes).
+    pub params: ClickParams,
+    /// The last result of [`cluster::click_to_cluster`].
+    pub selection: ClickSelection,
+    /// Whether the render tints the selection (`H`).
+    pub preview: bool,
+    /// The op "add as region" will give the new region.
+    pub op: Op,
+    /// The mix "add as region" will give it (ignored by `delete`).
+    pub mix: f64,
+    /// The camera and pixel of the last click, so a slider move re-runs it
+    /// against the frame it was made in rather than wherever the camera is now.
+    last: Option<(ClickCamera, (f64, f64))>,
+    /// Set by a Shift-click; consumed by [`EditSession::resolve_click`].
+    pending: Option<(f64, f64)>,
+    /// Set by a slider; also consumed by `resolve_click`.
+    dirty: bool,
+    /// The neighbour index, while the tool is in use.
+    cache: Option<ClickCache>,
+    /// Milliseconds the last clustering took.
+    ms: f64,
+    /// A one-line "what just happened" for the panel.
+    note: String,
+}
+
+impl Default for ClickUi {
+    fn default() -> Self {
+        Self {
+            params: ClickParams::default(),
+            selection: ClickSelection::default(),
+            preview: true,
+            op: Op::Fade,
+            mix: cluster::DEFAULT_MIX,
+            last: None,
+            pending: None,
+            dirty: false,
+            cache: None,
+            ms: 0.0,
+            note: String::new(),
+        }
+    }
+}
+
 /// Everything the editor holds for one open bundle.
 pub struct EditSession {
     /// The document, and the only place regions live.
@@ -136,6 +236,8 @@ pub struct EditSession {
     tool: Tool,
     /// The shade finder.
     shade: ShadeUi,
+    /// The click-to-cluster tool.
+    click: ClickUi,
     /// Set by any widget that changed the document; consumed by [`Self::apply`].
     needs_apply: bool,
     /// Milliseconds the last [`Self::apply`] took — `docs/EDITOR.md` §7's budget
@@ -202,6 +304,7 @@ impl EditSession {
             selected: None,
             tool: Tool::default(),
             shade: ShadeUi::new(shade_views, bundle_dir),
+            click: ClickUi::default(),
             // The first apply is unconditional: a bundle reopened with a saved
             // `edits.json` must render edited on its very first frame.
             needs_apply: true,
@@ -211,6 +314,167 @@ impl EditSession {
             name_buffer: String::new(),
             name_buffer_for: None,
         }
+    }
+
+    /// The point ids the render should tint this frame, if any.
+    ///
+    /// Both selection tools can ask for a highlight; where both do, the union is
+    /// tinted the one colour (`edit::apply::PREVIEW_TINT`). A single flat list
+    /// keeps `edited_points` doing exactly one tint pass, whichever tool asked.
+    fn preview_ids(&self) -> Option<Vec<u32>> {
+        let mut ids: Vec<u32> = Vec::new();
+        if self.shade.preview {
+            ids.extend_from_slice(&self.shade.selection.point_ids);
+        }
+        if self.click.preview {
+            ids.extend_from_slice(&self.click.selection.point_ids);
+        }
+        (!ids.is_empty()).then_some(ids)
+    }
+
+    /// Give the click tool a `max_radius` before anyone has touched a slider.
+    ///
+    /// `trippy.edit.cluster.default_max_radius_from_bundle`: the bundle's own
+    /// median nearest-CAMERA spacing, not point-cloud density. Called once, at
+    /// open; a user-moved slider is never overwritten because this only fires
+    /// while the radius is still the sentinel `0.0`.
+    ///
+    /// # Arguments
+    /// - `views`: every capture view, for their camera centres.
+    /// - `renderer`: only its `xyz`, and only for the single-view fallback.
+    /// - `scene_diameter`: world units across the captured area, the last
+    ///   resort when neither cameras nor points give any scale.
+    pub fn init_click_defaults(
+        &mut self,
+        views: &[trips_viewer::bundle::BundleView],
+        renderer: &Renderer,
+        scene_diameter: f32,
+    ) {
+        if self.click.params.max_radius > 0.0 {
+            return;
+        }
+        let mut centres = Vec::with_capacity(views.len() * 3);
+        for view in views {
+            let c = view.position();
+            centres.extend_from_slice(&[f64::from(c.x), f64::from(c.y), f64::from(c.z)]);
+        }
+        let radius = if centres.len() / 3 >= 2 {
+            cluster::default_max_radius(&centres, &[])
+        } else {
+            cluster::default_max_radius(&centres, &widen(&renderer.base_points().xyz))
+        };
+        // A bundle with one camera and one point gives no scale at all; a
+        // fraction of the scene is a better answer than a radius of zero, which
+        // would make every click select exactly its own seed.
+        self.click.params.max_radius = if radius > 0.0 {
+            radius
+        } else {
+            f64::from(scene_diameter * DEFAULT_REGION_SCENE_FRACTION)
+        };
+    }
+
+    /// Record a Shift-click on the render, in the render camera's own pixels.
+    ///
+    /// Only stored here: the camera is not known until the frame is laid out,
+    /// so [`Self::resolve_click`] is where the work happens.
+    pub fn request_click(&mut self, px: (f64, f64)) {
+        self.click.pending = Some(px);
+        self.tool = Tool::ClickCluster;
+    }
+
+    /// Run a pending Shift-click (or a slider move) against `camera`.
+    ///
+    /// A no-op on every frame where nothing asked for it, exactly as
+    /// [`Self::refresh_shade`] is.
+    pub fn resolve_click(&mut self, camera: &ClickCamera, renderer: &Renderer) {
+        let click = match (self.click.pending.take(), self.click.dirty) {
+            (Some(px), _) => {
+                self.click.last = Some((camera.clone(), px));
+                self.click.last.clone()
+            }
+            (None, true) => self.click.last.clone(),
+            (None, false) => return,
+        };
+        self.click.dirty = false;
+        let Some((camera, px)) = click else {
+            return;
+        };
+        self.run_click(&camera, px, renderer);
+    }
+
+    /// Cluster one click and keep the result. The headless `--click` path too.
+    ///
+    /// # Arguments
+    /// - `camera`: the camera the frame was rendered with.
+    /// - `px`: the clicked pixel in that camera's own coordinates.
+    /// - `renderer`: the source of the cloud (its UNEDITED rows, so the ids the
+    ///   selection carries index `points.npz` and not a delete-filtered copy).
+    pub fn run_click(&mut self, camera: &ClickCamera, px: (f64, f64), renderer: &Renderer) {
+        if self.click.cache.is_none() {
+            self.click.cache = Some(ClickCache::build(renderer.base_points()));
+        }
+        let cache = self.click.cache.as_ref().expect("just built");
+        let started = std::time::Instant::now();
+        self.click.selection = cluster::click_to_cluster(
+            &cache.grid,
+            &cache.xyz,
+            &cache.rgb,
+            camera,
+            px,
+            &self.click.params,
+        );
+        self.click.ms = started.elapsed().as_secs_f64() * 1e3;
+        self.click.last = Some((camera.clone(), px));
+        self.click.note = match &self.click.selection.warning {
+            Some(warning) => warning.clone(),
+            None => format!(
+                "{} points from ({:.0}, {:.0}) in {:.1} ms",
+                self.click.selection.point_ids.len(),
+                px.0,
+                px.1,
+                self.click.ms
+            ),
+        };
+        if self.click.preview {
+            self.needs_apply = true;
+        }
+    }
+
+    /// Drop the click selection, its preview and its index.
+    pub fn clear_click(&mut self) {
+        let had_preview = self.click.preview && !self.click.selection.point_ids.is_empty();
+        self.click.selection = ClickSelection::default();
+        self.click.last = None;
+        self.click.pending = None;
+        self.click.dirty = false;
+        self.click.cache = None;
+        self.click.note = "selection cleared".to_owned();
+        if had_preview {
+            // The tint has to come off the render, which only happens on an
+            // apply -- this is the "Clear restores the frame" half of the
+            // screenshot proof in `docs/EDITOR.md` §6.
+            self.needs_apply = true;
+        }
+    }
+
+    /// Show or hide the click selection's tint (the headless `--click` path).
+    pub fn set_click_preview(&mut self, on: bool) {
+        if self.click.preview != on {
+            self.click.preview = on;
+            self.needs_apply = true;
+        }
+    }
+
+    /// The current click selection, for the headless dump and the tests.
+    #[must_use]
+    pub const fn click_selection(&self) -> &ClickSelection {
+        &self.click.selection
+    }
+
+    /// Override the click tool's sliders (the `--click-*` flags).
+    pub fn set_click_params(&mut self, params: ClickParams) {
+        self.click.params = params;
+        self.click.dirty = self.click.last.is_some();
     }
 
     /// Recompose the per-point weights and hand the renderer its point sets.
@@ -229,9 +493,7 @@ impl EditSession {
         self.needs_apply = false;
         let started = std::time::Instant::now();
 
-        let preview_ids: Option<Vec<u32>> = (self.shade.preview
-            && !self.shade.selection.point_ids.is_empty())
-        .then(|| self.shade.selection.point_ids.clone());
+        let preview_ids = self.preview_ids();
 
         // Nothing enabled and no preview: clear the edit and return WITHOUT
         // composing. `edited_points` would otherwise clone the whole point set
@@ -544,9 +806,23 @@ impl EditSession {
         }
         if cycle_tool {
             self.tool = self.tool.next();
+            if self.tool != Tool::ClickCluster {
+                // Same rule the Tools panel's own radio applies: the click
+                // tool's `f64` copy of the cloud is not held for a tool nobody
+                // is using. The selection itself survives, so cycling back and
+                // pressing a slider rebuilds the index and re-runs the click.
+                self.click.cache = None;
+            }
         }
         if toggle_preview {
-            self.shade.preview = !self.shade.preview;
+            // `H` belongs to whichever tool has focus: both produce a tinted
+            // `pointset` preview and there is no second highlight colour to
+            // tell two of them apart with.
+            if self.tool == Tool::ClickCluster {
+                self.click.preview = !self.click.preview;
+            } else {
+                self.shade.preview = !self.shade.preview;
+            }
             self.needs_apply = true;
         }
         if remove {
@@ -837,14 +1113,27 @@ impl EditSession {
     #[allow(clippy::too_many_lines)]
     fn tools_panel(&mut self, ui: &mut egui::Ui, num_points: usize) {
         ui.label(egui::RichText::new("Tools (T)").strong());
+        let previous = self.tool;
         ui.horizontal(|ui| {
-            for tool in [Tool::Regions, Tool::ShadeFinder] {
+            for tool in [Tool::Regions, Tool::ShadeFinder, Tool::ClickCluster] {
                 ui.selectable_value(&mut self.tool, tool, tool.label());
             }
         });
-        if self.tool != Tool::ShadeFinder {
-            ui.label("place box/sphere/lid regions from the Regions panel above");
-            return;
+        if previous == Tool::ClickCluster && self.tool != previous {
+            // Leaving the tool drops its index: a `f64` copy of the cloud is
+            // not something to hold for a tool nobody is using (`ClickCache`).
+            self.click.cache = None;
+        }
+        match self.tool {
+            Tool::Regions => {
+                ui.label("place box/sphere/lid regions from the Regions panel above");
+                return;
+            }
+            Tool::ClickCluster => {
+                self.click_panel(ui, num_points);
+                return;
+            }
+            Tool::ShadeFinder => {}
         }
         if let Some(reason) = &self.shade.unavailable {
             ui.colored_label(egui::Color32::from_rgb(255, 200, 120), reason);
@@ -911,6 +1200,158 @@ impl EditSession {
                 self.add_shade_region(Op::Delete);
             }
         });
+    }
+
+    /// The Selection panel: what the last Shift-click found, and what to do with it.
+    ///
+    /// `docs/EDITOR.md` §4's Tools panel for E4. The four sliders are the same
+    /// four numbers `trippy edits click` takes on the command line, so a
+    /// selection made here and one made there are the same selection.
+    #[allow(clippy::too_many_lines)]
+    fn click_panel(&mut self, ui: &mut egui::Ui, num_points: usize) {
+        ui.label(
+            "SHIFT-CLICK the render to select the object under the pointer. \
+             A plain drag still orbits.",
+        );
+
+        let mut moved = false;
+        let params = &mut self.click.params;
+        moved |= ui
+            .add(
+                egui::Slider::new(&mut params.radius_px, 1.0..=64.0)
+                    .text("radius (px): how far from the click a point may project"),
+            )
+            .changed();
+        moved |= ui
+            .add(
+                egui::Slider::new(&mut params.colour_tol, 0.0..=2.0)
+                    .text("colour tol: distance in [0,1]^3 from the seed's mean colour"),
+            )
+            .changed();
+        // The radius slider is logarithmic because scene scales differ by
+        // orders of magnitude and a linear one is unusable on both.
+        moved |= ui
+            .add(
+                egui::Slider::new(&mut params.max_radius, 1e-3..=1e3)
+                    .logarithmic(true)
+                    .text("max radius (world units) from the seed centroid"),
+            )
+            .changed();
+        let mut max_points = params.max_points as f64;
+        if ui
+            .add(
+                egui::Slider::new(&mut max_points, 1.0..=(DEFAULT_MAX_POINTS as f64))
+                    .logarithmic(true)
+                    .text("max points"),
+            )
+            .changed()
+        {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            {
+                params.max_points = (max_points.round() as usize).max(1);
+            }
+            moved = true;
+        }
+        if moved && self.click.last.is_some() {
+            // Re-run the LAST click, not a new one: a slider is "show me more
+            // or less of what I clicked", never "click somewhere else".
+            self.click.dirty = true;
+        }
+
+        if ui
+            .checkbox(&mut self.click.preview, "preview highlight (H)")
+            .changed()
+        {
+            self.needs_apply = true;
+        }
+
+        let selection = &self.click.selection;
+        ui.label(format!(
+            "{} of {num_points} points selected  |  {} candidates within the radius  |  \
+             {} seeded the nearest depth mode  |  clustered in {:.1} ms",
+            selection.point_ids.len(),
+            selection.n_candidates,
+            selection.n_seed,
+            self.click.ms
+        ));
+        if let Some(depth) = selection.seed_depth_mean {
+            ui.label(format!(
+                "seed depth {depth:.3} world units in front of the camera{}",
+                if selection.hit_max_points {
+                    "  |  STOPPED AT max points -- raise it to grow further"
+                } else {
+                    ""
+                }
+            ));
+        }
+        if let Some(cache) = &self.click.cache {
+            ui.label(format!(
+                "neighbour index: {} points, {:.1} MiB, built in {:.0} ms (dropped when you \
+                 leave this tool or press clear)",
+                cache.grid.len(),
+                cache.megabytes(),
+                cache.build_ms
+            ));
+        }
+        if !self.click.note.is_empty() {
+            ui.label(&self.click.note);
+        }
+
+        ui.horizontal(|ui| {
+            ui.label("op:");
+            for op in Op::ALL {
+                ui.selectable_value(&mut self.click.op, op, op.as_str());
+            }
+        });
+        if self.click.op == Op::Delete {
+            ui.label("delete ignores mix: the selected points are removed");
+        } else {
+            ui.add(
+                egui::Slider::new(&mut self.click.mix, 0.0..=1.0)
+                    .text("mix (0 = splat, 1 = TRIPS)"),
+            );
+        }
+
+        ui.horizontal(|ui| {
+            let usable = !self.click.selection.point_ids.is_empty();
+            if ui
+                .add_enabled(usable, egui::Button::new("add as region"))
+                .on_hover_text("commit this selection as a pointset region")
+                .clicked()
+            {
+                self.add_click_region();
+            }
+            if ui
+                .add_enabled(usable, egui::Button::new("clear"))
+                .on_hover_text("drop the selection, its highlight and its neighbour index")
+                .clicked()
+            {
+                self.clear_click();
+            }
+        });
+    }
+
+    /// Turn the click selection into a committed `pointset` region.
+    fn add_click_region(&mut self) {
+        let params = self.click.params;
+        let (op, mix) = (self.click.op, self.click.mix);
+        self.add(Region::new(
+            new_region_id(),
+            format!(
+                "click cluster ({:.0} px, tol {:.2})",
+                params.radius_px, params.colour_tol
+            ),
+            Params::Pointset {
+                point_ids: self.click.selection.point_ids.clone(),
+            },
+            mix,
+            op,
+        ));
+        // The committed region is its own thing now; leave the tint off so it
+        // does not sit on top of the edit it just became (the shade finder's
+        // "add as region" makes the same choice, for the same reason).
+        self.click.preview = false;
+        self.needs_apply = true;
     }
 
     /// Turn the live preview into a committed `pointset` region.
@@ -1033,7 +1474,84 @@ mod tests {
         tool = tool.next();
         assert_eq!(tool, Tool::ShadeFinder);
         tool = tool.next();
+        assert_eq!(tool, Tool::ClickCluster);
+        tool = tool.next();
         assert_eq!(tool, Tool::Regions);
+    }
+
+    #[test]
+    fn a_shift_click_is_recorded_and_focuses_the_click_tool() {
+        let dir = std::env::temp_dir().join(format!("trips-edit-click-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut session = EditSession::open_with_path(&dir, "trippy-bundle-1", None);
+        assert_eq!(session.tool, Tool::Regions);
+        session.request_click((12.0, 34.0));
+        assert_eq!(session.tool, Tool::ClickCluster, "the click picks its tool");
+        assert_eq!(session.click.pending, Some((12.0, 34.0)));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn clearing_a_click_drops_the_selection_the_preview_and_the_index() {
+        let dir = std::env::temp_dir().join(format!("trips-edit-clear-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut session = EditSession::open_with_path(&dir, "trippy-bundle-1", None);
+        session.click.selection = ClickSelection {
+            point_ids: vec![1, 2, 3],
+            n_candidates: 9,
+            n_seed: 3,
+            ..ClickSelection::default()
+        };
+        session.click.preview = true;
+        assert_eq!(session.preview_ids(), Some(vec![1, 2, 3]));
+
+        session.needs_apply = false;
+        session.clear_click();
+        assert!(session.click.selection.point_ids.is_empty());
+        assert!(session.click.cache.is_none());
+        assert_eq!(session.preview_ids(), None);
+        assert!(
+            session.needs_apply,
+            "clearing has to reach the render, or the tint stays on screen"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn adding_a_click_region_commits_the_ids_and_turns_the_tint_off() {
+        let dir = std::env::temp_dir().join(format!("trips-edit-cadd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut session = EditSession::open_with_path(&dir, "trippy-bundle-1", None);
+        session.click.selection = ClickSelection {
+            point_ids: vec![4, 7, 9],
+            ..ClickSelection::default()
+        };
+        session.click.preview = true;
+        session.click.op = Op::Delete;
+        session.add_click_region();
+
+        let region = session.doc.regions().last().expect("a region was added");
+        assert_eq!(region.op, Op::Delete);
+        assert!(matches!(
+            &region.params,
+            Params::Pointset { point_ids } if point_ids == &vec![4, 7, 9]
+        ));
+        assert!(!session.click.preview, "the tint comes off what it became");
+        assert!(session.dirty, "an added region is an unsaved change");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_preview_tints_both_tools_selections_at_once() {
+        let dir = std::env::temp_dir().join(format!("trips-edit-both-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut session = EditSession::open_with_path(&dir, "trippy-bundle-1", None);
+        session.shade.selection.point_ids = vec![1, 2];
+        session.shade.preview = true;
+        session.click.selection.point_ids = vec![5];
+        session.click.preview = true;
+        assert_eq!(session.preview_ids(), Some(vec![1, 2, 5]));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

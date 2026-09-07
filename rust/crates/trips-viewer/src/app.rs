@@ -35,6 +35,7 @@ use crate::blit::{BlitCallback, BlitResources};
 use crate::blend::{Blend, BlendMode, GATE_SCALE_MAX, GATE_SCALE_MIN};
 use crate::bundle::Bundle;
 use crate::edit_ui::EditSession;
+use trips_viewer::edit::cluster::ClickCamera;
 use crate::camera::{Controller, Mode};
 use crate::renderer::{ExposureMode, Renderer, Settings, ViewMode, MANUAL_EXPOSURE_LIMIT};
 
@@ -161,6 +162,10 @@ impl ViewerApp {
         // with a saved `edits.json` must render edited on its first frame and
         // `apply` needs the renderer's own point cloud to compose against.
         let mut edit = EditSession::open_with_path(&bundle_dir, &bundle_format, edits);
+        // The click tool's `max_radius` is the bundle's own median camera
+        // spacing, which needs the views and the cloud -- both of which exist
+        // only now (`trippy.edit.cluster.default_max_radius_from_bundle`).
+        edit.init_click_defaults(&views, &renderer, controller.scene().diameter());
         edit.estimate_shade_depths(&renderer);
         edit.refresh_shade(&renderer);
         if let Err(e) = edit.apply(&mut renderer) {
@@ -261,6 +266,25 @@ impl ViewerApp {
             ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
         } else if response.hovered() {
             ctx.set_cursor_icon(egui::CursorIcon::Grab);
+        }
+
+        // Shift-click selects an object (`docs/EDITOR.md` §4, E4). Read from
+        // the same `response` every drag is, so a Shift-click that began on the
+        // Edit window never reaches the canvas; and it is a CLICK, not a drag,
+        // so Shift-dragging still orbits and navigation loses nothing. The
+        // pixel handed on is in the RENDER's own coordinates -- egui points
+        // scaled by the display's `pixels_per_point` and the render-scale
+        // lever -- because that is the camera the click will be projected
+        // against (`ui`'s own `width`/`height`).
+        if self.edit.active && response.clicked() && ctx.input(|i| i.modifiers.shift) {
+            if let Some(pos) = response.interact_pointer_pos() {
+                let ppp = ctx.pixels_per_point();
+                let scale = self.settings.render_scale.clamp(0.1, 1.0);
+                self.edit.request_click((
+                    f64::from((pos.x - response.rect.min.x) * ppp * scale),
+                    f64::from((pos.y - response.rect.min.y) * ppp * scale),
+                ));
+            }
         }
 
         // Only a text field should be allowed to eat the movement keys. The
@@ -698,14 +722,19 @@ impl eframe::App for ViewerApp {
         // re-uploads. Both are no-ops on a frame where nothing changed, which
         // is why flying through an edited scene costs what flying through an
         // unedited one does.
+        // The camera is built BEFORE the edit work because a Shift-click is
+        // resolved against it: the pixel was recorded in this frame's render
+        // coordinates and has to be projected with this frame's camera.
+        let reference = self.controller.reference().clone();
+        let camera = self.controller.render_camera(width, height, &reference);
+        let frame_index = reference.index;
+
+        self.edit
+            .resolve_click(&ClickCamera::from_render_camera(&camera), &self.renderer);
         self.edit.refresh_shade(&self.renderer);
         if let Err(e) = self.edit.apply(&mut self.renderer) {
             self.error = Some(e);
         }
-
-        let reference = self.controller.reference().clone();
-        let camera = self.controller.render_camera(width, height, &reference);
-        let frame_index = reference.index;
         // The renderer cannot see whether the camera is still on its reference
         // view, and `ExposureMode::Auto` is defined in terms of exactly that.
         self.renderer

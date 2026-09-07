@@ -10,6 +10,9 @@ Invariants under test:
     `trippy.edit.shade_finder.find_shade_pointset` selects at the same
     thresholds, and reports the same `dark_mass_fraction` -- the E2
     acceptance.
+  - `trips-viewer --click U V --dump-click` selects the SAME point ids that
+    `trippy.edit.cluster.click_to_cluster` selects at the same view, pixel
+    and parameters -- the E4 acceptance.
   - The committed fixture pair (tests/test_edit_golden.py plus the Rust
     `edit::golden` tests) is the always-on version of the same check; this
     module is the one that runs against a REAL bundle directory, points.npz
@@ -38,6 +41,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from trippy.edit.cluster import CameraView, click_to_cluster
 from trippy.edit.model import EditDocument
 from trippy.edit.shade_finder import find_shade_pointset
 from trippy.edit.weights import compose_trips_weights
@@ -51,6 +55,16 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 #: vacuously. These select roughly a fifth of the cloud.
 SHADE_LUM = 0.30
 SHADE_CONF = 0.95
+
+#: Click parameters for THIS bundle, again not the shipped defaults: its capture
+#: views are 48x36 px, so the default 12 px catchment covers most of the frame
+#: and every point becomes a candidate. Four pixels is a click on an object.
+#: `max_radius` is passed explicitly on both sides so the comparison measures
+#: the clustering rather than two implementations of a default.
+CLICK_PX = (24.0, 18.0)
+CLICK_RADIUS_PX = 4.0
+CLICK_COLOUR_TOL = 0.15
+CLICK_MAX_RADIUS = 0.8
 
 
 def _viewer_binary() -> Path | None:
@@ -204,3 +218,105 @@ def test_widening_the_luminance_slider_only_adds_points(
         )
         ids[lum] = set(json.loads(out.read_text())["point_ids"])
     assert ids[SHADE_LUM] < ids[SHADE_LUM * 1.5]
+
+
+def _f32(value):
+    """Round to float32 and back, as the Rust viewer's own parse does.
+
+    `crate::bundle::BundleView` stores every camera field as `f32`; the Python
+    side reads `bundle.json`'s decimals straight into `f64`. Rounding here makes
+    both halves project with the SAME numbers, so a disagreement can only come
+    from the clustering, which is the thing under test.
+    """
+    return np.asarray(value, dtype=np.float32).astype(np.float64)
+
+
+def _click_camera(bundle: Path) -> tuple[CameraView, dict]:
+    """The bundle's default view as a `CameraView`, float32-rounded."""
+    doc = json.loads((bundle / "bundle.json").read_text())
+    view = doc["views"][doc.get("default_view", 0)]
+    camera = CameraView(
+        R=_f32(view["R"]).reshape(3, 3),
+        t=_f32(view["t"]).reshape(3),
+        fx=float(_f32(view["fx"])),
+        fy=float(_f32(view["fy"])),
+        cx=float(_f32(view["cx"])),
+        cy=float(_f32(view["cy"])),
+        width=int(view["width"]),
+        height=int(view["height"]),
+        name=view["name"],
+    )
+    return camera, view
+
+
+def _dump_click(viewer: Path, bundle: Path, out: Path, px, radius_px=CLICK_RADIUS_PX) -> dict:
+    _run(
+        viewer,
+        [
+            str(bundle),
+            "--click",
+            str(px[0]),
+            str(px[1]),
+            "--click-radius-px",
+            str(radius_px),
+            "--click-colour-tol",
+            str(CLICK_COLOUR_TOL),
+            "--click-max-radius",
+            str(CLICK_MAX_RADIUS),
+            "--dump-click",
+            str(out),
+        ],
+    )
+    return json.loads(out.read_text())
+
+
+def test_dump_click_selects_what_the_python_clusterer_selects(
+    viewer: Path, bundle: Path, tmp_path: Path
+) -> None:
+    dumped = _dump_click(viewer, bundle, tmp_path / "click.json", CLICK_PX)
+    assert dumped["format"] == "trippy-edit-click-dump-1"
+
+    camera, view = _click_camera(bundle)
+    assert dumped["view"] == view["name"]
+    with np.load(bundle / "points.npz") as data:
+        xyz = np.asarray(data["xyz"], dtype=np.float64)
+        feat = np.asarray(data["feat"], dtype=np.float64)
+    region, summary = click_to_cluster(
+        xyz,
+        feat,
+        camera,
+        CLICK_PX,
+        radius_px=CLICK_RADIUS_PX,
+        colour_tol=CLICK_COLOUR_TOL,
+        max_radius=CLICK_MAX_RADIUS,
+    )
+
+    assert dumped["n"] == xyz.shape[0]
+    assert dumped["point_ids"] == region.params["point_ids"]
+    assert dumped["n_candidates"] == summary["n_candidates"]
+    assert dumped["n_seed"] == summary["n_seed"]
+    assert dumped["hit_max_points"] == summary["hit_max_points"]
+    assert dumped["seed_depth_mean"] == pytest.approx(summary["seed_depth_mean"], abs=1e-9)
+    # Non-vacuous: a click has to select some of the cloud and not all of it.
+    assert 0 < len(dumped["point_ids"]) < xyz.shape[0]
+
+
+def test_dump_click_on_empty_space_selects_nothing_and_says_so(
+    viewer: Path, bundle: Path, tmp_path: Path
+) -> None:
+    """A miss is a normal outcome of a click tool, not an error."""
+    camera, _view = _click_camera(bundle)
+    # Far outside a 48x36 image: nothing can project there.
+    dumped = _dump_click(viewer, bundle, tmp_path / "miss.json", (-500.0, -500.0), radius_px=1.0)
+    assert dumped["n_candidates"] == 0
+    assert dumped["point_ids"] == []
+    assert dumped["warning"]
+
+    with np.load(bundle / "points.npz") as data:
+        xyz = np.asarray(data["xyz"], dtype=np.float64)
+        feat = np.asarray(data["feat"], dtype=np.float64)
+    region, summary = click_to_cluster(
+        xyz, feat, camera, (-500.0, -500.0), radius_px=1.0, max_radius=CLICK_MAX_RADIUS
+    )
+    assert region.params["point_ids"] == []
+    assert summary["n_candidates"] == 0

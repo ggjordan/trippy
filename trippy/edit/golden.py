@@ -6,8 +6,10 @@ Purpose: the E1/E2 acceptance check that `trippy apply-edits` and the Rust
     (docs/EDITOR.md Sec 2, Sec 6). This module owns the synthetic fixture both
     sides read: a seeded point cloud, a seeded Gaussian cloud, an
     `EditDocument` exercising every region kind and every op, the weights
-    `trippy.edit.weights` composes from them, and a shade-frame sidecar plus
-    the selection `trippy.train.prune`'s own rule makes from it.
+    `trippy.edit.weights` composes from them, a shade-frame sidecar plus
+    the selection `trippy.train.prune`'s own rule makes from it, and (E4)
+    a structured click scene plus the `pointset` `trippy.edit.cluster.
+    click_to_cluster` grows from three clicks in it.
 Invariants:
     - SYNTHETIC ONLY. Every array comes from a seeded
       `numpy.random.Generator`; nothing here reads a photograph, a
@@ -22,6 +24,12 @@ Invariants:
       in a temp directory and diffs against the committed copy, so a drift in
       `trippy.edit.weights` fails the Python suite before it can silently
       re-bless the Rust one.
+    - The click fixture passes `max_radius` EXPLICITLY and never calls
+      `trippy.edit.cluster.default_max_radius_from_bundle`: that default runs
+      `median_nn_distance`, which draws a seeded numpy subsample when a cloud
+      is larger than `SUMMARY_NN_SAMPLE` and so has no portable Rust twin.
+      Pinning the number in the file keeps the parity test measuring the
+      clustering, not two random-number generators.
     - `write_shade_views` is the "run once per bundle" precompute
       docs/EDITOR.md Sec 3 describes: it records each shade frame's camera and
       its median COLMAP-observed depth `d`, which is the one input the
@@ -54,14 +62,17 @@ from trippy.constants import (
     SHADE_PRUNE_DEFAULT_ZFAR_FRAC,
     SHADE_PRUNE_DEFAULT_ZNEAR_FRAC,
 )
+from trippy.edit.cluster import CameraView, click_to_cluster
 from trippy.edit.model import EditDocument, Region
 from trippy.edit.weights import compose_gaussian_weights, compose_trips_weights
 from trippy.render.bundle import BUNDLE_FORMAT
 from trippy.train import prune
 
 __all__ = [
+    "CLICK_FIXTURE_FORMAT",
     "GOLDEN_FIXTURE_DIR",
     "SHADE_VIEWS_FORMAT",
+    "build_click_fixture",
     "build_golden_fixture",
     "write_golden_fixture",
     "write_shade_views",
@@ -87,6 +98,20 @@ _NUM_POINTS = 400
 _NUM_GAUSSIANS = 150
 
 _SEED = 20260907
+
+#: `"format"` of the click fixture, matching
+#: `trips_viewer::edit::cluster::CLICK_FIXTURE_FORMAT`.
+CLICK_FIXTURE_FORMAT = "trippy-edit-click-1"
+
+#: Seed for the click scene. Deliberately NOT `_SEED`: the click fixture is a
+#: structured scene (three blobs), not the uniform cloud the weight/shade
+#: fixtures share, and reusing the seed would only invite the two to be
+#: confused for one another.
+_CLICK_SEED = 20260908
+
+#: Points per blob in the click scene, and in the scatter around them.
+_CLICK_BLOB_POINTS = 100
+_CLICK_SCATTER_POINTS = 120
 
 
 def _floats(array: np.ndarray) -> list[float]:
@@ -329,13 +354,230 @@ def write_shade_views(
     return path
 
 
+# --- the click-to-cluster fixture (E4) -------------------------------------------------
+
+
+def _click_camera() -> CameraView:
+    """The one camera the click cases are made in.
+
+    Identity rotation with the centre at the world origin, so world and camera
+    coordinates coincide and every number below can be read straight off the
+    scene: `u = 500 * x / z + 320`. The same frontal camera
+    `tests/test_edit_cluster.py` uses, for the same reason.
+    """
+    return CameraView(
+        R=np.eye(3),
+        t=np.zeros(3),
+        fx=500.0,
+        fy=500.0,
+        cx=320.0,
+        cy=240.0,
+        width=640,
+        height=480,
+        name="SYN_CLICK.jpg",
+    )
+
+
+def _click_scene() -> tuple[np.ndarray, np.ndarray]:
+    """A structured cloud that makes every gate in `click_to_cluster` matter.
+
+    Four groups, all seeded:
+
+    1. **front** -- a red blob at `z = 5` centred on the optical axis. This is
+       what a click at the principal point is meant to select.
+    2. **behind** -- the SAME red, at `z = 7`. It projects into the same pixels
+       and passes the colour gate, so only the depth-mode seed (step 3 of
+       `trippy.edit.cluster`'s docstring) keeps it out of the seed, and only
+       the k-NN growth's own locality keeps it out of the region.
+    3. **beside** -- green, at `z = 5`, offset `+0.22` in `x` so it is
+       geometrically contiguous with **front** but 22 px away from the click.
+       Only the colour gate separates the two.
+    4. **scatter** -- uniform noise filling the volume, so the k-NN queries
+       have a non-trivial tree to walk rather than four tight clusters.
+
+    Returns:
+        `(xyz, rgb)`, both `(N, 3)` float64 already round-tripped through
+        float32 exactly as a bundle's `points.npz` would store them.
+    """
+    rng = np.random.default_rng(_CLICK_SEED)
+
+    def blob(centre: tuple[float, float, float], colour: tuple[float, float, float]):
+        xyz = rng.normal(scale=0.06, size=(_CLICK_BLOB_POINTS, 3)) + np.asarray(centre)
+        rgb = np.clip(
+            np.asarray(colour) + rng.normal(scale=0.01, size=(_CLICK_BLOB_POINTS, 3)),
+            0.0,
+            1.0,
+        )
+        return xyz, rgb
+
+    front_xyz, front_rgb = blob((0.0, 0.0, 5.0), (0.85, 0.15, 0.15))
+    behind_xyz, behind_rgb = blob((0.0, 0.0, 7.0), (0.85, 0.15, 0.15))
+    beside_xyz, beside_rgb = blob((0.25, 0.0, 5.0), (0.15, 0.80, 0.20))
+    scatter_xyz = np.stack(
+        [
+            rng.uniform(-2.0, 2.0, _CLICK_SCATTER_POINTS),
+            rng.uniform(-1.5, 1.5, _CLICK_SCATTER_POINTS),
+            rng.uniform(3.0, 12.0, _CLICK_SCATTER_POINTS),
+        ],
+        axis=1,
+    )
+    scatter_rgb = rng.uniform(0.0, 1.0, (_CLICK_SCATTER_POINTS, 3))
+
+    xyz = np.vstack([front_xyz, behind_xyz, beside_xyz, scatter_xyz])
+    rgb = np.vstack([front_rgb, behind_rgb, beside_rgb, scatter_rgb])
+    return (
+        xyz.astype(np.float32).astype(np.float64),
+        rgb.astype(np.float32).astype(np.float64),
+    )
+
+
+def _click_cases() -> list[dict[str, Any]]:
+    """The clicks both implementations replay, and the parameters for each.
+
+    Three, each pinning a different branch:
+
+    - `default` -- a hit on the front blob with every gate live. `max_radius`
+      is passed EXPLICITLY (never `default_max_radius_from_bundle`, whose
+      `median_nn_distance` draws a seeded numpy subsample that has no portable
+      twin), and `depth_gap_factor` is small enough that the blob at `z = 7`
+      is its own depth mode rather than part of the seed.
+    - `capped` -- the same click with a small `max_points`, so the
+      "stop mid-frontier" branch and its index order are pinned too.
+    - `loose_colour` -- the same click with the colour gate opened, so the
+      growth crosses into the neighbouring blob and both sides have to agree
+      on a much longer flood fill.
+    - `miss` -- a click where nothing projects, which must return an EMPTY
+      selection and a warning rather than an error.
+    """
+    return [
+        {
+            "name": "default",
+            "px": [320.0, 240.0],
+            "radius_px": 12.0,
+            "colour_tol": 0.15,
+            "max_radius": 3.0,
+            "max_points": 200000,
+            "knn_k": 16,
+            "depth_gap_factor": 0.3,
+        },
+        {
+            "name": "capped",
+            "px": [320.0, 240.0],
+            "radius_px": 12.0,
+            "colour_tol": 0.15,
+            "max_radius": 3.0,
+            # Above the seed's own size and below what the growth would reach,
+            # so the cap really does stop the flood fill part-way through a
+            # frontier -- the one branch whose answer depends on the order
+            # neighbours are visited in.
+            "max_points": 94,
+            "knn_k": 16,
+            "depth_gap_factor": 0.3,
+        },
+        {
+            "name": "loose_colour",
+            "px": [320.0, 240.0],
+            "radius_px": 12.0,
+            # Wide enough to admit any colour: the growth then crosses into the
+            # green blob beside the red one, which the default case must not.
+            "colour_tol": 2.0,
+            "max_radius": 3.0,
+            "max_points": 200000,
+            "knn_k": 16,
+            "depth_gap_factor": 0.3,
+        },
+        {
+            "name": "miss",
+            "px": [8.0, 8.0],
+            "radius_px": 4.0,
+            "colour_tol": 0.15,
+            "max_radius": 3.0,
+            "max_points": 200000,
+            "knn_k": 16,
+            "depth_gap_factor": 0.3,
+        },
+    ]
+
+
+def build_click_fixture() -> dict[str, dict[str, Any]]:
+    """The click-to-cluster half of the fixture: the scene, the clicks, the answers.
+
+    `click.json` is the INPUT both sides read (scene, camera, clicks,
+    parameters); `expected_click.json` is what `trippy.edit.cluster.
+    click_to_cluster` returns for each of them, which
+    `trips_viewer::edit::cluster` must reproduce exactly.
+
+    Returns:
+        `{"click.json": ..., "expected_click.json": ...}`.
+    """
+    xyz, rgb = _click_scene()
+    camera = _click_camera()
+    cases = _click_cases()
+
+    results = []
+    for case in cases:
+        region, summary = click_to_cluster(
+            xyz,
+            rgb,
+            camera,
+            (case["px"][0], case["px"][1]),
+            radius_px=case["radius_px"],
+            colour_tol=case["colour_tol"],
+            max_radius=case["max_radius"],
+            max_points=case["max_points"],
+            knn_k=case["knn_k"],
+            depth_gap_factor=case["depth_gap_factor"],
+            region_id=f"r-click{len(results):03d}",
+            name=f"click {case['name']}",
+        )
+        results.append(
+            {
+                "name": case["name"],
+                "point_ids": [int(i) for i in region.params["point_ids"]],
+                "n_candidates": int(summary["n_candidates"]),
+                "n_seed": int(summary["n_seed"]),
+                "n_selected": int(summary["n_selected"]),
+                "hit_max_points": bool(summary["hit_max_points"]),
+                "seed_depth_mean": (
+                    float(summary["seed_depth_mean"]) if "seed_depth_mean" in summary else None
+                ),
+                "warning": summary.get("warning"),
+            }
+        )
+
+    return {
+        "click.json": {
+            "format": CLICK_FIXTURE_FORMAT,
+            "n": int(xyz.shape[0]),
+            "xyz": _floats(xyz),
+            "rgb": _floats(rgb),
+            "camera": {
+                "name": camera.name,
+                "r": _floats(camera.R),
+                "t": _floats(camera.t),
+                "fx": float(camera.fx),
+                "fy": float(camera.fy),
+                "cx": float(camera.cx),
+                "cy": float(camera.cy),
+                "width": float(camera.width),
+                "height": float(camera.height),
+            },
+            "cases": cases,
+        },
+        "expected_click.json": {
+            "format": CLICK_FIXTURE_FORMAT,
+            "cases": results,
+        },
+    }
+
+
 def build_golden_fixture() -> dict[str, dict[str, Any]]:
     """Compute every file of the fixture, without writing anything.
 
     Returns:
         `{filename: json-serialisable document}` for `points.json`,
-        `edits.json`, `expected_weights.json`, `shade_views.json` and
-        `expected_shade.json`.
+        `edits.json`, `expected_weights.json`, `shade_views.json`,
+        `expected_shade.json`, `click.json` and `expected_click.json`.
     """
     clouds = _synthetic_clouds()
     edits = _golden_edits()
@@ -390,6 +632,7 @@ def build_golden_fixture() -> dict[str, dict[str, Any]]:
             "mass_in_region": float(stats["mass_in_region"]),
             "dark_mass_fraction": float(stats["dark_mass_fraction"]),
         },
+        **build_click_fixture(),
     }
 
 
