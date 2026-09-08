@@ -164,13 +164,25 @@ class CameraResponseNet(nn.Module):
         # (B, C, H, W, 2): sample coordinate (x, y=0) per Saiga's 1D-as-2D grid_sample trick.
         grid = torch.stack([scaled, y_offset], dim=-1)
 
-        result = torch.ones_like(image)
-        for c in range(num_channels):
-            channel_grid = grid[:, c]  # (B, H, W, 2)
-            channel_response = batched_response[:, c : c + 1]  # (B, 1, 1, n)
-            result[:, c : c + 1] = functional.grid_sample(
-                channel_response, channel_grid, mode="bilinear", padding_mode="border", align_corners=True
-            )
+        # One grid_sample for every channel at once, by folding the channel axis into
+        # the batch axis. `grid_sample` treats each batch item independently and each
+        # output position independently, so `(B*C, 1, H, W)` from `(B*C, 1, 1, n)` is
+        # the same arithmetic on the same operand pairs as C separate calls on
+        # `(B, 1, H, W)` -- both reshapes are batch-major then channel, so slot
+        # `b * C + c` carries exactly channel `c` of batch item `b`. Bit-identical
+        # (tests/test_net_camera.py::test_camera_response_matches_per_channel_loop),
+        # and it removes C-1 kernel launches plus the C in-place slice writes into
+        # `torch.ones_like(image)`, each of which is a full-tensor copy on MPS.
+        height, width = image.shape[2], image.shape[3]
+        folded = num_batches * num_channels
+        sampled = functional.grid_sample(
+            batched_response.reshape(folded, 1, 1, batched_response.shape[3]),
+            grid.reshape(folded, height, width, 2),
+            mode="bilinear",
+            padding_mode="border",
+            align_corners=True,
+        )
+        result = sampled.reshape(num_batches, num_channels, height, width)
 
         if leak_add is not None:
             result = result + leak_add

@@ -39,6 +39,7 @@ from trippy.constants import (
 )
 from trippy.raster.emit import LayerGrid, build_sorted_fragments, layer_grid
 from trippy.raster.sort import fragment_rank
+from trippy.train import steptimer
 
 
 def composite_sorted(
@@ -148,6 +149,7 @@ def render_pyramid_ref(
     pose_delta: Tensor | None = None,
     pixel_center: str = "half",
     pyramid_halving: str = "ceil",
+    cap_to_max_frags: bool = False,
 ) -> tuple[list[Tensor], dict]:
     """Render the whole pyramid in torch (the float64 CPU reference path).
 
@@ -176,6 +178,20 @@ def render_pyramid_ref(
             see trippy.raster.emit.emit_fragments.
         pyramid_halving: "ceil" or "floor"; see
             trippy.raster.emit.layer_grid.
+        cap_to_max_frags: drop, right after the sort, every fragment past
+            each layer-pixel's first `max_frags` -- exactly the ones the
+            compositing loop cannot reach (trippy.raster.emit.
+            _cap_segment_indices). **Default False here, unlike the MPS
+            path.** The fragments dropped are provably never composited, but
+            `composite_sorted` gets its transmittance from a *global* prefix
+            sum over the whole fragment list, rebased per segment, so a
+            shorter list changes the partial sums and hence the last bits of
+            every pixel. This module is the float64 ground truth every other
+            path is measured against, so it stays on the uncapped list;
+            `tests/test_train_step_perf.py` pins that the two agree to
+            float64 tolerance and that the kept fragments are exactly the
+            compositable prefix. `aux["num_fragments"]` and
+            `aux["fragments_per_layer"]` report the pre-cap list either way.
 
     Returns:
         layers: list of L tensors, layer l is (C, h_l, w_l) with
@@ -207,23 +223,29 @@ def render_pyramid_ref(
         segment_method=segment_method,
         pose_delta=delta_d,
         pixel_center=pixel_center,
+        cap_frags=max_frags if cap_to_max_frags else None,
     )
-    out, t_final, n_used, depth_sum = composite_sorted(
-        frags.layer_pixel,
-        frags.depth,
-        frags.point_id,
-        frags.alpha,
-        frags.offsets,
-        feat_d,
-        max_frags=max_frags,
-        t_cutoff=t_cutoff,
-    )
-    if bg is not None:
-        out = out + t_final.reshape(-1, 1) * bg.to(dtype).reshape(1, -1)
+    with steptimer.stage("raster_blend_fwd"):
+        out, t_final, n_used, depth_sum = composite_sorted(
+            frags.layer_pixel,
+            frags.depth,
+            frags.point_id,
+            frags.alpha,
+            frags.offsets,
+            feat_d,
+            max_frags=max_frags,
+            t_cutoff=t_cutoff,
+        )
+        if bg is not None:
+            out = out + t_final.reshape(-1, 1) * bg.to(dtype).reshape(1, -1)
 
-    layers, aux = split_layers(out, t_final, n_used, depth_sum, grid)
-    aux["num_fragments"] = len(frags)
-    aux["fragments_per_layer"] = fragments_per_layer(frags.offsets, grid)
+    with steptimer.stage("raster_split"):
+        layers, aux = split_layers(out, t_final, n_used, depth_sum, grid)
+    # Pre-cap numbers on purpose: `num_fragments` has always meant "fragments
+    # emission produced", and `cap_to_max_frags` must not change any reported
+    # quantity (see trippy.raster.emit._cap_segment_indices).
+    aux["num_fragments"] = frags.emitted_count
+    aux["fragments_per_layer"] = fragments_per_layer(frags.emitted_offsets, grid)
     return layers, aux
 
 

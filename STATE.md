@@ -83,6 +83,50 @@ Last updated: 2026-09-08 (feat/splat-clean session; previous: fix/editor-followu
 - Jordan set the goal (2026-09-05 ~22:50): finish all stages autonomously; anything needing Jordan goes in the review queue below.
 
 ## In flight
+- **perf/train-step (2026-09-09, `.worktrees/train-perf`): a Karekare-v2 step is 129 ms, and
+  2x at exact parity is not available on it.** MEASURED (jobs `trippy-train-perf-baseline`,
+  `-gputests`, `-sweep`, all rc 0). Steady-state step **129.2 ms = 1.43 min/epoch**; the split is
+  rasteriser 68 ms (52%), perceptual VGG loss 36 ms (27%), Adam 10.5 (8%), dataset crop 10.7 (8%),
+  U-Net **6.6 (5%)**. 36% of the step is the objective plus the update rule and cannot shrink
+  without changing what the run computes -- that is the ceiling, written up with the arithmetic in
+  `docs/ARCHITECTURE.md` "The ceiling". Three of the brief's candidates are now **dropped with
+  numbers**: crop-aware culling is already in place (the K-adjust crop culls against the 384-px
+  grid), per-image projection caching is dead (`xyz`/`size` are trainable from epoch 5 of 300), and
+  padding fragment buffers to bucketed sizes buys nothing (`FROZEN/UNTIMED` = 1.08/0.99/0.92).
+  **Both numerics-touching flags measured NEGATIVE and stay off**: float16 is 143-151 ms vs 131 and
+  moves the 30-step loss by 1.5e-01; MPS's fused Adam is 145 ms vs 131. The post-sort fragment cap
+  is worth **1.05x**. Also found: **MPS's float `index_add_` is not run-to-run deterministic**, which
+  is why the rasteriser's gradients cannot be held to byte-equality (the forward can, and is);
+  the GPU test now measures that noise floor and requires the change to sit under it.
+  **THE HEADLINE, and it is not a good one** (`trippy-train-perf-ab`, rc 0): measured against an
+  unmodified `main` worktree, alternating, twice, in one queue slot, **this branch is 1.2-1.6%
+  SLOWER** (main 116.1/117.0 ms, branch 117.5/118.9 ms). Six changes that each provably issue fewer
+  or smaller kernels net to nothing. **Do not merge this as a speed-up.** Parity IS proven properly:
+  `max|dloss|` between checkouts (2.3e-04, 6.2e-04) equals the same-code-twice noise floor
+  (4.7e-04, 3.8e-04). `pytest -m gpu`: **78 passed**. Prime suspects for giving the win back, both
+  now behind runtime knobs. `trippy-train-perf-isolate` (rc 0, 7 arms with main first and last)
+  found **one suspicion right and one wrong**: turning the host-side crop OFF is faster in both
+  the median and the min in two separate jobs, so **`Trainer.use_fast_crop` now defaults to
+  False** (it is kept, not deleted -- it should tip the other way at width 2016, where the frame
+  it avoids uploading is 4x larger). `main` itself drifted **117.1 -> 112.0 ms** across that job,
+  so the fragment cap and the sanitiser readback are **unresolved below a ~5 ms noise floor**;
+  their apparent +8/+11 ms rows are contradicted by their own `min` columns. `trippy-train-perf-knobs`
+  (rc 0) then settled them with 8 arms inside ONE process from ONE snapshot: paired effects
+  **use_fast_crop +5.3 ms** (real, third confirmation), **raster_cap -0.6 ms** (NOT established --
+  the earlier "1.05x" was one two-arm comparison; kept on only because it is byte-identical and
+  strictly less traffic), **sanitise_conditional +0.3 ms** (neutral). Their `max|dloss|` spread of
+  3.7e-04..1.6e-03 over 30 steps IS the noise floor at that step count, which closes the last loose
+  end. **Net: with `use_fast_crop` off the branch is ~2 ms (~1.8%) faster than main** -- at the edge
+  of resolution, not a speed-up worth the name. All five GPU jobs are done (rc 0); nothing is
+  pending. Both worktrees (`train-perf`, `train-perf-base`) can be removed once this is merged or
+  dropped. The run's own 3.9 min/epoch is unusable as a baseline: its per-epoch
+  time drifted 1.63 -> 5.78 min/epoch over the same recipe.
+  Next exact lever, briefed but NOT taken: `raster_project_cull` spends 14 ms to keep 5.1% of its
+  input; a division-free cull would move the divisions (and most of the geometry backward) onto the
+  386k survivors, worth ~10% -- see `docs/ARCHITECTURE.md` "The ceiling" for why it is not more.
+  **Two worktrees must stay until `trippy-train-perf-ab` finishes**: `.worktrees/train-perf` and
+  `.worktrees/train-perf-base` (a detached `main` checkout created purely as the A/B's "before";
+  remove it with `git worktree remove` once the job is done).
 - GPU queue (reordered 13:58; trippy manages it now): Splats' last Hunua training running; then prio-12/15 short jobs (live-splat-perf-1, edit-sam-1), then 40: kkv2-0-smoke, -1-full-masked, -2-full-unmasked, -3-removal, -4-render-1/2/3, -5-hybrid, -6-shade-prune, -7-hybrid-gate; 45: hybrid-a (bc, trips); 50: full2-trips-resume2, full3-alt, removal-rel, union-broadcast, union-trips. Each training self-delivers a viewer launcher + audit table.
 - EXP-0011 full-resolution variant (2026-09-08, branch `exp/kkv2-fullres`, answers Jordan's 19:10 "fuzzy and pixelated" open question): `config_fullres.yaml`/`config_fullres_smoke.yaml` (width 2016, crop 512, seeded from `kkv2-1-full-masked/checkpoints/checkpoint_latest.pt` epoch 122 via `--resume`; resume-across-resolution verified empirically on synthetic fixtures). Queued: `trippy-kkv2-9-fullres-smoke` (prio 15) and `trippy-kkv2-9-fullres` (prio 40, guarded on the smoke's rc). **BLOCKER-IN-WAITING**: both jobs' scripts `cd` into the MAIN checkout, so this branch must be reviewed+merged (or the two config files placed in main) before the smoke reaches the front of its short prio-15 lane (minutes to an hour out), or it fails on a missing-config error. See `experiments/EXP-0011-karekare-v2/README.md` "Full-resolution variant" for the estimate/method.
 - Worktrees that MUST stay until their queued jobs finish (job scripts cd into them): .worktrees/karekare-v2 (kkv2-0..6), .worktrees/blend-gate (kkv2-7-hybrid-gate, blend-gate-viewer2/3), .worktrees/live-splat (live-splat-perf-1), .worktrees/edit-sam (edit-sam-1 done: remove). point-removal's jobs are done: remove it. Remove with scripts/worktree_rm.sh.

@@ -2316,3 +2316,323 @@ occupied top-down cells are touched by `shade` (97,567 by `005`, 123,234 by `015
   `scripts/cpu_heavy.sh`'s own guard is 28 GB, and the machine OOM'd on 2026-09-05. This branch
   touches no Rust, so the Rust suite is unaffected; run `scripts/test.sh` in full from the main
   checkout at merge time.
+- 2026-09-08T09:13:33Z submitted job trippy-train-perf-baseline prio 15: bash -c set -x; python -m trippy.cli profile-step --config experiments/EXP-0011-karekare-v2/config.yaml --steps 30 --warmup 5 --epoch 0,5,50 --device mps --run-dir /Users/nzbirdranch/trippy/output/profile/train-perf-baseline-run --json /Users/nzbirdranch/trippy/output/profile/train-perf-baseline.json; echo profile_step_rc=$?; python tools/profile_raster.py --device mps --config experiments/EXP-0011-karekare-v2/config.yaml --crop 384 --modes broadcast --impls vectorised --repeat 5 --warmup 2 --micro --json /Users/nzbirdranch/trippy/output/profile/train-perf-baseline-raster.json; echo profile_raster_rc=$?
+- 2026-09-08T09:45:09Z submitted job trippy-train-perf-gputests prio 15: bash -c set -x; python -m pytest -q -m gpu tests; echo gpu_pytest_rc=$?
+
+## 2026-09-08 — Can a Karekare-v2 training step be made 2x cheaper on MPS, at parity? (perf/train-step)
+
+**Question**: `kkv2-1-full-masked` runs at **3.9 min/epoch** = ~0.35 s/step (width 1008, crop 384,
+7,542,137 points, 664 steps/epoch, `mode: broadcast`, 5 layers). GPU time is the bottleneck for every
+remaining question, so: where does that 0.35 s actually go, and how much of it can be removed without
+changing a single number?
+
+**Harness (new)**: `trippy profile-step --config <cfg> --steps 30 --epoch 0,5,50 --device mps`.
+It runs *real* `Trainer.train_step` calls; the stages are instrumented in the production code path
+(`trippy.train.steptimer` — a module-level no-op unless a timer is installed) rather than in a second
+copy of the step, so it cannot profile something the trainer does not do. Three totals per regime:
+**UNTIMED** (no synchronisation the trainer would not do — the honest seconds/step), **FROZEN** (one
+repeated crop, so every data-dependent tensor shape repeats: `UNTIMED / FROZEN` is the MPS
+unseen-shape tax at whole-step scale, the evidence for or against padding fragment buffers to
+bucketed sizes), and **TIMED** (`torch.mps.synchronize()` between stages, which is what makes the
+per-stage table attributable and also makes it bigger than UNTIMED). The backward is split by
+hooking `pred` / `net_out` / `layers[0]`, so loss, tone mapper, U-Net and rasteriser each get their
+own number. No imagery is read, written or displayed.
+
+**Which epoch is profiled matters, and this was nearly missed.** A Karekare-v2 step at epoch 0 is not
+the step the run spends its life in: `Trainer._apply_locks` frees `xyz`/`size` at epoch 5 and the pose
+deltas at epoch 50, and `Trainer.fit` switches the perceptual (VGG/LPIPS) loss term on at
+`vgg_start_epoch` = round(100/600 * 300) = **epoch 50**. `kkv2-1-full-masked` ran to epoch 122, so the
+3.9 min/epoch figure is a *VGG-on, all-locks-released* number. `--epoch 0,5,50` profiles all three
+regimes from one trainer build.
+
+**Two candidates from the brief were answered by reading the code, before any GPU time:**
+- *(a) crop-aware culling before emission.* Already there. `train_step` renders with the crop's own
+  adjusted intrinsics and `image_hw = (crop, crop)` (the K-adjust strategy,
+  `tests/test_train_crop_equivalence.py`), so `cull_points` culls against the 384-px grid, not the
+  1008x756 frame. Only the projection itself runs over all 7.5M points. **Dropped: already done.**
+- *(b) reuse per-image projections while poses are locked.* Dead on arrival: `lock_structure_epochs`
+  is 5 of 300, so `xyz` and `size` carry gradients and move on **every** step from epoch 5 onwards;
+  a cached visible-index set would be stale for 295 of 300 epochs. Only the *pose* is locked for 50.
+  **Dropped, with the number.**
+
+**Kept, exactly equivalent, default on** (each pinned against a literal re-implementation of the code
+it replaced, `tests/test_train_step_perf.py`):
+1. **Post-sort fragment cap** (`render_pyramid(cap_to_max_frags=True)`, MPS only). `blend_fwd` checks
+   `used >= MAX_FRAGS` *before* consuming a fragment, so every fragment past a layer-pixel's 16-deep
+   list is provably never read — by the forward or by `blend_bwd`, which replays the forward's own
+   `n_used`. At a 384-px `broadcast` crop that is ~24M sorted fragments down to at most
+   `grid.total * 16` = **3,142,656** reaching the five permutation gathers, both Metal kernels, and
+   the backward's per-fragment `d_feat` and its `index_add_` onto points. `aux["num_fragments"]` and
+   `aux["fragments_per_layer"]` still report the pre-cap list, so no published number moves.
+   Deliberately **not** applied to the CPU float64 reference: `composite_sorted` gets its
+   transmittance from a *global* prefix sum over the whole fragment list, so a shorter list moves the
+   last bits — the reference stays the untouched ground truth, and the bit-identity claim is made on
+   MPS, where the kernel loops sequentially per segment (`tests/test_raster_cap_metal.py`, gpu marker).
+2. **Host-side crop** (`SceneDataset.crop_item`). The old path uploaded the whole undistorted frame —
+   2.3 MB of RGB plus a 3.0 MB float32 person mask at 1008x756 — so that a 384x384 window could be
+   gathered on the device. Now the nearest-neighbour gather runs on the host against the
+   memory-mapped cache file and ~1 MB moves. Value-for-value identical including the padding and
+   person-mask paths (`tests/test_scene_dataset.py`).
+3. **`project_points` inlines `project_pinhole`** on the safe depth: no `(N, 3)` `torch.cat`, no
+   `(N,)` `clone` (~90 MB of copies per render at 7.5M points), and `u`/`v` stay contiguous instead of
+   being strided columns of a cat'ed buffer. Forward bit-identical; gradients agree to 1e-12 relative
+   in float64 (the same terms summed in a different order — float addition is not associative).
+4. **One transpose-copy in emission** instead of three stride-3 gathers of the `(F, 3)` `nonzero`
+   result. (A flat-`nonzero`-plus-integer-division version is cheaper still but was **rejected for
+   now**: nothing in trippy exercises `torch.div(..., rounding_mode="floor")` on an int64 MPS tensor,
+   and `PYTORCH_ENABLE_MPS_FALLBACK=0` turns an unsupported op into a lost GPU window.)
+5. **`CameraResponseNet.forward`** folds the channel axis into the batch axis for one `grid_sample`
+   instead of one per channel plus three in-place slice writes into a `torch.ones_like` (each a
+   full-tensor copy on MPS). Bit-identical, forward and backward.
+6. **`Trainer._sanitise_gradients`** drops one full pass over all ~67M gradient elements (the `~` of
+   `isfinite`) and skips the `nan_to_num_` read-modify-write pass entirely on any step where nothing
+   is non-finite — i.e. almost all of them.
+
+**Kept as a flag, because it touches numerics**: `optimizer_fused: true`. torch will **never** select
+its fused Adam kernel by itself on MPS — `_default_to_fused_or_foreach` only sets `fused` when the
+caller asks, and MPS is absent from the *foreach* device list entirely
+(`torch/utils/_foreach_utils.py`) — so an unmodified run drives ~7 separate kernels and one
+full-size temporary (`exp_avg_sq.sqrt()`, 30-120 MB per tensor here) per parameter tensor per step.
+Bit-identical over 8 steps on CPU; the MPS loss curve is the gate.
+
+**Also kept as a flag**: `amp: true` — the U-Net forward and the perceptual loss's *frozen* backbone
+under `torch.autocast(float16)`, float32 master weights (autocast casts per operation, never the
+parameters) and a `GradScaler`. `torch.amp.autocast_mode.is_autocast_available("mps")` and
+`torch.amp.GradScaler(device="mps")` are both available in the installed torch 2.14.0. The scope is
+deliberately narrow: the rasteriser keeps its float32 contract, the tone mapper and the L1/SSIM
+terms stay float32, and **every `evaluate()` is float32 unconditionally** (`_render` gates autocast
+on `self.net.training`), so a run's held-out numbers never depend on the precision it trained in.
+`Trainer.set_amp` makes it a runtime knob so one job measures both arms.
+
+**Numbers**: PENDING — the GPU is held by a 7-hour `kkv2-3-removal` training with three other
+prio-15 jobs ahead. **Three jobs are queued and run in filename order**:
+1. `trippy-train-perf-baseline` — `profile-step` at epochs **0 / 5 / 50** (the three regimes: locks
+   on, structure free, everything free + VGG on) plus `tools/profile_raster.py --micro` on the same
+   config. This is the "where the time goes" table, plus the FROZEN-vs-random ratio that decides
+   whether padding fragment buffers to bucketed sizes (brief candidate (f)) is worth anything.
+   -> `output/profile/train-perf-baseline{,-raster}.json`.
+2. `trippy-train-perf-gputests` — `pytest -q -m gpu tests`, which includes the new
+   `tests/test_raster_cap_metal.py` byte-identity gate for the fragment cap.
+3. `trippy-train-perf-sweep` — the before/after table: `profile-step --epoch 50 --raster-cap both
+   --amp both` (4 arms from one trainer build, each starting from the same snapshot so the
+   step-by-step loss curves are comparable; the printed comparison table carries each arm's
+   speed-up and its `max|dloss|` against the reference), then a second invocation with
+   `--fused-adam`. -> `output/profile/train-perf-{sweep,fused}.json`.
+
+CPU suite: **1233 passed, 10 skipped**; ruff clean. (The only exclusion is
+`test_web_build_script.py`, which needs the `rust/brush-trips` submodule this worktree does not
+have; same for `scripts/build.sh`'s cargo steps.)
+
+### Results 1: where the time goes (job `trippy-train-perf-baseline`, rc 0)
+
+7,542,137 points, 664 steps/epoch. Per step the cull keeps **386,368 points -- 5.1%** -- which emit
+**5.98M fragments**, of which at most **1.41M** can ever be composited. Milliseconds, medians of 30
+steps, `TIMED` phase:
+
+| stage | epoch 0 | epoch 50 (steady state) |
+|---|---:|---:|
+| `data` | 13.34 | 10.75 |
+| `raster_project_cull` | 14.02 | 14.09 |
+| `raster_emit` | 15.89 | 15.22 |
+| `raster_sort` | 4.67 | 4.67 |
+| `raster_segment` / `gather` / `blend_fwd` / `split` | 2.93 | 2.74 |
+| `unet_fwd` | 1.96 | 1.90 |
+| `tone_map` | 1.07 | 1.04 |
+| `loss` | 6.04 | **21.25** |
+| `backward` (loss / tone / unet / raster) | 9.30 (1.3/1.1/4.6/2.3) | **52.15** (14.8/1.3/4.7/**31.5**) |
+| `optimizer` | 7.26 | 10.54 |
+| `metrics_sync` | 1.30 | 1.27 |
+| **UNTIMED whole step** | **78.4 ms** | **129.2 ms** |
+| **min/epoch** | 0.87 | **1.43** |
+
+**Rasteriser 68 ms (52%), perceptual loss 36 ms (27%), optimiser 10.5 (8%), data 10.7 (8%), U-Net
+6.6 (5%).** Two consequences: anything aimed at the *network* is chasing 5% of the step (this is why
+fusing the gated block's two convolutions into one was designed and then not built), and
+`raster_project_cull` spends 14 ms to keep 5.1% of its input.
+
+**The epoch is worth 65%**: 78.4 ms with the locks on and no perceptual loss, 129.2 ms in the steady
+state. Freeing `xyz`/`size` adds ~26 ms of geometry backward (epoch 5 = 104.4 ms); the VGG term adds
+~25 ms across `loss` and `bwd_loss`.
+
+### Results 2: the MPS unseen-shape tax is not a factor -- candidate (f) is dead
+
+`FROZEN / UNTIMED` (one repeated crop, so every data-dependent shape repeats) came out **1.08x /
+0.99x / 0.92x** at epochs 0 / 5 / 50. The per-shape penalty is still real for one elementwise kernel
+-- the shape probe measures `floor(x * 0.5)` at **7.88x** cold-vs-warm -- but `nonzero`,
+`index_select`, `argsort` and `sum` all measure **1.0x**, and at step scale it vanishes. **Padding
+fragment buffers to bucketed sizes would buy nothing.** Dropped.
+
+### Results 3: both numerics-touching flags measured NEGATIVE (job `trippy-train-perf-sweep`, rc 0)
+
+Epoch 50, medians of 30 steps, every arm started from the same snapshot so the loss curves compare:
+
+| arm | ms/step | vs reference | `max\|dloss\|` (30 steps) |
+|---|---:|---:|---:|
+| cap off, fp32, unfused (reference) | 137.5 | 1.00x | 0 |
+| **cap on**, fp32, unfused | **131.4** | **1.05x** | 1.8e-03 |
+| cap off, **fp16**, unfused | 143.4 | 0.96x | 1.5e-01 |
+| cap on, **fp16**, unfused | 151.1 | 0.91x | 1.5e-01 |
+| cap on, fp32, **fused Adam** | 144.8 | 0.91x | -- |
+
+**float16 is slower AND moves the loss by 1.5e-01**, two orders past the 1e-03 bar. It has almost
+nothing to speed up: the U-Net is 5% of the step, and the casts cost more than the convolutions
+save. **MPS's fused Adam is also slower** than the unfused path at these tensor sizes. Both flags
+stay off; they are kept only so the measurement need not be redone from scratch on other hardware.
+
+**The post-sort fragment cap is worth 1.05x**, not the larger factor the kk-coherent numbers
+suggested: at Karekare-v2's crop the list is 5.98M fragments, not 24.6M, and the stages it shrinks
+(`gather` 0.59 ms, `blend_fwd` 0.53 ms, `index_add_` ~2.0 ms) were already small.
+
+### Results 4: the GPU parity gate, and a genuine surprise in it
+
+`pytest -q -m gpu tests`: **77 passed, 1 failed** -- the failure was this session's own new
+`test_cap_gradients_are_byte_identical_on_mps`. The **forward** is byte-identical with the cap on in
+all three modes (layers, `t_final`, `n_used`, `depth_sum`), but the `conf` **gradient** is not. The
+cause is not the cap: reducing per-fragment gradients onto points is a float `index_add_`, and
+**MPS's is not run-to-run deterministic**. The test was rewritten to measure that noise floor first
+(cap on vs cap on, identical inputs) and then require the cap-on-vs-cap-off difference to be no
+larger -- so a real regression would still show, instead of being hidden by a hand-picked tolerance.
+Requeued as part of `trippy-train-perf-ab`.
+
+This also explains the 1.8e-03 `max|dloss|` on the cap row above: 25 optimiser steps amplify
+last-bit gradient noise. The control for it -- the same code twice -- is the `BEFORE-main-1` vs
+`BEFORE-main-2` pair in `trippy-train-perf-ab`.
+
+### Why the "3.9 min/epoch" baseline is not a controlled measurement
+
+Read off `kkv2-1-full-masked`'s own eval-directory timestamps, the resumed run's per-epoch wall time
+**rose monotonically**: ep20-40 **1.63**, ep40-60 **2.77**, ep60-80 **3.98**, ep80-100 **5.38**,
+ep100-120 **5.78** min/epoch. The VGG term switching on at epoch 50 explains the first part of that
+climb; the rest is the machine, not the code. 3.9 is the average of a drifting quantity, so the
+before/after had to be measured directly: job `trippy-train-perf-ab` runs the *same* script against
+an unmodified `main` worktree and this branch, alternating, twice, in one queue slot.
+
+### Parity, CPU side, main vs this branch on the same script
+
+The same `output/profile/time_train_step.py` (a measurement artefact, not shipped code, so ONE file
+can be run against two checkouts) on the synthetic fixture scene, `PYTHONPATH` pointed at the
+unmodified `main` worktree and then at this one:
+
+```
+[train-perf-base] losses [0.540982, 0.529738, 0.541217, 0.500417]
+[train-perf]      losses [0.540982, 0.529738, 0.541217, 0.500417]
+```
+
+Identical to every printed digit, through the host-side crop, the inlined projection, the folded
+camera response and the new gradient sanitiser. (The fragment cap is MPS-only and is not exercised
+on this path.) The MPS half of the same comparison is job `trippy-train-perf-ab`.
+
+### Results 5: the controlled before/after -- the exact changes are a WASH (job `trippy-train-perf-ab`, rc 0)
+
+`output/profile/time_train_step.py` run against an unmodified `main` worktree and this branch,
+alternating, twice, in one queue slot on an idle GPU (`--steps 20 --warmup 4 --epoch 50`):
+
+| pass | `main` | this branch |
+|---|---:|---:|
+| 1 | **116.1 ms** (1.285 min/epoch) | 117.5 ms (1.300) |
+| 2 | **117.0 ms** (1.295 min/epoch) | 118.9 ms (1.315) |
+
+**This branch is 1.2-1.6% SLOWER than main.** Six changes that each provably issue fewer or smaller
+kernels net to nothing, and probably to slightly less than nothing. The per-op reasoning was right
+and the conclusion drawn from it was wrong: on a step where the individual wins are 1-2 ms, two of
+the changes plausibly give it straight back --
+(i) `_sanitise_gradients` now reads its non-finite count to the host to decide whether any
+`nan_to_num_` is needed, which is a **mid-step queue drain** between the backward and
+`optimizer.step()`; (ii) `crop_item` moves the gather from the device to a single-threaded numpy
+fancy-index over a memory-mapped file, and on unified memory the host->device traffic it saves was
+never the expensive part. Neither is measured yet. `Trainer.use_fast_crop` and
+`Trainer.sanitise_conditional` were added afterwards so the next slot isolates them instead of
+guessing.
+
+Also note the harness spread between jobs: the same steady-state step measured 129.2 ms
+(`-baseline`), 131.4/137.5 ms (`-sweep`) and 116-119 ms (`-ab`). Within-process A/B (the sweep) is
+tight; across jobs it is not, which is exactly why the before/after had to alternate inside one job.
+
+### Results 6: parity, measured against the machine's own noise floor
+
+Comparing two checkouts' loss curves only means something next to the run-to-run spread of
+*identical* code, so the job measured both. `max|dloss|` over 24 steps:
+
+| comparison | max\|dloss\| |
+|---|---:|
+| `main` vs `main` (identical code, twice) | 4.65e-04 |
+| branch vs branch (identical code, twice) | 3.84e-04 |
+| **`main` vs branch, pass 1** | **2.30e-04** |
+| **`main` vs branch, pass 2** | **6.19e-04** |
+
+The between-checkout difference is the same size as the same-code-twice difference: **the changes
+move nothing this machine does not already move by itself.** That is the parity gate passed, and it
+also retro-explains the 1.8e-03 on the cap row in Results 3 (25 optimiser steps amplifying
+`index_add_` noise), which is not evidence of a numerics change. `pytest -q -m gpu tests`:
+**78 passed** with the rewritten noise-floor-based cap gradient test.
+
+### Results 7: isolating each change (job `trippy-train-perf-isolate`, rc 0)
+
+Seven arms, `main` run first and last so drift is visible rather than assumed:
+
+| arm | median ms | min ms | vs drift-adjusted `main` |
+|---|---:|---:|---:|
+| `main` (first) | 117.1 | 111.6 | -- |
+| branch, defaults | 117.6 | 110.8 | +1.4 |
+| branch, **`use_fast_crop=0`** | **113.3** | **106.4** | **-2.1** |
+| branch, `sanitise_conditional=0` | 122.7 | 111.5 | +8.2 |
+| branch, **both off** | **110.6** | **105.8** | **-3.1** |
+| branch, `raster_cap=0` | 123.8 | 110.1 | +10.9 |
+| `main` (last) | 112.0 | 108.3 | -- |
+
+**`main` drifted 117.1 -> 112.0 ms across the job**, so this design cannot resolve anything under
+~5 ms -- and the +8.2 and +10.9 rows are contradicted by their own `min` columns (111.5 and 110.1,
+level with `main`), i.e. transient interference rather than real cost. One of my two suspicions was
+right and one was wrong, and I would not have known which without arms on both sides.
+
+**The one signal that survives in both statistics and in both jobs**: turning the host-side crop
+**off** is faster. `Trainer.use_fast_crop` now **defaults to False**. Cutting host->device traffic
+5x does not pay on unified memory, and the single-threaded numpy fancy-index that replaces the
+device gather costs more than it saves. The path is kept, not deleted: at width 2016 / crop 512
+(`config_fullres.yaml`) the frame it avoids uploading is ~4x larger, so re-measure there before
+assuming it loses again.
+
+The fragment cap and the sanitiser readback are **UNRESOLVED**. Settling them needs arms inside one
+process from one snapshot -- `trippy profile-step --raster-cap both --fast-crop both
+--sanitise-sync both`, queued as `trippy-train-perf-knobs`, 8 arms, all from the same restored
+state. On the synthetic fixture all 8 arms already give `max|dloss| = 0.000e+00`, so whatever it
+finds is pure cost, not numerics.
+
+### Results 8: all three knobs resolved (job `trippy-train-perf-knobs`, rc 0)
+
+8 arms, every one restored to the same snapshot inside one process, so these are *paired*
+differences. Epoch 50, medians of 30 steps. One arm (cap off / crop on / readback off, 158.2 ms) is
+discarded: its FROZEN phase came out 15 ms **faster** than its own untimed phase, which only happens
+when the untimed phase caught interference.
+
+| knob turned on | paired effect | verdict |
+|---|---:|---|
+| `use_fast_crop` | **+5.3 ms** | **a real cost** -- third independent confirmation. Default now False. |
+| `raster_cap_to_max_frags` | -0.6 ms | **not established** (pairs -4.7, +0.1, +2.8; the earlier two-arm sweep said -6.1). Kept on: byte-identical and strictly less traffic, but **the "1.05x" must not be quoted as its value.** |
+| `sanitise_conditional` | +0.3 ms | **neutral** -- the mid-step host readback I suspected costs nothing measurable. |
+
+All eight arms are exactly-equivalent code paths, so their `max|dloss|` spread -- **3.7e-04 to
+1.6e-03 over 30 steps** -- *is* the noise floor at that step count. That closes the last loose end:
+the 1.8e-03 on the cap row in Results 3 was noise, not a numerics change.
+
+**With `use_fast_crop` at its corrected default the branch is ~2 ms (~1.8%) faster than `main`**
+(isolate job: 113.3 ms against a drift-adjusted 115.4) -- at the edge of what this machine resolves,
+and not a speed-up worth the name.
+
+**Verdict**: the brief's 2x target is **NOT met and, at exact parity, is not reachable on this step**
+-- 36% of it is the training objective plus the update rule (`docs/ARCHITECTURE.md` "The ceiling").
+What this session actually delivers: `trippy profile-step` and the measured breakdown; four
+candidates killed with numbers ((a), (b), (f), (e)) and two more re-confirmed ((c) sort methods);
+a proven-neutral set of exact changes; and one live suspicion (the two changes above) with the
+knobs in place to test it. The exact changes should NOT be sold as a speed-up. Already
+settled: candidates (a), (b) and (f) dropped with numbers; (c) re-confirmed (composite int64 argsort
+**6.84 ms** vs `two_pass` **12.48**; `searchsorted` **0.246 ms** vs `bincount` **17.23** at 196k
+layer-pixels); (e) fp16 measured and rejected; the cap kept at 1.05x.
+
+**Artifacts**: `output/profile/train-perf-baseline.json`,
+`output/profile/train-perf-baseline-raster.json` (written by the queued job);
+`docs/ARCHITECTURE.md` "Where a training step's time goes".
+- 2026-09-08T09:58:44Z submitted job trippy-train-perf-sweep prio 15: bash -c set -x; C=experiments/EXP-0011-karekare-v2/config.yaml; O=/Users/nzbirdranch/trippy/output/profile; python -m trippy.cli profile-step --config $C --steps 30 --warmup 5 --epoch 50 --raster-cap both --amp both --device mps --run-dir $O/train-perf-sweep-run --json $O/train-perf-sweep.json; echo sweep_rc=$?; python -m trippy.cli profile-step --config $C --steps 30 --warmup 5 --epoch 50 --fused-adam --device mps --run-dir $O/train-perf-fused-run --json $O/train-perf-fused.json; echo fused_rc=$?
+- 2026-09-08T13:01:18Z submitted job trippy-train-perf-ab prio 15: bash -c set -x; python -m pytest -q -m gpu tests; echo gpu_pytest_rc=$?; S=/Users/nzbirdranch/trippy/output/profile/time_train_step.py; O=/Users/nzbirdranch/trippy/output/profile; BASE=/Users/nzbirdranch/trippy/.worktrees/train-perf-base; NEW=/Users/nzbirdranch/trippy/.worktrees/train-perf; C=experiments/EXP-0011-karekare-v2/config.yaml; for pass in 1 2; do PYTHONPATH=$BASE python $S --config $BASE/$C --steps 20 --warmup 4 --epoch 50 --device mps --run-dir $O/ab-run --label BEFORE-main-$pass --json $O/train-perf-ab-before-$pass.json; echo before_rc=$?; PYTHONPATH=$NEW python $S --config $NEW/$C --steps 20 --warmup 4 --epoch 50 --device mps --run-dir $O/ab-run --label AFTER-perf-$pass --json $O/train-perf-ab-after-$pass.json; echo after_rc=$?; done
+- 2026-09-08T18:20:43Z submitted job trippy-train-perf-isolate prio 15: bash -c set -x; S=/Users/nzbirdranch/trippy/output/profile/time_train_step.py; O=/Users/nzbirdranch/trippy/output/profile; BASE=/Users/nzbirdranch/trippy/.worktrees/train-perf-base; NEW=/Users/nzbirdranch/trippy/.worktrees/train-perf; C=experiments/EXP-0011-karekare-v2/config.yaml; A="--steps 20 --warmup 4 --epoch 50 --device mps --run-dir $O/iso-run"; PYTHONPATH=$BASE python $S --config $BASE/$C $A --label main-first --json $O/iso-main-1.json; PYTHONPATH=$NEW python $S --config $NEW/$C $A --label branch-default --json $O/iso-default.json; PYTHONPATH=$NEW python $S --config $NEW/$C $A --set use_fast_crop=0 --label branch-no-fastcrop --json $O/iso-nofastcrop.json; PYTHONPATH=$NEW python $S --config $NEW/$C $A --set sanitise_conditional=0 --label branch-no-sanitise-sync --json $O/iso-nosanitise.json; PYTHONPATH=$NEW python $S --config $NEW/$C $A --set use_fast_crop=0 --set sanitise_conditional=0 --label branch-neither --json $O/iso-neither.json; PYTHONPATH=$NEW python $S --config $NEW/$C $A --set raster_cap_to_max_frags=0 --label branch-no-cap --json $O/iso-nocap.json; PYTHONPATH=$BASE python $S --config $BASE/$C $A --label main-last --json $O/iso-main-2.json; echo isolate_rc=$?
+- 2026-09-08T18:45:50Z submitted job trippy-train-perf-knobs prio 15: bash -c set -x; C=experiments/EXP-0011-karekare-v2/config.yaml; O=/Users/nzbirdranch/trippy/output/profile; python -m trippy.cli profile-step --config $C --steps 30 --warmup 5 --epoch 50 --raster-cap both --fast-crop both --sanitise-sync both --device mps --run-dir $O/knobs-run --json $O/train-perf-knobs.json; echo knobs_rc=$?

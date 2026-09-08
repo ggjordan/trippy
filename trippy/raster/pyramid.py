@@ -43,6 +43,7 @@ from trippy.constants import (
 from trippy.raster.blend_autograd import blend_fragments
 from trippy.raster.emit import build_sorted_fragments, layer_grid
 from trippy.raster.ref_torch import fragments_per_layer, render_pyramid_ref, split_layers
+from trippy.train import steptimer
 
 
 def render_pyramid(
@@ -68,6 +69,7 @@ def render_pyramid(
     differentiable: bool | None = None,
     pixel_center: str = "half",
     pyramid_halving: str = "ceil",
+    cap_to_max_frags: bool = True,
 ) -> tuple[list[Tensor], dict]:
     """Render one image as an L-layer alpha-composited pyramid.
 
@@ -119,6 +121,21 @@ def render_pyramid(
             TRIPS-checkpoint parity render needs "integer".
         pyramid_halving: "ceil" (default, and what TRIPS does for every
             published checkpoint) or "floor".
+        cap_to_max_frags: **MPS only.** Drop, right after the sort, every
+            fragment past each layer-pixel's first `max_frags`. `blend_fwd`
+            stops at `used >= MAX_FRAGS` before consuming a fragment, so
+            those fragments are provably never read and dropping them is
+            bit-identical on this path (tests/test_raster_metal.py, GPU
+            marker) -- while shrinking the five permutation gathers, both
+            kernels' fragment arrays, and the backward's per-fragment
+            `d_feat` and its `index_add_`. At a 384-px crop in
+            `mode="broadcast"` that is ~24M fragments down to at most
+            `grid.total * 16` = 3.1M. `aux["num_fragments"]` and
+            `aux["fragments_per_layer"]` still report the pre-cap list.
+            The CPU dispatch ignores this flag on purpose: `render_pyramid_ref`
+            is the float64 ground truth and its global-prefix-sum
+            transmittance is only invariant to truncation up to rounding
+            (see its own docstring).
 
     Returns:
         layers: list of L tensors; layer l is (C, h_l, w_l), channel-first.
@@ -157,6 +174,7 @@ def render_pyramid(
             pose_delta=pose_delta,
             pixel_center=pixel_center,
             pyramid_halving=pyramid_halving,
+            # Deliberately not forwarded: see `cap_to_max_frags` in the docstring.
         )
     if device.type != "mps":
         raise ValueError(f"render_pyramid supports device 'cpu' and 'mps', got {device.type!r}")
@@ -180,6 +198,7 @@ def render_pyramid(
         "pose_delta": pose_delta,
         "pixel_center": pixel_center,
         "pyramid_halving": pyramid_halving,
+        "cap_to_max_frags": cap_to_max_frags,
     }
     if differentiable:
         return _render_pyramid_mps(xyz, size, feat, conf, K, R, t, image_hw, **kwargs)
@@ -209,6 +228,7 @@ def _render_pyramid_mps(
     pose_delta: Tensor | None,
     pixel_center: str,
     pyramid_halving: str,
+    cap_to_max_frags: bool,
 ) -> tuple[list[Tensor], dict]:
     """MPS path: torch emission/sort + the Metal blend_fwd/blend_bwd pair.
 
@@ -237,17 +257,21 @@ def _render_pyramid_mps(
         segment_method=segment_method,
         pose_delta=None if pose_delta is None else pose_delta.to(torch.float32),
         pixel_center=pixel_center,
+        cap_frags=max_frags if cap_to_max_frags else None,
     )
-    out, t_final, n_used, depth_sum = blend_fragments(
-        frags,
-        feat.to(torch.float32),
-        max_frags=max_frags,
-        t_cutoff=t_cutoff,
-    )
-    if bg is not None:
-        out = out + t_final.reshape(-1, 1) * bg.to(torch.float32).reshape(1, -1)
+    with steptimer.stage("raster_blend_fwd"):
+        out, t_final, n_used, depth_sum = blend_fragments(
+            frags,
+            feat.to(torch.float32),
+            max_frags=max_frags,
+            t_cutoff=t_cutoff,
+        )
+        if bg is not None:
+            out = out + t_final.reshape(-1, 1) * bg.to(torch.float32).reshape(1, -1)
 
-    layers, aux = split_layers(out, t_final, n_used, depth_sum, grid)
-    aux["num_fragments"] = len(frags)
-    aux["fragments_per_layer"] = fragments_per_layer(frags.offsets, grid)
+    with steptimer.stage("raster_split"):
+        layers, aux = split_layers(out, t_final, n_used, depth_sum, grid)
+    # Pre-cap numbers on purpose -- see the same note in ref_torch.
+    aux["num_fragments"] = frags.emitted_count
+    aux["fragments_per_layer"] = fragments_per_layer(frags.emitted_offsets, grid)
     return layers, aux

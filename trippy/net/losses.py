@@ -162,6 +162,13 @@ class _LazyLPIPS(nn.Module):
         super().__init__()
         self.net = net
         self._model: nn.Module | None = None
+        #: Run the backbone under `torch.autocast(dtype=float16)`. A runtime knob
+        #: set by `trippy.train.trainer.Trainer` when `TrainConfig.amp` is on, not a
+        #: constructor argument, because it must stay off for the *metric* LPIPS in
+        #: `Trainer.evaluate` even when the training loss uses it -- a held-out
+        #: number has to be comparable across runs regardless of training precision.
+        #: Changes numerics; see docs/LIMITATIONS.md.
+        self.amp: bool = False
 
     def _model_on(self, device: torch.device) -> nn.Module:
         if self._model is None:
@@ -184,7 +191,15 @@ class _LazyLPIPS(nn.Module):
             target = target * mask
         model = self._model_on(pred.device)
         # lpips expects inputs in [-1, 1] (ImageSimilarity.h:220-221 does the same rescale).
-        return model(pred * 2 - 1, target * 2 - 1).mean()
+        if not self.amp:
+            return model(pred * 2 - 1, target * 2 - 1).mean()
+        # The backbone is frozen (`requires_grad_(False)` above), so half precision
+        # here is a pure evaluation-cost change: the only gradient that leaves is
+        # `d loss / d pred`, and it is returned in the autocast region's output dtype
+        # and immediately upcast by `.float()`.
+        with torch.autocast(device_type=pred.device.type, dtype=torch.float16):
+            value = model(pred * 2 - 1, target * 2 - 1).mean()
+        return value.float()
 
 
 @dataclass

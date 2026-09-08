@@ -33,6 +33,7 @@ Related docs: docs/ARCHITECTURE.md "Module overview" (trippy/scene);
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -467,6 +468,87 @@ class SceneDataset(torch.utils.data.Dataset):
             item["mask"] = torch.from_numpy(mask_np).to(torch.float32).to(self.device)
         return item
 
+    def frame_size(self, index: int) -> tuple[int, int]:
+        """(H, W) of image `index` at this dataset's width, from the cache metadata.
+
+        Reads no pixels, so a caller that only needs the frame's shape --
+        `Trainer.train_step`, to sample a crop centre -- does not have to
+        materialise and upload a 2.3 MB image first.
+        """
+        meta = self._meta["images"][self._names[index]]
+        return int(meta["height"]), int(meta["width"])
+
+    def crop_item(
+        self,
+        index: int,
+        size: int,
+        zoom: float = 1.0,
+        center: tuple[float, float] | None = None,
+    ) -> dict[str, Any]:
+        """`crop(self[index], size, zoom, center)` without uploading the whole frame.
+
+        Identical output to that expression, key for key and value for value
+        (tests/test_scene_dataset.py::test_crop_item_matches_crop_of_getitem),
+        arrived at the other way round: the nearest-neighbour gather runs on
+        the host against the memory-mapped cache file, and only the
+        `size x size` result is moved to `self.device`.
+
+        Why it exists (perf/train-step): `__getitem__` uploads the full
+        undistorted frame -- at Karekare-v2's 1008x756 that is 2.3 MB of RGB
+        plus a 3.0 MB float32 person mask -- and `crop` then gathers a 384x384
+        window out of it on the device. Every training step pays for the
+        whole frame to reach the GPU so that ~8% of it can be used. Here the
+        step moves ~1 MB instead, and the two large device gathers disappear.
+
+        Args:
+            index: image index (same ordering as `names`).
+            size: output crop side length in pixels (square).
+            zoom: crop zoom factor (see `crop`).
+            center: (x, y) window centre in source pixels, or None for the
+                frame centre.
+
+        Returns:
+            dict with `crop`'s own keys -- "rgb" (size, size, 3) uint8,
+            "mask" (size, size) float32, "K" (3, 3) float32 -- plus the
+            per-image fields a caller would otherwise have taken from
+            `__getitem__`: "qvec", "tvec", "name", "index". Every tensor is
+            on `self.device`.
+        """
+        name = self._names[index]
+        meta = self._meta["images"][name]
+        height_src, width_src = int(meta["height"]), int(meta["width"])
+        plan = crop_plan(height_src, width_src, size, zoom, center)
+        row_np = plan.row_idx.numpy()
+        col_np = plan.col_idx.numpy()
+
+        # mmap: only the rows the window touches are faulted in, instead of
+        # reading the whole cached frame on every step.
+        rgb_src = np.load(self.cache_dir / f"{name}.npy", mmap_mode="r")
+        gathered = np.ascontiguousarray(rgb_src[row_np][:, col_np])
+        out_rgb = torch.from_numpy(gathered)
+        mask2d = plan.mask2d
+        out_rgb = out_rgb * mask2d.to(out_rgb.dtype).unsqueeze(-1)
+
+        valid = mask2d.to(torch.float32)
+        if self.masks_dir is not None:
+            mask_src = np.load(
+                self.cache_dir / f"{name}{SCENE_MASK_CACHE_SUFFIX}", mmap_mode="r"
+            )
+            person = torch.from_numpy(np.ascontiguousarray(mask_src[row_np][:, col_np]))
+            valid = valid * person.to(torch.float32)
+
+        device = self.device
+        K = torch.tensor(meta["K"], dtype=torch.float32)
+        return {
+            "rgb": out_rgb.to(device),
+            "mask": valid.to(device),
+            "K": adjust_intrinsics(K, plan.x0, plan.y0, zoom).to(device),
+            "qvec": torch.tensor(meta["qvec"], dtype=torch.float32, device=device),
+            "tvec": torch.tensor(meta["tvec"], dtype=torch.float32, device=device),
+            "name": name,
+            "index": index,
+        }
+
     def mask_keep_fracs(self) -> dict[str, float]:
         """`{name: fraction of pixels the loss may use}` for every image, or `{}` if unmasked.
 
@@ -478,6 +560,109 @@ class SceneDataset(torch.utils.data.Dataset):
         if self.masks_dir is None:
             return {}
         return {name: float(self._meta["images"][name]["mask_keep_frac"]) for name in self._names}
+
+
+@dataclass(frozen=True)
+class CropPlan:
+    """Where a crop window reads from, and which of its pixels are real.
+
+    The *only* place the crop's index arithmetic lives, so `crop` (which
+    gathers on whatever device the item is on) and
+    `SceneDataset.crop_item` (which gathers on the host, before anything is
+    uploaded) cannot drift apart by a pixel.
+
+    Attributes:
+        row_idx: (size,) int64 CPU, source row per output row, clamped into
+            the image.
+        col_idx: (size,) int64 CPU, source column per output column, clamped.
+        mask2d: (size, size) bool CPU, True where the window is inside the
+            source image (False = crop overshoot, i.e. padding that must
+            never be treated as content -- docs/GEOMETRY.md bug class 3).
+        x0, y0: float, the window's top-left corner in continuous source
+            pixel coordinates, needed for the intrinsics adjustment.
+    """
+
+    row_idx: torch.Tensor
+    col_idx: torch.Tensor
+    mask2d: torch.Tensor
+    x0: float
+    y0: float
+
+
+def crop_plan(
+    height_src: int,
+    width_src: int,
+    size: int,
+    zoom: float = 1.0,
+    center: tuple[float, float] | None = None,
+) -> CropPlan:
+    """Index arithmetic for one crop window (see CropPlan).
+
+    Args:
+        height_src, width_src: source image size in pixels.
+        size: output crop side length in pixels (square).
+        zoom: > 1 zooms in (samples a smaller `size / zoom` source window,
+            nearest-neighbour resampled up to `size`); 1.0 = no zoom.
+        center: (x, y) window centre in continuous source pixel coordinates;
+            None centres it on the image.
+
+    Returns:
+        CropPlan, all tensors on the CPU.
+
+    Raises:
+        ValueError: on a non-positive `size` or `zoom`.
+    """
+    if size <= 0:
+        raise ValueError(f"size must be positive, got {size}")
+    if zoom <= 0:
+        raise ValueError(f"zoom must be positive, got {zoom}")
+    if center is None:
+        center = (width_src / 2.0, height_src / 2.0)
+    center_x, center_y = center
+
+    window = size / zoom
+    half = window / 2.0
+    x0 = center_x - half
+    y0 = center_y - half
+
+    # Index math in float64 on the CPU (MPS has no float64); only the int64
+    # gather indices ever move to a device.
+    out_idx = torch.arange(size, dtype=torch.float64)
+    src_x = x0 + (out_idx + 0.5) / size * window  # (size,) continuous source pixel coords
+    src_y = y0 + (out_idx + 0.5) / size * window
+
+    src_col = torch.floor(src_x).to(torch.int64)  # nearest source pixel (spans [i, i+1))
+    src_row = torch.floor(src_y).to(torch.int64)
+
+    valid_col = (src_col >= 0) & (src_col < width_src)
+    valid_row = (src_row >= 0) & (src_row < height_src)
+    return CropPlan(
+        row_idx=src_row.clamp(0, height_src - 1),
+        col_idx=src_col.clamp(0, width_src - 1),
+        mask2d=valid_row[:, None] & valid_col[None, :],
+        x0=float(x0),
+        y0=float(y0),
+    )
+
+
+def adjust_intrinsics(K: torch.Tensor, x0: float, y0: float, zoom: float) -> torch.Tensor:
+    """`K` re-expressed in a crop window's own pixel coordinates.
+
+    Args:
+        K: (3, 3) float32 intrinsics at the source resolution.
+        x0, y0: the window's top-left corner in source pixels (CropPlan).
+        zoom: the crop's zoom factor.
+
+    Returns:
+        (3, 3) float32 on `K`'s device: focal lengths scaled by `zoom`, the
+        principal point moved to the window origin and then scaled.
+    """
+    new_k = K.clone()
+    new_k[0, 0] = K[0, 0] * zoom
+    new_k[1, 1] = K[1, 1] * zoom
+    new_k[0, 2] = (K[0, 2] - x0) * zoom
+    new_k[1, 2] = (K[1, 2] - y0) * zoom
+    return new_k
 
 
 def crop(
@@ -533,31 +718,13 @@ def crop(
 
     rgb = item["rgb"]
     height_src, width_src = rgb.shape[0], rgb.shape[1]
-    if center is None:
-        center = (width_src / 2.0, height_src / 2.0)
-    center_x, center_y = center
+    plan = crop_plan(int(height_src), int(width_src), size, zoom, center)
+    x0, y0 = plan.x0, plan.y0
 
-    window = size / zoom
-    half = window / 2.0
-    x0 = center_x - half
-    y0 = center_y - half
-
-    # Index math in float64 on the CPU (MPS has no float64); only the int64 gather indices move to
-    # the image's device.
     device = rgb.device
-    out_idx = torch.arange(size, dtype=torch.float64)
-    src_x = x0 + (out_idx + 0.5) / size * window  # (size,) continuous source pixel coords
-    src_y = y0 + (out_idx + 0.5) / size * window
-
-    src_col = torch.floor(src_x).to(torch.int64).to(device)  # nearest source pixel (spans [i, i+1))
-    src_row = torch.floor(src_y).to(torch.int64).to(device)
-
-    valid_col = (src_col >= 0) & (src_col < width_src)
-    valid_row = (src_row >= 0) & (src_row < height_src)
-    mask2d = valid_row[:, None] & valid_col[None, :]  # (size, size)
-
-    row_idx = src_row.clamp(0, height_src - 1)
-    col_idx = src_col.clamp(0, width_src - 1)
+    row_idx = plan.row_idx.to(device)
+    col_idx = plan.col_idx.to(device)
+    mask2d = plan.mask2d.to(device)
     out_rgb = rgb[row_idx][:, col_idx]  # (size, size, 3), gathered before masking
 
     mask_same_dtype = mask2d.to(out_rgb.dtype)
@@ -575,11 +742,6 @@ def crop(
 
     K = item.get("K")
     if K is not None:
-        new_k = K.clone()
-        new_k[0, 0] = K[0, 0] * zoom
-        new_k[1, 1] = K[1, 1] * zoom
-        new_k[0, 2] = (K[0, 2] - x0) * zoom
-        new_k[1, 2] = (K[1, 2] - y0) * zoom
-        result["K"] = new_k
+        result["K"] = adjust_intrinsics(K, x0, y0, zoom)
 
     return result
