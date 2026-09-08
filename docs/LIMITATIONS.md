@@ -1293,10 +1293,13 @@ feature. `trips-web` passes a constant `BlendMode::Trips`, which is a hard no-op
   `nn.Module.to(device)` does not move it, and after the model goes to MPS
   `sam3_image.py::_get_img_feats` indexes those CPU tensors with MPS indices
   (`indices should be either on cpu or on the same device as the indexed
-  tensor (cpu)`, job `trippy-edit-sam-3`). `_move_module_caches` moves any
-  module's `cache` dict of tensors onto the device — exactly what `.to()`
-  would have done had it been a buffer, so it moves data and changes no
-  arithmetic. `PYTORCH_ENABLE_MPS_FALLBACK` is untouched by any of this.
+  tensor (cpu)`, job `trippy-edit-sam-3`). `_move_stray_tensors` walks every
+  module's plain attributes (dicts, lists, tuples, sets, nested) and moves
+  every tensor `.to()` skipped because it was neither a parameter nor a
+  buffer — the `PositionEmbeddingSine.cache` dicts (job `trippy-edit-sam-4`)
+  and the decoder's `compilable_cord_cache` tuple (job `trippy-edit-sam-5`).
+  It moves data and changes no arithmetic; the runner refuses to start if a
+  re-scan still finds a stray tensor off-device. `PYTORCH_ENABLE_MPS_FALLBACK` is untouched by any of this.
 - **The mask threshold is a real knob, not a formality.** `Sam3Processor`
   hardcodes "inside = probability > 0.5"; `sam_runner` reproduces that but
   thresholds the probability map itself so `--mask-threshold` can move it.

@@ -876,39 +876,176 @@ def test_install_real_rope_forces_the_flag_the_builder_never_passes(
     assert not _install_real_rope()
 
 
-def test_move_module_caches_finds_plain_dict_tensor_caches() -> None:
-    """`nn.Module.to()` skips a plain `self.cache` dict; this is what covers it.
+def _sam3_shaped_model() -> Any:
+    """A miniature of the two SAM 3 modules that broke the MPS port.
 
-    SAM 3's `PositionEmbeddingSine` keeps its precomputed position encodings
-    there, which is why the MPS run died indexing a CPU tensor with MPS
-    indices (docs/LIMITATIONS.md "SAM-3 mask lift").
+    Not a mock of an interface -- a reproduction of the *trap*: a module that
+    parks precomputed tensors in a plain dict (`PositionEmbeddingSine.cache`)
+    and one that parks them in a plain tuple
+    (`TransformerDecoder.compilable_cord_cache`), each with a forward that does
+    the same arithmetic against them as SAM 3 does. `nn.Module.to()` moves
+    neither, so `.to(other_device)` then `forward()` raises exactly the error
+    jobs `trippy-edit-sam-3` and `-4` died with.
     """
     import torch
 
-    from trippy.edit.sam_runner import _move_module_caches
+    class DictCache(torch.nn.Module):
+        """`PositionEmbeddingSine`: a dict of precomputed encodings."""
 
-    class WithCache(torch.nn.Module):
         def __init__(self) -> None:
             super().__init__()
-            self.cache = {(4, 4): torch.zeros(1, 2), (8, 8): torch.zeros(1, 2)}
+            self.proj = torch.nn.Linear(2, 2)
+            self.cache = {(4, 4): torch.zeros(4, 4), (8, 8): torch.zeros(8, 8)}
 
-    class WithJunk(torch.nn.Module):
+        def forward(self, x: Any) -> Any:
+            return x + self.cache[(4, 4)]
+
+    class TupleCache(torch.nn.Module):
+        """`TransformerDecoder`: a tuple of coordinate vectors, warmed in __init__."""
+
         def __init__(self) -> None:
             super().__init__()
-            # Neither of these is a tensor cache and neither may be touched.
-            self.cache = {"note": "not a tensor"}
+            self.proj = torch.nn.Linear(2, 2)
+            self.compilable_cord_cache = (torch.arange(4.0), torch.arange(4.0))
+            self.compilable_stored_size = (4, 4)
+            self.coord_cache: dict[tuple[int, int], Any] = {}
+            self.not_a_tensor = "left alone"
 
-    class NotADict(torch.nn.Module):
+        def forward(self, boxes: Any) -> Any:
+            coords_h, _ = self.compilable_cord_cache
+            return coords_h.view(1, -1, 1) - boxes.reshape(-1, 1, 2)
+
+    class Nested(torch.nn.Module):
+        """The container shape SAM 3 does not use yet: a list of dicts."""
+
         def __init__(self) -> None:
             super().__init__()
-            self.cache = torch.zeros(1)
+            self.levels = [{"pos": torch.zeros(2)}, {"pos": torch.zeros(2)}]
 
-    model = torch.nn.Sequential(WithCache(), WithJunk(), NotADict(), torch.nn.Linear(2, 2))
-    # Every tensor is already on the cpu, so a cpu move is a no-op and the
-    # count is 0; what this pins is that the traversal reaches the right
-    # attributes and refuses the wrong ones.
-    assert _move_module_caches(model, "cpu") == 0
-    assert _move_module_caches(model, "meta") == 2
-    assert all(str(v.device) == "meta" for v in model[0].cache.values())
-    assert model[1].cache == {"note": "not a tensor"}
-    assert str(model[2].cache.device) == "cpu", "a non-dict `cache` is left alone"
+    return torch.nn.Sequential(DictCache(), TupleCache(), Nested())
+
+
+def test_stray_tensors_are_the_bug_and_moving_them_is_the_fix() -> None:
+    """The whole SAM-3-on-MPS story in one test, on a device CPU-only hosts have.
+
+    "meta" is not MPS, but it is a *different device from the CPU*, which is the
+    only property the bug needs: `.to()` moves parameters and buffers, leaves
+    the plain-attribute caches behind, and the next op that mixes the two
+    raises "found at least two devices". So this reproduces walls 3 and 4/5
+    without a GPU, and pins that `_move_stray_tensors` closes both.
+    """
+    import torch
+
+    from trippy.edit.sam_runner import _move_stray_tensors, _stray_tensor_devices
+
+    model = _sam3_shaped_model().to("meta")
+
+    # 1. The bug. Parameters moved; the caches did not.
+    assert str(model[0].proj.weight.device) == "meta"
+    strays = dict(_stray_tensor_devices(model))
+    assert set(strays.values()) == {"cpu"}, strays
+    assert "0.cache[(4, 4)]" in strays
+    assert "1.compilable_cord_cache[0]" in strays
+    assert "2.levels[0]['pos']" in strays
+    # meta words it as "is not on the expected device" where MPS words it
+    # "found at least two devices, mps:0 and cpu"; same refusal to mix.
+    with pytest.raises(RuntimeError, match="not on the expected device|two devices"):
+        model[1](torch.zeros(1, 2, device="meta"))
+
+    # 2. The fix. Every stray tensor, whatever container it sits in.
+    moved = _move_stray_tensors(model, "meta")
+    assert moved == 6, "2 dict entries + 2 tuple entries + 2 nested list entries"
+    assert all(where == "meta" for _, where in _stray_tensor_devices(model))
+    model[1](torch.zeros(1, 2, device="meta"))  # no longer raises
+    model[0](torch.zeros(4, 4, device="meta"))
+
+    # 3. Idempotent, and it leaves everything that is not a tensor alone.
+    assert _move_stray_tensors(model, "meta") == 0
+    assert model[1].not_a_tensor == "left alone"
+    assert model[1].compilable_stored_size == (4, 4)
+    assert isinstance(model[1].compilable_cord_cache, tuple)
+
+
+def test_stray_tensor_scan_reports_nothing_for_a_clean_model() -> None:
+    """A model that registers its tensors properly must produce no findings."""
+    import torch
+
+    from trippy.edit.sam_runner import _move_stray_tensors, _stray_tensor_devices
+
+    class Clean(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.linear = torch.nn.Linear(2, 2)
+            self.register_buffer("table", torch.zeros(3))
+
+    model = Clean().to("meta")
+    assert _stray_tensor_devices(model) == []
+    assert _move_stray_tensors(model, "meta") == 0
+
+
+def test_is_on_treats_mps_and_mps_0_as_the_same_place() -> None:
+    """`t.to("mps").device` prints `mps:0`; a string compare would loop forever."""
+    from trippy.edit.sam_runner import _is_on
+
+    assert _is_on("mps:0", "mps")
+    assert _is_on("mps", "mps")
+    assert _is_on("cpu", "cpu")
+    assert not _is_on("cpu", "mps")
+    assert not _is_on("mps:0", "cpu")
+
+
+def test_device_audit_records_only_the_calls_that_would_break_on_mps(
+    tmp_path: Path,
+) -> None:
+    """A device-less factory call inside SAM 3 is the whole bug class.
+
+    The audit has to name the SAM 3 frame (not the torch internals above it, and
+    not trippy's own frames below it) and has to stay quiet about calls that
+    pass `device=`, or its output is noise.
+    """
+    import importlib.util
+
+    import torch
+
+    from trippy.edit.sam_runner import _device_audit_mode, _DeviceAudit
+
+    repo = tmp_path / "repo"
+    module_path = repo / "sam3" / "model" / "pretend.py"
+    module_path.parent.mkdir(parents=True)
+    module_path.write_text(
+        "import torch\n"
+        "\n"
+        "def careless():\n"
+        "    return torch.zeros(2)\n"
+        "\n"
+        "def careful(device):\n"
+        "    return torch.zeros(2, device=device)\n"
+    )
+    spec = importlib.util.spec_from_file_location("pretend_sam3", module_path)
+    assert spec is not None and spec.loader is not None
+    pretend = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(pretend)
+
+    audit = _DeviceAudit(str(repo))
+    with _device_audit_mode(audit):
+        pretend.careless()
+        pretend.careless()
+        pretend.careful("cpu")
+        torch.zeros(2)  # trippy's own frame, not SAM 3's: not SAM 3's problem
+
+    report = audit.report()
+    assert len(report) == 1, report
+    assert report[0] == "sam3/model/pretend.py:4 in careless(): torch.zeros x2"
+
+
+def test_device_audit_is_transparent_to_the_arithmetic() -> None:
+    """The audit mode must observe and change nothing: same values, same devices."""
+    import torch
+
+    from trippy.edit.sam_runner import _device_audit_mode, _DeviceAudit
+
+    want = torch.arange(6.0).reshape(2, 3) @ torch.ones(3, 2)
+    with _device_audit_mode(_DeviceAudit("/nowhere")):
+        got = torch.arange(6.0).reshape(2, 3) @ torch.ones(3, 2)
+    assert torch.equal(got, want)
+    assert str(got.device) == "cpu"

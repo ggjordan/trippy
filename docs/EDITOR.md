@@ -798,9 +798,35 @@ trippy edits sam --bundle <dir> --scene <root> --view IMG.jpg \
   `--device mps` needs three more repairs to SAM 3's own code — the model is
   moved to the device (`build_sam3_image_model` only does that for CUDA), the
   ViT is forced onto its own real-valued rotary embedding (MPS has no
-  `torch.view_as_complex`), and the position encoder's precomputed cache — a
-  plain dict, so `.to()` skips it — is moved with it.
-  `docs/LIMITATIONS.md`'s "SAM-3 mask lift" section has all five, with the
+  `torch.view_as_complex`), and **every tensor `nn.Module.to()` leaves
+  behind** is moved with it.
+
+  That last one is one bug wearing two hats, and each hat cost a queued run.
+  `.to()` moves registered parameters and registered buffers and nothing
+  else, so a precomputed cache parked in a plain attribute stays on the CPU:
+  `PositionEmbeddingSine.cache` is a **dict** (job `trippy-edit-sam-3`, died
+  in `_get_img_feats` with "indices should be either on cpu or on the same
+  device as the indexed tensor"), and `TransformerDecoder`'s
+  `compilable_cord_cache` is a **tuple** of boxRPB coordinate vectors built
+  in `__init__` (job `trippy-edit-sam-4`, died at `decoder.py:380` with
+  "found at least two devices, mps:0 and cpu"). So `_move_stray_tensors`
+  stopped chasing container shapes and now walks every module's `__dict__`
+  and moves every tensor at any depth inside dicts, lists, tuples and sets —
+  what `.to()` would have done had SAM 3 registered them as buffers, so it
+  moves data and changes no arithmetic. `_stray_tensor_devices` then re-scans
+  and the child **refuses to start** if anything is still off-device, naming
+  the attribute, rather than letting it surface six layers into a forward
+  pass.
+
+  That leaves one place the module tree cannot see: a device-less
+  `torch.zeros(...)` made *during* the forward. `--device-audit` (a
+  `TorchFunctionMode`, slow, never for a timing run) records every one SAM 3
+  makes and prints it to stderr. Run on the box-prompt path (synthetic image,
+  random weights, CPU, 2026-09-08) it found five, and all five are followed
+  immediately by an explicit `.to(device)` in SAM 3's own code:
+  `sam3_image_processor.py:54` and `:209`, `geometry_encoders.py:650`,
+  `tokenizer_ve.py:250` and `:255`. The forward path is clean.
+  `docs/LIMITATIONS.md`'s "SAM-3 mask lift" section has the shims with the
   job names that found them.
 - **The mask is depth-gated before it becomes a selection.** A mask is 2D:
   everything behind the object along the same ray is inside it too. Points
@@ -902,8 +928,18 @@ the pixel mapping, one child process, and the import.
   it. The imported points are tinted immediately (the same magenta the other
   two selection tools use); `H` toggles that tint while the SAM tool has
   focus.
-- **The default device is `cpu`.** A CPU lift is ~9 s per view since the
-  bfloat16 shim was replaced (§3); `mps` is a radio button next to it.
+- **The default device is `cpu`, and the rule for changing it is written
+  down.** A CPU lift is ~9 s per view since the bfloat16 shim was replaced
+  (§3); `mps` is a radio button next to it. The decision rule, agreed
+  2026-09-08 while jobs `trippy-edit-sam-5` (MPS) and `trippy-edit-sam-5-cpu`
+  (CPU, same photo, same box, same code) sat in the queue: **the default
+  becomes `mps` only if `edit-sam-5` returns rc=0 AND its
+  `per_view[0].segmenter.seconds` beats `edit-sam-5-cpu`'s.** A crash, or a
+  pass that is not faster, and the default stays `cpu` — an MPS radio button
+  that is slower than the default is a trap, not a feature. Fill both numbers
+  in here when the jobs land (`output/edits/edit-sam-5{,-cpu}/summary.json`);
+  until then `cpu` is the documented default and ~9 s per view is the number
+  to quote.
 - **`--fake` is how this is tested and screenshotted.** `trippy edits sam
   --fake` (or `TRIPPY_SAM_FAKE=1`) synthesises the mask from the prompt — a
   box fills its rectangle, a point fills a disc — and runs the entire rest of

@@ -517,9 +517,20 @@ All notable changes to trippy. Format: Keep a Changelog. Versions: semver tags `
 - `experiments/EXP-0011-karekare-v2/config_hybrid_gate.yaml`: `config_hybrid.yaml` with the gate
   on and nothing else changed, queued as `kkv2-7-hybrid-gate`.
 ### Fixed
-- **`trippy edits sam --device mps` works.** Three separate walls, all in SAM 3's
-  own code and all fixed by rebinding rather than by an MPS fallback
-  (`PYTORCH_ENABLE_MPS_FALLBACK` is untouched):
+- **`trippy edits sam --device-audit`: a switch that finds the NEXT device wall
+  instead of waiting for it.** A `TorchFunctionMode` that records every
+  device-less tensor factory call SAM 3 makes during the forward pass (a
+  `torch.zeros(...)` with no `device=` lands on the CPU, and meeting a model
+  tensor on MPS is what walls 3, 4 and 5 all were) and prints each site to
+  stderr, which survives a crash. Off by default and never for a timing run:
+  it sees every torch call and costs real time. Run on the box-prompt path it
+  reports five sites, every one of them already followed by an explicit
+  `.to(device)` in SAM 3's own code.
+- **`trippy edits sam --device mps`: four walls down, all in SAM 3's own code
+  and all fixed by rebinding rather than by an MPS fallback
+  (`PYTORCH_ENABLE_MPS_FALLBACK` is untouched). Whether MPS becomes the
+  viewer's default is decided by jobs `trippy-edit-sam-5` / `-5-cpu`, whose
+  rule is in `docs/EDITOR.md` Sec 3; until they land the default stays `cpu`:
   - `sam3.perflib.fused.addmm_act` casts its inputs to bfloat16 unconditionally
     and hands the result to the next fp32 layer. MPS's autocast policy casts a
     convolution's INPUT but not its WEIGHT, so the pass died with `Input type
@@ -531,9 +542,18 @@ All notable changes to trippy. Format: Keep a Changelog. Versions: semver tags `
     does not implement; SAM 3 ships the real-valued twin
     (`ViT(use_rope_real=True)`) but the builder never passes the flag, and it
     has no learned parameters, so the checkpoint loads identically.
-  - `PositionEmbeddingSine` precomputes its position encodings into a plain
-    `self.cache` dict rather than a buffer, so `nn.Module.to()` left them on
-    the CPU and `_get_img_feats` indexed them with MPS indices.
+  - `nn.Module.to()` moves registered parameters and buffers and nothing else,
+    and SAM 3 parks precomputed caches in plain attributes: a **dict** in
+    `PositionEmbeddingSine.cache` (job `trippy-edit-sam-3`: `_get_img_feats`
+    indexed CPU tensors with MPS indices) and a **tuple** in
+    `TransformerDecoder.compilable_cord_cache` (job `trippy-edit-sam-4`:
+    `decoder.py:380` "found at least two devices, mps:0 and cpu"). Rather than
+    wait for a third container shape, `_move_stray_tensors` walks every
+    module's `__dict__` and moves every tensor at any depth inside dicts,
+    lists, tuples and sets, and `_stray_tensor_devices` re-scans afterwards so
+    the child refuses to start -- naming the attribute -- if anything is still
+    off-device. Checked against the real model: exactly 10 such tensors exist,
+    and all 10 move.
 - **The `torch.autocast(bfloat16)` region round SAM 3 inference is gone, and
   the CPU lift got 6x faster: 9.2 s against 58.8 s** for the same mask (129,712
   mask pixels, 74,007 of 104,218 in-mask points selected on

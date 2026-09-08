@@ -66,6 +66,7 @@ Related docs: docs/EDITOR.md Sec 3 "4. SAM 3 lift (E5)" and Sec 7 (risks);
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import subprocess
@@ -512,6 +513,17 @@ def fake_requested(flag: bool = False) -> bool:
 # --------------------------------------------------------------------------
 
 
+#: `nn.Module.__dict__` keys `.to()` already handles (or that hold no tensors);
+#: everything else a module carries is fair game for `_move_stray_tensors`.
+_MODULE_STATE_ATTRS = frozenset({"_parameters", "_buffers", "_modules"})
+
+#: How deep to look for a tensor inside a module attribute. SAM 3's two known
+#: strays are a dict of tensors and a tuple of tensors, i.e. depth 1; 4 leaves
+#: room for a container of containers without letting a cyclic structure hang
+#: the model load.
+_STRAY_TENSOR_MAX_DEPTH = 4
+
+
 def _install_dynamo_stub() -> None:
     """Pre-seed `torch._dynamo` so `torchvision.ops` imports without triton.
 
@@ -652,48 +664,240 @@ def _install_real_rope() -> bool:
     return True
 
 
-def _move_module_caches(model: Any, device: str) -> int:
-    """Move every module's plain-`dict` tensor cache onto `device`. **MPS only.**
+def _is_on(where: Any, device: str) -> bool:
+    """Whether a tensor's device IS `device`, ignoring the index when unstated.
 
-    `sam3.model.position_encoding.PositionEmbeddingSine` warms a `self.cache`
-    dict at construction time (a `precompute_resolution` optimisation for
-    `torch.compile`), and `forward` returns the cached tensor verbatim when the
-    input's `(H, W)` is a hit. That cache is a plain attribute, not a
-    `register_buffer`, so `nn.Module.to(device)` does not touch it: after the
-    model moves to MPS the visual features are on the GPU while their position
-    encodings are still on the CPU, and `sam3_image.py::_get_img_feats`'s
-    `x[img_ids]` dies with
+    `t.to("mps")` gives a tensor whose device prints as `mps:0`, so a plain
+    string comparison against `"mps"` says "wrong device" about a tensor that is
+    exactly where it was asked to go -- which would make the shims below move
+    everything twice and the check after them fail on a healthy model.
+    """
+    import torch
 
-        RuntimeError: indices should be either on cpu or on the same device as
-        the indexed tensor (cpu)
+    want = torch.device(device)
+    have = torch.device(str(where))
+    if have.type != want.type:
+        return False
+    return want.index is None or have.index == want.index
 
-    (job `trippy-edit-sam-3`, 2026-09-07). This does exactly what `.to()` would
-    have done if the cache had been a buffer -- it moves data and changes no
-    arithmetic. Generic over "any module with a `cache` dict of tensors" rather
-    than hardcoding `PositionEmbeddingSine`, because the trap is the pattern,
-    not the class.
+
+def _move_stray_tensors(model: Any, device: str) -> int:
+    """Move every tensor `nn.Module.to()` leaves behind onto `device`. **MPS only.**
+
+    `.to()` moves exactly two things: registered parameters and registered
+    buffers. Anything else a module happens to hold -- a precomputed cache
+    parked in a plain attribute, a dict, a tuple -- stays where it was built,
+    which on this machine is the CPU. Two of SAM 3's modules do that, and each
+    one cost a queued MPS run before it was found:
+
+    - `sam3.model.position_encoding.PositionEmbeddingSine.cache`, a **dict**
+      of precomputed position encodings warmed at construction. Job
+      `trippy-edit-sam-3` died on it in `sam3_image.py::_get_img_feats` with
+      "indices should be either on cpu or on the same device as the indexed
+      tensor (cpu)".
+    - `sam3.model.decoder.TransformerDecoder.compilable_cord_cache`, a
+      **tuple** `(coords_h, coords_w)` built in `__init__` so the boxRPB cache
+      is warm before `torch.compile` runs. Job `trippy-edit-sam-4` died on it
+      at `decoder.py:380` with "Expected all tensors to be on the same device,
+      but found at least two devices, mps:0 and cpu".
+
+    Rather than chase a third container shape, this walks every module's
+    `__dict__` (minus `_parameters`/`_buffers`/`_modules`, which `.to()`
+    already handled) and moves every tensor it finds, at any depth, inside
+    dicts, lists, tuples and sets. That is precisely what `.to()` would have
+    done had SAM 3 registered them as buffers: it moves data and changes no
+    arithmetic.
+
+    Completeness was checked, not assumed: building the image model and
+    enumerating every tensor reachable from it that is neither a parameter nor
+    a buffer returns exactly ten -- eight `PositionEmbeddingSine.cache`
+    entries and the two `compilable_cord_cache` coordinate vectors -- and this
+    function moves all ten (2026-09-08, `research/trips-metal.md`).
 
     Args:
         model: the built SAM 3 model, already `.to(device)`.
         device: the torch device string.
 
     Returns:
-        How many cached tensors were moved -- reported in `info.json`, because
-        zero on MPS means SAM 3 stopped precomputing and this shim is no longer
-        doing anything.
+        How many tensors were moved -- reported in `info.json`, because zero on
+        MPS means SAM 3 stopped precomputing and this shim is no longer doing
+        anything.
     """
     import torch
 
     moved = 0
+
+    def relocate(value: Any, depth: int) -> tuple[Any, bool]:
+        """Return `value` with every tensor inside it on `device`, and whether
+        anything changed. Immutable containers are rebuilt, not mutated."""
+        nonlocal moved
+        if isinstance(value, torch.Tensor):
+            if _is_on(value.device, device):
+                return value, False
+            moved += 1
+            return value.to(device), True
+        # A cache nested deeper than this does not exist in SAM 3 and the bound
+        # keeps a cyclic structure from hanging the load.
+        if depth >= _STRAY_TENSOR_MAX_DEPTH:
+            return value, False
+        if isinstance(value, dict):
+            changed = False
+            for key in list(value.keys()):
+                item, hit = relocate(value[key], depth + 1)
+                if hit:
+                    value[key] = item
+                    changed = True
+            return value, changed
+        if isinstance(value, list):
+            changed = False
+            for index, item in enumerate(value):
+                moved_item, hit = relocate(item, depth + 1)
+                if hit:
+                    value[index] = moved_item
+                    changed = True
+            return value, changed
+        if isinstance(value, tuple):
+            items = [relocate(item, depth + 1) for item in value]
+            if any(hit for _, hit in items):
+                # A namedtuple takes its fields positionally, a plain tuple an
+                # iterable; `_fields` is the standard way to tell them apart.
+                rebuilt = [item for item, _ in items]
+                if hasattr(value, "_fields"):
+                    return type(value)(*rebuilt), True
+                return type(value)(rebuilt), True
+            return value, False
+        if isinstance(value, set):
+            items = [relocate(item, depth + 1) for item in value]
+            if any(hit for _, hit in items):
+                return {item for item, _ in items}, True
+            return value, False
+        return value, False
+
     for module in model.modules():
-        cache = getattr(module, "cache", None)
-        if not isinstance(cache, dict):
-            continue
-        for key, value in list(cache.items()):
-            if isinstance(value, torch.Tensor) and str(value.device) != str(device):
-                cache[key] = value.to(device)
-                moved += 1
+        for name, value in list(vars(module).items()):
+            if name in _MODULE_STATE_ATTRS:
+                continue
+            replacement, changed = relocate(value, 0)
+            if changed:
+                setattr(module, name, replacement)
     return moved
+
+
+def _stray_tensor_devices(model: Any) -> list[tuple[str, str]]:
+    """Every tensor reachable from `model` that is neither parameter nor buffer.
+
+    The read-only twin of [`_move_stray_tensors`]: it names what is left rather
+    than moving it, so the child can prove after the move that nothing is still
+    on the CPU instead of finding out inside a forward pass six layers down.
+
+    Returns:
+        `(dotted_name, device)` pairs, in traversal order.
+    """
+    import torch
+
+    registered = {id(t) for t in model.parameters()}
+    registered |= {id(t) for t in model.buffers()}
+    out: list[tuple[str, str]] = []
+
+    def walk(value: Any, path: str, depth: int) -> None:
+        if isinstance(value, torch.Tensor):
+            if id(value) not in registered:
+                out.append((path, str(value.device)))
+            return
+        if depth >= _STRAY_TENSOR_MAX_DEPTH:
+            return
+        if isinstance(value, dict):
+            for key, item in value.items():
+                walk(item, f"{path}[{key!r}]", depth + 1)
+        elif isinstance(value, (list, tuple, set)):
+            for index, item in enumerate(value):
+                walk(item, f"{path}[{index}]", depth + 1)
+
+    for name, module in model.named_modules():
+        for attr, value in vars(module).items():
+            if attr in _MODULE_STATE_ATTRS:
+                continue
+            walk(value, f"{name or type(module).__name__}.{attr}", 0)
+    return out
+
+
+class _DeviceAudit:
+    """Record every device-less tensor factory call SAM 3 makes. Diagnostic only.
+
+    A `torch.zeros(...)` with no `device=` lands on the CPU. If the value then
+    meets a model tensor on MPS, the forward pass dies -- that single mistake is
+    walls 3, 4 and 5 of this port. [`_move_stray_tensors`] covers the ones made
+    at construction time; this covers the ones made *during* the forward pass,
+    which no amount of walking the module tree can see.
+
+    It is a `TorchFunctionMode`, so it sees every torch call and costs real time
+    (the ViT alone makes hundreds of thousands). It is therefore opt-in
+    (`--device-audit`) and must never be on for a timing run.
+
+    Each entry is `"<file>:<line> in <func>(): torch.<factory> xN"`, counted, and
+    printed to stderr as well as stored -- stderr survives a crash, `info.json`
+    does not.
+
+    Measured 2026-09-08 on the box-prompt path (synthetic image, random weights,
+    CPU): five sites, every one of them followed immediately by an explicit
+    `.to(device)` in SAM 3's own code, so the forward path is clean.
+    """
+
+    #: Factories whose result lands on the default device when `device=` is absent.
+    FACTORIES = frozenset(
+        {
+            "arange", "as_tensor", "empty", "eye", "full", "linspace", "logspace",
+            "ones", "rand", "randint", "randn", "randperm", "range", "scalar_tensor",
+            "tensor", "zeros",
+        }
+    )
+
+    def __init__(self, repo: str) -> None:
+        self.repo = str(Path(repo).resolve())
+        self.sites: dict[str, int] = {}
+
+    def record(self, func: Any, kwargs: dict[str, Any]) -> None:
+        """Note one torch call if it is a device-less factory made by SAM 3."""
+        import traceback
+
+        if getattr(func, "__name__", "") not in self.FACTORIES:
+            return
+        if kwargs.get("device") is not None:
+            return
+        for frame in reversed(traceback.extract_stack()):
+            if frame.filename.startswith(self.repo):
+                where = (
+                    f"{frame.filename[len(self.repo) + 1:]}:{frame.lineno} "
+                    f"in {frame.name}(): torch.{func.__name__}"
+                )
+                if where not in self.sites:
+                    print(f"device-audit: {where}", file=sys.stderr)
+                self.sites[where] = self.sites.get(where, 0) + 1
+                return
+
+    def report(self) -> list[str]:
+        """The recorded sites, most frequent first, as `"<site> xN"` strings."""
+        return [
+            f"{site} x{count}"
+            for site, count in sorted(self.sites.items(), key=lambda kv: (-kv[1], kv[0]))
+        ]
+
+
+def _device_audit_mode(audit: _DeviceAudit) -> Any:
+    """A `TorchFunctionMode` context manager feeding `audit`. Diagnostic only."""
+    import torch
+    from torch.overrides import TorchFunctionMode
+
+    class Mode(TorchFunctionMode):  # type: ignore[misc]
+        def __torch_function__(
+            self, func: Any, types: Any, args: Any = (), kwargs: Any = None
+        ) -> Any:
+            kwargs = kwargs or {}
+            audit.record(func, kwargs)
+            return func(*args, **kwargs)
+
+    del torch
+    return Mode()
 
 
 def _child_parser() -> argparse.ArgumentParser:
@@ -715,6 +919,10 @@ def _child_parser() -> argparse.ArgumentParser:
     p.add_argument("--point", type=float, nargs=2, default=None, metavar=("U", "V"))
     p.add_argument("--box", type=float, nargs=4, default=None, metavar=("X0", "Y0", "X1", "Y1"))
     p.add_argument("--text", default=None)
+    p.add_argument(
+        "--device-audit", action="store_true",
+        help="record SAM 3's device-less tensor factory calls (slow; never for a timing run)",
+    )
     return p
 
 
@@ -833,14 +1041,28 @@ def _child_main(argv: list[str] | None = None) -> int:
     # weight type (torch.FloatTensor) should be the same" (job
     # `trippy-edit-sam-2`, 2026-09-07). A no-op when device is already cpu.
     model = model.to(args.device)
-    # `.to()` moves parameters and buffers; SAM 3's position encoder keeps its
-    # precomputed encodings in a plain dict, which it does not (see
-    # `_move_module_caches`).
-    moved_caches = _move_module_caches(model, args.device) if args.device == "mps" else 0
+    # `.to()` moves parameters and buffers and nothing else; SAM 3 parks
+    # precomputed caches in a plain dict and a plain tuple, which it therefore
+    # leaves on the CPU (jobs `trippy-edit-sam-3` and `-4`; `_move_stray_tensors`).
+    moved_caches = _move_stray_tensors(model, args.device) if args.device == "mps" else 0
+    # ...and then prove it, here, where the message can name the attribute --
+    # rather than six layers into a forward pass as "found at least two devices".
+    strays = [
+        f"{name} on {where}"
+        for name, where in _stray_tensor_devices(model)
+        if not _is_on(where, args.device)
+    ]
+    if strays:
+        raise RuntimeError(
+            f"{len(strays)} tensor(s) held by SAM 3 modules are not on {args.device} "
+            f"after _move_stray_tensors: {', '.join(strays[:8])}"
+        )
     processor = Sam3Processor(
         model, resolution=args.resolution, device=args.device, confidence_threshold=args.threshold
     )
     t_load = time.time() - t0
+
+    audit = _DeviceAudit(args.repo) if args.device_audit else None
 
     t1 = time.time()
     # No autocast, on either device: `_install_fp32_addmm` above already took
@@ -848,37 +1070,43 @@ def _child_main(argv: list[str] | None = None) -> int:
     # would only reintroduce the mixed dtypes it removed (and, on CPU, the 6x
     # emulation cost). Nothing here is an MPS *fallback* either:
     # PYTORCH_ENABLE_MPS_FALLBACK stays whatever the queue job set it to.
-    with Image.open(args.image) as handle:
-        image = handle.convert("RGB")
-        width, height = image.size
-        state = processor.set_image(image)
+    with contextlib.ExitStack() as stack:
+        if audit is not None:
+            # Diagnostic only, and slow enough to invalidate the timing --
+            # `--device-audit` exists for the NEXT wall, not for the run that
+            # measures seconds per image (see `_DeviceAudit`).
+            stack.enter_context(_device_audit_mode(audit))
+        with Image.open(args.image) as handle:
+            image = handle.convert("RGB")
+            width, height = image.size
+            state = processor.set_image(image)
 
-    if args.kind == "text":
-        state = processor.set_text_prompt(args.text, state)
-    elif args.kind == "box":
-        x0, y0, x1, y1 = args.box
-        cx, cy = (x0 + x1) / 2.0 / width, (y0 + y1) / 2.0 / height
-        bw, bh = abs(x1 - x0) / width, abs(y1 - y0) / height
-        state = processor.add_geometric_prompt([cx, cy, bw, bh], True, state)
-    else:
-        # `Sam3Processor` exposes boxes but not points; the underlying
-        # Prompt does carry them (geometry_encoders.Prompt.append_points,
-        # "points in normalized xy"), and `add_geometric_prompt`'s own
-        # body is exactly this sequence with `append_boxes` instead.
-        u, v = args.point
-        if "language_features" not in state["backbone_out"]:
-            state["backbone_out"].update(
-                model.backbone.forward_text(["visual"], device=args.device)
+        if args.kind == "text":
+            state = processor.set_text_prompt(args.text, state)
+        elif args.kind == "box":
+            x0, y0, x1, y1 = args.box
+            cx, cy = (x0 + x1) / 2.0 / width, (y0 + y1) / 2.0 / height
+            bw, bh = abs(x1 - x0) / width, abs(y1 - y0) / height
+            state = processor.add_geometric_prompt([cx, cy, bw, bh], True, state)
+        else:
+            # `Sam3Processor` exposes boxes but not points; the underlying
+            # Prompt does carry them (geometry_encoders.Prompt.append_points,
+            # "points in normalized xy"), and `add_geometric_prompt`'s own
+            # body is exactly this sequence with `append_boxes` instead.
+            u, v = args.point
+            if "language_features" not in state["backbone_out"]:
+                state["backbone_out"].update(
+                    model.backbone.forward_text(["visual"], device=args.device)
+                )
+            if "geometric_prompt" not in state:
+                state["geometric_prompt"] = model._get_dummy_prompt()
+            points = torch.tensor([u / width, v / height], device=args.device, dtype=torch.float32)
+            state["geometric_prompt"].append_points(
+                points.view(1, 1, 2),
+                torch.ones(1, 1, device=args.device, dtype=torch.long),
+                mask=torch.zeros(1, 1, device=args.device, dtype=torch.bool),
             )
-        if "geometric_prompt" not in state:
-            state["geometric_prompt"] = model._get_dummy_prompt()
-        points = torch.tensor([u / width, v / height], device=args.device, dtype=torch.float32)
-        state["geometric_prompt"].append_points(
-            points.view(1, 1, 2),
-            torch.ones(1, 1, device=args.device, dtype=torch.long),
-            mask=torch.zeros(1, 1, device=args.device, dtype=torch.bool),
-        )
-        state = processor._forward_grounding(state)
+            state = processor._forward_grounding(state)
     t_infer = time.time() - t1
 
     # `masks_logits` is the per-pixel PROBABILITY at the photo's own
@@ -917,6 +1145,7 @@ def _child_main(argv: list[str] | None = None) -> int:
             "fp32_addmm": bool(fp32_addmm),
             "real_rope": bool(real_rope),
             "moved_caches": int(moved_caches),
+            "device_audit": audit.report() if audit is not None else None,
             "resolution": int(args.resolution),
             "threshold": float(args.threshold),
             "mask_threshold": float(args.mask_threshold),
