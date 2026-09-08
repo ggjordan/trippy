@@ -2122,3 +2122,62 @@ the areas I want". Artefacts: `$SPLATS_ROOT/tools/gpu_queue/logs/trippy-viewer-k
 - 2026-09-08T08:35:54Z submitted job trippy-kkv2-1-combined-parity prio 15: bash -c scripts/viewer_parity_check.sh /Users/nzbirdranch/trippy/output/bundles/kkv2-1-combined/bundle
 - 2026-09-08T08:36:22Z submitted job trippy-kkv2-9b-fullres-cont prio 40: bash -c test "$(cat /Users/nzbirdranch/Splats/tools/gpu_queue/done/trippy-kkv2-9-fullres.rc 2>/dev/null)" = 0 || { echo 'previous segment kkv2-9-fullres did not succeed'; exit 3; }; PYTHONPATH=. TRIPPY_OUTPUT=/Users/nzbirdranch/trippy/output /Users/nzbirdranch/trippy/.venv/bin/python -m trippy.cli train --config experiments/EXP-0011-karekare-v2/config_fullres.yaml --resume $(ls -t /Users/nzbirdranch/trippy/output/runs/EXP-0011-karekare-v2/kkv2-9*/checkpoints/checkpoint_latest.pt | head -1) --device mps --max-minutes 720 --report
 - 2026-09-08T08:36:22Z submitted job trippy-kkv2-9c-fullres-cont prio 40: bash -c test "$(cat /Users/nzbirdranch/Splats/tools/gpu_queue/done/trippy-kkv2-9b-fullres-cont.rc 2>/dev/null)" = 0 || { echo 'previous segment kkv2-9b-fullres-cont did not succeed'; exit 3; }; PYTHONPATH=. TRIPPY_OUTPUT=/Users/nzbirdranch/trippy/output /Users/nzbirdranch/trippy/.venv/bin/python -m trippy.cli train --config experiments/EXP-0011-karekare-v2/config_fullres.yaml --resume $(ls -t /Users/nzbirdranch/trippy/output/runs/EXP-0011-karekare-v2/kkv2-9*/checkpoints/checkpoint_latest.pt | head -1) --device mps --max-minutes 720 --report
+- 2026-09-08T08:26:52Z delivered kkv2-1-combined-viewer: Combined bundle: kkv2-1-full-masked TRIPS + kklid_20000 splat, big-tree shade region preset (mix slider demo) (/Users/nzbirdranch/trippy/output/deliver/kkv2-1-combined/OPEN_TRIPS_MAC_kkv2-1-combined.command)
+- **2026-09-08 (feat/combined-bundle) — the combined TRIPS+splat bundle Jordan has wanted from the start.**
+  *Question:* the delivered kkv2-1-full-masked bundle has no Gaussian block ("the mix sliders did
+  nothing" per Jordan's viewer verdict today) -- can one bundle carry BOTH the full-scene TRIPS
+  checkpoint (which fixed the big-tree shade) and the kklid_20000 splat (which is sharp everywhere
+  else), with a preset so the per-region mix visibly works on open? *Finding: the machinery already
+  existed, it just was never re-run.* `trippy.render.bundle.native_blend` (landed with `feat/live-splat`,
+  2026-09-07) already writes `blend.splat_ply` for ANY Gaussian-seeded run, not just hybrids -- every
+  Karekare run qualifies (`point_source.type: gaussian`, `kklid_20000.ply`). The delivered
+  kkv2-1-full-masked bundle (`output/runs/EXP-0011-karekare-v2/kkv2-1-full-masked/bundle`, written
+  2026-09-08 10:20) simply predates being re-exported with that code path: its `bundle.json` has no
+  `blend` key at all. Re-exporting the SAME checkpoint (`checkpoint_best.pt`, epoch 122, deterministic,
+  no training touched) via `trippy export-bundle` fixed it in one CPU-only step, no GPU:
+  `blend.splat_ply = /Users/nzbirdranch/Splats/output/Training-Data/karekare/karekare-lid/kklid_20000.ply`
+  (read live by the viewer's existing `brush-render` path, `blend.channels = []` since this is a plain
+  seed not a trained hybrid gate). 36.7 s wall, peak RSS 5.6 GB (well under the 28 GB `cpu_heavy.sh`
+  gate, so this ran directly, no queue). New bundle: `$TRIPPY_OUTPUT/bundles/kkv2-1-combined/bundle`
+  (7,542,137 TRIPS points, 756 views, `num_channels=4`, no gate). *Alignment, measured (never viewed,
+  numbers only):* sampled 20,000 TRIPS points, matched each to its nearest of the PLY's 8,910,382
+  Gaussian centres (3D nearest-neighbour, `cKDTree`; median 3D distance 0.0057 world units -- training
+  moved points very little, `lr_points 1e-4` over 122 epochs), then projected BOTH the TRIPS point and
+  its matched splat centre through 3 training cameras (views 0/378/755) with the bundle's own `(R, t,
+  fx, fy, cx, cy)`, no distortion (trippy-native views carry none). Per-camera in-frame median pixel
+  offset: view 0 `IMG_3703.jpg` 0.79 px (4,709 pairs in frame), view 378 `IMG_4202.jpg` 0.88 px (2,377
+  pairs), view 755 `IMG_5660.jpg` 3.01 px (432 pairs, an edge-of-capture view with fewer in-frame
+  matches). **Combined median 0.87 px across all 3 cameras (n=7,518), well under the 2 px bar** -- the
+  splat and the TRIPS points are the same coordinate frame, not a fitted-after-the-fact alignment.
+  *Edits.json preset:* `trippy edits shade-find` against the exact 93 measured big-tree shade frames
+  (`$TRIPPY_OUTPUT/scratch/shade_frames.json`'s `big_tree` list, the same 93 named in the
+  2026-09-06 19:30 entry) selected **758,178 points** (10.1% of the cloud) inside the shade audit
+  region at the tool's default thresholds (`lum<0.25 AND conf<0.5`, znear/zfar 0.05/0.5, mode
+  absolute); `EditDocument.update_region` then set it to `op=blend, mix=1.0` (full TRIPS, the brief's
+  convention: 1=TRIPS) and renamed it "Big tree shade (TRIPS)" -- the shade-finder's own default
+  (`op=fade, mix=0.0`, meant for DELETING a shade cloud) is the opposite of what this bundle needs, so
+  it was overridden via the documented `update_region(**changes)` API rather than hand-editing JSON.
+  `EditDocument.validate()` passes against the bundle's own format tag; every `point_ids` entry is
+  `< 7,542,137` (checked directly, not just trusted). Launcher opens at `BlendMode::Mix, mix=0.0` (0 =
+  splat globally, per the viewer's own Blend-panel convention), which the region's own `mix=1.0`
+  overrides on its 758k points regardless -- confirmed from `renderer.rs::compose`'s own comment ("the
+  edit override goes on the TRIPS operand FIRST, so every panel mode below sees the TRIPS frame as
+  Jordan edited it"), not just docs. *Bundle sanity, CPU-only, numbers-only (`trippy bundle-parity
+  --device cpu`, view 0, scale 0.25 -- never opened the PNG):* per-channel mean (0.50, 0.49, 0.44), no
+  saturation, no crushed black, coverage_mean 0.65 -- the combined bundle loads and renders end to end
+  with no NaN/crash. *Not measured:* fps at scale 1.0/0.75 (the viewer needs the GPU, which a training
+  holds; per the brief, skipped rather than run outside the queue). *Verdict:* PASS on every numeric
+  check available without the GPU. `scripts/test.sh` green (1226 pytest / 154+50 trips-viewer +
+  49+4+7+12+4+1 brush-pyramid/brush-unet rust, 0 failed) -- no code was changed, only CLI tools already
+  shipped by `feat/live-splat`/`feat/blend-gate`/E2 (shade-cloud finder) were run against real data; the
+  worktree's `rust/brush-trips` submodule was uninitialised (a worktree setup gap, not a code bug) and
+  `git submodule update --init` fixed it before `cargo test` would even compile. **Gap for the
+  Orchestrator:** no automated bundle-vs-viewer parity number for THIS bundle+edits combination exists
+  yet (`scripts/viewer_parity_check.sh`/`viewer_splat_check.sh` both need the GPU and the splat-check
+  script's public-scene allow-list would refuse a Karekare bundle outright even queued) -- an actual
+  fps/screenshot number needs a `scripts/gpu_submit.sh --prio 15` job once the training frees the GPU;
+  not submitted here per the brief ("do not wait"), left for the Orchestrator to queue if wanted.
+  Artifacts: bundle `$TRIPPY_OUTPUT/bundles/kkv2-1-combined/bundle`, edits
+  `$TRIPPY_OUTPUT/bundles/kkv2-1-combined/edits.json`, launcher
+  `$TRIPPY_OUTPUT/deliver/kkv2-1-combined/OPEN_TRIPS_MAC_kkv2-1-combined.command`, delivered as
+  `kkv2-1-combined-viewer` (Jordan-Review 4-other).

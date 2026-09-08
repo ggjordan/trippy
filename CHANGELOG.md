@@ -2,6 +2,16 @@
 All notable changes to trippy. Format: Keep a Changelog. Versions: semver tags `vX.Y.Z`. Every push also gets a `build-NNNN` tag.
 
 ## [Unreleased]
+### Delivered
+- **Combined TRIPS+splat bundle for the full Karekare-v2 scene** (`kkv2-1-combined-viewer.command`):
+  `kkv2-1-full-masked`'s TRIPS checkpoint re-exported with its Gaussian block (`blend.splat_ply` ->
+  `kklid_20000.ply`, via the `feat/live-splat` export path every Gaussian-seeded run already qualifies
+  for, just not yet re-run for this bundle) plus an `edits.json` preset -- "Big tree shade (TRIPS)"
+  (758,178 points from the shade-cloud finder on the 93 measured big-tree frames, `mix=1.0`) full TRIPS,
+  everything else full splat (`--blend-mode mix --mix 0.0`) -- so the per-region mix is visible on open.
+  Alignment (TRIPS points vs their nearest splat Gaussian, reprojected into 3 training cameras): median
+  0.87 px. No code changed; see `research/trips-metal.md` 2026-09-08 for the full numbers.
+
 ### Added
 - **Lid plane-normal gizmo handle** (`docs/EDITOR.md` Sec 1, Sec 6): a 4th
   handle on a `lid` region, projected along its own `up` instead of a world
