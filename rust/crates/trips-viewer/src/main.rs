@@ -428,6 +428,10 @@ impl Default for Args {
             brush_undo: false,
             move_region: None,
             solo: None,
+            click_auto: false,
+            click_stress: None,
+            place: None,
+            place_op: None,
         }
     }
 }
@@ -515,64 +519,6 @@ fn attach_live_splat(
 }
 
 fn parse_args() -> Result<Args, String> {
-    let mut args = Args {
-        bundle: None,
-        settings: Settings::default(),
-        view: None,
-        mode: ViewMode::Network,
-        exposure: ExposureMode::default(),
-        screenshot: None,
-        warmup: 2,
-        bench: None,
-        bench_brush_anchor: None,
-        camera_yaw_deg: None,
-        free: false,
-        blend: Blend::default(),
-        splat: SplatArgs::default(),
-        render_size: None,
-        splat_bench: None,
-        edit: false,
-        edits: None,
-        save_edits: None,
-        brush_npz_selftest: None,
-        dump_weights: None,
-        dump_shade: None,
-        shade_lum: None,
-        shade_conf: None,
-        shade_znear: None,
-        shade_zfar: None,
-        click: None,
-        dump_click: None,
-        click_radius_px: None,
-        click_colour_tol: None,
-        click_max_radius: None,
-        click_max_points: None,
-        click_auto: false,
-        click_stress: None,
-        place: None,
-        place_op: None,
-        sam_box: None,
-        sam_point: None,
-        sam_views_around: 0,
-        sam_op: trips_viewer::edit::Op::Fade,
-        sam_mix: 0.0,
-        sam_device: "cpu",
-        sam_fake: false,
-        sam_undo: false,
-        brush: None,
-        brush_to: None,
-        brush_radius: None,
-        brush_weight: 1.0,
-        // A painted region that deletes is the one whose effect a screenshot
-        // can see without a splat to blend towards, which is what the proof in
-        // `docs/EDITOR.md` §6 measures.
-        brush_op: trips_viewer::edit::Op::Delete,
-        brush_mix: 0.0,
-        brush_erase: false,
-        brush_undo: false,
-        move_region: None,
-        solo: None,
-    };
     let mut args = Args::default();
     let mut argv = std::env::args().skip(1);
     while let Some(flag) = argv.next() {

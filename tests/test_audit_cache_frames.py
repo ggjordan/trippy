@@ -5,7 +5,7 @@ Related: trippy/eval/audits.py (cached_baseline_audit), docs/RESULTS.md (2026-09
 """
 from __future__ import annotations
 
-import trippy.eval.audits as audits
+from trippy.eval import audits
 
 
 def test_cache_entries_differ_per_frame_list(tmp_path, monkeypatch):
