@@ -2,6 +2,95 @@
 All notable changes to trippy. Format: Keep a Changelog. Versions: semver tags `vX.Y.Z`. Every push also gets a `build-NNNN` tag.
 
 ## [Unreleased]
+### Added
+- **`trippy profile-step`**: stage-by-stage timing of a real `Trainer.train_step` on a real
+  config (`--config`, `--steps`, `--epoch 0,5,50`, `--raster-cap on|off|both`, `--fused-adam`,
+  `--json`). The stages are instrumented in the production code path
+  (`trippy.train.steptimer`, a no-op when no timer is installed), not in a copy of it, so it
+  cannot profile something the trainer does not do. Prints three totals -- UNTIMED (the honest
+  seconds/step), FROZEN (one repeated crop, so every data-dependent tensor shape repeats: the
+  MPS unseen-shape tax at whole-step scale) and TIMED (synchronised per stage) -- a per-stage
+  table with the backward split into loss / tone-map / U-Net / rasteriser, and the step-by-step
+  loss curve that is the parity gate for any change. `--raster-cap both` / `--amp both` sweep
+  the arms from ONE trainer build, snapshotting and restoring everything a step mutates
+  (including the crop RNG) so the arms' loss curves are comparable, and print a comparison
+  table with the speed-up and `max|dloss|` of each arm against the reference. Writes no imagery.
+  See docs/ARCHITECTURE.md "Where a training step's time goes".
+- **`SceneDataset.crop_item` / `frame_size` / `crop_plan`**: a training crop is now gathered on
+  the host against the memory-mapped cache file and only the `crop x crop` window is uploaded,
+  instead of moving the whole undistorted frame (2.3 MB RGB + 3.0 MB float32 mask at 1008x756)
+  to the GPU so a 384-px window of it could be gathered there. Value-for-value identical to
+  `crop(dataset[i], ...)`, including the padding and person-mask paths.
+- **`optimizer_fused` (TrainConfig, default false)**: use torch's fused Adam kernel. torch never
+  selects it by itself on MPS -- `_default_to_fused_or_foreach` only sets `fused` when asked and
+  MPS is not in the *foreach* device list -- so the default path drives ~7 kernels and one
+  full-size temporary per parameter tensor per step. A flag rather than an unconditional change
+  because the intermediate rounding is not guaranteed identical (it is bit-identical over 8
+  steps on CPU).
+- **`amp` (TrainConfig, default false)**: run the U-Net forward and the perceptual loss's frozen
+  backbone under `torch.autocast(float16)` with float32 master weights and a `GradScaler`. The
+  rasteriser, the tone mapper, the L1/SSIM terms and every `evaluate()` call stay float32, so a
+  run's held-out numbers do not depend on the precision it trained in. `Trainer.set_amp` is a
+  runtime knob, so `trippy profile-step --amp both` gets the cost *and* the loss curve of both
+  arms from one trainer build.
+
+### Measured
+- **The exactly-equivalent changes below are a WASH, measured** (job `trippy-train-perf-ab`): one
+  script run against an unmodified `main` worktree and this branch, alternating, twice, in one
+  queue slot gives `main` 116.1 / 117.0 ms and this branch 117.5 / 118.9 ms -- **1.2-1.6% slower**.
+  They are kept because they are provably equivalent and reduce real work per operation, not
+  because they made the step faster; do not describe them as an optimisation. Parity IS rigorous:
+  `max|dloss|` between the checkouts (2.3e-04, 6.2e-04) is the same size as between two runs of
+  *identical* code (4.7e-04, 3.8e-04).
+- **The host-side crop is the culprit, measured** (job `trippy-train-perf-isolate`, seven arms with
+  `main` first and last): turning `use_fast_crop` off is faster in both the median and the min, in
+  two separate jobs, so **`Trainer.use_fast_crop` now defaults to False**. Cutting host->device
+  traffic 5x does not pay on unified memory. The path is kept because it should tip the other way
+  at width 2016 (`config_fullres.yaml`), where the frame it avoids uploading is ~4x larger.
+  `main` drifted 117.1 -> 112.0 ms across that job, so the remaining two knobs were settled by an
+  8-arm sweep inside one process from one snapshot (job `trippy-train-perf-knobs`): paired effects
+  **`use_fast_crop` +5.3 ms** (a real cost, third confirmation), **`raster_cap_to_max_frags`
+  -0.6 ms** (not established -- the earlier "1.05x" was one two-arm comparison and must not be
+  quoted as its value; kept on because it is byte-identical and strictly less traffic), and
+  **`sanitise_conditional` +0.3 ms** (neutral). All eight arms are exactly-equivalent paths, so
+  their `max|dloss|` spread of 3.7e-04 to 1.6e-03 over 30 steps *is* the noise floor at that step
+  count. With the corrected default the branch is ~2 ms (~1.8%) faster than `main` -- at the edge
+  of what this machine resolves.
+- **Where a Karekare-v2 training step's 129 ms goes** (job `trippy-train-perf-baseline`, epoch 50,
+  7.5M points, crop 384, `mode: broadcast`): rasteriser 68 ms (52%), perceptual VGG loss 36 ms
+  (27%), Adam 10.5 ms (8%), dataset crop 10.7 ms (8%), U-Net 6.6 ms (5%). The cull keeps **5.1%**
+  of the points; `raster_project_cull` spends 14 ms to do it. Epoch matters: 78.4 ms with the locks
+  on and no perceptual loss, 129.2 ms in the steady state. Full tables in docs/ARCHITECTURE.md and
+  research/trips-metal.md, including the ceiling argument for why **2x at exact parity is not
+  available on this step** (36% of it is the objective and the update rule).
+- **The MPS unseen-shape tax does not survive at step scale**: `FROZEN/UNTIMED` = 1.08 / 0.99 /
+  0.92 at epochs 0 / 5 / 50, even though a single elementwise kernel still measures 7.88x
+  cold-vs-warm. Padding fragment buffers to bucketed sizes is therefore **not** worth doing.
+- **float16 (`amp`) and MPS's fused Adam both measured slower** and stay off: 143.4 / 151.1 ms
+  (fp16) and 144.8 ms (fused) against 131.4 ms. fp16 also moves the 30-step loss curve by 1.5e-01.
+  The U-Net is only 5% of the step, so there is almost nothing for mixed precision to speed up.
+
+### Changed
+- **The MPS rasteriser drops uncompositable fragments** (`render_pyramid(cap_to_max_frags=True)`,
+  the default on MPS): after the sort, every fragment past a layer-pixel's 16-deep list is
+  dropped. `blend_fwd` checks `used >= MAX_FRAGS` before consuming a fragment, so those are
+  provably never read -- at a 384-px `broadcast` crop that is ~24M sorted fragments down to at
+  most `grid.total * 16` = 3.1M reaching the permutation gathers, both Metal kernels, and the
+  backward's per-fragment `d_feat` and its `index_add_` onto points. Byte-identical on MPS
+  (`tests/test_raster_cap_metal.py`); `aux["num_fragments"]` and `aux["fragments_per_layer"]`
+  still report the pre-cap list. The CPU float64 reference deliberately keeps the uncapped list,
+  because its transmittance comes from a global prefix sum whose last bits move when the list
+  gets shorter.
+- **Cheaper hot path, same numbers**: `project_points` inlines `project_pinhole` on the safe
+  depth (no `(N, 3)` `cat`, no `(N,)` `clone`); `_emit_fragments_vectorised` takes one
+  transpose-copy of the `nonzero` result instead of three stride-3 gathers;
+  `CameraResponseNet.forward` folds the channel axis into the batch axis for a single
+  `grid_sample` instead of one per channel plus three in-place slice writes;
+  `Trainer._sanitise_gradients` drops one full pass over all ~67M gradient elements and skips
+  the `nan_to_num_` write pass entirely on the (overwhelmingly common) steps where no gradient
+  is non-finite. Each is pinned against a literal re-implementation of the code it replaced in
+  `tests/test_train_step_perf.py`.
+
 ### Delivered
 - **Combined TRIPS+splat bundle for the full Karekare-v2 scene** (`kkv2-1-combined-viewer.command`):
   `kkv2-1-full-masked`'s TRIPS checkpoint re-exported with its Gaussian block (`blend.splat_ply` ->

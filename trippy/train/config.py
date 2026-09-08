@@ -205,6 +205,26 @@ class TrainConfig:
     lr_response: float = TRAIN_DEFAULT_LR_RESPONSE
     lr_decay_factor: float = TRAIN_LR_DECAY_FACTOR
     lr_decay_patience: int = TRAIN_LR_DECAY_PATIENCE
+    # Use torch's FUSED Adam kernel instead of the single-tensor Python loop.
+    # torch's own defaults never pick it on MPS: `_default_to_fused_or_foreach`
+    # only turns `fused` on when the caller asks (`use_fused`), and MPS is not in
+    # the *foreach* device list at all -- so an unmodified run drives ~7 separate
+    # kernels and one full-size temporary (`exp_avg_sq.sqrt()`) per parameter
+    # tensor per step. With 7.5M points that temporary alone is 30-120 MB a
+    # tensor. The fused kernel does the same Adam update in one pass. It is the
+    # same algorithm, but the intermediate rounding is not guaranteed identical,
+    # so this is a flag rather than an unconditional change (AGENTS.md: flags for
+    # anything that changes numerics); `trippy profile-step --fused-adam` measures
+    # the step cost and the 30-step loss curve side by side with it off.
+    optimizer_fused: bool = False
+    # Mixed precision: run the U-Net and the perceptual (VGG) loss under
+    # `torch.autocast(float16)` with float32 master weights and a `GradScaler`.
+    # The rasteriser, the tone mapper, the metric losses and every `evaluate()`
+    # call stay float32, so held-out numbers remain comparable across runs.
+    # OFF by default and a flag rather than a default because it changes numerics
+    # (AGENTS.md); the gate for turning it on for a given run is the 30-step loss
+    # curve `trippy profile-step` records with and without it.
+    amp: bool = False
 
     # --- losses (trippy.net.losses.LossWeights defaults, reused directly) ---
     loss_vgg: float = LOSS_DEFAULT_WEIGHT_VGG

@@ -337,6 +337,337 @@ Two more MPS numbers from the same job, both load-bearing for the defaults:
   fragments; the `"two_pass"` fallback is **36.5 ms**. The int64 key is not the
   problem it was assumed to be (docs/LIMITATIONS.md).
 
+## Where a training step's time goes (perf/train-step, 2026-09-08)
+
+`trippy profile-step --config <cfg> --steps 30 [--epoch 0,5,50] --device mps`
+answers this with numbers instead of guesses. It runs **real**
+`Trainer.train_step` calls -- the stages are instrumented in the production
+code path (`trippy.train.steptimer`), never in a copy of it -- and prints
+three totals plus a per-stage table:
+
+- **UNTIMED** -- seconds per step with no synchronisation the trainer would
+  not do itself. This is the number a run's minutes-per-epoch comes from.
+- **FROZEN** -- the same step with one crop repeated, so every data-dependent
+  tensor shape repeats too. `UNTIMED / FROZEN` is the MPS unseen-shape tax at
+  whole-step scale (see "Emission cost" above for why that tax is a real
+  quantity here). It is a diagnostic, not an achievable speed: a real run
+  never repeats a crop.
+- **TIMED** -- the same steps with `torch.mps.synchronize()` between stages.
+  Larger than UNTIMED by construction; that is the price of attributing the
+  time, and it is why both numbers are always printed.
+
+The backward is split by hooking the three tensors that separate its parts
+(`pred` -> loss backward done, `net_out` -> tone mapper done, `layers[0]` ->
+U-Net done; whatever is left is the rasteriser's).
+
+`--raster-cap both` and `--amp both` sweep those knobs from one trainer build
+(building one on Karekare-v2 reads a 2.1 GB PLY), snapshotting and restoring
+everything a step mutates -- model, camera, points, poses, background,
+optimiser state and **the crop RNG** -- so each arm starts from the same
+place and the arms' step-by-step loss curves are directly comparable. The
+printed comparison table carries each arm's speed-up and its `max|dloss|`
+against the reference arm: `0.000e+00` there is the "changed no number"
+claim, measured rather than asserted.
+
+**The epoch matters.** A Karekare-v2 step at epoch 0 is not the step the run
+spends its life in: `Trainer._apply_locks` frees `xyz`/`size` at epoch 5 and
+the pose deltas at epoch 50, and `fit()` switches the perceptual (VGG/LPIPS)
+loss term on at `vgg_start_epoch` (epoch 50 for a 300-epoch run). `--epoch`
+selects the regime and defaults to the steady state, where all three are on.
+
+### What is *not* costing what it looks like it costs
+
+- **Crop-aware culling is already in place.** `train_step` renders with the
+  crop's own adjusted intrinsics and `image_hw = (crop, crop)` (the
+  "K-adjust" strategy, `tests/test_train_crop_equivalence.py`), so
+  `cull_points` culls against the 384-px grid, not the 1008-px frame. Only
+  the projection itself -- one `(N, 3) @ (3, 3)` and a handful of
+  element-wise passes -- runs over all 7.5M points.
+- **Caching per-image projections is dead on arrival.** `xyz` and `size`
+  become trainable at `lock_structure_epochs` (epoch 5 of 300) and move on
+  every step from then on, so a cached visible-index set would be stale for
+  295 of 300 epochs. Only the pose is locked for 50.
+
+### Measured: a Karekare-v2 step at the steady state (job `trippy-train-perf-baseline`)
+
+`config.yaml`, width 1008, crop 384, `mode: broadcast`, 5 layers, **7,542,137
+points**, 664 steps/epoch. Per step the cull keeps **386k points (5.1%)**, which
+emit **5.98M fragments**, of which at most **1.41M** can ever be composited.
+Milliseconds, medians of 30 steps, `TIMED` phase (per-stage synchronisation, so
+the total is ~5% above the honest 129.2 ms):
+
+| stage | epoch 0 (locks on, no VGG) | epoch 50 (steady state) | share |
+|---|---:|---:|---:|
+| `data` | 13.34 | 10.75 | 7.9% |
+| `raster_project_cull` | 14.02 | 14.09 | 10.3% |
+| `raster_emit` | 15.89 | 15.22 | 11.2% |
+| `raster_sort` | 4.67 | 4.67 | 3.4% |
+| `raster_segment` | 1.48 | 1.32 | 1.0% |
+| `raster_gather` | 0.60 | 0.59 | 0.4% |
+| `raster_blend_fwd` | 0.54 | 0.53 | 0.4% |
+| `raster_split` | 0.31 | 0.30 | 0.2% |
+| `unet_fwd` | 1.96 | 1.90 | 1.4% |
+| `tone_map` | 1.07 | 1.04 | 0.8% |
+| `loss` (L1 + SSIM [+ VGG]) | 6.04 | **21.25** | 15.6% |
+| `backward` | 9.30 | **52.15** | 38.3% |
+| &nbsp;&nbsp;`bwd_loss` | 1.30 | 14.75 | 10.8% |
+| &nbsp;&nbsp;`bwd_tone_map` | 1.14 | 1.26 | 0.9% |
+| &nbsp;&nbsp;`bwd_unet` | 4.62 | 4.67 | 3.4% |
+| &nbsp;&nbsp;`bwd_raster` | 2.29 | **31.54** | 23.1% |
+| `optimizer` | 7.26 | 10.54 | 7.7% |
+| `metrics_sync` | 1.30 | 1.27 | 0.9% |
+| **whole step (UNTIMED)** | **78.4** | **129.2** | |
+| **min/epoch** | 0.87 | **1.43** | |
+
+Three things this settles.
+
+1. **The rasteriser is half the step** (36.7 ms forward + 31.5 ms backward =
+   68 ms of 136), the perceptual loss is a quarter (21.3 + 14.8 = 36 ms), and
+   **the U-Net is 5%** (1.9 + 4.7 = 6.6 ms). Any work aimed at the network
+   itself -- fusing its two gated convolutions into one, for instance -- is
+   chasing 5% of the step.
+2. **The epoch is worth 65%.** Epoch 0 (pose deltas and `xyz`/`size` locked, no
+   perceptual loss) is 78.4 ms; the steady state is 129.2 ms. Freeing the
+   structure adds ~26 ms of geometry backward; switching the VGG term on adds
+   ~25 ms across `loss` and `bwd_loss`.
+3. **`raster_project_cull` costs 14 ms to keep 5.1% of its input.** Every one of
+   the 7.5M points pays two divisions and a `safe_depth` so that 386k of them
+   can be emitted. That is the largest remaining exactly-equivalent saving in
+   the step, and it is not yet taken.
+
+### Measured: the MPS unseen-shape tax is NOT a factor at step scale
+
+`FROZEN / UNTIMED` -- one repeated crop, so every data-dependent tensor shape
+repeats -- came out **1.08x, 0.99x, 0.92x** at epochs 0, 5 and 50. The
+per-shape penalty is still real for an individual elementwise kernel (the
+shape probe measures `floor(x * 0.5)` at **7.88x** cold-vs-warm) but `nonzero`,
+`index_select`, `argsort` and `sum` all measure **1.0x**, and at whole-step
+scale it disappears into the noise. **Padding the fragment buffers to bucketed
+sizes would buy nothing** and is not worth its complexity.
+
+### Measured: the exactly-equivalent changes are a WASH (job `trippy-train-perf-ab`)
+
+The honest headline, and it is not the one this section was written expecting.
+One script (`$TRIPPY_OUTPUT/profile/time_train_step.py`, an artefact rather than
+shipped code, so the *same* file runs against two checkouts) was pointed at an
+unmodified `main` worktree and at this branch, alternating, twice, in one queue
+slot on an otherwise idle GPU:
+
+| pass | `main` | this branch |
+|---|---:|---:|
+| 1 | **116.1 ms** | 117.5 ms |
+| 2 | **117.0 ms** | 118.9 ms |
+
+**This branch is 1.2-1.6% slower than `main`.** The per-op reasoning in the
+table below is sound -- each change genuinely issues fewer or smaller kernels --
+and it still nets to nothing, because on this step the wins are 1-2 ms each and
+at least two of the changes plausibly give it back:
+
+- `Trainer._sanitise_gradients` now reads its non-finite count back to the host
+  to decide whether any `nan_to_num_` is needed. That is a **mid-step queue
+  drain** between the backward and `optimizer.step()`, and it buys a write pass
+  the GPU would have done asynchronously.
+- `SceneDataset.crop_item` moves the nearest-neighbour gather from the device to
+  a single-threaded numpy fancy-index over a memory-mapped file. It cuts
+  host->device traffic 5x, but on unified memory that traffic was never the
+  expensive part.
+
+Both were then measured (job `trippy-train-perf-isolate`, seven arms with
+`main` run first and last to bound drift). **One suspicion was right and one
+was wrong**, and the job also showed why one-process-per-arm cannot settle
+this:
+
+| arm | median ms | min ms | vs drift-adjusted `main` |
+|---|---:|---:|---:|
+| `main` (first) | 117.1 | 111.6 | — |
+| branch, defaults | 117.6 | 110.8 | +1.4 |
+| branch, **`use_fast_crop=0`** | **113.3** | **106.4** | **-2.1** |
+| branch, `sanitise_conditional=0` | 122.7 | 111.5 | +8.2 |
+| branch, **both off** | **110.6** | **105.8** | **-3.1** |
+| branch, `raster_cap=0` | 123.8 | 110.1 | +10.9 |
+| `main` (last) | 112.0 | 108.3 | — |
+
+`main` itself drifted **117.1 -> 112.0 ms** across the job, so **effects below
+~5 ms are not resolved by this design** -- and indeed the +8.2 and +10.9 rows
+are contradicted by their own `min` columns (111.5 and 110.1, both level with
+`main`), i.e. they caught transient interference, not a real cost.
+
+The one signal that survives in *both* statistics and in *both* jobs is
+`use_fast_crop`: turning the host-side crop **off** is faster.
+`Trainer.use_fast_crop` therefore now **defaults to False**. Cutting
+host->device traffic 5x does not pay on unified memory, and the
+single-threaded numpy fancy-index that replaces the device gather costs more
+than it saves. The code path is kept rather than deleted because the balance
+should tip the other way at width 2016 / crop 512 (`config_fullres.yaml`),
+where the frame it avoids uploading is ~4x larger -- re-measure there.
+
+### Measured, finally: all three knobs, 8 arms in one process (`trippy-train-perf-knobs`)
+
+Every arm restored to the same snapshot, so these are paired differences rather
+than separate runs. Epoch 50, medians of 30 steps:
+
+| cap | fast crop | readback | ms/step |
+|---|---|---|---:|
+| off | off | off | 131.7 |
+| off | off | **on** | 129.1 |
+| off | **on** | off | *158.2 (discarded -- its `frozen` phase came out 15 ms **faster** than its untimed one, so the arm caught interference)* |
+| off | **on** | **on** | 132.3 |
+| **on** | off | off | **127.0** |
+| **on** | off | **on** | 129.2 |
+| **on** | **on** | off | 133.7 |
+| **on** | **on** | **on** | 135.1 |
+
+Paired main effects over the usable pairs:
+
+| knob turned on | effect | verdict |
+|---|---:|---|
+| `use_fast_crop` | **+5.3 ms** | **a real cost.** Third independent confirmation; default flipped to False. |
+| `raster_cap_to_max_frags` | -0.6 ms | **not established.** The pairs are -4.7, +0.1, +2.8; the earlier two-arm sweep said -6.1. Somewhere between a small win and nothing. |
+| `sanitise_conditional` | +0.3 ms | **neutral.** The mid-step readback I suspected costs nothing measurable. |
+
+The cap stays on: it is byte-identical, it strictly reduces memory traffic, and
+the two cleanest measurements favour it -- but **the earlier "1.05x" was one
+two-arm comparison and should not be quoted as its value.**
+
+All eight arms are exactly-equivalent code paths, so their spread in
+`max|dloss|` -- **3.7e-04 to 1.6e-03 over 30 steps** -- *is* the noise floor at
+that step count. That retro-explains the 1.8e-03 on the cap row in the flags
+table below, which is therefore not evidence of a numerics change either.
+
+**With `use_fast_crop` at its corrected default the branch comes out ~2 ms
+(~1.8%) faster than `main`** (isolate job: 113.3 ms against a drift-adjusted
+115.4). That is at the edge of what this machine can resolve, and it is not a
+speed-up worth the name. Treat this branch's value as the measurement harness,
+the ruled-out hypotheses, and one regression found and switched off.
+
+The parity claim, by contrast, is now rigorous. Comparing the two checkouts'
+step-by-step loss curves is only meaningful against the machine's own
+run-to-run spread, so the job measured both:
+
+| comparison | `max\|dloss\|` over 24 steps |
+|---|---:|
+| `main` vs `main` (identical code, twice) | 4.65e-04 |
+| branch vs branch (identical code, twice) | 3.84e-04 |
+| **`main` vs branch, pass 1** | **2.30e-04** |
+| **`main` vs branch, pass 2** | **6.19e-04** |
+
+The between-checkout difference is the same size as the same-code-twice
+difference. The changes move nothing the machine does not already move by
+itself (MPS's float `index_add_` is not run-to-run deterministic -- see the
+fragment-cap test).
+
+### Changes that are exactly equivalent (default on)
+
+Each row states what the change removes **per operation**. Read it together
+with the measurement above: per-operation savings of this size did not add up
+to a faster step, and the right column is not a claim that they did.
+
+| change | what it removes |
+|---|---|
+| `render_pyramid(cap_to_max_frags=True)` on MPS | Every fragment past a layer-pixel's 16-deep list, right after the sort. `blend_fwd` checks `used >= MAX_FRAGS` *before* consuming a fragment, so those are provably never read. At Karekare-v2's 384-px `broadcast` crop that is a measured 5.98M sorted fragments down to 1.41M reaching the five permutation gathers, both kernels, and -- the expensive one -- the backward's per-fragment `d_feat` and its `index_add_` onto points. Byte-identical on MPS (`tests/test_raster_cap_metal.py`, GPU marker). |
+| `SceneDataset.crop_item` | The per-step upload of a whole undistorted frame (2.3 MB of RGB + a 3.0 MB float32 person mask at 1008x756) so that a 384-px window of it could be gathered on the device. The gather now runs on the host against the memory-mapped cache file and only ~1 MB moves. Value-for-value identical (`tests/test_scene_dataset.py`). |
+| `project_points` inlining `project_pinhole` | An `(N, 3)` `torch.cat` and an `(N,)` `clone` per render -- ~90 MB of copies at 7.5M points -- and it keeps `u`/`v` contiguous instead of strided columns of a cat'ed buffer. Forward bit-identical; gradients agree to float64 rounding (the same terms are summed in a different order). |
+| `_emit_fragments_vectorised`'s single transpose-copy | Three separate stride-3 gathers of the `(F, 3)` `nonzero` result, each of which materialises a multi-million-element strided read on MPS. |
+| `CameraResponseNet.forward` folding channels into the batch | Two of three `grid_sample` launches and the three in-place slice writes into a `torch.ones_like(image)`, each a full-tensor copy on MPS. Bit-identical. |
+| `Trainer._sanitise_gradients` | One full pass over all ~67M gradient elements (the `~` of `isfinite`), and -- on any step where nothing is non-finite, i.e. almost all of them -- the `nan_to_num_` read-modify-write pass as well. |
+
+### Changes that are flags, because they touch numerics
+
+- `optimizer_fused: true` -- torch's fused Adam kernel. torch will **never**
+  pick it by itself on MPS: `_default_to_fused_or_foreach` only sets `fused`
+  when the caller asks for it, and MPS is not in the *foreach* device list at
+  all, so the default path drives ~7 kernels and one full-size temporary
+  (`exp_avg_sq.sqrt()`) per parameter tensor per step. Same algorithm, no
+  guarantee about intermediate rounding -- bit-identical over 8 steps on CPU
+  (`tests/test_train_step_perf.py`), and the MPS loss curve is compared over
+  30 steps in `research/trips-metal.md`.
+- `amp: true` -- the U-Net forward and the perceptual loss's frozen backbone
+  under `torch.autocast(float16)`, with float32 master weights (autocast casts
+  per operation, never the parameters) and a `GradScaler`. The scope is
+  deliberately narrow: the rasteriser keeps its float32 contract, the tone
+  mapper and the L1/SSIM terms stay float32, and **every `evaluate()` call is
+  float32 unconditionally** (`_render` gates autocast on `self.net.training`),
+  so a run's held-out numbers never depend on the precision it trained in.
+  `Trainer.set_amp` makes it a runtime knob, so `trippy profile-step
+  --amp both` measures both arms -- cost *and* loss curve -- from one trainer
+  build.
+
+**Both flags measured NEGATIVE on this machine** (job `trippy-train-perf-sweep`,
+epoch 50, medians of 30 steps, all arms in one process). The cap row's 1.05x is
+a **single two-arm comparison and was later contradicted**: the 8-arm sweep
+above puts the cap's paired effect at -0.6 ms. Read that row as "fp16 and fused
+Adam lost to a reference that was itself within noise of the cap arm", not as
+the cap's value:
+
+| arm | ms/step | vs reference | `max\|dloss\|` over 30 steps |
+|---|---:|---:|---:|
+| cap off, fp32, unfused (reference) | 137.5 | 1.00x | 0 |
+| cap **on**, fp32, unfused | **131.4** | **1.05x** | 1.8e-03 |
+| cap off, **fp16**, unfused | 143.4 | 0.96x | 1.5e-01 |
+| cap on, **fp16**, unfused | 151.1 | 0.91x | 1.5e-01 |
+| cap on, fp32, **fused Adam** | 144.8 | 0.91x | -- |
+
+float16 is *slower* here and moves the loss by 1.5e-01, two orders past the
+1e-03 bar -- the U-Net is only 5% of the step, so there is almost nothing for
+it to speed up, and the casts cost more than they save. MPS's fused Adam
+kernel is likewise slower than the unfused path at these tensor sizes. Neither
+is a torch bug to work around; both are simply the wrong tool for this step's
+shape, and the flags are kept only so the measurement does not have to be
+redone from scratch on different hardware.
+
+
+### The ceiling: why 2x at exact parity is not available on this step
+
+At the steady state the 129 ms step is, in round numbers:
+
+| block | ms | reducible at exact parity? |
+|---|---:|---|
+| rasteriser fwd + bwd | 68 | partly -- see below |
+| perceptual (VGG) loss fwd + bwd | 36 | **no**: it *is* the objective |
+| optimiser (Adam over ~67M elements) | 10.5 | **no**: same update rule, and MPS's fused kernel measured slower |
+| dataset crop + upload | 10.7 | a little; already ~5x smaller than it was |
+| U-Net fwd + bwd | 6.6 | 5% of the step; not worth touching |
+
+Two of those five blocks -- 47 ms, 36% of the step -- are the training objective
+and the update rule. They cannot shrink without changing what the run computes.
+That alone caps an exact-parity speed-up at **2.8x**, and only if everything
+else went to zero.
+
+Inside the rasteriser the remaining fat is concentrated and known:
+
+- **`raster_project_cull`, 14 ms, keeps 5.1% of its input.** All 7.5M points
+  pay `safe_depth` plus two divisions so that 386k can be emitted. The cull
+  predicate can be rewritten division-free by multiplying each inequality by
+  the (positive) depth, which would let the divisions run on the 386k
+  survivors instead -- and, more valuable, would leave `world_to_cam` as the
+  *only* differentiable operation over all N, collapsing most of the geometry
+  backward. **The catch, which the micro-benchmarks make explicit, is that
+  these kernels are memory-bound: cost tracks the number of `torch` ops over
+  N, not the arithmetic in them.** The division-free predicate needs ~24 such
+  ops where the current path needs ~32, so the forward saving is ~25% of 14 ms,
+  not 90%. The backward saving is the larger half. Estimated total 12-15 ms,
+  i.e. ~10% of the step, for a change to `emit_fragments`' entry contract.
+  Not taken in this pass; this paragraph is the brief for taking it.
+- **`raster_emit`, 15 ms, and its share of `bwd_raster`.** Emission is already
+  vectorised and the fragment count (5.98M from 386k points, 15.5 per point in
+  `mode: broadcast`) is what the mode asks for.
+
+Adding the two together: even a *perfect* projection change plus the fragment
+cap already in place would land near **110 ms, i.e. ~1.2x**, not 2x.
+
+**The 2x levers that exist are all non-parity**, and are recorded here rather
+than in the bin (AGENTS.md section 7):
+
+- `mode: trips` instead of `broadcast` emits 2.7x fewer fragments for the same
+  points (9.02M vs 24.61M on kk-coherent) and measured 1.1x a broadcast step
+  after the vectorised-emission fix. EXP-0011 chose `broadcast` to keep the
+  comparison one-variable, not because it is cheaper.
+- A smaller crop, or fewer crops per epoch. Per-step cost is dominated by
+  blocks that scale with the crop (loss, emission) plus blocks that scale with
+  the point count (projection, optimiser), so `crop` is the direct knob.
+- Fewer points. 7.5M is the Gaussian cloud at `min_opacity: 0.05`; the
+  optimiser alone spends 10.5 ms/step on the ~67M parameters they carry.
+
 ## Core principle: No atomics anywhere — a deliberate redesign, not a port
 
 **TRIPS uses `atomicAdd` extensively** — for per-pixel list counting and slot allocation in `CountTiled`/`CollectTiled2`, and for every gradient reduction in `RenderBackward.cu`. We do **not**, by design: 64-bit atomics do not compile in Metal via `torch.mps.compile_shader`, so the atomic list-building step is replaced by a global sort. Nothing below describes TRIPS's own algorithm; TRIPS's fragment counts and list caps do not carry over to an atomic-free formulation without re-deriving them (docs/TRIPS_REFERENCE.md §10.3).

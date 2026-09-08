@@ -1701,6 +1701,72 @@ def _cmd_distill(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_profile_step(args: argparse.Namespace) -> int:
+    """Time one training step stage by stage on a real config (see trippy.train.profile_step)."""
+    from trippy.train import profile_step as profile_mod
+
+    cfg = TrainConfig.load_yaml(args.config)
+    if args.device is not None:
+        cfg.device = args.device
+    if args.fused_adam:
+        cfg.optimizer_fused = True
+    if args.run_dir is not None:
+        cfg.run_dir = args.run_dir
+    else:
+        # Never write a profile's metrics.jsonl/log.txt into a real run's directory:
+        # `Trainer` appends to both, and a profiling row in a 300-epoch run's metrics
+        # would corrupt the leaderboard's step accounting.
+        settings = load_settings()
+        cfg.run_dir = str(settings.trippy_output / "profile" / f"profile-step-{Path(args.config).parent.name}")
+    # One Trainer for every requested regime: building it on Karekare-v2 reads a
+    # 2.1 GB PLY and computes 7.5M kNN sizes, which would otherwise dominate the job.
+    epochs: list[int | None]
+    if args.epoch is None:
+        epochs = [None]
+    else:
+        epochs = [int(part) for part in str(args.epoch).split(",") if part.strip() != ""]
+    trainer = Trainer(cfg)
+    # `--raster-cap both` measures the same regime with and without the post-sort
+    # fragment cap, in one trainer build: that pair IS the before/after table.
+    sweep = {"on": [True], "off": [False], "both": [False, True]}
+    caps = sweep[args.raster_cap]
+    def _axis(value: str | None) -> list[bool | None]:
+        return [None] if value is None else list(sweep[value])
+
+    amps = _axis(args.amp)
+    crops = _axis(args.fast_crop)
+    syncs = _axis(args.sanitise_sync)
+    results = []
+    for which in epochs:
+        for cap in caps:
+            for amp in amps:
+                for crop_knob in crops:
+                    for sync in syncs:
+                        result = profile_mod.profile_step(
+                            cfg,
+                            steps=args.steps,
+                            warmup=args.warmup,
+                            epoch=which,
+                            trainer=trainer,
+                            raster_cap=cap,
+                            amp=amp,
+                            fast_crop=crop_knob,
+                            sanitise_sync=sync,
+                        )
+                        results.append(result)
+                        print(profile_mod.format_table(result))
+                        print()
+    comparison = profile_mod.format_comparison(results)
+    if comparison:
+        print(comparison)
+        print()
+    if args.json:
+        payload = results[0] if len(results) == 1 else {"runs": results}
+        path = profile_mod.write_json(payload, args.json)
+        print(f"profile-step: wrote {path}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="trippy")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1750,6 +1816,71 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     train.set_defaults(func=_cmd_train)
+
+    profile_step_p = sub.add_parser(
+        "profile-step",
+        help="time one training step stage by stage on a real config (no eval, no checkpoint)",
+    )
+    profile_step_p.add_argument("--config", required=True, help="path to a TrainConfig YAML file")
+    profile_step_p.add_argument("--steps", type=int, default=30, help="timed steps per phase (default 30)")
+    profile_step_p.add_argument(
+        "--warmup", type=int, default=3, help="untimed steps before each phase (default 3)"
+    )
+    profile_step_p.add_argument(
+        "--epoch",
+        default=None,
+        help=(
+            "profile the step as it is at this epoch (locks released, perceptual loss on/off); "
+            "comma-separated for several regimes in one trainer build (e.g. '0,50'); default is "
+            "the run's steady state, i.e. max(lock_cameras, lock_structure, vgg_start)"
+        ),
+    )
+    profile_step_p.add_argument(
+        "--raster-cap",
+        choices=["on", "off", "both"],
+        default="on",
+        help=(
+            "post-sort fragment cap (Trainer.raster_cap_to_max_frags): 'on' (the training "
+            "default), 'off' (the pre-perf/train-step rasteriser), or 'both' for the "
+            "before/after pair in one trainer build"
+        ),
+    )
+    profile_step_p.add_argument(
+        "--fused-adam",
+        action="store_true",
+        help="override the config's optimizer_fused to True for this profile",
+    )
+    profile_step_p.add_argument(
+        "--amp",
+        choices=["on", "off", "both"],
+        default=None,
+        help=(
+            "mixed precision (U-Net + perceptual loss in float16): 'on', 'off', or 'both' for "
+            "the pair in one trainer build; default leaves the config's own setting. The "
+            "printed loss curve is the parity evidence for or against it"
+        ),
+    )
+    profile_step_p.add_argument(
+        "--fast-crop",
+        choices=["on", "off", "both"],
+        default=None,
+        help="Trainer.use_fast_crop: host-side crop gather ('on'), device gather ('off'), or both",
+    )
+    profile_step_p.add_argument(
+        "--sanitise-sync",
+        choices=["on", "off", "both"],
+        default=None,
+        help=(
+            "Trainer.sanitise_conditional: read the non-finite gradient count back to skip "
+            "`nan_to_num_` ('on'), always sanitise ('off'), or both"
+        ),
+    )
+    profile_step_p.add_argument("--device", choices=["cpu", "mps"], default=None)
+    profile_step_p.add_argument(
+        "--run-dir", default=None, help="override the scratch run_dir the profile writes into"
+    )
+    profile_step_p.add_argument("--json", default=None, help="also write the full result as JSON here")
+    profile_step_p.set_defaults(func=_cmd_profile_step)
 
     ev = sub.add_parser("eval", help="evaluate a checkpoint's held-out (or given) images")
     ev.add_argument("--checkpoint", required=True, help="checkpoint .pt path")

@@ -95,9 +95,73 @@ from trippy.render.sheets import colorize, contact_sheet
 from trippy.scene import splits
 from trippy.scene.dataset import SceneDataset, resolve_sparse_dir
 from trippy.scene.dataset import crop as dataset_crop
-from trippy.train import checkpoint_io, export, prune, retention
+from trippy.train import checkpoint_io, export, prune, retention, steptimer
 from trippy.train.config import TrainConfig
 from trippy.train.params import PointParams, PoseParams
+
+
+def _install_backward_marks(
+    timer: steptimer.StepTimer,
+    pred: torch.Tensor,
+    net_out: torch.Tensor,
+    layers: list[torch.Tensor],
+) -> None:
+    """Timestamp the backward at the three tensors that separate its parts.
+
+    A backward pass is one opaque `total.backward()` call, but its cost is
+    not one thing: on this pipeline it is loss + tone mapper + U-Net +
+    rasteriser, in that order. `Tensor.register_hook` fires exactly when the
+    gradient *with respect to that tensor* has been produced, so hooking
+    `pred`, `net_out` and `layers[0]` puts a synchronised timestamp on each
+    of the three boundaries; `_finish_backward_marks` turns them into
+    durations once `backward()` returns.
+
+    Args:
+        timer: the active StepTimer (this is only called under profiling).
+        pred: the tone-mapped prediction the loss consumed.
+        net_out: the raw U-Net output.
+        layers: the rasteriser's pyramid, `layers[0]` being the finest level.
+
+    Only tensors that require grad are hooked; a hook on a leaf-free tensor
+    would never fire and would leave the split incomplete rather than wrong
+    (a missing boundary shows up as a `None` in the row).
+    """
+    marks: dict[str, float] = {}
+    timer.note("_bwd_marks", marks)
+
+    def _mark(key: str):
+        def hook(grad: torch.Tensor) -> None:
+            marks[key] = timer.mark()
+
+        return hook
+
+    marks["start"] = timer.mark()
+    for key, tensor in (("pred", pred), ("net_out", net_out), ("layers0", layers[0])):
+        if tensor.requires_grad:
+            tensor.register_hook(_mark(key))
+
+
+def _finish_backward_marks(timer: steptimer.StepTimer) -> None:
+    """Convert `_install_backward_marks`' timestamps into per-part seconds."""
+    row = timer.row()
+    marks = row.pop("_bwd_marks", None)
+    if not marks:
+        return
+    total = row.get("backward")
+    order = [("start", "bwd_loss", "pred"), ("pred", "bwd_tone_map", "net_out"),
+             ("net_out", "bwd_unet", "layers0")]
+    last = marks.get("start")
+    for begin, name, end in order:
+        t0, t1 = marks.get(begin), marks.get(end)
+        if t0 is None or t1 is None:
+            continue
+        row[name] = t1 - t0
+        last = t1
+    if total is not None and last is not None and "start" in marks:
+        # Whatever the backward spent after `layers[0]`'s gradient existed is the
+        # rasteriser's own backward (blend_bwd, the index_add_ reduction, and the
+        # emission/projection graph).
+        row["bwd_raster"] = max(0.0, total - (last - marks["start"]))
 
 
 def _center_crop_like(x: torch.Tensor, target_h: int, target_w: int) -> torch.Tensor:
@@ -317,6 +381,38 @@ class Trainer:
         # `hybrid.gate_scale`, so doing nothing reproduces the run's own default mix.
         self.gate_enabled: bool = cfg.hybrid.gate_enabled
         self.gate_scale: float = gate_mod.clamp_scale(cfg.hybrid.gate_scale)
+
+        # Runtime knob, not a config field, for the same reason `gate_scale` is one:
+        # it changes no numbers, so no checkpoint needs to record it. True (the
+        # default) lets the MPS rasteriser drop, after sorting, every fragment past
+        # each layer-pixel's 16-deep compositing list -- provably never read, and on
+        # a 384-px broadcast crop that is ~24M fragments down to ~3M
+        # (trippy.raster.pyramid's `cap_to_max_frags`). `trippy profile-step
+        # --raster-cap off|both` turns it off to measure what it is worth; nothing
+        # else should.
+        self.raster_cap_to_max_frags: bool = True
+
+        # Two more runtime knobs, added after the controlled before/after showed this
+        # branch's exactly-equivalent changes to be a wash (docs/ARCHITECTURE.md
+        # "the exactly-equivalent changes are a WASH"). Both select between two code
+        # paths that produce identical values, so they exist purely so the next queue
+        # slot can isolate which change costs what instead of guessing.
+        #   use_fast_crop: gather the crop on the host against the memory-mapped cache
+        #     (True) or upload the whole frame and gather on the device (False).
+        #     **Default False: MEASURED SLOWER at width 1008 / crop 384** (job
+        #     `trippy-train-perf-isolate`: turning it off was the one change that came
+        #     out faster in both the median and the min, in two separate jobs).
+        #     Cutting host->device traffic 5x does not pay on unified memory, and the
+        #     single-threaded numpy fancy-index that replaces the device gather costs
+        #     more than it saves. Kept, not deleted, because the balance should tip the
+        #     other way at width 2016 / crop 512, where the frame it avoids uploading is
+        #     ~4x larger (`config_fullres.yaml`) -- re-measure there before assuming.
+        #   sanitise_conditional: read the non-finite gradient count back to decide
+        #     whether any `nan_to_num_` is needed (True, one mid-step queue drain) or
+        #     just always sanitise (False, no readback). Unresolved: its effect is
+        #     under `trippy-train-perf-isolate`'s ~5 ms noise floor.
+        self.use_fast_crop: bool = False
+        self.sanitise_conditional: bool = True
         if self.gate_enabled:
             self._log(
                 f"hybrid blend gate: on (+1 net output channel, gate_scale={self.gate_scale}, "
@@ -353,6 +449,18 @@ class Trainer:
         self.loss_fn = TripsLoss(
             LossWeights(vgg=0.0, l1=cfg.loss_l1, ssim=cfg.loss_ssim, lpips=cfg.loss_lpips)
         ).to(self.device)
+
+        # --- mixed precision (cfg.amp; see TrainConfig.amp) ---
+        # Scope is deliberately narrow: the U-Net forward and the perceptual loss's
+        # frozen backbone, both of which are convolution-bound, and nothing else. The
+        # rasteriser keeps its own float32 contract (`render_pyramid` refuses any other
+        # compute dtype on MPS), the tone mapper and the L1/SSIM terms stay float32
+        # because they are cheap and their dynamic range is not worth risking, and
+        # `evaluate` is float32 unconditionally (`_render` checks `self.net.training`)
+        # so a run's held-out numbers do not depend on how it was trained.
+        self.amp_enabled: bool = False
+        self._scaler = torch.amp.GradScaler(device=self.device.type, enabled=False)
+        self.set_amp(bool(cfg.amp))
         # Gated on cfg.eval_lpips (default True) so a caller that wants CPU tests to never
         # touch a (possibly network-fetched) VGG backbone can opt out cleanly.
         self._eval_lpips = _LazyLPIPS(net=TRAIN_LPIPS_METRIC_NET) if cfg.eval_lpips else None
@@ -371,7 +479,13 @@ class Trainer:
         if self.camera.camera_response is not None:
             group_specs.append(("response", list(self.camera.camera_response.parameters()), cfg.lr_response))
         self._group_index = {name: i for i, (name, _, _) in enumerate(group_specs)}
-        self.optimizer = torch.optim.Adam([{"params": params, "lr": lr} for _, params, lr in group_specs])
+        # `fused=False` is exactly torch's own default path (see TrainConfig.optimizer_fused);
+        # `fused=True` asks for the single-kernel update, which torch will never select by
+        # itself on MPS.
+        self.optimizer = torch.optim.Adam(
+            [{"params": params, "lr": lr} for _, params, lr in group_specs],
+            fused=bool(cfg.optimizer_fused),
+        )
         self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer, mode="max", factor=cfg.lr_decay_factor, patience=cfg.lr_decay_patience
         )
@@ -398,6 +512,36 @@ class Trainer:
         self._best_psnr: float = float("-inf")
 
     # --- construction helpers ---
+
+    def set_amp(self, enabled: bool) -> None:
+        """Turn mixed precision on or off on an already-built Trainer.
+
+        A runtime knob, like `gate_scale` and `raster_cap_to_max_frags`, so
+        `trippy profile-step --amp both` can measure a step with and without it
+        from ONE trainer build (building one on Karekare-v2 reads a 2.1 GB PLY).
+        It rebuilds the `GradScaler`, which resets its scale to the default --
+        harmless here, since the scaler re-warms within a few steps and a
+        profile discards its own steps anyway.
+
+        Args:
+            enabled: True to run the U-Net forward and the perceptual loss's
+                frozen backbone under `torch.autocast(float16)`.
+
+        Raises:
+            ValueError: if torch has no autocast support for this device.
+        """
+        enabled = bool(enabled)
+        if enabled and not torch.amp.autocast_mode.is_autocast_available(self.device.type):
+            raise ValueError(f"amp: torch has no autocast support for device {self.device.type!r}")
+        self.amp_enabled = enabled
+        # float32 master weights come for free: autocast casts per operation and never
+        # touches the parameters themselves. The scaler is what keeps float16 gradients
+        # off the floor of the format.
+        self._scaler = torch.amp.GradScaler(device=self.device.type, enabled=enabled)
+        self.loss_fn._vgg.amp = enabled
+        self.loss_fn._lpips.amp = enabled
+        if enabled:
+            self._log("amp: U-Net + perceptual loss in float16 (rasteriser and eval stay float32)")
 
     def mask_stats(self) -> dict:
         """Person-mask coverage over this run's dataset, from the cache sidecar only.
@@ -551,11 +695,19 @@ class Trainer:
             bg=self.background,
             pixel_center=self.cfg.pixel_center,
             pyramid_halving=self.cfg.pyramid_halving,
+            cap_to_max_frags=self.raster_cap_to_max_frags,
         )
-        inputs = [layer.unsqueeze(0) for layer in layers]
-        if self.hybrid is not None:
-            inputs = self.hybrid.attach(inputs, gaussian)
-        net_out = self.net(inputs)
+        with steptimer.stage("unet_fwd"):
+            inputs = [layer.unsqueeze(0) for layer in layers]
+            if self.hybrid is not None:
+                inputs = self.hybrid.attach(inputs, gaussian)
+            # Training only: an eval must not depend on the precision the run trained in.
+            amp = self.amp_enabled and self.net.training
+            with torch.autocast(device_type=self.device.type, dtype=torch.float16, enabled=amp):
+                net_out = self.net(inputs)
+            if amp:
+                # Everything downstream (tone mapper, gate, losses, metrics) is float32.
+                net_out = net_out.float()
         return net_out, layers, aux
 
     def _tone_map(self, net_out: torch.Tensor, frame_index: int) -> torch.Tensor:
@@ -756,46 +908,63 @@ class Trainer:
         """
         self.net.train()
         self.camera.train()
+        timer = steptimer.active()
 
-        if name is None:
-            pick = torch.randint(0, len(self.train_names), (), generator=self._rng).item()
-            name = self.train_names[pick]
-        frame_index = self._name_to_index[name]
-        item = self.dataset[frame_index]
-        height, width = int(item["rgb"].shape[0]), int(item["rgb"].shape[1])
+        with steptimer.stage("data"):
+            if name is None:
+                pick = torch.randint(0, len(self.train_names), (), generator=self._rng).item()
+                name = self.train_names[pick]
+            frame_index = self._name_to_index[name]
+            height, width = self.dataset.frame_size(frame_index)
 
-        zoom = self._sample_zoom() if zoom is None else zoom
-        center = self._sample_crop_center(height, width, zoom) if center is None else center
-        cropped = dataset_crop(item, size=self.cfg.crop, zoom=zoom, center=center)
+            zoom = self._sample_zoom() if zoom is None else zoom
+            center = self._sample_crop_center(height, width, zoom) if center is None else center
 
-        target = cropped["rgb"].to(torch.float32).permute(2, 0, 1).unsqueeze(0) / 255.0
-        mask = cropped["mask"].unsqueeze(0).unsqueeze(0)
+            # Design A needs the whole frame in hand (`hybrid.crop_frame` crops the
+            # Gaussian render alongside it); everything else takes the host-side fast
+            # path, which gathers the window before anything is uploaded and so moves
+            # ~1 MB per step instead of the frame's 5.3 MB. Both produce the same
+            # crop value for value (tests/test_scene_dataset.py).
+            gaussian = None
+            dropped = False
+            if self.hybrid is None and self.use_fast_crop:
+                item = self.dataset.crop_item(
+                    frame_index, size=self.cfg.crop, zoom=zoom, center=center
+                )
+                cropped = item
+            else:
+                item = self.dataset[frame_index]
+                cropped = dataset_crop(item, size=self.cfg.crop, zoom=zoom, center=center)
+                # `dropped` is ablation 1: a fraction of crops see zeros instead, so the
+                # net cannot rely on the Gaussians everywhere. The Gaussian render is
+                # cropped through the *same* function with the *same* (size, zoom,
+                # center), so its K-adjust is identical to the photo's by construction
+                # (tests/test_hybrid_a_crop.py).
+                if self.hybrid is not None:
+                    dropped = self.hybrid.should_drop(self._rng)
+                    if not dropped:
+                        gaussian = self.hybrid.crop_frame(name, item, self.cfg.crop, zoom, center)
 
-        # Design A: the Gaussian render is cropped through the *same* function with the
-        # *same* (size, zoom, center), so its K-adjust is identical to the photo's by
-        # construction (tests/test_hybrid_a_crop.py). `dropped` is ablation 1: a fraction
-        # of crops see zeros instead, so the net cannot rely on the Gaussians everywhere.
-        gaussian = None
-        dropped = False
-        if self.hybrid is not None:
-            dropped = self.hybrid.should_drop(self._rng)
-            if not dropped:
-                gaussian = self.hybrid.crop_frame(name, item, self.cfg.crop, zoom, center)
+            target = cropped["rgb"].to(torch.float32).permute(2, 0, 1).unsqueeze(0) / 255.0
+            mask = cropped["mask"].unsqueeze(0).unsqueeze(0)
 
-        R, t = self._pose_for(item, frame_index)
-        net_out, _layers, _aux = self._render(
+            R, t = self._pose_for(item, frame_index)
+
+        net_out, layers, _aux = self._render(
             cropped["K"], R, t, (self.cfg.crop, self.cfg.crop), gaussian=gaussian
         )
-        # Training always blends at `gate_scale = 1`: the scale is a post-training viewing
-        # knob, and training through it would make the learned gate a function of the knob.
-        pred, gate = self._decode(net_out, frame_index, gaussian, scale=1.0)
+        with steptimer.stage("tone_map"):
+            # Training always blends at `gate_scale = 1`: the scale is a post-training viewing
+            # knob, and training through it would make the learned gate a function of the knob.
+            pred, gate = self._decode(net_out, frame_index, gaussian, scale=1.0)
 
-        target = _center_crop_like(target, pred.shape[-2], pred.shape[-1])
-        mask = _center_crop_like(mask, pred.shape[-2], pred.shape[-1])
+        with steptimer.stage("loss"):
+            target = _center_crop_like(target, pred.shape[-2], pred.shape[-1])
+            mask = _center_crop_like(mask, pred.shape[-2], pred.shape[-1])
 
-        image_loss = self.loss_fn(pred, target, mask)
-        extent_penalty = self._extent_penalty()
-        camera_reg = self.camera.regularizer()
+            image_loss = self.loss_fn(pred, target, mask)
+            extent_penalty = self._extent_penalty()
+            camera_reg = self.camera.regularizer()
         # Optional mean-gate prior (`hybrid.gate_prior.weight` > 0; off by default). It is
         # added to the SAME total the image losses feed, so the gate is shaped by one
         # objective rather than fitted separately.
@@ -808,13 +977,63 @@ class Trainer:
         )
         total = image_loss + self.cfg.extent_penalty_weight * extent_penalty + camera_reg + gate_prior
 
-        self.optimizer.zero_grad(set_to_none=True)
-        total.backward()
-        nonfinite_grads = self._sanitise_gradients()
-        self.optimizer.step()
-        self.camera.apply_constraints()
+        if timer is not None:
+            # Split the backward at the two tensors that separate its three halves:
+            # `pred`'s grad is ready once the loss backward is done, `net_out`'s once
+            # the tone mapper's is, `layers[0]`'s once the U-Net's is. Everything after
+            # that is the rasteriser's backward. The hooks synchronise, so they make the
+            # backward slower than it really is -- which is why only `profile-step`
+            # installs a timer (see trippy.train.steptimer).
+            _install_backward_marks(timer, pred, net_out, layers)
+
+        with steptimer.stage("zero_grad"):
+            self.optimizer.zero_grad(set_to_none=True)
+        with steptimer.stage("backward"):
+            # `scale` is the identity when amp is off (`GradScaler(enabled=False)`).
+            self._scaler.scale(total).backward()
+        with steptimer.stage("optimizer"):
+            if self.amp_enabled:
+                # Unscale first, so `_sanitise_gradients` sees (and reports) real
+                # gradient magnitudes and so `scaler.step` can decide for itself
+                # whether this step overflowed.
+                self._scaler.unscale_(self.optimizer)
+            nonfinite_grads = self._sanitise_gradients()
+            self._scaler.step(self.optimizer)
+            self._scaler.update()
+            self.camera.apply_constraints()
+        if timer is not None:
+            _finish_backward_marks(timer)
 
         self.global_step += 1
+        with steptimer.stage("metrics_sync"):
+            record = self._step_record(
+                name, zoom, total, image_loss, extent_penalty, camera_reg,
+                nonfinite_grads, mask, dropped, gaussian, gate, gate_prior,
+            )
+        self._append_metrics(record)
+        return record
+
+    def _step_record(
+        self,
+        name: str,
+        zoom: float,
+        total: torch.Tensor,
+        image_loss: torch.Tensor,
+        extent_penalty: torch.Tensor,
+        camera_reg: torch.Tensor,
+        nonfinite_grads: torch.Tensor,
+        mask: torch.Tensor,
+        dropped: bool,
+        gaussian: torch.Tensor | None,
+        gate: torch.Tensor | None,
+        gate_prior: torch.Tensor,
+    ) -> dict:
+        """One step's `metrics.jsonl` row.
+
+        Split out of `train_step` so `trippy profile-step` can charge the
+        device->host readbacks these scalars need to their own `metrics_sync`
+        stage instead of hiding them inside the step total.
+        """
         record = {
             "step": self.global_step,
             "epoch": self.epoch,
@@ -838,7 +1057,6 @@ class Trainer:
             # waiting for the next eval.
             record["gate_mean"] = float(gate.detach().mean().item())
             record["gate_prior"] = float(gate_prior.detach().item())
-        self._append_metrics(record)
         return record
 
     def _sanitise_gradients(self) -> torch.Tensor:
@@ -855,16 +1073,41 @@ class Trainer:
         corruption that must not reach a checkpoint. Zeroing the offending
         entries keeps the run alive and puts the count in `metrics.jsonl`
         so it is visible rather than silent.
+
+        Cost, and an honest caveat (perf/train-step): Karekare-v2 has ~67M
+        gradient elements, so every full pass over them is ~270 MB of traffic.
+        The original form made three (`isfinite`, its `~`, and `nan_to_num_`'s
+        read-modify-write) on every step, for an event that is rare by
+        construction. This version counts with `isfinite().sum()` and
+        `numel - finite`, dropping the `~` pass unconditionally, and -- when
+        `sanitise_conditional` is on -- reads the count back once to skip the
+        `nan_to_num_` write pass on a healthy step.
+
+        **That readback is a mid-step device synchronisation**, between the
+        backward and `optimizer.step()`, and the controlled before/after
+        (`docs/ARCHITECTURE.md`, job `trippy-train-perf-ab`) showed this
+        branch's exactly-equivalent changes netting to *nothing* -- so it may
+        well cost more than the write pass it saves. `sanitise_conditional`
+        is the knob that settles it; set it False to keep the cheaper count
+        without the readback. Behaviour is identical either way: when
+        anything is non-finite every gradient is sanitised exactly as before
+        (tests/test_train_step_perf.py).
         """
-        count: torch.Tensor | None = None
-        for group in self.optimizer.param_groups:
-            for param in group["params"]:
-                if param.grad is None:
-                    continue
-                bad = ~torch.isfinite(param.grad)
-                count = bad.sum() if count is None else count + bad.sum()
-                torch.nan_to_num_(param.grad, nan=0.0, posinf=0.0, neginf=0.0)
-        return count if count is not None else torch.zeros((), dtype=torch.long, device=self.device)
+        grads = [
+            param.grad
+            for group in self.optimizer.param_groups
+            for param in group["params"]
+            if param.grad is not None
+        ]
+        if not grads:
+            return torch.zeros((), dtype=torch.long, device=self.device)
+        total_elements = sum(grad.numel() for grad in grads)
+        finite = torch.stack([torch.isfinite(grad).sum() for grad in grads]).sum()
+        count = finite.new_tensor(total_elements) - finite
+        if not self.sanitise_conditional or int(count.item()) > 0:
+            for grad in grads:
+                torch.nan_to_num_(grad, nan=0.0, posinf=0.0, neginf=0.0)
+        return count
 
     # --- evaluation ---
 

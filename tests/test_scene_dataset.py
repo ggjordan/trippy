@@ -221,6 +221,26 @@ def _synthetic_gradient(height: int, width: int, seed: int) -> np.ndarray:
     return rng.randint(0, 256, size=(height, width, 3), dtype=np.uint8)
 
 
+def _build_masked_scene(tmp_path: Path) -> Path:
+    """A 3-image synthetic scene with a person mask per image (all generated)."""
+    scene_root = tmp_path / "scene"
+    images = [
+        ("a.jpg", _synthetic_gradient(24, 32, seed=10)),
+        ("b.jpg", _synthetic_gradient(24, 32, seed=11)),
+        ("c.jpg", _synthetic_gradient(24, 32, seed=12)),
+    ]
+    _write_txt_scene(scene_root, images)
+    masks_dir = scene_root / "masks"
+    masks_dir.mkdir(parents=True)
+    for index, (name, _arr) in enumerate(images):
+        mask = np.full((24, 32), 255, dtype=np.uint8)
+        # A BLACK (person) block in a different place per image, so the mask
+        # cannot accidentally line up with the crop window for all of them.
+        mask[4 + index : 12 + index, 6 + 2 * index : 18 + 2 * index] = 0
+        PILImage.fromarray(mask, mode="L").save(masks_dir / f"{Path(name).stem}.png")
+    return scene_root
+
+
 def test_scene_dataset_cache_hit_on_second_construction(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     scene_root = tmp_path / "scene"
     cache_root = tmp_path / "cache"
@@ -329,3 +349,51 @@ def test_scene_dataset_real_scene_first_three_images(splats_scene: Path, tmp_pat
     assert torch.equal(ds[0]["rgb"], ds2[0]["rgb"])
 
     assert elapsed < 60.0, f"building 3 images took {elapsed:.1f}s"
+
+
+def test_crop_item_matches_crop_of_getitem(tmp_path: Path) -> None:
+    """The host-side fast path is value-for-value the old `crop(dataset[i], ...)`.
+
+    `SceneDataset.crop_item` exists to stop a training step uploading a whole
+    undistorted frame so it can use a 384-px window of it (perf/train-step).
+    It must produce exactly what the two-step form produced, including the
+    adjusted intrinsics and the person mask, or a training crop and its
+    target would silently disagree by a pixel.
+    """
+    scene_root = _build_masked_scene(tmp_path)
+    dataset = scene_dataset.SceneDataset(scene_root, width=32, cache_root=tmp_path / "cache")
+    assert dataset.masks_dir is not None
+
+    for index in range(len(dataset)):
+        assert dataset.frame_size(index) == tuple(dataset[index]["rgb"].shape[:2])
+        for size, zoom, center in (
+            (8, 1.0, None),
+            (8, 1.0, (5.0, 6.0)),
+            (12, 1.7, (10.0, 9.0)),
+            # A window that overshoots the frame on both axes: the padding
+            # path (rgb 0, mask 0) has to be identical too.
+            (16, 0.75, (2.0, 2.0)),
+        ):
+            fast = dataset.crop_item(index, size=size, zoom=zoom, center=center)
+            slow = scene_dataset.crop(dataset[index], size=size, zoom=zoom, center=center)
+            assert torch.equal(fast["rgb"], slow["rgb"])
+            assert torch.equal(fast["mask"], slow["mask"])
+            assert torch.equal(fast["K"], slow["K"])
+            assert torch.equal(fast["qvec"], dataset[index]["qvec"])
+            assert torch.equal(fast["tvec"], dataset[index]["tvec"])
+            assert fast["name"] == dataset.names[index]
+            assert fast["index"] == index
+
+
+def test_crop_item_matches_crop_of_getitem_unmasked(tmp_path: Path) -> None:
+    """Same equivalence on a scene with no person masks at all."""
+    scene_root = _build_masked_scene(tmp_path)
+    dataset = scene_dataset.SceneDataset(
+        scene_root, width=32, cache_root=tmp_path / "cache", use_masks=False
+    )
+    assert dataset.masks_dir is None
+    fast = dataset.crop_item(0, size=10, zoom=1.3, center=(7.0, 7.0))
+    slow = scene_dataset.crop(dataset[0], size=10, zoom=1.3, center=(7.0, 7.0))
+    assert torch.equal(fast["rgb"], slow["rgb"])
+    assert torch.equal(fast["mask"], slow["mask"])
+    assert torch.equal(fast["K"], slow["K"])

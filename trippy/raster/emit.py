@@ -61,8 +61,12 @@ from trippy.constants import (
     RASTER_SMALL_POINT_CUTOFF,
     RASTER_ZNEAR,
 )
-from trippy.geom.xform_b import compose, project_pinhole, world_to_cam
+from trippy.geom.xform_b import compose, world_to_cam
 from trippy.raster.sort import segment_offsets, sort_fragments
+
+# Zero-cost unless `trippy profile-step` installs a timer; imports nothing from
+# trippy, so this does not invert the raster/train layering (see its docstring).
+from trippy.train import steptimer
 
 EMIT_MODES = RASTER_MODES
 PIXEL_CENTERS = RASTER_PIXEL_CENTERS
@@ -371,8 +375,17 @@ def project_points(
     # safe_depth for the full argument; this is the fix for docs/LIMITATIONS.md
     # "NaN gradient out of the rasteriser backward".
     depth_safe = safe_depth(depth, znear)
-    xyz_c_safe = torch.cat([xyz_c[:, :2], depth_safe.reshape(-1, 1)], dim=1)
-    uv, _ = project_pinhole(xyz_c_safe, fx, fy, cx, cy)
+    # `project_pinhole(cat([xyz_c[:, :2], depth_safe], 1), ...)` inlined. It is the
+    # same arithmetic on the same values -- `cat` copies columns 0 and 1 unchanged and
+    # `project_pinhole` immediately re-slices them, and its `depth.clone()` is
+    # `depth_safe` -- so `u`/`v` are bit-identical
+    # (tests/test_raster_project_inline.py). What it removes is an (N, 3) copy and a
+    # (N,) clone per render, i.e. ~90 MB of pointless traffic at Karekare-v2's 7.5M
+    # points, and it keeps `u`/`v` contiguous instead of strided columns of a cat'ed
+    # buffer.
+    u = fx * xyz_c[:, 0] / depth_safe + cx
+    v = fy * xyz_c[:, 1] / depth_safe + cy
+    uv = torch.stack([u, v], dim=1)
     size_px = fx * size / depth_safe
     return uv, depth, size_px
 
@@ -911,12 +924,12 @@ def _emit_fragments_vectorised(
     nz = torch.nonzero(keep, as_tuple=False)
     if int(nz.shape[0]) == 0:
         return _empty_fragments(dtype, device, grid)
-    # Contiguous copies, not stride-3 views: each column is read several times
-    # below, and a strided read of a multi-million-element MPS tensor is
-    # materialised every time.
-    frag_layer = nz[:, 0].contiguous()
-    frag_row = nz[:, 1].contiguous()
-    corner = nz[:, 2].contiguous()
+    # Contiguous columns, because each is read several times below and a
+    # strided read of a multi-million-element MPS tensor is materialised on
+    # every read. One transpose-copy of the whole (F, 3) block, then three
+    # views of it -- rather than three separate stride-3 gathers, which at
+    # Karekare-v2's ~24M fragments cost roughly twice as much traffic.
+    frag_layer, frag_row, corner = nz.t().contiguous().unbind(0)
 
     # --- pass 2: alpha, on the survivors only ---
     #
@@ -989,6 +1002,14 @@ class SortedFragments:
         alpha: (F,) float in (0, 1), differentiable.
         offsets: (P + 1,) int64, segment starts; P == grid.total.
         grid: LayerGrid the indices refer to.
+        emitted_count: fragments emission produced, **before** any
+            `cap_frags` truncation. Equal to `len(self)` when no cap was
+            applied. This is the number `aux["num_fragments"]` reports, so
+            capping cannot silently change a render's published fragment
+            count (docs/ARCHITECTURE.md "Emission cost").
+        emitted_offsets: (P + 1,) int64 segment starts of the **pre-cap**
+            list, or None when no cap was applied (then `offsets` already is
+            it). `aux["fragments_per_layer"]` is read off this.
     """
 
     layer_pixel: Tensor
@@ -999,9 +1020,63 @@ class SortedFragments:
     alpha: Tensor
     offsets: Tensor
     grid: LayerGrid
+    emitted_count: int = -1
+    emitted_offsets: Tensor | None = None
+
+    def __post_init__(self) -> None:
+        if self.emitted_count < 0:
+            self.emitted_count = int(self.layer_pixel.shape[0])
+        if self.emitted_offsets is None:
+            self.emitted_offsets = self.offsets
 
     def __len__(self) -> int:
         return int(self.layer_pixel.shape[0])
+
+
+def _cap_segment_indices(offsets_full: Tensor, cap_frags: int) -> tuple[Tensor, Tensor]:
+    """Indices of each segment's first `min(count, cap_frags)` fragments.
+
+    The compositing step -- Metal `blend_fwd`/`blend_bwd` and the torch twin
+    `trippy.raster.ref_torch.composite_sorted` alike -- reads at most
+    `max_frags` fragments from each layer-pixel's segment and never looks past
+    them. In `mode="broadcast"` at a 384-px crop that is a factor of ~7:
+    ~24M fragments are sorted, of which at most `grid.total * 16` = 3.1M can
+    ever be composited. Dropping the rest *after* the sort (which establishes
+    the order, so "first" means "nearest") is therefore exactly equivalent,
+    and it shrinks every downstream array: the five permutation gathers, both
+    kernels' inputs, and -- the big one -- the backward's per-fragment
+    `d_feat` and its `index_add_` reduction onto points.
+
+    Args:
+        offsets_full: (P + 1,) int64 segment starts of the sorted list.
+        cap_frags: the compositing cap (`RASTER_MAX_FRAGS` in practice); must
+            be >= 1.
+
+    Returns:
+        (take, offsets): `take` is (F2,) int64, positions in the sorted list
+        to keep, in order; `offsets` is the (P + 1,) int64 segment starts of
+        the kept list. `F2 = sum_p min(count_p, cap_frags)`.
+
+    Raises:
+        ValueError: if `cap_frags` < 1.
+    """
+    if cap_frags < 1:
+        raise ValueError(f"cap_frags must be >= 1, got {cap_frags}")
+    device = offsets_full.device
+    counts = offsets_full[1:] - offsets_full[:-1]
+    kept = torch.clamp(counts, max=cap_frags)
+    offsets = torch.zeros(offsets_full.shape[0], dtype=torch.int64, device=device)
+    offsets[1:] = torch.cumsum(kept, dim=0)
+    total = int(offsets[-1].item())
+    if total == 0:
+        return torch.zeros(0, dtype=torch.int64, device=device), offsets
+    slot = torch.arange(total, dtype=torch.int64, device=device)
+    # Which layer-pixel owns each kept slot, and its rank inside that segment.
+    # `right=True` on the *kept* offsets is exact because `offsets` is
+    # non-decreasing and `slot` is a valid position in the kept list.
+    owner = torch.searchsorted(offsets, slot, right=True) - 1
+    rank = slot - offsets.index_select(0, owner)
+    return offsets_full.index_select(0, owner) + rank, offsets
 
 
 def build_sorted_fragments(
@@ -1021,6 +1096,7 @@ def build_sorted_fragments(
     pose_delta: Tensor | None = None,
     pixel_center: str = "half",
     emit_impl: str = "vectorised",
+    cap_frags: int | None = None,
 ) -> SortedFragments:
     """Project -> cull -> emit -> sort -> segment, the whole pre-compositing pipeline.
 
@@ -1045,42 +1121,75 @@ def build_sorted_fragments(
         pixel_center: "half" or "integer" (see emit_fragments).
         emit_impl: one of EMIT_IMPLS; "loop" selects the original per-layer
             emission, which is bit-identical and slower (see emit_fragments).
+        cap_frags: drop, after sorting, every fragment past each layer-pixel's
+            first `cap_frags` -- exactly the ones no compositing step can
+            reach (see `_cap_segment_indices`). Pass the caller's `max_frags`;
+            None keeps the whole sorted list. Bit-identical either way
+            (tests/test_train_step_perf.py); `emitted_count` /
+            `emitted_offsets` still describe the pre-cap list.
 
     Returns:
         SortedFragments on the same device/dtype as the inputs.
     """
-    uv, depth, size_px = project_points(xyz, size, K, R, t, znear=znear, pose_delta=pose_delta)
-    valid = cull_points(uv, depth, size_px, grid, znear=znear)
-    frags = emit_fragments(
-        uv,
-        depth,
-        size_px,
-        conf,
-        grid,
-        mode=mode,
-        valid=valid,
-        alpha_min=alpha_min,
-        pixel_center=pixel_center,
-        impl=emit_impl,
-    )
+    with steptimer.stage("raster_project_cull"):
+        uv, depth, size_px = project_points(xyz, size, K, R, t, znear=znear, pose_delta=pose_delta)
+        valid = cull_points(uv, depth, size_px, grid, znear=znear)
+    if steptimer.active() is not None:
+        # A device->host reduction, so it only ever runs under `trippy profile-step`:
+        # how many of the N points survived the cull is the number that decides whether
+        # culling harder before emission could pay.
+        steptimer.note("points_total", int(xyz.shape[0]))
+        steptimer.note("points_valid", int(valid.sum().item()))
+    with steptimer.stage("raster_emit"):
+        frags = emit_fragments(
+            uv,
+            depth,
+            size_px,
+            conf,
+            grid,
+            mode=mode,
+            valid=valid,
+            alpha_min=alpha_min,
+            pixel_center=pixel_center,
+            impl=emit_impl,
+        )
     # `grid.total - 1` is emission's own hard bound on layer_pixel, so handing it
     # to the sort removes the composite key's `.max().item()` synchronisation.
-    perm = sort_fragments(
-        frags.layer_pixel,
-        frags.depth,
-        method=sort_method,
-        stable=sort_stable,
-        max_layer_pixel=grid.total - 1,
-    )
-    layer_pixel = frags.layer_pixel.index_select(0, perm)
-    offsets = segment_offsets(layer_pixel, grid.total, method=segment_method)
-    return SortedFragments(
-        layer_pixel=layer_pixel,
-        layer=frags.layer.index_select(0, perm),
-        pixel=frags.pixel.index_select(0, perm),
-        depth=frags.depth.index_select(0, perm),
-        point_id=frags.point_id.index_select(0, perm),
-        alpha=frags.alpha.index_select(0, perm),
-        offsets=offsets,
-        grid=grid,
-    )
+    with steptimer.stage("raster_sort"):
+        perm = sort_fragments(
+            frags.layer_pixel,
+            frags.depth,
+            method=sort_method,
+            stable=sort_stable,
+            max_layer_pixel=grid.total - 1,
+        )
+    with steptimer.stage("raster_segment"):
+        layer_pixel_sorted = frags.layer_pixel.index_select(0, perm)
+        offsets_full = segment_offsets(layer_pixel_sorted, grid.total, method=segment_method)
+        emitted_count = len(frags)
+        if cap_frags is None:
+            take = perm
+            offsets = offsets_full
+            layer_pixel = layer_pixel_sorted
+            emitted_offsets = None
+        else:
+            take, offsets = _cap_segment_indices(offsets_full, cap_frags)
+            layer_pixel = layer_pixel_sorted.index_select(0, take)
+            take = perm.index_select(0, take)
+            emitted_offsets = offsets_full
+    with steptimer.stage("raster_gather"):
+        sorted_frags = SortedFragments(
+            layer_pixel=layer_pixel,
+            layer=frags.layer.index_select(0, take),
+            pixel=frags.pixel.index_select(0, take),
+            depth=frags.depth.index_select(0, take),
+            point_id=frags.point_id.index_select(0, take),
+            alpha=frags.alpha.index_select(0, take),
+            offsets=offsets,
+            grid=grid,
+            emitted_count=emitted_count,
+            emitted_offsets=emitted_offsets,
+        )
+    steptimer.note("fragments", emitted_count)
+    steptimer.note("fragments_kept", len(sorted_frags))
+    return sorted_frags
