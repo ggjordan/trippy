@@ -928,18 +928,29 @@ the pixel mapping, one child process, and the import.
   it. The imported points are tinted immediately (the same magenta the other
   two selection tools use); `H` toggles that tint while the SAM tool has
   focus.
-- **The default device is `cpu`, and the rule for changing it is written
-  down.** A CPU lift is ~9 s per view since the bfloat16 shim was replaced
-  (§3); `mps` is a radio button next to it. The decision rule, agreed
-  2026-09-08 while jobs `trippy-edit-sam-5` (MPS) and `trippy-edit-sam-5-cpu`
-  (CPU, same photo, same box, same code) sat in the queue: **the default
-  becomes `mps` only if `edit-sam-5` returns rc=0 AND its
-  `per_view[0].segmenter.seconds` beats `edit-sam-5-cpu`'s.** A crash, or a
-  pass that is not faster, and the default stays `cpu` — an MPS radio button
-  that is slower than the default is a trap, not a feature. Fill both numbers
-  in here when the jobs land (`output/edits/edit-sam-5{,-cpu}/summary.json`);
-  until then `cpu` is the documented default and ~9 s per view is the number
-  to quote.
+- **The default device is `mps` (flipped 2026-09-09), and the rule that
+  decided it is written down.** The decision rule, agreed 2026-09-08 while
+  jobs `trippy-edit-sam-5` (MPS) and `trippy-edit-sam-5-cpu` (CPU, same
+  photo, same box, same code) sat in the queue: **the default becomes `mps`
+  only if `edit-sam-5` returns rc=0 AND its `per_view[0].segmenter.seconds`
+  beats `edit-sam-5-cpu`'s.** Both landed: `edit-sam-5` rc=0 at **8.05 s per
+  view**, `edit-sam-5-cpu` at **9.65 s per view**
+  (`output/edits/edit-sam-5{,-cpu}/summary.json`, `segmenter.seconds`) — MPS
+  is rc=0 AND faster, so the rule is satisfied and the default is now `mps`.
+  `cpu` remains a fully supported fallback, one click away in the viewer's
+  device radio group (`rust/crates/trips-viewer/src/edit_ui.rs`'s `SamUi`)
+  and the headless twin's `--sam-device cpu`
+  (`rust/crates/trips-viewer/src/main.rs`) — an MPS default that is slower
+  than CPU would have been a trap, not a feature, but it is not: it is 17%
+  faster. `trippy.edit.sam_runner.Sam3Segmenter`'s own dataclass default
+  (the Python API a script builds a segmenter from directly, without going
+  through the viewer or the `trippy edits sam` CLI) is `mps` for the same
+  reason. **Known gap, flagged for the Orchestrator**: `trippy edits sam`'s
+  own terminal CLI default (`SAM3_DEFAULT_DEVICE` in `trippy/constants.py`,
+  read by `trippy/cli.py`) is unchanged at `cpu` — those two files were
+  outside this task's edit list, so a one-line follow-up
+  (`SAM3_DEFAULT_DEVICE = "mps"`, plus its `--device` help text) is needed
+  to make the terminal command agree with the viewer and the Python API.
 - **`--fake` is how this is tested and screenshotted.** `trippy edits sam
   --fake` (or `TRIPPY_SAM_FAKE=1`) synthesises the mask from the prompt — a
   box fills its rectangle, a point fills a disc — and runs the entire rest of

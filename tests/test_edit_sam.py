@@ -53,7 +53,7 @@ from trippy.edit.sam_lift import (
     sam_lift,
     write_selection_preview,
 )
-from trippy.edit.sam_runner import MaskFileSegmenter, SamPrompt, sam3_command
+from trippy.edit.sam_runner import MaskFileSegmenter, Sam3Segmenter, SamPrompt, sam3_command
 
 # --- the synthetic scene ---------------------------------------------------
 # One 100x100 bundle view per camera, photographs at 200x200 (scale 2.0), a
@@ -447,6 +447,20 @@ def test_preview_is_a_from_scratch_heatmap(tmp_path: Path) -> None:
 
 
 # --- the runner's command, and the CLI --------------------------------------
+
+
+def test_sam3_segmenter_defaults_to_mps_with_cpu_still_a_valid_choice() -> None:
+    """docs/EDITOR.md §3's decision rule was satisfied 2026-09-08: `edit-sam-5`
+    (MPS) rc=0 at 8.05 s/view beat `edit-sam-5-cpu`'s 9.65 s/view, so the
+    Python-API default (a caller building a segmenter directly, without going
+    through the viewer or the `trippy edits sam` CLI, which always passes
+    `--device` explicitly) now matches -- `cpu` remains a supported choice.
+    """
+    from trippy.constants import SAM3_DEVICES
+
+    assert Sam3Segmenter().device == "mps"
+    assert Sam3Segmenter().device in SAM3_DEVICES
+    assert "cpu" in SAM3_DEVICES  # the fallback is still a real, valid choice
 
 
 def test_sam3_command_names_the_local_checkout_and_weights(tmp_path: Path) -> None:

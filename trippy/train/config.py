@@ -278,6 +278,21 @@ class TrainConfig:
     # "calibrate" promotes the existing `eval_calibrate_camera` per-image fit to be the `_eval`
     # row's number instead of only a diagnostic side column.
     eval_exposure_mode: str = EVAL_EXPOSURE_MODE_DEFAULT
+    # Frame names defining the shade region for `trippy train --report`'s Splats shade
+    # audit (`trippy.eval.audits.run_shade_audit`'s `--frames`; see
+    # `trippy.render.report.resolve_shade_frames` for how this is turned into the actual
+    # list). None (the default) is UNCHANGED behaviour: the audit script's own default
+    # applies (`trippy.constants.SHADE_FRAMES_KK`, the kk-coherent IMG_3828-3833 group) --
+    # correct for scenes whose shade region is exactly those 6 frames, wrong for any scene
+    # (e.g. karekare-v2, EXP-0011) whose own measured shade frames differ, which is why this
+    # field exists rather than the caller silently reusing forced_heldout (forced_heldout
+    # often mixes shade frames with an unrelated held-out sample -- see kk-coherent's own
+    # "all"-mode runs). A `list[str]` embeds the frame names directly (EXP-0011's configs
+    # use this: the measured 93-frame big-tree list, README "Finding the shade frames" --
+    # MEASURING, not assumption). A `str` is a path to a JSON file (a bare list, or a dict
+    # with a "frames"/"big_tree"/"shade_frames" list key) or a plain-text file (one frame
+    # name per line, '#' comments ignored).
+    shade_frames: list[str] | str | None = None
     eval_every: int = TRAIN_DEFAULT_EVAL_EVERY
     checkpoint_every: int = TRAIN_DEFAULT_CHECKPOINT_EVERY
     eval_lpips: bool = True  # see trainer.py docstring: gated so CPU tests don't require a

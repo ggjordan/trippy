@@ -1,9 +1,42 @@
 # STATE — externalized progress (update at end of every session)
 
-Last updated: 2026-09-08 (feat/combined-bundle session; previous: fix/editor-followups)
+Last updated: 2026-09-09 (fix/report-shade-frames session; previous: feat/combined-bundle)
 
 ## Done
 - 2026-09-09 07:50: merged splat-clean, viewer Simple Mode + Brush camera, perf harness (build pending). REVIEW QUEUE for Jordan: (1) 2-open-in-brush/kklid-tripsclean-shade.ply then -005 and -015 (your splat minus TRIPS-identified fog; open in Brush); (2) 4-other/kkv2-1-combined-viewer.command (splat + TRIPS under the tree, mix slider works); (3) 4-other/kkv2-3-removal-viewer.command (removal arm, 15.04 dB). Viewer Simple Mode lands in every launcher once the binary rebuilds in the next GPU gap. SAM default -> mps (8.0 s vs 9.6 s CPU). Perf: no exact-parity 2x exists (see research log); queue hold was not executed (permission layer) and is moot.
+- 2026-09-09 (fix/report-shade-frames): two fixes, worktree `.worktrees/report-frames`.
+  **(1) Shade-frame bug**: `trippy train --report` always audited shade dark-mass on
+  `depthprior_shade_audit.py`'s own default (kk-coherent's `IMG_3828-3833`, 6 frames)
+  instead of karekare-v2's measured 93-frame big-tree group, on EVERY karekare-v2 report
+  so far (kkv2-1/2/3). Fixed with a new `TrainConfig.shade_frames` config key
+  (`trippy.render.report.resolve_shade_frames` threads it to both the candidate and
+  baseline audits; `report.json["shade_frames"]` now always records which frames were
+  used); every EXP-0011 config now sets it. Tested with a fake `depthprior_shade_audit.py`
+  stand-in (`tests/test_cli_train_report.py`) plus pure unit tests
+  (`tests/test_render_report.py`). Also found (not fixed, out of file scope):
+  `trippy.eval.audits.cached_baseline_audit`'s cache key ignores `frames` entirely --
+  the stale `kklid_20000` cache entry (wrong-frame result, matched the old 17.3% number)
+  was deleted, but the underlying key bug needs a follow-up touching
+  `trippy/eval/audits.py`. **Re-audit PENDING**: job `trippy-shade-audit-rerun` (prio 15)
+  queued behind `kkv2-5-hybrid` (training, up to 420 min) -- machine had 12-16 GB free
+  (AGENTS.md wants >=28 GB), so it was queued rather than run directly. Old wrong numbers
+  (34.5% / 34.5% / 34.9% vs Gaussian baseline 17.3%) marked PENDING in `docs/RESULTS.md`
+  and `research/trips-metal.md`'s 2026-09-09 entry with the explanation; corrected numbers
+  to be filled in once the job's `.rc`/log land.
+  **(2) SAM 3 default device flipped `cpu` -> `mps`** (`docs/EDITOR.md` §3's decision rule
+  satisfied: `edit-sam-5` MPS rc=0 at 8.05 s/view beat `edit-sam-5-cpu`'s 9.65 s/view).
+  Changed: viewer's `SamUi::default()` and headless `--sam-device` default
+  (`rust/crates/trips-viewer/src/edit_ui.rs`, `src/main.rs`), and
+  `trippy.edit.sam_runner.Sam3Segmenter`'s own Python default. `cpu` stays a one-click/
+  one-flag fallback everywhere. **Known gap**: `trippy edits sam`'s terminal CLI default
+  (`SAM3_DEFAULT_DEVICE`, `trippy/constants.py`, read by `trippy/cli.py`) is UNCHANGED --
+  both files were outside this task's edit-file list; a one-line follow-up is needed so the
+  terminal command agrees with the viewer.
+  Python suite green (1223 passed, `tests/test_web_build_script.py`'s 10 failures are
+  pre-existing/unrelated -- `rust/brush-trips` submodule not initialised on this machine,
+  confirmed via `git submodule status`). Rust `cargo test` NOT run: this worktree has no
+  `rust/target` yet (cold build), and free memory was 12-16 GB with a live training running
+  -- deferred per this task's own brief ("say so and I will run it on main").
 - 2026-09-08 20:50 (Jordan): the 3-day full-res run is PARKED (not worth the GPU time now; keep as an option). Job files moved to ~/Splats/tools/gpu_queue/parked-trippy/ (kkv2-9-fullres-smoke, kkv2-9-fullres, 9b, 9c); configs merged on main. kkv2-8 (half-res to 300 ep) still runs.
 - 2026-09-08 20:30 (Jordan): still wants the HIGHEST-QUALITY plain TRIPS scene for comparison. Plan: turn kkv2-9-fullres into a chained multi-day run (2016 wide, crop 512, full 300 epochs, resumable 12 h segments) at prio 42 (after the kkv2 hybrid arms, before hybrid-a), launcher at render scale 1.0 without half-net. Set up when the fullres agent reports.
 - 2026-09-08 19:40: Jordan: TRIPS looks nothing like a photo anywhere except that the clouds/fogs are gone; splat is the base. New track: TRIPS-confidence-guided cleaning of kklid_20000 (delete fog Gaussians) -> clean PLY for Brush. Full-res variant demoted below hybrids once queued.
@@ -128,6 +161,16 @@ Last updated: 2026-09-08 (feat/splat-clean session; previous: fix/editor-followu
   **Two worktrees must stay until `trippy-train-perf-ab` finishes**: `.worktrees/train-perf` and
   `.worktrees/train-perf-base` (a detached `main` checkout created purely as the A/B's "before";
   remove it with `git worktree remove` once the job is done).
+- **`trippy-shade-audit-rerun` (prio 15, queued 2026-09-09)**: re-runs the Splats shade
+  audit on the CORRECT 93-frame big-tree list for `kkv2-1-full-masked`,
+  `kkv2-2-full-unmasked`, `kkv2-3-removal` and the `kklid_20000` baseline (see "Done"
+  above). Worktree `.worktrees/report-frames` must stay until it finishes (script `cd`s
+  into main, reading `output/scratch/shade_audit_rerun/reconstruct_and_audit.py`, so that
+  script -- or its logic -- should be preserved even if the worktree is removed first).
+  Once `~/Splats/tools/gpu_queue/done/trippy-shade-audit-rerun.rc` appears, read
+  `output/scratch/shade_audit_rerun/*.shade_audit.json`, compute the corrected dark-mass
+  fractions, and fill them into `docs/RESULTS.md` and a follow-up `research/trips-metal.md`
+  entry (both currently say PENDING).
 - GPU queue (reordered 13:58; trippy manages it now): Splats' last Hunua training running; then prio-12/15 short jobs (live-splat-perf-1, edit-sam-1), then 40: kkv2-0-smoke, -1-full-masked, -2-full-unmasked, -3-removal, -4-render-1/2/3, -5-hybrid, -6-shade-prune, -7-hybrid-gate; 45: hybrid-a (bc, trips); 50: full2-trips-resume2, full3-alt, removal-rel, union-broadcast, union-trips. Each training self-delivers a viewer launcher + audit table.
 - EXP-0011 full-resolution variant (2026-09-08, branch `exp/kkv2-fullres`, answers Jordan's 19:10 "fuzzy and pixelated" open question): `config_fullres.yaml`/`config_fullres_smoke.yaml` (width 2016, crop 512, seeded from `kkv2-1-full-masked/checkpoints/checkpoint_latest.pt` epoch 122 via `--resume`; resume-across-resolution verified empirically on synthetic fixtures). Queued: `trippy-kkv2-9-fullres-smoke` (prio 15) and `trippy-kkv2-9-fullres` (prio 40, guarded on the smoke's rc). **BLOCKER-IN-WAITING**: both jobs' scripts `cd` into the MAIN checkout, so this branch must be reviewed+merged (or the two config files placed in main) before the smoke reaches the front of its short prio-15 lane (minutes to an hour out), or it fails on a missing-config error. See `experiments/EXP-0011-karekare-v2/README.md` "Full-resolution variant" for the estimate/method.
 - Worktrees that MUST stay until their queued jobs finish (job scripts cd into them): .worktrees/karekare-v2 (kkv2-0..6), .worktrees/blend-gate (kkv2-7-hybrid-gate, blend-gate-viewer2/3), .worktrees/live-splat (live-splat-perf-1), .worktrees/edit-sam (edit-sam-1 done: remove). point-removal's jobs are done: remove it. Remove with scripts/worktree_rm.sh.

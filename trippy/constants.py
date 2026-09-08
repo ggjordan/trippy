@@ -1717,7 +1717,7 @@ SAM3_PROMPT_KINDS = ("point", "box", "text")
 # inside a gpu_queue job (AGENTS.md Sec 6); "cpu" is the always-available path the
 # CPU test suite and any non-queue run use.
 SAM3_DEVICES = ("cpu", "mps")
-SAM3_DEFAULT_DEVICE = "cpu"
+SAM3_DEFAULT_DEVICE = "mps"
 
 # How long the parent waits for the SAM subprocess (seconds). A cold MPS run loads
 # a 3.4 GB checkpoint and runs a ViT-L at 1008x1008 per view; 4 neighbour views on

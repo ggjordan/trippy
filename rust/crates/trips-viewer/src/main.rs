@@ -151,7 +151,9 @@ Editing (docs/EDITOR.md; press M in the window for the panels):
                        (default 0 = the prompted view alone)
   --sam-op <op>        blend | fade | delete for the imported region (fade)
   --sam-mix <f>        its mix, 0 = splat, 1 = TRIPS (default 0)
-  --sam-device <d>     cpu | mps, passed straight to `trippy edits sam` (cpu)
+  --sam-device <d>     cpu | mps, passed straight to `trippy edits sam` (mps --
+                       docs/EDITOR.md §3: measured faster, 8.05 s/view vs 9.65
+                       s/view CPU; --sam-device cpu is the fallback)
   --sam-fake           synthesise the mask instead of loading SAM 3: proves the
                        whole path -- child, progress, region, tint -- with no
                        checkpoint and no GPU. This is what the screenshot proof
@@ -335,7 +337,9 @@ struct Args {
     sam_op: trips_viewer::edit::Op,
     /// `--sam-mix`.
     sam_mix: f64,
-    /// `--sam-device`.
+    /// `--sam-device`. Defaults to `mps` (`docs/EDITOR.md` §3's decision rule,
+    /// satisfied 2026-09-08: MPS measured faster than CPU); `--sam-device cpu`
+    /// is the fallback.
     sam_device: &'static str,
     /// `--sam-fake`.
     sam_fake: bool,
@@ -361,6 +365,71 @@ struct Args {
     move_region: Option<(String, [f64; 3])>,
     /// `--solo ID`.
     solo: Option<String>,
+}
+
+impl Default for Args {
+    /// The pre-flag-parsing defaults `parse_args` starts from, factored out so a test can
+    /// check one (`sam_device`) without going through `std::env::args()`.
+    fn default() -> Self {
+        Args {
+            bundle: None,
+            settings: Settings::default(),
+            view: None,
+            mode: ViewMode::Network,
+            exposure: ExposureMode::default(),
+            screenshot: None,
+            warmup: 2,
+            bench: None,
+            bench_brush_anchor: None,
+            camera_yaw_deg: None,
+            free: false,
+            blend: Blend::default(),
+            splat: SplatArgs::default(),
+            render_size: None,
+            splat_bench: None,
+            edit: false,
+            edits: None,
+            save_edits: None,
+            brush_npz_selftest: None,
+            dump_weights: None,
+            dump_shade: None,
+            shade_lum: None,
+            shade_conf: None,
+            shade_znear: None,
+            shade_zfar: None,
+            click: None,
+            dump_click: None,
+            click_radius_px: None,
+            click_colour_tol: None,
+            click_max_radius: None,
+            click_max_points: None,
+            sam_box: None,
+            sam_point: None,
+            sam_views_around: 0,
+            sam_op: trips_viewer::edit::Op::Fade,
+            sam_mix: 0.0,
+            // docs/EDITOR.md §3's decision rule was satisfied 2026-09-08 (edit-sam-5 MPS
+            // rc=0 at 8.05 s/view beat edit-sam-5-cpu's 9.65 s/view): mps is now the
+            // default here too, matching the viewer's SamUi::default(). --sam-device cpu
+            // is the fallback.
+            sam_device: "mps",
+            sam_fake: false,
+            sam_undo: false,
+            brush: None,
+            brush_to: None,
+            brush_radius: None,
+            brush_weight: 1.0,
+            // A painted region that deletes is the one whose effect a screenshot
+            // can see without a splat to blend towards, which is what the proof in
+            // `docs/EDITOR.md` §6 measures.
+            brush_op: trips_viewer::edit::Op::Delete,
+            brush_mix: 0.0,
+            brush_erase: false,
+            brush_undo: false,
+            move_region: None,
+            solo: None,
+        }
+    }
 }
 
 /// Parse `1920x1080`.
@@ -504,6 +573,7 @@ fn parse_args() -> Result<Args, String> {
         move_region: None,
         solo: None,
     };
+    let mut args = Args::default();
     let mut argv = std::env::args().skip(1);
     while let Some(flag) = argv.next() {
         let mut value = || {
@@ -2002,5 +2072,22 @@ fn main() {
     if let Err(message) = run() {
         eprintln!("{message}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sam_device_defaults_to_mps_with_cpu_still_a_valid_choice() {
+        // docs/EDITOR.md §3's decision rule was satisfied 2026-09-08 (edit-sam-5 MPS
+        // rc=0 at 8.05 s/view beat edit-sam-5-cpu's 9.65 s/view) -- the headless
+        // twin's --sam-device default flips with the interactive viewer's.
+        assert_eq!(Args::default().sam_device, "mps");
+        // The fallback stays a real, parseable choice (see the "--sam-device" match
+        // arm below in parse_args): this just pins the literal both sides must agree
+        // on without needing a full std::env::args() parse in a test.
+        assert!(["cpu", "mps"].contains(&Args::default().sam_device));
     }
 }

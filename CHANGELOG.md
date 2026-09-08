@@ -220,7 +220,32 @@ All notable changes to trippy. Format: Keep a Changelog. Versions: semver tags `
   for the Python/Rust cross-language parity test) and `--save-edits <p>`
   (write the document after any headless mutation).
 
+### Changed
+- **SAM 3 lift default device flipped `cpu` -> `mps`** (`docs/EDITOR.md` §3):
+  the decision rule agreed 2026-09-08 is now satisfied -- job `edit-sam-5`
+  (MPS) rc=0 at 8.05 s/view beat `edit-sam-5-cpu`'s 9.65 s/view (17% faster).
+  Changed: the viewer's interactive SAM tool (`SamUi::default()` in
+  `rust/crates/trips-viewer/src/edit_ui.rs`), its headless twin's
+  `--sam-device` default (`rust/crates/trips-viewer/src/main.rs`), and
+  `trippy.edit.sam_runner.Sam3Segmenter`'s own Python default. `cpu` remains
+  a one-click/one-flag fallback everywhere. Known gap: `trippy edits sam`'s
+  terminal CLI default (`SAM3_DEFAULT_DEVICE`, `trippy/constants.py`) is
+  unchanged -- out of this change's file scope, follow-up needed.
+
 ### Fixed
+- **`trippy train --report`'s shade dark-mass was measured on the wrong
+  frames for karekare-v2.** The Splats shade audit
+  (`depthprior_shade_audit.py`) was always called with `frames=None`, so
+  every karekare-v2 report (kkv2-1-full-masked, kkv2-2-full-unmasked,
+  kkv2-3-removal) measured dark-mass on the tool's own default
+  (`SHADE_FRAMES_KK`, kk-coherent's 6-frame IMG_3828-3833 group) instead of
+  the scene's own measured 93-frame big-tree group
+  (`experiments/EXP-0011-karekare-v2/README.md` "Finding the shade frames").
+  New optional `TrainConfig.shade_frames` (path or inline list) is now
+  threaded through to both the candidate and baseline audits and recorded in
+  `report.json["shade_frames"]`; every EXP-0011 config now sets it to the
+  measured 93-frame list. Corrected numbers: `research/trips-metal.md` and
+  `docs/RESULTS.md` (old kk-coherent-frame numbers kept alongside, labelled).
 - **The brush's per-sample depth anchor was an unmeasured `O(points)` scan.**
   Measured at 47.4 ms/sample on the real Karekare-scale bundle (7.5M points)
   -- too slow for a stroke sampling several times a second. `edit::brush::

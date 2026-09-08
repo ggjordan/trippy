@@ -44,6 +44,43 @@ from test_train_helpers import build_synthetic_ply, build_synthetic_scene, tiny_
 
 from trippy.constants import TRAIN_REPORT_FAILED_FILENAME
 
+_FAKE_SHADE_AUDIT_SCRIPT = '''
+import argparse
+import json
+from pathlib import Path
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--scene", required=True)
+parser.add_argument("--frames", nargs="*", default=None)
+parser.add_argument("--json-out", required=True)
+parser.add_argument("plys", nargs="+")
+args = parser.parse_args()
+payload = {
+    "scene": args.scene,
+    "frames": args.frames,
+    "results": [
+        {"path": ply, "n": 10, "n_in_region": 5, "mass_in_region": 5.0, "dark_mass_lum0.25": 1.0}
+        for ply in args.plys
+    ],
+}
+Path(args.json_out).write_text(json.dumps(payload))
+'''
+
+
+def _write_fake_shade_audit_tool(splats_root: Path) -> None:
+    """A stand-in for ~/Splats/tools/depthprior_shade_audit.py (AGENTS.md: never edit
+    Splats' real tools) that echoes back whatever `--frames` it was called with, so a
+    test can verify report.py's shade_frames plumbing reaches the actual `--frames`
+    argv without needing the real Splats tool to be present on this machine.
+    """
+    python_path = splats_root / "tools" / "ml-sharp" / ".venv" / "bin" / "python"
+    python_path.parent.mkdir(parents=True, exist_ok=True)
+    os.symlink(sys.executable, python_path)
+
+    script_path = splats_root / "tools" / "depthprior_shade_audit.py"
+    script_path.parent.mkdir(parents=True, exist_ok=True)
+    script_path.write_text(_FAKE_SHADE_AUDIT_SCRIPT)
+
 
 def test_cli_train_report_end_to_end_on_synthetic_scene(tmp_path: Path) -> None:
     scene_root, point_set = build_synthetic_scene(tmp_path)
@@ -155,3 +192,84 @@ def test_cli_train_report_failure_writes_report_failed_but_never_raises(
     failed_path = run_dir / TRAIN_REPORT_FAILED_FILENAME
     assert failed_path.exists()
     assert "audit tool exploded" in failed_path.read_text()
+
+
+def test_cli_train_report_shade_frames_config_key_reaches_the_audit_tool(tmp_path: Path) -> None:
+    """This task's bug fix: `shade_frames:` in the config must reach the shade audit's
+    `--frames` argv for BOTH the candidate export and the baseline PLY, not the
+    hardcoded `frames=None` `run_train_report` used to always pass -- which meant every
+    karekare-v2 report measured "shade dark-mass" on depthprior_shade_audit.py's own
+    default (kk-coherent's 6-frame IMG_3828-3833 group) instead of the scene's own
+    measured 93-frame big-tree group (experiments/EXP-0011-karekare-v2/README.md).
+
+    Uses a fake stand-in for the real Splats tool (`_write_fake_shade_audit_tool`) that
+    echoes back whatever `--frames` it received, so this is verifiable without the real
+    ml-sharp venv/script being present.
+    """
+    scene_root, point_set = build_synthetic_scene(tmp_path)
+    ply_path = build_synthetic_ply(tmp_path, point_set)
+    run_dir = tmp_path / "run"
+    shade_frames = ["IMG_1.jpg", "IMG_3.jpg"]
+    cfg = tiny_train_config(scene_root, ply_path, run_dir, tmp_path / "cache", shade_frames=shade_frames)
+    config_path = cfg.save_yaml(tmp_path / "config.yaml")
+
+    splats_root = tmp_path / "fake_splats"
+    _write_fake_shade_audit_tool(splats_root)
+
+    env = dict(os.environ)
+    env["TRIPPY_DELIVER_DRY_RUN"] = "1"
+    env["TRIPPY_OUTPUT"] = str(tmp_path / "trippy_output")
+    env["SPLATS_ROOT"] = str(splats_root)
+
+    argv = [
+        sys.executable, "-m", "trippy.cli", "train",
+        "--config", str(config_path), "--device", "cpu", "--report",
+    ]  # fmt: skip
+    result = subprocess.run(argv, capture_output=True, text=True, timeout=180, env=env, check=False)
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+
+    report = json.loads((run_dir / "report" / "report.json").read_text())
+
+    # The candidate export's shade audit was called with the config's shade_frames --
+    # not the tool's own kk-coherent default.
+    assert report["audits"]["candidate"]["shade_audit"]["frames"] == shade_frames
+    # So was the baseline's -- same region, or the comparison table's two columns would
+    # be describing different places.
+    assert report["audits"]["baseline"]["shade_audit"]["frames"] == shade_frames
+    # report.json records exactly which frames were used (this task's brief).
+    assert report["shade_frames"] == {"source": "config shade_frames", "count": 2, "frames": shade_frames}
+
+
+def test_cli_train_report_no_shade_frames_key_falls_back_to_the_script_default(tmp_path: Path) -> None:
+    """Old/unchanged behaviour for a config with no `shade_frames` key: the audit tool
+    is called with no `--frames` at all (its own SHADE_FRAMES_KK default applies), and
+    report.json spells that default out explicitly rather than a bare `null`.
+    """
+    scene_root, point_set = build_synthetic_scene(tmp_path)
+    ply_path = build_synthetic_ply(tmp_path, point_set)
+    run_dir = tmp_path / "run"
+    cfg = tiny_train_config(scene_root, ply_path, run_dir, tmp_path / "cache")
+    assert cfg.shade_frames is None
+    config_path = cfg.save_yaml(tmp_path / "config.yaml")
+
+    splats_root = tmp_path / "fake_splats"
+    _write_fake_shade_audit_tool(splats_root)
+
+    env = dict(os.environ)
+    env["TRIPPY_DELIVER_DRY_RUN"] = "1"
+    env["TRIPPY_OUTPUT"] = str(tmp_path / "trippy_output")
+    env["SPLATS_ROOT"] = str(splats_root)
+
+    argv = [
+        sys.executable, "-m", "trippy.cli", "train",
+        "--config", str(config_path), "--device", "cpu", "--report",
+    ]  # fmt: skip
+    result = subprocess.run(argv, capture_output=True, text=True, timeout=180, env=env, check=False)
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+
+    report = json.loads((run_dir / "report" / "report.json").read_text())
+    from trippy.constants import SHADE_FRAMES_KK
+
+    assert report["audits"]["candidate"]["shade_audit"]["frames"] is None
+    assert report["shade_frames"]["source"].startswith("script default")
+    assert report["shade_frames"]["frames"] == list(SHADE_FRAMES_KK)
