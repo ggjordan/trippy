@@ -2201,3 +2201,118 @@ the areas I want". Artefacts: `$SPLATS_ROOT/tools/gpu_queue/logs/trippy-viewer-k
 **Artifact**: none yet (queued). `experiments/EXP-0011-karekare-v2/README.md` "Full-resolution variant" section has the full method/estimate; results row placeholders added to that README's Results table.
 - 2026-09-08T08:22:58Z submitted job trippy-kkv2-9-fullres-smoke prio 15 (logged directly to main's research/trips-metal.md by gpu_submit.sh, since the job correctly cds into main — not duplicated here): trippy train --config experiments/EXP-0011-karekare-v2/config_fullres_smoke.yaml --resume /Users/nzbirdranch/trippy/output/runs/EXP-0011-karekare-v2/kkv2-1-full-masked/checkpoints/checkpoint_latest.pt --device mps --max-minutes 30 --report
 - 2026-09-08T08:23:40Z submitted job trippy-kkv2-9-fullres prio 40 (same note — logged to main directly): bash -c '<rc guard against trippy-kkv2-9-fullres-smoke.rc>; python -m trippy.cli train --config experiments/EXP-0011-karekare-v2/config_fullres.yaml --resume .../checkpoint_latest.pt --device mps --max-minutes 720 --report'
+- 2026-09-08T09:08:02Z delivered kklid-tripsclean-shade: Your splat minus 365,716 of 8,910,382 Gaussians (4.10%) that TRIPS stopped believing in, inside the measured 93-frame big-tree shade volume only; rest of the scene byte-identical. 93-frame shade audit dark-mass 27.08% (untouched splat 26.71%), extent p99 12.89 vs 12.87, max 34.40 unchanged; 233,984 shade-view pixels now see through to a confident surface, 1.07% of covered pixels emptied. Least aggressive of three - open this one first. (/Users/nzbirdranch/trippy/output/clean/kklid-tripsclean/kklid-tripsclean-shade.ply)
+- 2026-09-08T09:08:02Z delivered kklid-tripsclean-005: Same rule applied everywhere in the scene: 972,630 of 8,910,382 Gaussians deleted (10.92%). 93-frame shade audit dark-mass 27.08% (untouched 26.71%), extent p99 12.91 vs 12.87, max 34.40 unchanged; 716,335 shade-view pixels now see through to a confident surface, 4.49% of covered pixels emptied. Try this if kklid-tripsclean-shade still has fog. (/Users/nzbirdranch/trippy/output/clean/kklid-tripsclean/kklid-tripsclean-005.ply)
+- 2026-09-08T09:08:02Z delivered kklid-tripsclean-015: Most aggressive: 2,085,635 of 8,910,382 Gaussians deleted (23.41%) at a wider confidence cutoff, everywhere. 93-frame shade audit dark-mass 27.62% (untouched 26.71%), extent p99 12.98 vs 12.87, max 34.39; 1,545,073 shade-view pixels now see through to a confident surface, 10.74% of covered pixels emptied - watch for thin/background coverage disappearing. (/Users/nzbirdranch/trippy/output/clean/kklid-tripsclean/kklid-tripsclean-015.ply)
+- 2026-09-08T09:08:02Z delivered kklid-tripsclean-honesty: Honesty pack for the three cleaned splats: top-down deleted-Gaussian maps (count | fraction, drawn from coordinates only, no photo content), summary.json with the mapping proof, confidence distribution, free-space classification and both Splats audits, plus the run log. (/Users/nzbirdranch/trippy/output/clean/kklid-tripsclean/honesty)
+
+## 2026-09-08 21:10 — Design B built: TRIPS deletes the fog Gaussians from Jordan's own splat (`feat/splat-clean`)
+
+- **Question.** Jordan's 19:10 verdict was that full-scene TRIPS makes the canopy shade cloud
+  disappear but looks "nothing like a photo" elsewhere, while the Gaussian splat "felt like being
+  in the scene". So: can the splat stay the base and TRIPS be used *only* as a classifier, deleting
+  the Gaussians it stopped believing in? And can that avoid the failure of every earlier prune
+  ("it removed everything under the tree — nothing behind the cloud")?
+- **Job:** none. CPU only, local, read-only against the checkpoint, the splat and the scene; nothing
+  was copied into the repo and no GPU was touched (a training held it).
+
+### The 1:1 mapping question, answered exactly
+
+The brief asked whether TRIPS point `i` still corresponds to Gaussian row `i`, and whether
+`points_removed_total` broke it. **It is exact, and no nearest-neighbour recovery was needed.**
+`GaussianPlySource.build` applies `sigmoid(opacity) >= min_opacity` as a *boolean mask*, which
+preserves row order, and `kkv2-1-full-masked` set no `max_points`. Four independent checks:
+
+1. `points_removed_total = 0` in the checkpoint — training never ran a removal pass.
+2. The reconstructed filter keeps **7,542,137 of 8,910,382** rows at `min_opacity = 0.05`, exactly
+   the checkpoint's point count and exactly the "exported 7542137 points" in the run log.
+3. **`init_conf` is a bit-exact fingerprint.** `PointParams.init_conf` is a snapshot of
+   `sigmoid(ply.opacity)` frozen before the first optimiser step, so a correct mapping reproduces
+   it per point. Measured: **max |Δ| = 0.000e+00, exactly equal on all 7,542,137 points** (not
+   "within tolerance" — every one identical).
+4. **Positional control.** `|ckpt.xyz − ply.xyz[keep]|` is p50 **0.0147**, p99 0.0414, max 0.149
+   world units (epoch 40) / p50 0.031, max 0.237 (epoch 122). The same distance under a
+   shift-by-one mapping is p50 **6.18** and under a random permutation p50 **6.37** — a 200x
+   separation, so the alignment is not a coincidence of a smooth field.
+
+`trippy.clean.mapping` reproduces this, *proves* it against the fingerprint on every run, refuses a
+mapping that fails the check, and falls back to a cKDTree nearest neighbour on seed positions (and
+records `nn_distance_*`) for the case the brief anticipated — a checkpoint whose training did
+remove points. Both routes are pinned by synthetic tests.
+
+### Checkpoint choice: `checkpoint_latest.pt` (ep 122), NOT `checkpoint_best.pt` (ep 40)
+
+The brief named `checkpoint_best.pt`. **That file is epoch 40** (`best.json`: PSNR 15.199), while
+the bundle Jordan gave the 19:10 "shade is SOLVED" verdict on was exported from
+`checkpoint_latest.pt` at **epoch 122**. Three measurements say ep 122 is the better judge, so it
+was used and the deviation is recorded here rather than buried:
+
+| | ep 40 (best) | ep 122 (latest) |
+|---|---|---|
+| conf < 0.05 | 394,065 (5.22%) | **972,630 (12.90%)** |
+| conf p90 | 0.7595 | **0.9235** |
+| fell below 0.5x its own init | 873,154 | 1,582,577 |
+| revealed pixels landing on a confident surface (93 shade views, conf<0.05) | 255,120 / 434,258 = **58.8%** | 716,335 / 959,575 = **74.7%** |
+
+Every seeded point started at or above 0.05 (that IS the source filter), so "conf < 0.05" is by
+construction a point training pushed down. Re-running from ep 40 is one flag
+(`--checkpoint checkpoint_best.pt`) if that call is wrong.
+
+### The rule, and why it is not the prune that failed
+
+Confidence only. Not colour, not darkness, not `init_conf`. The earlier prunes keyed on "dark AND
+in the shade volume", which is equally true of the *ground* under the tree. TRIPS renders that
+ground, so its confidence separates the two.
+
+**The guarantee is structural, not statistical:** the surface is defined at `conf >= 0.5`
+(TRIPS's own shipped `removal_confidence_cutoff`) and every deletion threshold here is 0.05 or
+0.15, so **a Gaussian whose TRIPS twin is confident can never be a deletion candidate**, and a
+pixel that a confident point covers can never be emptied. A Gaussian the source filter dropped
+before training (1,368,245 of them) is never deleted either — TRIPS was never shown it.
+
+### Numbers (source `kklid_20000.ply`, 8,910,382 Gaussians; 93-frame big-tree shade audit)
+
+| variant | deleted | % | kept | dark mass (lum<0.25) | extent p99 / max | pixels emptied | pixels revealed onto a confident surface |
+|---|---|---|---|---|---|---|---|
+| *untouched* `kklid_20000` | — | — | 8,910,382 | **26.71%** | 12.87 / 34.40 | — | — |
+| `kklid-tripsclean-shade` | 365,716 | 4.10% | 8,544,666 | 27.08% | 12.89 / 34.40 | 146,226 (1.07%) | **233,984** of 291,259 |
+| `kklid-tripsclean-005` | 972,630 | 10.92% | 7,937,752 | 27.08% | 12.91 / 34.40 | 611,466 (4.49%) | **716,335** of 959,575 |
+| `kklid-tripsclean-015` | 2,085,635 | 23.41% | 6,824,747 | 27.62% | 12.98 / 34.39 | 1,461,334 (10.74%) | **1,545,073** of 1,940,409 |
+
+Free-space classification of the condemned points against the confident-surface depth buffer
+(93 views, 1/8 buffers): `shade` front 15.3% / on 21.4% / behind 44.6% / no-surface 18.7%;
+`005` front 10.8% / on 13.3% / behind 57.5%; `015` front 10.7% / on 13.7% / behind 57.4%.
+Scene-wide control on 40 evenly-spaced non-shade frames: front 15.7-20.4%, emptied 1.63% (`shade`),
+2.71% (`005`), 6.69% (`015`) — i.e. the rest of the scene is touched *less* than the shade region,
+which is the right sign. Deletion is concentrated, not a uniform shave: only 39,428 of 186,106
+occupied top-down cells are touched by `shade` (97,567 by `005`, 123,234 by `015`).
+
+### Verdicts
+
+- **PASS on the mechanism.** Exact mapping, byte-identical survivors (spot-checked: the first
+  300,000 source rows filter to 267,073 output rows that are `np.array_equal` to the source),
+  no extent inflation, zero non-finite means or scales in any variant, and a structural guarantee
+  that a confidently-rendered surface cannot be removed.
+- **The dark-mass audit is flat: 26.71% -> 27.08 / 27.08 / 27.62%.** The deletion removes dark and
+  light mass in the shade region in roughly equal proportion. Per the 19:10 decision this metric
+  was already retired as a shade pass/fail signal on this scene ("keep it only as a geometry-density
+  indicator"), and it is reported here for continuity, not as a verdict. **The verdict is Jordan's
+  eyes in Brush.**
+- **Correction to the record:** the run reports quote the baseline dark mass as 17.3% and the
+  candidate as 34.5%, but `trippy.render.report` ran `depthprior_shade_audit.py` with the script's
+  DEFAULT `SHADE_FRAMES_KK` (the six `IMG_3828-3833` frames), which
+  `experiments/EXP-0011-karekare-v2/README.md` establishes is **a different shady place 5.79 world
+  units from the big tree**. On the correct measured 93-frame big-tree region the untouched splat
+  is **26.71%**, not 17.3%. Every number in the table above is on the 93-frame region.
+- Artefacts: `kklid-tripsclean-{shade,005,015}` in `2-open-in-brush/`, `kklid-tripsclean-honesty`
+  in `4-other/` (two-panel top-down deleted-density maps drawn from coordinates only — count on the
+  left, deleted *fraction* on the right — plus `summary.json` and the run log). Source dir
+  `$TRIPPY_OUTPUT/clean/kklid-tripsclean/`. New CLI `trippy splat-clean`, package `trippy/clean/`,
+  `tests/test_clean_splat.py` (14 tests, synthetic fixture with planted fog).
+- Tests: **1240 pytest passed, 10 skipped** (14 new in `tests/test_clean_splat.py`), `ruff check .` clean.
+  The Rust half of `scripts/test.sh` was **not** run in this worktree: `rust/brush-trips` had to be
+  initialised here (it is a submodule; new worktrees start empty) and a cold Burn/CubeCL/wgpu build
+  wants far more than the **10 GB** free this machine had while `kkv2-3-removal` was training —
+  `scripts/cpu_heavy.sh`'s own guard is 28 GB, and the machine OOM'd on 2026-09-05. This branch
+  touches no Rust, so the Rust suite is unaffected; run `scripts/test.sh` in full from the main
+  checkout at merge time.

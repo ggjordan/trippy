@@ -21,6 +21,33 @@ All notable changes to trippy. Format: Keep a Changelog. Versions: semver tags `
   checkpoint into a `Trainer` built at a different width/crop is verified empirically on
   synthetic fixtures, not just by reading `Trainer.resume`/`load_state`. Both jobs queued
   (`kkv2-9-fullres-smoke` prio 15, `kkv2-9-fullres` prio 40, guarded on the smoke's rc).
+- **Design B shipped: `trippy splat-clean`** (`docs/SPEC.md` D2,
+  `docs/USER_GUIDE.md` "Cleaning a splat with TRIPS"). A trained TRIPS model
+  is used purely as a classifier over the Gaussian splat that seeded it: the
+  Gaussians whose TRIPS twin lost confidence are deleted, and every survivor's
+  PLY row is copied through byte for byte (all SH coefficients, the trained
+  anisotropic scale and rotation -- none of which `trippy.train.export` can
+  represent). Three aggressiveness levels ship (`shade`, `005`, `015`).
+  New package `trippy/clean/`:
+  - `mapping.py` recovers the TRIPS point -> PLY row correspondence by
+    reproducing `GaussianPlySource`'s own opacity filter, and *proves* it
+    against `PointParams.init_conf` (a pre-training snapshot of
+    `sigmoid(ply.opacity)`, i.e. a per-point fingerprint of the source row);
+    a mapping that does not reproduce the fingerprint is refused, and a
+    checkpoint whose training removed points falls back to a nearest
+    neighbour on seed positions and says so.
+  - `ply_filter.py` streams a multi-GB PLY through a keep mask in
+    `CLEAN_PLY_CHUNK_ROWS` chunks, rewriting only the header's vertex count.
+  - `freespace.py` classifies each condemned point against a first-hit depth
+    buffer built from the confident points alone (`front` / `on` / `behind`),
+    and counts pixels that held a point before the deletion and hold none
+    after -- the direct guard against the earlier Splats-side prune's failure
+    ("it removed the ground behind the cloud too").
+  - `heatmap.py` writes the honesty artifact: a two-panel top-down map of
+    deleted-Gaussian count and deleted *fraction*, drawn from coordinates
+    only, with no photographic content (AGENTS.md Sec 6).
+  - `run.py` orchestrates it and writes `summary.json`, including Splats'
+    own shade audit and extent gate run on the source PLY and every variant.
 - **Lid plane-normal gizmo handle** (`docs/EDITOR.md` Sec 1, Sec 6): a 4th
   handle on a `lid` region, projected along its own `up` instead of a world
   axis, drags the plane's tilt (rotating about the two in-plane axes) as one

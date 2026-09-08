@@ -178,12 +178,15 @@ import torch
 import yaml
 
 from trippy import __version__
+from trippy.clean.select import VARIANTS as CLEAN_VARIANTS
 from trippy.config import load_settings, pick_device
 from trippy.constants import (
     CANDIDATE_REPORT_DOLLY_DIRNAME,
     CANDIDATE_REPORT_JSON_FILENAME,
     CANDIDATE_REPORT_OFFPATH_DIRNAME,
     CANDIDATE_REPORT_README_FILENAME,
+    CLEAN_DEFAULT_FRAMES_KEY,
+    CLEAN_FREESPACE_DEPTH_SCALE,
     CLICK_DEFAULT_COLOUR_TOL,
     CLICK_DEFAULT_DEPTH_GAP_FACTOR,
     CLICK_DEFAULT_MAX_POINTS,
@@ -2351,7 +2354,103 @@ def build_parser() -> argparse.ArgumentParser:
     distill.add_argument("--scene-root", default=None, help="--stage compare only (without a preceding render stage): the scene root for sparse_txt/")
     distill.set_defaults(func=_cmd_distill)
 
+    splat_clean = sub.add_parser(
+        "splat-clean",
+        help="Design B: delete the fog Gaussians a trained TRIPS model disbelieves from its own seed splat",
+    )
+    splat_clean.add_argument("--checkpoint", required=True, help="trained TRIPS checkpoint (.pt) whose confidences judge")
+    splat_clean.add_argument("--ply", required=True, help="the 3DGS PLY that checkpoint was seeded from")
+    splat_clean.add_argument("--out", required=True, help="output directory for the cleaned PLYs, heatmaps and summary.json")
+    splat_clean.add_argument(
+        "--variant",
+        action="append",
+        choices=[v.name for v in CLEAN_VARIANTS],
+        default=None,
+        help="which variant(s) to build; repeatable, default all three",
+    )
+    splat_clean.add_argument("--scene", default=None, help="COLMAP model dir for the shade region (sparse/0 or sparse_txt)")
+    splat_clean.add_argument("--frames", nargs="*", default=None, help="shade-region frame names")
+    splat_clean.add_argument(
+        "--frames-json",
+        default=None,
+        help="JSON file of frame names (a list, or a dict of named lists -- see --frames-key)",
+    )
+    splat_clean.add_argument(
+        "--frames-key",
+        default=CLEAN_DEFAULT_FRAMES_KEY,
+        help="key to read from --frames-json when it holds a dict of lists",
+    )
+    splat_clean.add_argument("--znear-frac", type=float, default=SHADE_PRUNE_DEFAULT_ZNEAR_FRAC, help="shade region near plane, as a fraction of each frame's median observed depth")
+    splat_clean.add_argument("--zfar-frac", type=float, default=SHADE_PRUNE_DEFAULT_ZFAR_FRAC, help="shade region far plane, same units")
+    splat_clean.add_argument(
+        "--min-opacity",
+        type=float,
+        default=None,
+        help="the training config's point_source.min_opacity (default: read it out of the checkpoint)",
+    )
+    splat_clean.add_argument("--no-freespace", action="store_true", help="skip the in-front-of-surface classification")
+    splat_clean.add_argument("--freespace-scale", type=int, default=CLEAN_FREESPACE_DEPTH_SCALE, help="depth-buffer size divisor for that check")
+    splat_clean.add_argument("--no-heatmap", action="store_true", help="skip the top-down deleted-density PNG")
+    splat_clean.add_argument("--no-audit", action="store_true", help="skip Splats' shade audit + extent gate")
+    splat_clean.add_argument(
+        "--audit-scene",
+        default=None,
+        help="TEXT COLMAP model for the Splats audits (default: --scene, which must then be a sparse_txt dir)",
+    )
+    splat_clean.set_defaults(func=_cmd_splat_clean)
+
     return parser
+
+
+def _cmd_splat_clean(args: argparse.Namespace) -> int:
+    """`trippy splat-clean`: Design B, a TRIPS checkpoint cleaning its own seed splat.
+
+    Everything the command decides lives in `trippy.clean.run.clean_splat`;
+    this only resolves the frame list, picks the variants, and turns an
+    expected failure (a missing shade region for a shade-only variant, an
+    unrecoverable point <-> Gaussian mapping) into an exit code instead of
+    a traceback. It is CPU-only by construction -- no `--device` exists,
+    and nothing downstream builds one (AGENTS.md Sec 6).
+    """
+    from trippy.clean.run import clean_splat, load_frames
+    from trippy.clean.select import VARIANTS, variant_by_name
+
+    variants = [variant_by_name(n) for n in args.variant] if args.variant else list(VARIANTS)
+    frames = None
+    if args.frames or args.frames_json:
+        try:
+            frames = load_frames(args.frames, args.frames_json, args.frames_key)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            print(f"trippy splat-clean: could not read the frame list: {exc}", file=sys.stderr)
+            return 2
+
+    try:
+        summary = clean_splat(
+            checkpoint=args.checkpoint,
+            ply=args.ply,
+            out_dir=args.out,
+            variants=variants,
+            sparse_dir=args.scene,
+            frames=frames,
+            znear_frac=args.znear_frac,
+            zfar_frac=args.zfar_frac,
+            min_opacity=args.min_opacity,
+            freespace=not args.no_freespace,
+            freespace_scale=args.freespace_scale,
+            heatmap=not args.no_heatmap,
+            audit=not args.no_audit,
+            audit_sparse_txt=args.audit_scene,
+        )
+    except (FileNotFoundError, KeyError, ValueError) as exc:
+        print(f"trippy splat-clean: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 2
+
+    for name, entry in summary["variants"].items():
+        print(
+            f"{name}: deleted {entry['n_deleted']:,} of {summary['n_ply']:,} Gaussians "
+            f"({100 * entry['deleted_fraction']:.2f}%) -> {entry['ply']}"
+        )
+    return 0
 
 
 def main(argv: Sequence[str] | None = None) -> int:

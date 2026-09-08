@@ -633,6 +633,75 @@ The agent will adjust the queue position. Priority ranges:
 - **60**: Splats trainings (current baseline).
 - **70**: trippy trainings (lower priority, longer wall-clock time expected).
 
+## Cleaning a splat with TRIPS (`trippy splat-clean`)
+
+**What it is for.** Your Gaussian splat "felt like being in the scene", but it has
+fog in it — the canopy shade cloud, and other floaters. The full-scene TRIPS runs
+make that fog disappear, but TRIPS does not look like a photograph elsewhere. So
+this tool keeps the splat and uses TRIPS only as a *judge*: it asks the trained
+TRIPS model which of your Gaussians it stopped believing in, and deletes exactly
+those. Nothing else about the splat changes — every surviving Gaussian keeps its
+own colour, opacity, shape and rotation, copied through byte for byte.
+
+**Why this is not the prune that failed before.** The earlier Splats-side prune
+keyed on "dark, and in the shade volume", which is also true of the *ground* under
+the tree, so it took the ground with it. TRIPS renders that ground, so its
+confidence separates the two: a point in free space is contradicted by every view
+that sees past it and its confidence falls; a point on a surface is confirmed and
+its confidence rises. The tool measures this before it deletes anything and puts
+the numbers in `summary.json`.
+
+**What you get.** Three PLYs at increasing aggressiveness, so you pick with your
+eyes rather than from a metric:
+
+| variant | what it deletes |
+|---|---|
+| `kklid-tripsclean-shade` | the least-believed points, inside the measured shade volume only — the rest of the scene is untouched |
+| `kklid-tripsclean-005` | the same threshold, everywhere in the scene |
+| `kklid-tripsclean-015` | a wider threshold, everywhere — the most aggressive |
+
+Open them in Brush the usual way (see "How to open a .ply file in Brush"). Start
+with `shade`; if the fog is still there, try `005`, then `015`. If `015` starts
+eating things you wanted, say so and the threshold moves.
+
+**The honesty artifact.** Each variant also writes
+`kklid-tripsclean-<variant>-deleted-density.png`: a top-down map of the scene with
+no photographic content in it at all. The left panel is how many Gaussians were
+deleted per cell, the right panel is what *fraction* of each cell went. The right
+panel is the one to read — if the deletion were a blind shave off the whole scene
+it would be flat, and if it is finding the fog it is concentrated.
+
+**Running it.**
+
+```
+PYTHONPATH=. .venv/bin/python -m trippy.cli splat-clean \
+  --checkpoint <run>/checkpoints/checkpoint_latest.pt \
+  --ply <the splat that run was seeded from>.ply \
+  --out $TRIPPY_OUTPUT/clean/<name> \
+  --scene <scene>/sparse_txt \
+  --frames-json $TRIPPY_OUTPUT/scratch/shade_frames.json --frames-key big_tree
+```
+
+It is CPU-only and takes a few minutes per variant on a 9M-Gaussian splat. Add
+`--variant 005` (repeatable) to build only some of them, `--no-audit` to skip the
+Splats shade/extent audits, and `--no-freespace` to skip the in-front-of-surface
+check.
+
+**What `summary.json` tells you.**
+
+- `mapping` — how the tool matched Gaussians to TRIPS points, and the evidence.
+  `fingerprint_max_abs_err: 0.0` means every point was matched to the exact
+  Gaussian that seeded it, with no guessing.
+- `confidence` — the distribution of what TRIPS believes, so you can see where the
+  thresholds fall in it.
+- `variants.<name>.freespace` — of the points being deleted, how many sit in front
+  of a surface TRIPS believes in (`front`), on it (`on`), or behind it (`behind`),
+  and above all `pixels_emptied`: how many pixels held *something* before the
+  deletion and hold *nothing* after. That last number is the hole count. It should
+  be zero or near it.
+- `audits` — Splats' own shade audit and extent gate, run on the original splat and
+  on every variant, so the numbers sit in the same column as every training run's.
+
 ## How to ask for a release
 
 When a milestone is ready to ship (e.g., v0.1.0 complete), ask:
