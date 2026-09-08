@@ -8,8 +8,18 @@
 //!     (400 lines built around its own `brush_render::camera::Camera`,
 //!     splat-specific clamping and dataset focus points) — but the *input
 //!     model* is deliberately Brush's, because that is the one every splat
-//!     viewer uses: left-drag orbits or looks, right/middle-drag pans, scroll
-//!     zooms or changes fly speed.
+//!     viewer uses. Since 2026-09-08 it is Brush's *button for button*, on
+//!     Jordan's own request ("left click and drag to orbit, right click and
+//!     drag to POV free move the camera, like brush"):
+//!     left-drag = orbit the focus point; right-drag = first-person look, with
+//!     W/A/S/D/Q/E flying while it is held; middle-drag or shift + left-drag =
+//!     pan; scroll = dolly towards or away from the focus point; shift +
+//!     scroll (or scroll during a right-drag) = fly speed; double-click = put
+//!     the focus point on what was clicked.
+//!     [`Mode`] is therefore no longer "what a left-drag does" — every gesture
+//!     above works in both modes. It is now only the **fence**:
+//!     [`Mode::Orbit`] keeps the camera inside the area the capture cameras
+//!     cover, [`Mode::Free`] lets it leave.
 //! Invariants:
 //!     - The frame is `docs/GEOMETRY.md`'s: the camera looks down **+Z**,
 //!       **+X** is right and **+Y** is down, `x_cam = R @ x_world + t`, `R`
@@ -78,14 +88,20 @@ pub const LOST_BOX_FACTOR: f32 = 3.0;
 /// Below this a distance counts as zero, world units.
 const TINY: f32 = 1e-6;
 
-/// What a left-drag does.
+/// Whether the camera is fenced into the area the capture cameras cover.
+///
+/// NOT "what a left-drag does": a left-drag has orbited in both modes since
+/// 2026-09-08. See the module doc's gesture table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Mode {
-    /// Turn about a pivot inside the scene. The default: reviewing a scene
-    /// means walking round the thing in it, and it cannot lose the subject.
+    /// Fenced: the orbit pivot is clamped into the camera box and the camera
+    /// only ever moves with it, so no gesture can leave the captured area.
+    /// The default, because a reviewer who cannot get lost never has to be
+    /// told how to get back.
     #[default]
     Orbit,
-    /// Look around from where the camera is, first-person.
+    /// Unfenced: the camera may fly anywhere, and says so through
+    /// [`Controller::is_lost`] once it has.
     Free,
 }
 
@@ -99,12 +115,12 @@ impl Mode {
         }
     }
 
-    /// Short label for the HUD.
+    /// Short label for the HUD, in Jordan's words rather than a mode name.
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
-            Self::Orbit => "orbit",
-            Self::Free => "free",
+            Self::Orbit => "stay in the photographed area",
+            Self::Free => "fly anywhere",
         }
     }
 }
@@ -121,7 +137,7 @@ pub struct Controller {
     /// World up. Note TRIPS scenes are usually Y-**down**, so this is often
     /// `(0, -1, 0)`; the controller only uses it as the yaw axis.
     up_world: Vec3,
-    /// What a left-drag does.
+    /// Whether the camera is fenced into the camera box.
     mode: Mode,
     /// The orbit pivot, always inside `scene.bounds`.
     target: Vec3,
@@ -186,13 +202,13 @@ impl Controller {
         self.pinned
     }
 
-    /// What a left-drag does.
+    /// Whether the camera is fenced into the camera box.
     #[must_use]
     pub const fn mode(&self) -> Mode {
         self.mode
     }
 
-    /// Switch between orbiting and free-look, re-deriving the pivot.
+    /// Put the fence up or take it down, re-deriving the pivot when it goes up.
     pub fn set_mode(&mut self, mode: Mode) {
         self.mode = mode;
         if mode == Mode::Orbit {
@@ -302,10 +318,15 @@ impl Controller {
             MIN_ORBIT_FRACTION * diagonal,
             MAX_ORBIT_FRACTION * diagonal,
         );
-        self.target = self
-            .scene
-            .bounds
-            .clamp_point(self.position + self.forward * distance);
+        let on_ray = self.position + self.forward * distance;
+        // The box clamp is the FENCE, and the fence is [`Mode::Orbit`] only.
+        // Clamping in [`Mode::Free`] would drag the focus point back towards
+        // the capture box every time the camera looked around from outside it,
+        // and the next left-drag would then orbit something behind the camera.
+        self.target = match self.mode {
+            Mode::Orbit => self.scene.bounds.clamp_point(on_ray),
+            Mode::Free => on_ray,
+        };
     }
 
     /// Down axis of camera space, `forward x right` — the `+Y` row of `R`.
@@ -327,19 +348,25 @@ impl Controller {
         self.right = right.normalize_or(Vec3::X);
     }
 
-    /// A left-drag, in screen points: orbit or look, depending on the mode.
+    /// A left-drag, in screen points. Always an orbit — see the module doc.
+    ///
+    /// Kept as a named gesture (rather than callers reaching for [`Self::orbit`]
+    /// directly) so there is one place to read what the left button does.
     ///
     /// # Arguments
     /// - `dx`: rightward drag, points.
     /// - `dy`: downward drag, points.
     pub fn drag(&mut self, dx: f32, dy: f32) {
-        match self.mode {
-            Mode::Orbit => self.orbit(dx, dy),
-            Mode::Free => self.look(dx, dy),
-        }
+        self.orbit(dx, dy);
     }
 
     /// Rotate in place by a mouse drag, in screen points (first-person look).
+    ///
+    /// The right-drag. The orbit pivot is re-derived afterwards, so the very
+    /// next left-drag turns about whatever is now in front of the camera
+    /// instead of about something behind it. Without that the two buttons
+    /// fight each other: look away, and the first orbit drag whips the view
+    /// back round.
     ///
     /// # Arguments
     /// - `dx`: rightward drag, points; yaws about the world up axis.
@@ -350,6 +377,7 @@ impl Controller {
         }
         self.pinned = false;
         self.rotate_in_place(-dx * LOOK_SPEED, -dy * LOOK_SPEED);
+        self.recentre_target();
     }
 
     /// Yaw in place by an exact angle, radians — the scripted camera change
@@ -467,15 +495,39 @@ impl Controller {
         }
     }
 
-    /// The scroll wheel: fly speed when flying, distance when orbiting.
+    /// The scroll wheel: dolly towards or away from the focus point.
+    ///
+    /// One binding in both modes, because "the wheel does a different thing
+    /// depending on a mode you cannot see" is exactly the kind of thing that
+    /// made the old scheme unusable. Fly speed moved onto SHIFT + scroll
+    /// ([`Self::adjust_speed`]), which `app.rs` also fires while the right
+    /// button is held, which is where Brush puts it.
     ///
     /// # Arguments
     /// - `notches`: scroll notches, positive away from the user.
     pub fn scroll(&mut self, notches: f32) {
-        match self.mode {
-            Mode::Orbit => self.zoom(notches),
-            Mode::Free => self.adjust_speed(notches),
+        self.zoom(notches);
+    }
+
+    /// Put the orbit focus on a world point — the double-click gesture.
+    ///
+    /// The camera does **not** move: only what a left-drag turns about, and
+    /// what the wheel dollies towards, changes. `point` is clamped into the
+    /// camera box expanded by [`LOST_BOX_FACTOR`] rather than into the box
+    /// itself: a clicked surface is often a little outside the volume the
+    /// cameras stood in (a far wall, the far side of a tree), and refusing to
+    /// focus on it would make the gesture look broken, while an unclamped
+    /// focus on a far-field environment point thousands of units away would
+    /// make every later orbit useless.
+    ///
+    /// # Returns
+    /// `false` (and changes nothing) when `point` is not finite.
+    pub fn set_focus(&mut self, point: Vec3) -> bool {
+        if !point.is_finite() {
+            return false;
         }
+        self.target = self.scene.bounds.expanded(LOST_BOX_FACTOR).clamp_point(point);
+        true
     }
 
     /// Scale the fly speed by `notches` scroll steps, clamped to
@@ -858,7 +910,7 @@ mod tests {
         let notches = (MAX_SPEED_SCALE.ln() / SPEED_STEP.ln()).ceil() as usize;
         assert_eq!(notches, 18);
         for _ in 0..notches {
-            c.scroll(1.0);
+            c.adjust_speed(1.0);
         }
         assert!(
             (c.move_speed() - base * MAX_SPEED_SCALE).abs() < 1e-3 * base,
@@ -896,43 +948,115 @@ mod tests {
     }
 
     #[test]
-    fn the_scroll_wheel_scales_the_speed_and_clamps_it() {
+    fn shift_scroll_scales_the_speed_and_clamps_it() {
         let views = ring(24, 4.0);
         let mut c = Controller::new(&views, 0, UP);
         c.set_mode(Mode::Free);
         let base = c.move_speed();
-        c.scroll(1.0);
+        c.adjust_speed(1.0);
         assert!((c.move_speed() - base * SPEED_STEP).abs() < 1e-4 * base);
-        c.scroll(-1.0);
+        c.adjust_speed(-1.0);
         assert!((c.move_speed() - base).abs() < 1e-4 * base);
         for _ in 0..200 {
-            c.scroll(1.0);
+            c.adjust_speed(1.0);
         }
         assert!((c.move_speed() - base * MAX_SPEED_SCALE).abs() < 1e-3 * base);
         for _ in 0..400 {
-            c.scroll(-1.0);
+            c.adjust_speed(-1.0);
         }
         assert!((c.move_speed() - base * MIN_SPEED_SCALE).abs() < 1e-4 * base);
     }
 
     #[test]
-    fn scrolling_in_orbit_mode_zooms_instead_of_changing_the_speed() {
+    fn the_wheel_dollies_in_both_modes_and_never_changes_the_speed() {
+        // Jordan's complaint about the old scheme was that the wheel did one
+        // thing in one mode and another in the other, with nothing on screen
+        // to say which. One binding now, in both modes.
+        for mode in [Mode::Orbit, Mode::Free] {
+            let views = ring(24, 4.0);
+            let mut c = Controller::new(&views, 0, UP);
+            c.set_mode(mode);
+            let speed = c.move_speed();
+            let distance = c.orbit_distance();
+            c.scroll(1.0);
+            assert!(
+                (c.move_speed() - speed).abs() < 1e-9,
+                "{mode:?}: the wheel changed the fly speed"
+            );
+            assert!(
+                c.orbit_distance() < distance,
+                "{mode:?}: scrolling up must move closer"
+            );
+            // And it cannot be scrolled through the pivot or out of the scene.
+            for _ in 0..500 {
+                c.scroll(1.0);
+            }
+            assert!(c.orbit_distance() >= MIN_ORBIT_FRACTION * c.scene().diameter() - 1e-4);
+            for _ in 0..1000 {
+                c.scroll(-1.0);
+            }
+            assert!(c.orbit_distance() <= MAX_ORBIT_FRACTION * c.scene().diameter() + 1e-3);
+        }
+    }
+
+    #[test]
+    fn a_left_drag_orbits_in_both_modes() {
+        // The whole point of the 2026-09-08 rebinding: "left click and drag to
+        // orbit" is true whether or not the fence is up. Orbiting preserves the
+        // distance to the focus point exactly; looking does not move the camera
+        // at all, so the two are told apart by whether the camera moved.
+        for mode in [Mode::Orbit, Mode::Free] {
+            let views = ring(24, 4.0);
+            let mut c = Controller::new(&views, 0, UP);
+            c.set_mode(mode);
+            let before = c.position;
+            let distance = c.orbit_distance();
+            c.drag(40.0, 0.0);
+            assert!(
+                (c.position - before).length() > 1e-3,
+                "{mode:?}: a left-drag did not move the camera, so it was not an orbit"
+            );
+            assert!(
+                (c.orbit_distance() - distance).abs() < 1e-3 * distance,
+                "{mode:?}: an orbit must preserve the focus distance"
+            );
+        }
+    }
+
+    #[test]
+    fn a_right_drag_looks_without_moving_the_camera_and_re_aims_the_focus() {
         let views = ring(24, 4.0);
         let mut c = Controller::new(&views, 0, UP);
-        let speed = c.move_speed();
-        let distance = c.orbit_distance();
-        c.scroll(1.0);
-        assert!((c.move_speed() - speed).abs() < 1e-9, "orbit scroll changed the fly speed");
-        assert!(c.orbit_distance() < distance, "scrolling up must move closer");
-        // And it cannot be scrolled through the pivot or out of the scene.
-        for _ in 0..500 {
-            c.scroll(1.0);
-        }
-        assert!(c.orbit_distance() >= MIN_ORBIT_FRACTION * c.scene().diameter() - 1e-4);
-        for _ in 0..1000 {
-            c.scroll(-1.0);
-        }
-        assert!(c.orbit_distance() <= MAX_ORBIT_FRACTION * c.scene().diameter() + 1e-3);
+        let before = c.position;
+        let forward = c.forward;
+        c.look(60.0, 0.0);
+        assert!(
+            (c.position - before).length() < 1e-5,
+            "a first-person look must not translate the camera"
+        );
+        assert!(c.forward.dot(forward) < 0.999, "the camera did not turn");
+        // The re-aim: the focus point is in front of the camera, not behind it.
+        assert!(
+            (c.target() - c.position).dot(c.forward) > 0.0,
+            "the focus point stayed behind the camera after a look"
+        );
+    }
+
+    #[test]
+    fn a_double_click_focus_moves_the_pivot_but_not_the_camera() {
+        let views = ring(24, 4.0);
+        let mut c = Controller::new(&views, 0, UP);
+        let before = c.position;
+        assert!(c.set_focus(Vec3::new(1.0, 0.5, -0.5)));
+        assert!((c.position - before).length() < 1e-6);
+        assert!((c.target() - Vec3::new(1.0, 0.5, -0.5)).length() < 1e-4);
+        // A far-field point is clamped rather than accepted, so the next orbit
+        // is still usable; a non-finite one is refused outright.
+        assert!(c.set_focus(Vec3::splat(1.0e6)));
+        assert!(c.target().length() < 1.0e5);
+        let kept = c.target();
+        assert!(!c.set_focus(Vec3::new(f32::NAN, 0.0, 0.0)));
+        assert_eq!(c.target(), kept);
     }
 
     #[test]

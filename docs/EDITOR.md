@@ -878,7 +878,7 @@ the pixel mapping, one child process, and the import.
 
 - **The gesture.** With the SAM tool selected (`T` cycles to it), a primary
   **drag** on the render draws a marquee and becomes a `--box`; **Alt-click**
-  becomes a `--point`. Orbit is not lost: Shift-drag still orbits, right- and
+  becomes a `--point`. The camera is not lost: right-drag still looks and shift+left- or
   middle-drag still pan, and outside this one tool the primary drag is
   untouched. A drag shorter than `MIN_BOX_PX` (8 render px) is treated as a
   click, not a 2 px box.
@@ -969,6 +969,75 @@ splat_bundle.py`; 4000 points, 48x36 views), box `12 9 36 27` on `IMG_0.jpg`,
 
 ## 4. UI sketch
 
+### Simple Mode (default since 2026-09-08)
+
+Jordan, on the full Karekare scene: *"I don't get how to use the editor at all,
+needs to be more simple."* The four panels below are still there, but they are
+now behind a **Simple / Advanced** switch and Advanced is not what opens.
+Simple Mode is one panel, four numbered steps, and no word Jordan has to look
+up — no "op", "mix", "threshold", "pointset", "voxel" and, specifically, no
+"gizmo" (*"Idk what a gizmo is"*): the handles are **move arrows** in every
+string the UI shows. `edit_ui.rs`'s own unit test asserts that.
+
+```
+┌─ Edit (M) ───────────────── [Simple] Advanced ─┐
+│ Do these in any order. Cmd-Z undoes anything.  │
+│                                                 │
+│ 1. Find shade clouds                            │
+│    [Find them] [x] highlight them               │
+│    18 231 of 7 512 044 points look like shade   │
+│    cloud (0.24% of the scene)                   │
+│    [Soften them] [Remove them]                  │
+│                                                 │
+│ 2. Select an object                             │
+│    [on -- click the scene]                      │
+│    608 of 5 000 000 points selected (0.012%)    │
+│    [smaller] [bigger]  reach 0.29 world units   │
+│    [Keep this as an object] [Start again]       │
+│                                                 │
+│ 3. Paint an area                                │
+│    [on -- drag on the scene]                    │
+│    brush size |--------| 0.31 world units [ / ] │
+│    what happens where you paint:                │
+│      [remove] [soften] [choose]                 │
+│    soften: leave the points where they are, but │
+│      fade this area towards the splat.          │
+│                                                 │
+│ 4. What to show here                            │
+│    [x] brush-1  (312 points)   [forget it]      │
+│        [remove] [soften] [choose]               │
+│        Splat  <-->  TRIPS  |------------|       │
+│                                                 │
+│ Put a shape somewhere                           │
+│    [+ box] [+ ball] [+ pool lid]                │
+│    it goes where you click, sized to how far    │
+│    away that is                                 │
+│                                                 │
+│ [undo] [redo] [save] [reload]                   │
+└─────────────────────────────────────────────────┘
+```
+
+Three rules make it work, and each is a change to behaviour rather than to
+wording:
+
+1. **A plain click is claimed, in this order**: an armed placement first, then
+   Simple Mode's "select an object" step. Everywhere else selection is still
+   SHIFT-click, so no launcher, script or habit changed.
+2. **Placement is arm-then-click.** `+ box` does not create anything; it arms
+   [`Placement`], and the next plain click on the render creates the region ON
+   the point under it (`EditSession::resolve_placement`), sized to
+   `PLACEMENT_SIZE_DEPTH_FRACTION` of that point's camera-space depth. Pressing
+   the button again disarms.
+3. **A greyed control says why.** With no `blend` block in `bundle.json` there
+   is no Gaussian half, so the Splat/TRIPS slider is disabled and carries the
+   sentence *"This bundle has no splat to mix. Open a combined bundle."*
+   (`EditSession::no_splat_reason`). It used to move and do nothing.
+
+The `?` overlay `app.rs` paints lists six gestures, from `edit_ui::MOUSE_HELP`
+— one list, quoted by `docs/USER_GUIDE.md`, asserted jargon-free by a test.
+
+### Advanced Mode
+
 Four egui panels (the sketch's three, plus **Named Objects**), added the same
 way the existing HUD window is built (`app.rs::ViewerApp::overlay`, an
 `egui::Window`) — an "Edit" window shown alongside it, toggled independently of
@@ -1023,7 +1092,7 @@ already binds — `V X Tab - = F R N P W A S D Q E` and drag/scroll):
 |---|---|
 | `M` | toggle edit mode (shows Regions/Named Objects/Inspector/Tools). `--edit` opens straight into it. Click-drag on the canvas still orbits *unless it starts on a gizmo handle* — the drag is scoped to what it started on, so navigation is never taken away |
 | **Shift-click** | E4's selection gesture: cluster the object under the pointer. Read from the scene `Response` like every drag, and scoped to `clicked()` rather than `dragged()`, so a Shift-DRAG still orbits and navigation loses nothing |
-| **drag** | E5's box prompt **while the SAM tool has focus**, a brush stroke **while the Brush tool has focus**, and a gizmo drag when it STARTS on a handle. Shift-drag still orbits and right/middle-drag still pans in every case, so each gesture is borrowed rather than taken |
+| **drag** | E5's box prompt **while the SAM tool has focus**, a brush stroke **while the Brush tool has focus**, and a move-arrow drag when it STARTS on a handle. Right-drag still looks around and shift+left- or middle-drag still pans in every case, so each gesture is borrowed rather than taken |
 | **Alt-click / Alt-drag** | E5's point prompt; with the Brush tool, an ERASE stroke. Alt is bound to nothing else in this viewer, so this costs no existing gesture |
 | **drag a gizmo handle** | translate the selected box/sphere/lid along that handle's world axis. **Shift-drag** a handle resizes; **Ctrl-drag** rotates a box about that axis (nothing else has an orientation to rotate). One drag = one undo entry, however many frames it took |
 | `T` | cycle the active tool (Regions → shade-cloud finder → click-to-cluster → SAM 3 lift → brush) |
@@ -1033,7 +1102,7 @@ already binds — `V X Tab - = F R N P W A S D Q E` and drag/scroll):
 | `Cmd`/`Ctrl` + `Z` | undo |
 | `Cmd`/`Ctrl` + `Shift` + `Z` | redo |
 | `Cmd`/`Ctrl` + `S` | save `edits.json` |
-| `H` | toggle the preview highlight of whichever tool has focus (a tinted point cloud, not a new `ViewMode` — see §6). Where several tools have a live preview, the union is tinted the one colour. The brush has no preview of its own — what a stroke paints IS the region — so `H` keeps its one meaning; the 3D handles have their own checkbox in the Regions panel |
+| `H` | toggle the preview highlight of whichever tool has focus (a tinted point cloud, not a new `ViewMode` — see §6). Where several tools have a live preview, the union is tinted the one colour. Since 2026-09-08 the **brush has one too**: the points its region claims are recomputed once at button-up (`EditSession::refresh_brush_tint`, one `brush::membership` hash probe per point, never per sample) and tinted like everything else, because "what a stroke paints IS the region" was only visible for a `delete` op. An undo or a redo DROPS that tint rather than leave a stale one, which is what keeps `--brush-undo`'s frame byte-identical to a run that never painted |
 | `Cmd`/`Ctrl` + `N` | *not built*, and not needed: "new region from the current selection" is the **add as region** button next to each tool's own selection (E2's shade finder, E4's click-to-cluster), where the op and mix for it are chosen |
 
 Left-click behaviour while in edit mode: **unchanged from viewing**, except
@@ -1165,6 +1234,21 @@ schedule.
 | **E4** | Click-to-cluster: ray cast + k-d tree + k-NN growth in world+colour space, radius slider | 3 d | Clicking a point-cloud cluster selects a `pointset` region that visibly matches the clicked object's extent, without needing a depth buffer | **Done** (2026-09-07), on both sides. Python: `trippy.edit.cluster`, `trippy edits click` (`tests/test_edit_cluster.py`). Rust: `edit/cluster.rs` (the projection, the depth-mode seed, an exact k-NN spatial hash in place of the unavailable k-d tree, the colour/radius/point gates), the **Selection panel** with the four sliders + op/mix + "add as region" + "clear" in `edit_ui.rs`, and **Shift-click** on the render in `app.rs`. Parity is exact, not approximate: the committed `click.json`/`expected_click.json` fixture replays four clicks (depth-mode seeding, the colour gate, the `max_points` cut-off, a miss) and both languages return the identical id list; `--click U V --dump-click` reproduces it against a real bundle. Measured on the synthetic bundle at 480x360: a click at (240, 180) selects 261 of 4000 points, the tint changes **71.55 %** of the frame's pixels (3.81 % of them turning magenta, the rest dimmed by the preview) with a max channel diff of 79, and a run without `--click` reproduces the untinted frame **bit for bit** (0.0000 % of pixels differ, max channel diff 0). Not built: an Inspector-side gizmo for a committed `pointset` region (there is no shape to drag). |
 | **E5** | SAM 3 lift: photo segmentation, multi-view projection + majority vote, `pointset` region output | 2–3 wk | Segmenting an object in 2–3 registered views of the same scene produces one `pointset` region that, previewed, highlights that object and not its neighbours; runs entirely local (no image leaves the machine) | **Shipped, both sides.** Python: `trippy/edit/sam_lift.py`, `trippy/edit/sam_runner.py`, `trippy edits sam` (§3's "Implemented" note has the command, the depth-gate and the vote rules). Viewer: the `SAM 3 lift` tool — drag a box or Alt-click on the render while pinned to a capture view, one `trippy edits sam` child with live progress and a Cancel button, and the region imported through the undo log and tinted (§3's "5. The SAM tool in the viewer"). SAM 3 runs locally in a subprocess under Splats' SAM venv, on CPU (~9 s/view) or MPS; the whole path is CPU-testable and screenshottable with `--fake` / `TRIPPY_SAM_FAKE=1`, which needs no checkpoint and no GPU (`tests/test_edit_sam.py`, `trips-viewer --sam-box`). Not built: batching several views into ONE child (each view still pays a model load, `docs/LIMITATIONS.md`), and any per-point clean-up of the returned selection. |
 | **E6** | Publish path: `trippy apply-edits`, TRIPS `export.ply` mask wiring, distilled-splat publish order (edit-then-distil for pointset regions, geometry-reapply for box/sphere/lid) | 3 d | `trippy apply-edits --target both` on a bundle with a mix of region kinds produces a TRIPS PLY with the deleted points absent and, after a `trippy distill` run on the same edited bundle, a distilled PLY that also lacks them; a box/sphere/lid region re-applied directly to an already-distilled PLY (no re-distillation) also removes the matching geometry | **Done** (`trippy/edit/apply.py`, `trippy/edit/checkpoint.py`): `--target trips\|distilled\|both` (default `both`); `trips`/`both` write the filtered TRIPS `points.npz`/`blend_weights.npy`/`export.ply` and, if named, a filtered `blend.splat_ply`; `distilled`/`both` (with `--distilled-ply`) re-apply box/sphere/lid regions to an already-distilled PLY as delete/opacity-scale-fade; `--edits` wired into `trippy distill --stage render` (edit-then-distil ordering) and into `trippy candidate-report`/`trippy eval` (checkpoint-side keep mask + gate suppression on gate-hybrid checkpoints, BOTH commands as of 2026-09-07 — see §5's own paragraph). |
+
+**Usability pass, 2026-09-08 (`feat/viewer-simple-mode`).** Jordan drove the
+finished editor on the full Karekare scene (7.5M points) and reported five
+concrete failures. Each is fixed as a behaviour change, and each has a test:
+
+| what Jordan said | what was wrong | what changed |
+|---|---|---|
+| "make it left click and drag to orbit, right click and drag to POV free move the camera, like brush" | a left-drag orbited or looked depending on an invisible mode; the right button panned; the wheel changed speed in one mode and distance in the other | `camera.rs`: left = orbit, right = first-person look (WASD flying while held), middle / shift+left = pan, wheel = dolly, shift+wheel = fly speed, **double-click = put the focus point on what you clicked** (`Controller::set_focus`, depth from `brush::depth_anchor_f32`). [`Mode`] is now only a fence, not a control scheme |
+| "I don't get how to use the editor at all, needs to be more simple" | four dense panels of sliders with units | **Simple Mode**, on by default; see §4 |
+| "I couldn't put boxes or spheres where I wanted" | `+ box` dropped a region at the camera's look-at point, at one size for the whole scene | arm-then-click placement: the region is created ON the clicked point, sized to `PLACEMENT_SIZE_DEPTH_FRACTION` of its depth (`EditSession::resolve_placement`, headless `--place`) |
+| "Clicking to select an object seemed to just select the whole scene" | `max_radius` defaulted to the median nearest-CAMERA spacing — metres on a walked capture — and nothing stopped k-NN growth in a connected cloud | `cluster::depth_capped_max_radius` (min of 15% of the click depth and 2% of the captured area, floored at the catchment disc, times the grow/shrink scale), `ClickParams::density_gate` (stop where the cloud thins out), and a seed clipped to the surface under the cursor instead of a cone through the cloud. All three are OFF on the `trippy edits click` parity path |
+| "Mix sliders didn't seem to make any difference" | that bundle had no Gaussian block, and the slider moved anyway | `EditSession::no_splat_reason`: the slider is greyed and says "This bundle has no splat to mix. Open a combined bundle." |
+| "Brushing seemed to blur the foreground and the background" | a scene-sized default radius, an anchor that took the nearest point in a fixed 12 px catchment whatever the brush size, no depth continuity along a stroke, and a default op of `delete` | radius from the view distance (`DEFAULT_BRUSH_VIEW_FRACTION`), anchor inside the brush's OWN ring (`brush::ring_radius_px`), `brush::clamp_stroke_depth` (a sample may move at most 1.5 radii in depth from the last), default op `fade`, and a magenta tint of what was painted |
+| "Idk what a gizmo is" | the word was in the UI | "move arrows" in every user-visible string; a test asserts it |
+| "Undo worked" | — | unchanged |
 
 **Three deviations worth naming.** (1) The preview highlight is not a fourth
 `ViewMode`: it is a copy of the point cloud with the selection's first three

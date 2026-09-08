@@ -15,19 +15,31 @@
 //!       frame: [`EditSession::needs_apply`] is set by the widgets and consumed
 //!       once in [`EditSession::apply`], which is also where the timing the HUD
 //!       reports comes from (`docs/EDITOR.md` §7 asks for that number).
-//!     - New regions are sized and placed from `crate::bundle::SceneScale` and
-//!       the camera's own look-at point — never from the point cloud's bounds,
-//!       which a TRIPS export's environment sphere makes meaningless
-//!       (`renderer.rs`'s `bounds` field says why).
-//!     - The 3D drag gizmos are NOT built. E1 ships numeric fields plus
-//!         keyboard nudge/resize instead, which the brief explicitly allows; the
-//!       keys are listed in [`KEYS_HELP`] and in `docs/USER_GUIDE.md`.
+//!     - New regions are placed ON THE POINT THAT WAS CLICKED and sized from
+//!       that point's own camera-space depth ([`EditSession::resolve_placement`],
+//!       `PLACEMENT_SIZE_DEPTH_FRACTION`) — never at the camera's look-at point,
+//!       and never from the point cloud's bounds, which a TRIPS export's
+//!       environment sphere makes meaningless (`renderer.rs`'s `bounds` field
+//!       says why). `crate::bundle::SceneScale` remains the only source of a
+//!       whole-scene distance, and it is a CAP here rather than the size itself.
+//!     - The panel opens in **Simple Mode** ([`EditSession::simple`]): four
+//!       numbered steps, plain words, and no jargon — specifically not the word
+//!       "gizmo", which Jordan reported not understanding on 2026-09-08. The
+//!       three drag handles are "move arrows" in every string the UI shows;
+//!       the module and type names in [`gizmo`] keep the term.
+//!     - The click tool's growth cap and density gate ([`ClickParams`]'s
+//!       `density_gate`) are ON in the window and OFF whenever
+//!       [`EditSession::set_click_params`] has been called, which is the
+//!       headless `--click` path `tests/test_edit_viewer_parity.py` compares
+//!       against `trippy edits click`. That path must keep running exactly the
+//!       arithmetic the Python twin runs.
 //! Units: world units for every geometry field; `mix` is 0 = splat, 1 = TRIPS.
 //! Related docs: `docs/EDITOR.md` §1, §3, §4; `docs/USER_GUIDE.md` "Editor".
 
 use std::path::{Path, PathBuf};
 
 use brush_pyramid::gpu::block_on;
+use brush_pyramid::scene::PointSet;
 use eframe::egui;
 use serde_json::json;
 
@@ -47,8 +59,9 @@ use trips_viewer::edit::weights::{
 };
 use trips_viewer::edit::{
     EditDocument, BRUSH_CELLS_PER_RADIUS, BRUSH_RADIUS_STEP, BRUSH_SAMPLE_PX,
-    DEFAULT_BRUSH_SCENE_FRACTION, DEFAULT_REGION_SCENE_FRACTION, EDITS_FILENAME,
-    NUDGE_SCENE_FRACTION, RESIZE_STEP,
+    DEFAULT_BRUSH_SCENE_FRACTION, DEFAULT_BRUSH_VIEW_FRACTION, DEFAULT_REGION_SCENE_FRACTION,
+    EDITS_FILENAME, NUDGE_SCENE_FRACTION, PLACEMENT_ANCHOR_PX, PLACEMENT_MAX_SCENE_FRACTION,
+    PLACEMENT_SIZE_DEPTH_FRACTION, RESIZE_STEP,
 };
 use trips_viewer::renderer::Renderer;
 
@@ -57,18 +70,65 @@ use crate::sam_child::{
     SamRequest, SamState,
 };
 
-/// The editor's key bindings, shown in the panel and in `docs/USER_GUIDE.md`.
+/// The editor's key bindings, shown in the Advanced panel and in
+/// `docs/USER_GUIDE.md`.
 ///
 /// Chosen to avoid every key `app.rs::ViewerApp::handle_input` already binds
 /// (`V X B Tab - = F R N P W A S D Q E`), per `docs/EDITOR.md` §4.
+///
+/// The word "gizmo" does not appear here, or anywhere else Jordan can read:
+/// 2026-09-08, "Idk what a gizmo is." The handles are **move arrows**
+/// throughout the UI; the module and type names keep the term, because that is
+/// what every other 3D tool's source calls them.
 pub const KEYS_HELP: &str = "\
 M edit mode | T cycle tool | H preview highlight | SHIFT-CLICK the render to select\n\
-SAM tool: DRAG a box on the render (SHIFT-drag still orbits) or ALT-CLICK a point\n\
-Brush tool: DRAG to paint, ALT-drag to erase (SHIFT-drag still orbits), [ / ] radius\n\
-gizmo: DRAG a handle to move it, SHIFT-drag to resize, CTRL-drag to rotate a box\n\
+SAM tool: DRAG a box on the render or ALT-CLICK a point\n\
+Brush tool: DRAG to paint, ALT-drag to erase, [ / ] radius\n\
+move arrows: DRAG a handle to move it, SHIFT-drag to resize, CTRL-drag to rotate a box\n\
 arrows + PageUp/PageDown nudge the selected region | [ / ] shrink / grow (brush radius\n\
 while the Brush tool has focus)\n\
 Delete removes the selected region | Cmd-Z undo | Cmd-Shift-Z redo | Cmd-S save";
+
+/// The six mouse and key bindings the `?` overlay lists, in plain words.
+///
+/// One list, one place: `app.rs` paints it over the render and
+/// `docs/USER_GUIDE.md` quotes it. If it changes here it changes there.
+pub const MOUSE_HELP: &[(&str, &str)] = &[
+    ("left-drag", "turn around what you are looking at"),
+    ("right-drag", "look around from where you are (W A S D fly, Q / E down / up)"),
+    ("middle-drag, or shift + left-drag", "slide sideways and up/down"),
+    ("scroll", "move closer / further (shift + scroll = fly faster)"),
+    ("double-click", "look at THAT: puts the turning point on what you clicked"),
+    ("R", "back to the photo you started on, whenever you are lost"),
+];
+
+/// What an armed placement click will create.
+///
+/// `docs/EDITOR.md` §4. A box, a sphere or the pool lid is placed ON THE POINT
+/// THAT WAS CLICKED (2026-09-08: "I couldn't put boxes or spheres where I
+/// wanted") rather than at the camera's look-at point, so the gesture is
+/// arm-then-click: press the button, then click the thing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Placement {
+    /// An axis-aligned box centred on the click.
+    Box,
+    /// A sphere centred on the click.
+    Sphere,
+    /// The Karekare pool lid preset, its plane moved onto the click.
+    Lid,
+}
+
+impl Placement {
+    /// The word the button and the prompt use.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Box => "box",
+            Self::Sphere => "ball",
+            Self::Lid => "pool lid",
+        }
+    }
+}
 
 /// Which tool the Tools panel has focus on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -217,6 +277,18 @@ pub struct ClickUi {
     pub op: Op,
     /// The mix "add as region" will give it (ignored by `delete`).
     pub mix: f64,
+    /// Multiplies the depth-derived growth cap: the "grow" / "shrink" pair of
+    /// buttons, which is all Simple Mode exposes of the four sliders.
+    grow_scale: f64,
+    /// Whether `params.max_radius` is derived from the click's own depth
+    /// ([`cluster::depth_capped_max_radius`]) and the density gate is on.
+    ///
+    /// True in the window. False the moment [`EditSession::set_click_params`]
+    /// is called, which is the headless `--click` path that
+    /// `tests/test_edit_viewer_parity.py` compares against `trippy edits
+    /// click` — that path must keep running exactly the arithmetic the Python
+    /// twin runs (`edit::cluster`'s `density_gate` field says the same).
+    auto_radius: bool,
     /// The camera and pixel of the last click, so a slider move re-runs it
     /// against the frame it was made in rather than wherever the camera is now.
     last: Option<(ClickCamera, (f64, f64))>,
@@ -238,6 +310,8 @@ impl Default for ClickUi {
             params: ClickParams::default(),
             selection: ClickSelection::default(),
             preview: true,
+            grow_scale: 1.0,
+            auto_radius: true,
             op: Op::Fade,
             mix: cluster::DEFAULT_MIX,
             last: None,
@@ -371,6 +445,19 @@ pub struct BrushUi {
     /// Where the cursor was last painted, render pixels, and the radius the
     /// stroke is painting at there, for the on-screen circle.
     cursor: Option<((f64, f64), f64)>,
+    /// The point ids the last stroke's region claims, for the magenta tint.
+    ///
+    /// 2026-09-08: a stroke used to be invisible unless its op happened to be
+    /// `delete`, which is why "brushing seemed to blur the foreground and the
+    /// background" was the only feedback there was. Recomputed at the END of a
+    /// stroke (one pass over the cloud), never per sample.
+    selection: Vec<u32>,
+    /// Whether the render tints [`Self::selection`] (`H`, and the panel).
+    preview: bool,
+    /// Whether [`Self::radius`] is still the one the viewer chose. Cleared by
+    /// the slider, the `[`/`]` keys and the headless `--brush-radius`, so a
+    /// chosen radius is never silently replaced.
+    auto_radius: bool,
     /// A one-line "what just happened".
     note: String,
 }
@@ -412,7 +499,12 @@ impl Default for BrushUi {
             // a zero radius paints nothing, which is the safe sentinel.
             radius: 0.0,
             weight: 1.0,
-            op: Op::Delete,
+            // `fade` towards mix 0, not `delete`. A brush whose default op
+            // removes points shows nothing where it painted and a blurred
+            // U-Net guess where the points used to be, which is exactly the
+            // report on 2026-09-08. `fade` is visible (the tint), reversible
+            // and does not change the geometry.
+            op: Op::Fade,
             mix: 0.0,
             region: None,
             stroke: None,
@@ -421,6 +513,9 @@ impl Default for BrushUi {
             screen_grid: None,
             depth: None,
             cursor: None,
+            selection: Vec::new(),
+            preview: true,
+            auto_radius: true,
             note: String::new(),
         }
     }
@@ -476,6 +571,29 @@ pub struct EditSession {
     selected: Option<String>,
     /// Which tool the Tools panel has focus on (`T`).
     tool: Tool,
+    /// **Simple Mode**: one panel, four numbered steps, plain words, no
+    /// sliders with units in their labels. On by default since 2026-09-08
+    /// ("I don't get how to use the editor at all, needs to be more simple");
+    /// the toggle at the top of the panel switches to the Advanced panels,
+    /// which are exactly what v0.6.0 shipped.
+    pub simple: bool,
+    /// What the next plain click on the render will place, if anything.
+    placing: Option<Placement>,
+    /// A placement click waiting for the frame's camera, render pixels — the
+    /// same two-step every other gesture here uses.
+    place_pending: Option<(f64, f64)>,
+    /// World units across the captured area, from `crate::bundle::SceneScale`.
+    /// Cached because the click tool's growth cap needs it and `run_click` is
+    /// also called from the headless path, which has no `ui` frame to pass it.
+    scene_diameter: f64,
+    /// How far away the camera is looking, world units (the orbit distance).
+    /// The brush's default radius and its hover ring are derived from it.
+    view_distance: f64,
+    /// Whether the bundle carries a Gaussian block at all. `false` greys out
+    /// every splat/TRIPS mix control and says why, instead of leaving Jordan
+    /// dragging a slider that cannot do anything ("Mix sliders didn't seem to
+    /// make any difference", 2026-09-08 — that bundle had no splat).
+    has_splat: bool,
     /// The shade finder.
     shade: ShadeUi,
     /// The click-to-cluster tool.
@@ -570,6 +688,12 @@ impl EditSession {
             active: false,
             selected: None,
             tool: Tool::default(),
+            simple: true,
+            placing: None,
+            place_pending: None,
+            scene_diameter: 0.0,
+            view_distance: 0.0,
+            has_splat: false,
             shade: ShadeUi::new(shade_views, bundle_dir),
             click: ClickUi::default(),
             sam: SamUi::default(),
@@ -612,6 +736,9 @@ impl EditSession {
         if self.sam.preview {
             ids.extend_from_slice(&self.sam.selection);
         }
+        if self.brush.preview {
+            ids.extend_from_slice(&self.brush.selection);
+        }
         (!ids.is_empty()).then_some(ids)
     }
 
@@ -633,6 +760,7 @@ impl EditSession {
         renderer: &Renderer,
         scene_diameter: f32,
     ) {
+        self.scene_diameter = f64::from(scene_diameter);
         if self.click.params.max_radius > 0.0 {
             return;
         }
@@ -669,7 +797,7 @@ impl EditSession {
     ///
     /// A no-op on every frame where nothing asked for it, exactly as
     /// [`Self::refresh_shade`] is.
-    pub fn resolve_click(&mut self, camera: &ClickCamera, renderer: &Renderer) {
+    pub fn resolve_click(&mut self, camera: &ClickCamera, points: &PointSet) {
         let click = match (self.click.pending.take(), self.click.dirty) {
             (Some(px), _) => {
                 self.click.last = Some((camera.clone(), px));
@@ -682,7 +810,7 @@ impl EditSession {
         let Some((camera, px)) = click else {
             return;
         };
-        self.run_click(&camera, px, renderer);
+        self.run_click(&camera, px, points);
     }
 
     /// Cluster one click and keep the result. The headless `--click` path too.
@@ -692,9 +820,31 @@ impl EditSession {
     /// - `px`: the clicked pixel in that camera's own coordinates.
     /// - `renderer`: the source of the cloud (its UNEDITED rows, so the ids the
     ///   selection carries index `points.npz` and not a delete-filtered copy).
-    pub fn run_click(&mut self, camera: &ClickCamera, px: (f64, f64), renderer: &Renderer) {
+    pub fn run_click(&mut self, camera: &ClickCamera, px: (f64, f64), points: &PointSet) {
+        // The window's own defaults: cap the growth by a radius derived from
+        // how far away the clicked surface is, and stop where the cloud thins
+        // out. Both are off on the `--click` parity path (`set_click_params`).
+        //
+        // The depth comes from the same nearest-point-under-the-cursor anchor
+        // the brush uses, taken BEFORE the cluster runs, because the cap has to
+        // be a parameter of the run rather than a fact discovered by it.
+        if self.click.auto_radius {
+            let depth =
+                brush::depth_anchor_f32(camera, &points.xyz, px, self.click.params.radius_px);
+            let depth = depth.unwrap_or(0.0);
+            // The catchment disc's own world radius at that depth: the click
+            // may never reach LESS far than the circle it was made in.
+            let catchment = self.click.params.radius_px * depth / camera.fx.max(1e-9);
+            self.click.params.max_radius = cluster::depth_capped_max_radius(
+                depth,
+                self.scene_diameter,
+                catchment,
+                self.click.grow_scale,
+            );
+            self.click.params.density_gate = Some(cluster::DEFAULT_DENSITY_GATE_FACTOR);
+        }
         if self.click.cache.is_none() {
-            self.click.cache = Some(ClickCache::build(renderer.base_points()));
+            self.click.cache = Some(ClickCache::build(points));
         }
         let cache = self.click.cache.as_ref().expect("just built");
         let started = std::time::Instant::now();
@@ -755,9 +905,227 @@ impl EditSession {
     }
 
     /// Override the click tool's sliders (the `--click-*` flags).
+    ///
+    /// This is the PARITY path: it turns the depth-derived growth cap and the
+    /// density gate OFF, so `--click` reproduces `trippy edits click` exactly
+    /// (`tests/test_edit_viewer_parity.py`). `--click-auto` turns them back on
+    /// to exercise what the window actually does.
     pub fn set_click_params(&mut self, params: ClickParams) {
         self.click.params = params;
+        self.click.auto_radius = false;
         self.click.dirty = self.click.last.is_some();
+    }
+
+    /// Put the click tool back on the window's own defaults: a growth cap
+    /// derived from the click's depth, and the density gate on
+    /// (the headless `--click-auto` flag).
+    pub fn set_click_auto(&mut self, on: bool) {
+        self.click.auto_radius = on;
+        self.click.dirty = self.click.last.is_some();
+    }
+
+    /// The growth radius the last click ran with, world units.
+    #[must_use]
+    pub const fn click_max_radius(&self) -> f64 {
+        self.click.params.max_radius
+    }
+
+    /// How far the click tool may grow, as a multiple of its own default:
+    /// the "grow" / "shrink" buttons' state.
+    #[must_use]
+    pub const fn click_grow_scale(&self) -> f64 {
+        self.click.grow_scale
+    }
+
+    /// One press of "grow" (`+1`) or "shrink" (`-1`), re-running the last click.
+    pub fn grow_click(&mut self, steps: i32) {
+        let factor = cluster::GROW_STEP.powi(steps);
+        self.click.grow_scale = (self.click.grow_scale * factor)
+            .clamp(1.0 / cluster::GROW_SCALE_LIMIT, cluster::GROW_SCALE_LIMIT);
+        self.click.auto_radius = true;
+        self.click.dirty = self.click.last.is_some();
+    }
+
+    /// Tell the session how big the scene is and how far the camera is looking.
+    ///
+    /// Called once per frame from `app.rs`. Both numbers come from
+    /// `crate::bundle::SceneScale` and the camera controller, never from the
+    /// point cloud's bounds — a TRIPS export's environment sphere makes those
+    /// meaningless (`renderer.rs`'s `bounds` field).
+    pub fn set_scene_scale(&mut self, scene_diameter: f64, view_distance: f64) {
+        if scene_diameter.is_finite() && scene_diameter > 0.0 {
+            self.scene_diameter = scene_diameter;
+        }
+        if view_distance.is_finite() && view_distance > 0.0 {
+            self.view_distance = view_distance;
+            if self.brush.auto_radius {
+                self.brush.radius = (DEFAULT_BRUSH_VIEW_FRACTION * view_distance).max(1e-9);
+            }
+        }
+    }
+
+    /// Whether this bundle has a Gaussian splat to mix with at all.
+    pub fn set_has_splat(&mut self, has_splat: bool) {
+        self.has_splat = has_splat;
+    }
+
+    /// The sentence every greyed-out mix control shows, or `None` when the
+    /// bundle does carry a splat and the control works.
+    #[must_use]
+    pub const fn no_splat_reason(&self) -> Option<&'static str> {
+        if self.has_splat {
+            None
+        } else {
+            Some("This bundle has no splat to mix. Open a combined bundle.")
+        }
+    }
+
+    // --- placing a box, a ball or the lid ON something ----------------------
+
+    /// Arm the next plain click on the render to place `what`; a second press
+    /// of the same button disarms it.
+    pub fn arm_placement(&mut self, what: Placement) {
+        self.placing = if self.placing == Some(what) {
+            None
+        } else {
+            // Leave whichever tool owns the primary gesture, so the placement
+            // click cannot also paint a dab or seed a cluster.
+            self.set_tool(Tool::Regions);
+            Some(what)
+        };
+        self.note = match self.placing {
+            Some(what) => format!("click the scene to put the {} there", what.label()),
+            None => "placing cancelled".to_owned(),
+        };
+    }
+
+    /// What the next plain click will place, if anything.
+    #[must_use]
+    pub const fn placing(&self) -> Option<Placement> {
+        self.placing
+    }
+
+    /// Record a placement click, in the render camera's own pixels.
+    ///
+    /// Only stored: the camera is not known until the frame is laid out, so
+    /// [`Self::resolve_placement`] is where the work happens — the same
+    /// two-step the Shift-click and the brush use.
+    pub fn request_placement(&mut self, px: (f64, f64)) {
+        if self.placing.is_some() {
+            self.place_pending = Some(px);
+        }
+    }
+
+    /// Place the armed region on whatever the click landed on.
+    ///
+    /// A no-op on every frame where nothing is pending. The depth is the
+    /// nearest point within [`PLACEMENT_ANCHOR_PX`] of the click — the brush's
+    /// own anchor trick — and the size comes from that depth
+    /// ([`PLACEMENT_SIZE_DEPTH_FRACTION`]), so a region placed on something
+    /// far away is bigger in world units and the same size on screen.
+    ///
+    /// # Returns
+    /// The id of the region created, or `None` when nothing was pending or
+    /// nothing was under the click.
+    pub fn resolve_placement(
+        &mut self,
+        camera: &ClickCamera,
+        points: &PointSet,
+    ) -> Option<String> {
+        let px = self.place_pending.take()?;
+        let what = self.placing?;
+        let Some(depth) =
+            brush::depth_anchor_f32(camera, &points.xyz, px, PLACEMENT_ANCHOR_PX)
+        else {
+            self.note = format!(
+                "nothing under ({:.0}, {:.0}) to put the {} on -- aim at the scene, not at \
+                 empty sky",
+                px.0,
+                px.1,
+                what.label()
+            );
+            return None;
+        };
+        let centre = camera.unproject(px, depth);
+        let limit = PLACEMENT_MAX_SCENE_FRACTION * self.scene_diameter.max(f64::MIN_POSITIVE);
+        let mut half = PLACEMENT_SIZE_DEPTH_FRACTION * depth;
+        if limit > 0.0 {
+            half = half.min(limit);
+        }
+        let half = half.max(1e-6);
+        let id = new_region_id();
+        let region = match what {
+            Placement::Box => Region::new(
+                id.clone(),
+                auto_name_for(&self.doc, "box", None),
+                Params::Box {
+                    center: centre,
+                    half_extents: [half, half, half],
+                    quat: [1.0, 0.0, 0.0, 0.0],
+                },
+                0.0,
+                Op::Blend,
+            ),
+            Placement::Sphere => Region::new(
+                id.clone(),
+                auto_name_for(&self.doc, "ball", None),
+                Params::Sphere {
+                    center: centre,
+                    radius: half,
+                },
+                0.0,
+                Op::Blend,
+            ),
+            Placement::Lid => {
+                // The fitted plane NORMAL is kept (that is the whole value of
+                // the preset); only where the plane sits, and how wide the
+                // disc is, come from the click.
+                let mut lid = KAREKARE_LID;
+                let up = {
+                    let n = (lid.up[0] * lid.up[0] + lid.up[1] * lid.up[1] + lid.up[2] * lid.up[2])
+                        .sqrt();
+                    if n > 0.0 {
+                        [lid.up[0] / n, lid.up[1] / n, lid.up[2] / n]
+                    } else {
+                        [0.0, -1.0, 0.0]
+                    }
+                };
+                lid.center = centre;
+                lid.height = up[0] * centre[0] + up[1] * centre[1] + up[2] * centre[2];
+                lid.radius = half * 4.0;
+                lid.falloff = half;
+                lid.band = half;
+                Region::new(
+                    id.clone(),
+                    auto_name_for(&self.doc, "pool lid", None),
+                    Params::Lid(lid),
+                    0.0,
+                    Op::Delete,
+                )
+            }
+        };
+        let name = region.name.clone();
+        self.add(region);
+        self.placing = None;
+        self.note = format!(
+            "put {name} on the point you clicked: ({:.2}, {:.2}, {:.2}), {:.3} u across, \
+             {depth:.2} u in front of the camera",
+            centre[0],
+            centre[1],
+            centre[2],
+            half * 2.0
+        );
+        Some(id)
+    }
+
+    /// Whether a plain (unmodified) click on the render selects an object.
+    ///
+    /// Only in Simple Mode, and only on its "select an object" step: everywhere
+    /// else the gesture is still SHIFT-click, so nothing an existing launcher
+    /// or a habit relies on changed.
+    #[must_use]
+    pub fn simple_select_active(&self) -> bool {
+        self.active && self.simple && self.tool == Tool::ClickCluster
     }
 
     // --- the SAM 3 lift (E5) -------------------------------------------------
@@ -1058,6 +1426,10 @@ impl EditSession {
         if self.brush.radius > 0.0 {
             return;
         }
+        // The fallback. `set_scene_scale` replaces it with a radius taken from
+        // the distance the camera is actually looking at, as soon as `app.rs`
+        // reports one — that is the number the panel calls "about a thirtieth
+        // of how far away you are looking".
         self.brush.radius = f64::from(scene_diameter * DEFAULT_BRUSH_SCENE_FRACTION).max(1e-6);
     }
 
@@ -1065,6 +1437,36 @@ impl EditSession {
     #[must_use]
     pub fn brush_tool_active(&self) -> bool {
         self.active && self.tool == Tool::Brush
+    }
+
+    /// Where the pointer is hovering with the Brush tool armed, so the ring is
+    /// drawn BEFORE the first dab rather than only while painting.
+    ///
+    /// The ring's radius is `fx * radius / depth`, the projection of the
+    /// brush's sphere; the depth used is the stroke's own last anchor if there
+    /// is one, else the distance the camera is looking at
+    /// ([`Self::set_scene_scale`]). No point cloud is touched — a per-frame
+    /// depth anchor is ~47 ms on a Karekare-scale cloud, and this is chrome.
+    /// A stroke in progress overrides it: [`Self::resolve_brush`] sets the
+    /// cursor from the depth it actually painted at.
+    ///
+    /// # Arguments
+    /// - `px`: the pointer in render pixels, or `None` when it is off the
+    ///   canvas or the Brush tool does not have focus.
+    /// - `fx`: this frame's focal length in those same pixels.
+    pub fn set_brush_hover(&mut self, px: Option<(f64, f64)>, fx: f64) {
+        if self.brush.stroke.is_some() {
+            return;
+        }
+        self.brush.cursor = px.map(|px| {
+            let depth = self
+                .brush
+                .depth
+                .filter(|d| *d > 0.0)
+                .unwrap_or(self.view_distance)
+                .max(1e-9);
+            (px, fx * self.brush.radius / depth)
+        });
     }
 
     /// Where to draw the brush cursor: `(render pixel, radius in render px)`.
@@ -1081,6 +1483,7 @@ impl EditSession {
 
     /// Override the brush's settings (the `--brush-*` headless flags).
     pub fn set_brush_settings(&mut self, radius: f64, weight: f64, op: Op, mix: f64) {
+        self.brush.auto_radius = false;
         self.brush.radius = radius;
         self.brush.weight = weight;
         self.brush.op = op;
@@ -1163,12 +1566,17 @@ impl EditSession {
     }
 
     /// Finish the stroke: the next drag starts a new undo step.
-    pub fn end_brush_stroke(&mut self) {
+    ///
+    /// This is also where the magenta tint of what was painted is computed —
+    /// ONE pass over the cloud per stroke, at button-up, never per sample.
+    /// `renderer` is what makes that possible; a caller with no renderer to
+    /// hand (there is none in the shipped code) simply gets no tint.
+    pub fn end_brush_stroke_with(&mut self, points: Option<&PointSet>) {
         let Some(stroke) = self.brush.stroke.take() else {
             return;
         };
         if stroke.emitted {
-            self.brush.region = Some(stroke.region_id);
+            self.brush.region = Some(stroke.region_id.clone());
             self.brush.note = format!(
                 "{} stroke: {} samples, {} cells",
                 if stroke.erasing { "erase" } else { "paint" },
@@ -1177,6 +1585,55 @@ impl EditSession {
             );
         }
         self.brush.cursor = None;
+        if let Some(points) = points {
+            self.refresh_brush_tint(points);
+        }
+    }
+
+    /// Recompute which points the brush's current region claims, for the tint.
+    ///
+    /// One `brush::membership` lookup per point — a hash probe, not a distance
+    /// test against every sphere of the stroke — so the cost is the cloud's
+    /// size and not the stroke's length.
+    fn refresh_brush_tint(&mut self, points: &PointSet) {
+        let had = !self.brush.selection.is_empty();
+        self.brush.selection.clear();
+        let region = self
+            .brush
+            .region
+            .as_ref()
+            .and_then(|id| self.doc.region(id))
+            .map(|r| r.params.clone());
+        if let Some(Params::Brush {
+            origin,
+            cell_size,
+            cells,
+        }) = region
+        {
+            let xyz = &points.xyz;
+            for row in 0..xyz.len() / 3 {
+                let p = [
+                    f64::from(xyz[3 * row]),
+                    f64::from(xyz[3 * row + 1]),
+                    f64::from(xyz[3 * row + 2]),
+                ];
+                if brush::membership(&cells, origin, cell_size, p) > 0.0 {
+                    if let Ok(id) = u32::try_from(row) {
+                        self.brush.selection.push(id);
+                    }
+                }
+            }
+        }
+        if self.brush.preview && (had || !self.brush.selection.is_empty()) {
+            self.needs_apply = true;
+        }
+    }
+
+    /// How many points the last stroke's region claims (the panel's readout
+    /// and the headless proof's number).
+    #[must_use]
+    pub fn brush_selection_len(&self) -> usize {
+        self.brush.selection.len()
     }
 
     /// Whether a stroke is in progress (so `app.rs` keeps feeding it pixels).
@@ -1191,7 +1648,7 @@ impl EditSession {
     /// while the pointer is in egui's coordinates, and the work happens here,
     /// once the frame's camera exists (`docs/EDITOR.md` §4's last paragraph).
     /// A no-op on every frame with nothing pending.
-    pub fn resolve_brush(&mut self, camera: &ClickCamera, renderer: &Renderer) {
+    pub fn resolve_brush(&mut self, camera: &ClickCamera, points: &PointSet) {
         if self.brush.pending.is_empty() || self.brush.stroke.is_none() {
             // A pending sample with no stroke cannot happen through either
             // caller, and dropping it silently would be the wrong answer if it
@@ -1200,24 +1657,34 @@ impl EditSession {
         }
         let samples: Vec<(f64, f64)> = std::mem::take(&mut self.brush.pending);
         if self.brush.cache.is_none() {
-            self.brush.cache = Some(widen(&renderer.base_points().xyz));
+            self.brush.cache = Some(widen(&points.xyz));
         }
         let cache = self.brush.cache.as_ref().expect("just built");
         let radius = self.brush.radius;
         let weight = self.brush.weight;
 
+        // The catchment is the brush's OWN ring, not a fixed 12 px: the anchor
+        // has to be "the nearest point inside the circle you can see", or a
+        // stroke aimed at the background can lock onto a foreground point far
+        // from the cursor and paint at its depth. That was half of Jordan's
+        // 2026-09-08 report ("brushing seemed to blur the foreground and the
+        // background"); `brush::clamp_stroke_depth` below is the other half.
+        let ring_px = brush::ring_radius_px(camera.fx, radius, self.brush.depth.unwrap_or(0.0));
+
         // Rebuild the screen-space anchor index only when the camera actually
         // moved (`ClickCamera` is `PartialEq`): a still camera during a drag,
         // or a second stroke from the same viewpoint, reuses it instead of
         // re-scanning the whole cloud (`brush::ScreenGrid`'s own doc comment).
+        // It is also rebuilt when the ring has grown past the cell size, because
+        // `ScreenGrid::nearest` is only exact for `radius_px <= cell_px`.
         let stale = self
             .brush
             .screen_grid
             .as_ref()
-            .is_none_or(|(built_with, _)| built_with != camera);
+            .is_none_or(|(built_with, grid)| built_with != camera || grid.cell_px() < ring_px);
         if stale {
             self.brush.screen_grid =
-                Some((camera.clone(), brush::ScreenGrid::build(camera, cache, brush::ANCHOR_RADIUS_PX)));
+                Some((camera.clone(), brush::ScreenGrid::build(camera, cache, ring_px)));
         }
         let grid = &self.brush.screen_grid.as_ref().expect("just built").1;
 
@@ -1226,9 +1693,10 @@ impl EditSession {
         // shape the Python's own `paint_along` produces for a dragged stroke.
         let mut path: Vec<[f64; 3]> = Vec::with_capacity(samples.len());
         let mut last_pixel = None;
+        let mut previous_depth = self.brush.depth;
         for px in samples {
-            let depth = grid.nearest(px, brush::ANCHOR_RADIUS_PX).or(self.brush.depth);
-            let Some(depth) = depth else {
+            let found = grid.nearest(px, ring_px).or(previous_depth);
+            let Some(found) = found else {
                 // Nothing under the cursor and no earlier anchor: painting at an
                 // invented depth would put cells somewhere Jordan cannot see.
                 self.brush.note =
@@ -1236,6 +1704,11 @@ impl EditSession {
                         .to_owned();
                 continue;
             };
+            // One stroke stays on one surface: a sample may only move
+            // `STROKE_DEPTH_JUMP_RADII` radii in depth from the one before it,
+            // so a drag cannot straddle the foreground and the background.
+            let depth = brush::clamp_stroke_depth(found, previous_depth, radius);
+            previous_depth = Some(depth);
             self.brush.depth = Some(depth);
             path.push(camera.unproject(px, depth));
             last_pixel = Some((px, depth));
@@ -1319,6 +1792,10 @@ impl EditSession {
     /// Forget the tool's current region, so the next stroke starts a new one.
     pub fn new_brush_region(&mut self) {
         self.brush.region = None;
+        if !self.brush.selection.is_empty() {
+            self.brush.selection.clear();
+            self.needs_apply = true;
+        }
         self.brush.note = "the next stroke starts a new region".to_owned();
     }
 
@@ -1804,6 +2281,21 @@ impl EditSession {
             if self.selected_index().is_none() {
                 self.selected = None;
             }
+            self.drop_brush_tint();
+        }
+    }
+
+    /// Drop the brush's highlight because the document moved under it.
+    ///
+    /// The tint is a list of point ids measured against the cells as they were;
+    /// after an undo or a redo those cells are different (or gone), and there
+    /// is no point cloud in scope here to recompute against. Dropping it is
+    /// what keeps "undo a stroke and the frame matches a run that never made
+    /// it" literally true, which is the property `--brush-undo` asserts.
+    fn drop_brush_tint(&mut self) {
+        if !self.brush.selection.is_empty() {
+            self.brush.selection.clear();
+            self.needs_apply = true;
         }
     }
 
@@ -1813,6 +2305,7 @@ impl EditSession {
             self.dirty = true;
             self.needs_apply = true;
             self.note = format!("redo ({}/{})", self.doc.cursor, self.doc.log.len());
+            self.drop_brush_tint();
         }
     }
 
@@ -1879,14 +2372,10 @@ impl EditSession {
             self.save();
         }
         if cycle_tool {
-            self.tool = self.tool.next();
-            if self.tool != Tool::ClickCluster {
-                // Same rule the Tools panel's own radio applies: the click
-                // tool's `f64` copy of the cloud is not held for a tool nobody
-                // is using. The selection itself survives, so cycling back and
-                // pressing a slider rebuilds the index and re-runs the click.
-                self.click.cache = None;
-            }
+            // `set_tool` drops whatever index the tool being left was holding.
+            // The selections themselves survive, so cycling back and pressing a
+            // slider rebuilds the index and re-runs the click.
+            self.set_tool(self.tool.next());
         }
         if toggle_preview {
             // `H` belongs to whichever tool has focus: both produce a tinted
@@ -1895,11 +2384,12 @@ impl EditSession {
             match self.tool {
                 Tool::ClickCluster => self.click.preview = !self.click.preview,
                 Tool::Sam => self.sam.preview = !self.sam.preview,
-                // The brush has no preview of its own -- what a stroke paints IS
-                // the region, and the region is already in the frame -- so `H`
-                // keeps the one meaning it has everywhere else. The 3D handles
-                // have their own checkbox in the Regions panel.
-                Tool::Regions | Tool::ShadeFinder | Tool::Brush => {
+                // Since 2026-09-08 the brush HAS a preview of its own: what a
+                // stroke paints is tinted magenta like every other selection,
+                // because "the region is already in the frame" was only true
+                // for a `delete` op and was invisible for the other two.
+                Tool::Brush => self.brush.preview = !self.brush.preview,
+                Tool::Regions | Tool::ShadeFinder => {
                     self.shade.preview = !self.shade.preview;
                 }
             }
@@ -1918,6 +2408,9 @@ impl EditSession {
                     1.0 / BRUSH_RADIUS_STEP
                 };
                 self.brush.radius = (self.brush.radius * step).max(1e-9);
+                // A radius the user chose is never replaced by the
+                // view-distance default again (`set_scene_scale`).
+                self.brush.auto_radius = false;
                 self.brush.note = format!("brush radius {:.4} world units", self.brush.radius);
             } else {
                 self.resize_selected(resize);
@@ -1943,13 +2436,24 @@ impl EditSession {
         scene_diameter: f32,
         num_points: usize,
     ) {
-        self.regions_panel(ui, look_at, scene_diameter);
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.simple, true, "Simple")
+                .on_hover_text("four numbered steps, plain words -- start here");
+            ui.selectable_value(&mut self.simple, false, "Advanced")
+                .on_hover_text("every slider and every number, as v0.6.0 shipped");
+        });
         ui.separator();
-        self.named_objects_panel(ui);
-        ui.separator();
-        self.inspector_panel(ui, scene_diameter);
-        ui.separator();
-        self.tools_panel(ui, num_points);
+        if self.simple {
+            self.simple_panel(ui, num_points);
+        } else {
+            self.regions_panel(ui, look_at, scene_diameter);
+            ui.separator();
+            self.named_objects_panel(ui);
+            ui.separator();
+            self.inspector_panel(ui, scene_diameter);
+            ui.separator();
+            self.tools_panel(ui, num_points);
+        }
 
         ui.separator();
         ui.horizontal(|ui| {
@@ -1986,7 +2490,308 @@ impl EditSession {
         if let Some(error) = &self.error {
             ui.colored_label(egui::Color32::from_rgb(255, 120, 120), error);
         }
-        ui.label(KEYS_HELP);
+        if !self.simple {
+            ui.label(KEYS_HELP);
+        }
+    }
+
+    /// **Simple Mode**: four numbered steps and a place-something row.
+    ///
+    /// `docs/EDITOR.md` §4. Everything here is a button or a single slider with
+    /// a plain-English label; nothing here says "op", "mix", "threshold",
+    /// "pointset", "gizmo" or "voxel". The Advanced panels above are unchanged
+    /// and one click away.
+    #[allow(clippy::too_many_lines)]
+    fn simple_panel(&mut self, ui: &mut egui::Ui, num_points: usize) {
+        ui.label("Do these in any order. Cmd-Z undoes anything.");
+
+        // --- 1. Find shade clouds -------------------------------------------
+        ui.separator();
+        ui.label(egui::RichText::new("1.  Find shade clouds").strong());
+        if let Some(reason) = self.shade.unavailable.clone() {
+            ui.colored_label(egui::Color32::from_rgb(255, 200, 120), reason);
+        } else {
+            ui.label("The dark blobs of nothing that hang in the shade under trees.");
+            ui.horizontal(|ui| {
+                if ui.button("Find them").clicked() {
+                    self.tool = Tool::ShadeFinder;
+                    self.shade.preview = true;
+                    self.shade.dirty = true;
+                }
+                if ui
+                    .checkbox(&mut self.shade.preview, "highlight them")
+                    .changed()
+                {
+                    self.needs_apply = true;
+                }
+            });
+            let found = self.shade.selection.point_ids.len();
+            ui.label(format!(
+                "{found} of {num_points} points look like shade cloud ({:.2}% of the scene)",
+                percentage(found, num_points)
+            ));
+            ui.horizontal(|ui| {
+                let usable = found > 0;
+                if ui
+                    .add_enabled(usable, egui::Button::new("Soften them"))
+                    .on_hover_text("keep the points, fade them towards the splat")
+                    .clicked()
+                {
+                    self.add_shade_region(Op::Fade);
+                }
+                if ui
+                    .add_enabled(usable, egui::Button::new("Remove them"))
+                    .on_hover_text("take the points out; the model fills the hole in")
+                    .clicked()
+                {
+                    self.add_shade_region(Op::Delete);
+                }
+            });
+        }
+
+        // --- 2. Select an object --------------------------------------------
+        ui.separator();
+        ui.label(egui::RichText::new("2.  Select an object").strong());
+        let selecting = self.tool == Tool::ClickCluster;
+        if ui
+            .selectable_label(selecting, if selecting { "on -- click the scene" } else { "Turn on" })
+            .clicked()
+        {
+            self.set_tool(if selecting { Tool::Regions } else { Tool::ClickCluster });
+        }
+        if selecting {
+            ui.label("Click the thing you want. Then make the selection bigger or smaller.");
+            let picked = self.click.selection.point_ids.len();
+            ui.label(format!(
+                "{picked} of {num_points} points selected ({:.2}% of the scene)",
+                percentage(picked, num_points)
+            ));
+            ui.horizontal(|ui| {
+                if ui.button("smaller").clicked() {
+                    self.grow_click(-1);
+                }
+                if ui.button("bigger").clicked() {
+                    self.grow_click(1);
+                }
+                ui.label(format!(
+                    "reach {:.2} world units",
+                    self.click.params.max_radius
+                ));
+            });
+            if self.click.selection.hit_max_points {
+                ui.colored_label(
+                    egui::Color32::from_rgb(255, 200, 120),
+                    "that is as much as one selection may hold",
+                );
+            }
+            ui.horizontal(|ui| {
+                let usable = picked > 0;
+                if ui
+                    .add_enabled(usable, egui::Button::new("Keep this as an object"))
+                    .clicked()
+                {
+                    self.add_click_region();
+                }
+                if ui.add_enabled(usable, egui::Button::new("Start again")).clicked() {
+                    self.clear_click();
+                }
+            });
+        }
+
+        // --- 3. Paint an area -----------------------------------------------
+        ui.separator();
+        ui.label(egui::RichText::new("3.  Paint an area").strong());
+        let painting = self.tool == Tool::Brush;
+        if ui
+            .selectable_label(painting, if painting { "on -- drag on the scene" } else { "Turn on" })
+            .clicked()
+        {
+            self.set_tool(if painting { Tool::Regions } else { Tool::Brush });
+        }
+        if painting {
+            ui.label("Drag on the scene to paint. Hold ALT to rub it out again.");
+            let mut radius = self.brush.radius;
+            if ui
+                .add(
+                    egui::Slider::new(&mut radius, 1e-4..=1e3)
+                        .logarithmic(true)
+                        .text("brush size (world units)  [ / ]"),
+                )
+                .changed()
+            {
+                self.brush.radius = radius.max(1e-9);
+                self.brush.auto_radius = false;
+            }
+            ui.label("The magenta circle on the render is that size, where you are pointing.");
+            ui.horizontal(|ui| {
+                ui.label("what happens where you paint:");
+                for op in Op::ALL {
+                    if ui
+                        .selectable_label(self.brush.op == op, plain_op_name(op))
+                        .on_hover_text(op_sentence(op))
+                        .clicked()
+                    {
+                        self.brush.op = op;
+                    }
+                }
+            });
+            ui.label(op_sentence(self.brush.op));
+            if ui
+                .checkbox(&mut self.brush.preview, "highlight what I painted")
+                .changed()
+            {
+                self.needs_apply = true;
+            }
+            ui.label(format!(
+                "{} points painted so far",
+                self.brush.selection.len()
+            ));
+            if ui.button("Start a new patch").clicked() {
+                self.new_brush_region();
+            }
+            if !self.brush.note.is_empty() {
+                ui.label(&self.brush.note);
+            }
+        }
+
+        // --- 4. What to show here -------------------------------------------
+        ui.separator();
+        ui.label(egui::RichText::new("4.  What to show here").strong());
+        self.simple_regions(ui);
+
+        // --- placing a shape -------------------------------------------------
+        ui.separator();
+        ui.label(egui::RichText::new("Put a shape somewhere").strong());
+        ui.horizontal(|ui| {
+            for what in [Placement::Box, Placement::Sphere, Placement::Lid] {
+                let armed = self.placing == Some(what);
+                if ui
+                    .selectable_label(armed, format!("+ {}", what.label()))
+                    .on_hover_text("press this, then click the spot in the scene")
+                    .clicked()
+                {
+                    self.arm_placement(what);
+                }
+            }
+        });
+        match self.placing {
+            Some(what) => ui.colored_label(
+                egui::Color32::from_rgb(255, 200, 120),
+                format!("now click the spot where the {} should go", what.label()),
+            ),
+            None => ui.label("it goes where you click, sized to how far away that is"),
+        };
+    }
+
+    /// Simple Mode's region list: one row per region, one slider, keep/remove.
+    fn simple_regions(&mut self, ui: &mut egui::Ui) {
+        if self.doc.regions().is_empty() {
+            ui.label("Nothing yet. Steps 1-3 above make things to show here.");
+            return;
+        }
+        let no_splat = self.no_splat_reason();
+        let rows: Vec<(String, String, Op, f64, bool)> = self
+            .doc
+            .regions()
+            .iter()
+            .map(|r| {
+                (
+                    r.id.clone(),
+                    if r.name.is_empty() {
+                        r.id.clone()
+                    } else {
+                        r.name.clone()
+                    },
+                    r.op,
+                    r.mix,
+                    r.enabled,
+                )
+            })
+            .collect();
+        let mut set_op: Option<(String, Op)> = None;
+        let mut set_mix: Option<(String, f64)> = None;
+        let mut set_enabled: Option<(String, bool)> = None;
+        let mut remove: Option<String> = None;
+        egui::ScrollArea::vertical()
+            .max_height(240.0)
+            .show(ui, |ui| {
+                for (id, name, op, mix, enabled) in &rows {
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        let mut on = *enabled;
+                        if ui.checkbox(&mut on, "").on_hover_text("show this edit").changed() {
+                            set_enabled = Some((id.clone(), on));
+                        }
+                        ui.label(egui::RichText::new(name).strong());
+                        if let Some(count) = self.count_for(id) {
+                            ui.label(format!("({count} points)"));
+                        }
+                        if ui.button("forget it").clicked() {
+                            remove = Some(id.clone());
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        for candidate in [Op::Delete, Op::Fade, Op::Blend] {
+                            if ui
+                                .selectable_label(*op == candidate, plain_op_name(candidate))
+                                .on_hover_text(op_sentence(candidate))
+                                .clicked()
+                                && *op != candidate
+                            {
+                                set_op = Some((id.clone(), candidate));
+                            }
+                        }
+                    });
+                    if *op == Op::Delete {
+                        ui.label("the points here are taken out; nothing to mix");
+                        continue;
+                    }
+                    let mut value = *mix;
+                    let slider = egui::Slider::new(&mut value, 0.0..=1.0)
+                        .show_value(false)
+                        .text("Splat  <-->  TRIPS");
+                    if let Some(reason) = no_splat {
+                        ui.add_enabled(false, slider);
+                        ui.colored_label(egui::Color32::from_rgb(255, 200, 120), reason);
+                    } else if ui.add(slider).changed() {
+                        set_mix = Some((id.clone(), value));
+                    }
+                }
+            });
+        if let Some((id, op)) = set_op {
+            let result = self.doc.update_region(&id, json!({ "op": op.as_str() }));
+            self.record(result);
+        }
+        if let Some((id, mix)) = set_mix {
+            self.set_mix(&id, mix);
+        }
+        if let Some((id, on)) = set_enabled {
+            let result = self.doc.update_region(&id, json!({ "enabled": on }));
+            self.record(result);
+        }
+        if let Some(id) = remove {
+            self.selected = Some(id);
+            self.delete_selected();
+        }
+    }
+
+    /// Switch tools, dropping whatever index the one being left was holding.
+    ///
+    /// The same rule the Tools panel's radio and the `T` key already applied,
+    /// in one place so Simple Mode's buttons cannot forget it: a `f64` copy of
+    /// a multi-million-point cloud is not held for a tool nobody is using.
+    pub fn set_tool(&mut self, tool: Tool) {
+        if self.tool == tool {
+            return;
+        }
+        if self.tool == Tool::ClickCluster {
+            self.click.cache = None;
+        }
+        if self.tool == Tool::Brush {
+            self.brush.cache = None;
+            self.brush.screen_grid = None;
+        }
+        self.tool = tool;
     }
 
     /// The Regions list: enable, select, reorder, delete, and the three "+" buttons.
@@ -2036,52 +2841,27 @@ impl EditSession {
             self.selected = Some(id);
         }
 
+        // Placing is ARM-THEN-CLICK: press the button, then click the spot.
+        // Before 2026-09-08 these three buttons dropped a region at the
+        // camera's look-at point, at one size for the whole scene, which is
+        // what "I couldn't put boxes or spheres where I wanted" was about.
+        // `look_at` and `scene_diameter` remain the fallback the panel quotes
+        // when nothing has been clicked yet.
         let half = f64::from(scene_diameter * DEFAULT_REGION_SCENE_FRACTION);
-        let centre = [
-            f64::from(look_at.x),
-            f64::from(look_at.y),
-            f64::from(look_at.z),
-        ];
         ui.horizontal(|ui| {
-            if ui.button("+ box").clicked() {
-                self.add(Region::new(
-                    new_region_id(),
-                    "box".to_owned(),
-                    Params::Box {
-                        center: centre,
-                        half_extents: [half, half, half],
-                        quat: [1.0, 0.0, 0.0, 0.0],
-                    },
-                    0.0,
-                    Op::Blend,
-                ));
-            }
-            if ui.button("+ sphere").clicked() {
-                self.add(Region::new(
-                    new_region_id(),
-                    "sphere".to_owned(),
-                    Params::Sphere {
-                        center: centre,
-                        radius: half,
-                    },
-                    0.0,
-                    Op::Blend,
-                ));
-            }
-            if ui
-                .button("+ lid")
-                .on_hover_text(
-                    "seeded with the Karekare pool plane already fitted in SURFACE_LID.md",
-                )
-                .clicked()
-            {
-                self.add(Region::new(
-                    new_region_id(),
-                    "pool lid".to_owned(),
-                    Params::Lid(KAREKARE_LID),
-                    0.0,
-                    Op::Delete,
-                ));
+            for what in [Placement::Box, Placement::Sphere, Placement::Lid] {
+                let armed = self.placing == Some(what);
+                let button = ui
+                    .selectable_label(armed, format!("+ {}", what.label()))
+                    .on_hover_text(if what == Placement::Lid {
+                        "the Karekare pool plane already fitted in SURFACE_LID.md, moved onto \
+                         the point you click"
+                    } else {
+                        "press this, then click the spot in the scene"
+                    });
+                if button.clicked() {
+                    self.arm_placement(what);
+                }
             }
             if ui
                 .add_enabled(self.selected.is_some(), egui::Button::new("^"))
@@ -2098,18 +2878,31 @@ impl EditSession {
                 self.move_selected(1);
             }
         });
-        ui.label(format!(
-            "new regions are born at the look-at point ({:.2}, {:.2}, {:.2}), {half:.2} u across",
-            look_at.x, look_at.y, look_at.z
-        ));
+        match self.placing {
+            Some(what) => {
+                ui.colored_label(
+                    egui::Color32::from_rgb(255, 200, 120),
+                    format!("now click the spot where the {} should go", what.label()),
+                );
+            }
+            None => {
+                ui.label(format!(
+                    "a new region goes ON the point you click, sized to how far away it is \
+                     ({PLACEMENT_SIZE_DEPTH_FRACTION} of the depth); with nothing clicked the \
+                     old fallback is the look-at point ({:.2}, {:.2}, {:.2}) at {half:.2} u",
+                    look_at.x, look_at.y, look_at.z
+                ));
+            }
+        }
         ui.horizontal(|ui| {
-            ui.checkbox(&mut self.gizmo.show, "3D handles")
+            ui.checkbox(&mut self.gizmo.show, "Move arrows")
                 .on_hover_text(
-                    "drag a handle to move the selected region along that axis; SHIFT-drag \
-                     resizes, CTRL-drag rotates a box. A drag anywhere else still orbits.",
+                    "the three coloured arrows on the selected region. Drag one to move the \
+                     region along that arrow; SHIFT-drag resizes, CTRL-drag rotates a box. A \
+                     drag anywhere else still moves the camera.",
                 );
             if self.gizmo.show && self.gizmo.screen.is_none() && self.selected.is_some() {
-                ui.label("(no handles: this kind has no shape, or it is behind the camera)");
+                ui.label("(no arrows: this kind has no shape, or it is behind the camera)");
             }
         });
     }
@@ -2235,7 +3028,7 @@ impl EditSession {
     #[allow(clippy::too_many_lines)]
     fn tools_panel(&mut self, ui: &mut egui::Ui, num_points: usize) {
         ui.label(egui::RichText::new("Tools (T)").strong());
-        let previous = self.tool;
+        let mut chosen = self.tool;
         ui.horizontal(|ui| {
             for tool in [
                 Tool::Regions,
@@ -2244,21 +3037,12 @@ impl EditSession {
                 Tool::Sam,
                 Tool::Brush,
             ] {
-                ui.selectable_value(&mut self.tool, tool, tool.label());
+                ui.selectable_value(&mut chosen, tool, tool.label());
             }
         });
-        if previous == Tool::ClickCluster && self.tool != previous {
-            // Leaving the tool drops its index: a `f64` copy of the cloud is
-            // not something to hold for a tool nobody is using (`ClickCache`).
-            self.click.cache = None;
-        }
-        if previous == Tool::Brush && self.tool != previous {
-            // Same rule for the brush's own widened copy of the cloud, and the
-            // screen-space index built from it (stale the moment the points
-            // it indexed might not be).
-            self.brush.cache = None;
-            self.brush.screen_grid = None;
-        }
+        // `set_tool` is what drops the index of the tool being left; see its
+        // own doc comment for the rule.
+        self.set_tool(chosen);
         match self.tool {
             Tool::Regions => {
                 ui.label("place box/sphere/lid regions from the Regions panel above");
@@ -2354,7 +3138,7 @@ impl EditSession {
     fn sam_panel(&mut self, ui: &mut egui::Ui, num_points: usize) {
         ui.label(
             "DRAG a box on the render to segment the object inside it, or ALT-CLICK a point. \
-             SHIFT-drag still orbits. The camera must be pinned to a capture view -- the lift \
+             Right-drag still looks around. The camera must be pinned to a capture view -- the lift \
              needs the photograph, not the render.",
         );
         if !self.has_scene_root {
@@ -2496,10 +3280,16 @@ impl EditSession {
     /// render; everything here is the settings it uses and the state it leaves.
     fn brush_panel(&mut self, ui: &mut egui::Ui, num_points: usize) {
         ui.label(
-            "DRAG on the render to paint a 3D brush region, ALT-drag to erase. \
-             SHIFT-drag still orbits. Each dab is a sphere at the depth of the nearest \
-             point under the cursor -- aim at the scene, not at empty sky.",
+            "DRAG on the render to paint a 3D brush region, ALT-drag to erase. Each dab is a \
+             sphere at the depth of the nearest point INSIDE THE MAGENTA RING under the \
+             cursor -- aim at the scene, not at empty sky.",
         );
+        ui.label(format!(
+            "one stroke stays on one surface: a sample may move at most {} brush radii in \
+             depth from the one before it, so a drag cannot straddle the foreground and the \
+             background",
+            brush::STROKE_DEPTH_JUMP_RADII
+        ));
 
         let mut radius = self.brush.radius;
         // Logarithmic, like the click tool's own radius: scene scales differ by
@@ -2513,11 +3303,34 @@ impl EditSession {
             .changed()
         {
             self.brush.radius = radius.max(1e-9);
+            self.brush.auto_radius = false;
         }
+        ui.label(format!(
+            "the magenta ring on the render is that radius at the depth under the cursor{}",
+            if self.brush.auto_radius {
+                format!(
+                    " (chosen as {DEFAULT_BRUSH_VIEW_FRACTION} of the {:.2} u you are looking \
+                     at; move the slider and it stays where you put it)",
+                    self.view_distance
+                )
+            } else {
+                String::new()
+            }
+        ));
         ui.add(
             egui::Slider::new(&mut self.brush.weight, 0.0..=1.0)
                 .text("weight: how strongly a painted cell claims a point"),
         );
+        if ui
+            .checkbox(&mut self.brush.preview, "highlight what was painted (H)")
+            .changed()
+        {
+            self.needs_apply = true;
+        }
+        ui.label(format!(
+            "{} points claimed by the current patch",
+            self.brush.selection.len()
+        ));
 
         let active = self
             .brush
@@ -2546,16 +3359,23 @@ impl EditSession {
                 ui.horizontal(|ui| {
                     ui.label("new region op:");
                     for op in Op::ALL {
-                        ui.selectable_value(&mut self.brush.op, op, op.as_str());
+                        ui.selectable_value(&mut self.brush.op, op, op.as_str())
+                            .on_hover_text(op_sentence(op));
                     }
                 });
+                ui.label(op_sentence(self.brush.op));
                 if self.brush.op == Op::Delete {
                     ui.label("delete ignores mix: the painted points are removed");
                 } else {
-                    ui.add(
-                        egui::Slider::new(&mut self.brush.mix, 0.0..=1.0)
-                            .text("mix (0 = splat, 1 = TRIPS)"),
-                    );
+                    let reason = self.no_splat_reason();
+                    let slider = egui::Slider::new(&mut self.brush.mix, 0.0..=1.0)
+                        .text("mix (0 = splat, 1 = TRIPS)");
+                    if let Some(reason) = reason {
+                        ui.add_enabled(false, slider);
+                        ui.colored_label(egui::Color32::from_rgb(255, 200, 120), reason);
+                    } else {
+                        ui.add(slider);
+                    }
                 }
             }
         }
@@ -2778,14 +3598,19 @@ impl EditSession {
             )
             .changed();
         // The radius slider is logarithmic because scene scales differ by
-        // orders of magnitude and a linear one is unusable on both.
-        moved |= ui
-            .add(
-                egui::Slider::new(&mut params.max_radius, 1e-3..=1e3)
-                    .logarithmic(true)
-                    .text("max radius (world units) from the seed centroid"),
-            )
-            .changed();
+        // orders of magnitude and a linear one is unusable on both. It is
+        // disabled while the tool is deriving the cap from the click's own
+        // depth, which is the default (see `run_click`) — a slider that is
+        // silently overwritten on the next click is worse than a greyed one.
+        let auto = self.click.auto_radius;
+        let radius_slider = egui::Slider::new(&mut params.max_radius, 1e-3..=1e3)
+            .logarithmic(true)
+            .text("max radius (world units) from the seed centroid");
+        if auto {
+            ui.add_enabled(false, radius_slider);
+        } else {
+            moved |= ui.add(radius_slider).changed();
+        }
         let mut max_points = params.max_points as f64;
         if ui
             .add(
@@ -2806,6 +3631,30 @@ impl EditSession {
             // or less of what I clicked", never "click somewhere else".
             self.click.dirty = true;
         }
+
+        let mut auto_now = auto;
+        if ui
+            .checkbox(
+                &mut auto_now,
+                "size the reach from the click's own depth, and stop where the cloud thins out",
+            )
+            .on_hover_text(
+                "the default. Off reproduces `trippy edits click` exactly, which is what the \
+                 headless --click parity path runs.",
+            )
+            .changed()
+        {
+            self.set_click_auto(auto_now);
+        }
+        ui.horizontal(|ui| {
+            if ui.button("shrink").clicked() {
+                self.grow_click(-1);
+            }
+            if ui.button("grow").clicked() {
+                self.grow_click(1);
+            }
+            ui.label(format!("reach x{:.2}", self.click.grow_scale));
+        });
 
         if ui
             .checkbox(&mut self.click.preview, "preview highlight (H)")
@@ -2833,6 +3682,14 @@ impl EditSession {
                 }
             ));
         }
+        ui.label(format!(
+            "growth stopped: {} refused by the reach, {} by the density drop{}",
+            selection.n_blocked_by_radius,
+            selection.n_blocked_by_density,
+            selection.seed_spacing.map_or_else(String::new, |spacing| format!(
+                "  |  the object's own point spacing is {spacing:.4} world units"
+            ))
+        ));
         if let Some(cache) = &self.click.cache {
             ui.label(format!(
                 "neighbour index: {} points, {:.1} MiB, built in {:.0} ms (dropped when you \
@@ -2971,6 +3828,46 @@ impl EditSession {
             view.d = view.estimate_median_depth(&xyz);
         }
         self.shade.dirty = true;
+    }
+}
+
+/// `count` as a percentage of `total`, and `0.0` rather than a NaN when the
+/// cloud is empty.
+#[must_use]
+fn percentage(count: usize, total: usize) -> f64 {
+    if total == 0 {
+        return 0.0;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    {
+        100.0 * count as f64 / total as f64
+    }
+}
+
+/// What an [`Op`] is called in Simple Mode. `blend`, `fade` and `delete` are
+/// the words `edits.json` uses; these are the words a person uses.
+#[must_use]
+const fn plain_op_name(op: Op) -> &'static str {
+    match op {
+        Op::Blend => "choose",
+        Op::Fade => "soften",
+        Op::Delete => "remove",
+    }
+}
+
+/// One sentence saying what an [`Op`] does where it applies.
+///
+/// `docs/EDITOR.md` §4: "Explain what happens here in one sentence per op."
+#[must_use]
+const fn op_sentence(op: Op) -> &'static str {
+    match op {
+        Op::Blend => {
+            "choose: show this area from the splat or from TRIPS, wherever the slider is set."
+        }
+        Op::Fade => {
+            "soften: leave the points where they are, but fade this area towards the splat."
+        }
+        Op::Delete => "remove: take the points out here; the model fills the hole in.",
     }
 }
 
@@ -3422,6 +4319,327 @@ mod tests {
 
     /// The camera `edit::gizmo`'s own tests use: at the origin, looking down
     /// +Z, 100 px focal length, principal point (100, 100).
+    /// A synthetic point cloud, colour-flat, three feature channels.
+    ///
+    /// SYNTHETIC ONLY (`AGENTS.md` §6): every coordinate here is computed, and
+    /// no scene of Jordan's is read by any test in this file.
+    fn a_cloud(xyz: Vec<f32>) -> PointSet {
+        let n = xyz.len() / 3;
+        PointSet::new(
+            xyz,
+            vec![0.01; n],
+            (0..n).flat_map(|_| [0.4_f32, 0.5, 0.3]).collect(),
+            vec![0.5; n],
+            3,
+        )
+        .expect("a well-shaped synthetic cloud")
+    }
+
+    /// A flat wall at `z`, `steps x steps` points across `[-half, half]^2`.
+    fn a_wall(z: f32, half: f32, steps: usize) -> Vec<f32> {
+        let mut xyz = Vec::with_capacity(steps * steps * 3);
+        for i in 0..steps {
+            for j in 0..steps {
+                #[allow(clippy::cast_precision_loss)]
+                let t = |k: usize| -half + 2.0 * half * k as f32 / (steps - 1) as f32;
+                xyz.extend_from_slice(&[t(i), t(j), z]);
+            }
+        }
+        xyz
+    }
+
+    #[test]
+    fn a_placed_box_lands_on_the_clicked_point_and_is_sized_by_its_depth() {
+        // The camera looks down +Z from the origin with fx = fy = 100 and the
+        // principal point at (100, 100), so the pixel (100, 100) is the ray
+        // straight ahead and (140, 100) is x = 0.4 z.
+        let (dir, mut session) = a_session("place-box");
+        session.set_scene_scale(10.0, 5.0);
+        let points = a_cloud(a_wall(5.0, 3.0, 40));
+
+        session.arm_placement(Placement::Box);
+        assert_eq!(session.placing(), Some(Placement::Box));
+        session.request_placement((140.0, 100.0));
+        let id = session
+            .resolve_placement(&a_camera(), &points)
+            .expect("the wall is under that pixel");
+        assert!(session.placing().is_none(), "placing disarms once it has placed");
+
+        let region = session.doc.region(&id).expect("just added").clone();
+        let Params::Box {
+            center,
+            half_extents,
+            ..
+        } = &region.params
+        else {
+            panic!("+ box makes a box")
+        };
+        // ON the clicked point: (0.4 x 5, 0, 5), to the wall's own resolution.
+        assert!((center[0] - 2.0).abs() < 0.1, "centre x {}", center[0]);
+        assert!(center[1].abs() < 0.1, "centre y {}", center[1]);
+        assert!((center[2] - 5.0).abs() < 1e-6, "centre z {}", center[2]);
+        // ... never the origin, and never the camera.
+        assert!(center.iter().any(|c| c.abs() > 1e-3), "born at the origin");
+        // Sized by the depth, not by the scene: 0.06 x 5.
+        let want = PLACEMENT_SIZE_DEPTH_FRACTION * 5.0;
+        for (axis, half) in half_extents.iter().enumerate() {
+            assert!((half - want).abs() < 1e-9, "half extent {axis} = {half}");
+        }
+        // One region, one undo entry, and undo takes it away again.
+        assert_eq!(session.doc.log.len(), 1);
+        session.undo_once();
+        assert!(session.doc.regions().is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_ball_placed_further_away_is_bigger_and_a_lid_moves_its_plane() {
+        let (dir, mut session) = a_session("place-ball");
+        session.set_scene_scale(100.0, 20.0);
+        let near = a_cloud(a_wall(5.0, 3.0, 30));
+        let far = a_cloud(a_wall(20.0, 12.0, 30));
+
+        session.arm_placement(Placement::Sphere);
+        session.request_placement((100.0, 100.0));
+        let a = session.resolve_placement(&a_camera(), &near).expect("near hit");
+        session.arm_placement(Placement::Sphere);
+        session.request_placement((100.0, 100.0));
+        let b = session.resolve_placement(&a_camera(), &far).expect("far hit");
+
+        let radius = |id: &str| match &session.doc.region(id).expect("added").params {
+            Params::Sphere { radius, .. } => *radius,
+            other => panic!("expected a sphere, got {other:?}"),
+        };
+        assert!(
+            radius(&b) > 3.0 * radius(&a),
+            "a ball placed 4x further away must be about 4x bigger: {} vs {}",
+            radius(&b),
+            radius(&a)
+        );
+
+        // The lid keeps its fitted normal but moves its plane onto the click.
+        session.arm_placement(Placement::Lid);
+        session.request_placement((100.0, 100.0));
+        let lid_id = session.resolve_placement(&a_camera(), &near).expect("lid hit");
+        let Params::Lid(lid) = &session.doc.region(&lid_id).expect("added").params else {
+            panic!("+ lid makes a lid")
+        };
+        assert_eq!(lid.up, KAREKARE_LID.up, "the fitted normal is the point of the preset");
+        assert!((lid.center[2] - 5.0).abs() < 1e-6, "the lid moved onto the click");
+        let n = (lid.up[0] * lid.up[0] + lid.up[1] * lid.up[1] + lid.up[2] * lid.up[2]).sqrt();
+        let want = (lid.up[0] * lid.center[0] + lid.up[1] * lid.center[1]
+            + lid.up[2] * lid.center[2])
+            / n;
+        assert!((lid.height - want).abs() < 1e-9, "the plane offset follows the centre");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_placement_click_on_empty_sky_creates_nothing_and_says_so() {
+        let (dir, mut session) = a_session("place-miss");
+        session.set_scene_scale(10.0, 5.0);
+        let points = a_cloud(a_wall(5.0, 0.2, 10));
+        session.arm_placement(Placement::Box);
+        // Far off the wall's own projection (|x| <= 0.2 at z = 5 is |u - 100| <= 4).
+        session.request_placement((900.0, 900.0));
+        assert!(session.resolve_placement(&a_camera(), &points).is_none());
+        assert!(session.doc.regions().is_empty(), "nothing was created");
+        assert!(
+            session.note.contains("aim at the scene"),
+            "the miss must be explained: {:?}",
+            session.note
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn one_click_on_a_dense_cloud_selects_far_less_than_five_percent() {
+        // A solid block of 50^3 = 125 000 points, one colour, filling the frame
+        // — the shape that made Jordan's click "just select the whole scene",
+        // because nothing but `max_radius` can stop growth in it.
+        let steps = 50_usize;
+        let mut xyz = Vec::with_capacity(steps * steps * steps * 3);
+        for i in 0..steps {
+            for j in 0..steps {
+                for k in 0..steps {
+                    #[allow(clippy::cast_precision_loss)]
+                    let lin = |a: usize, lo: f32, hi: f32| {
+                        lo + (hi - lo) * a as f32 / (steps - 1) as f32
+                    };
+                    xyz.extend_from_slice(&[
+                        lin(i, -2.0, 2.0),
+                        lin(j, -2.0, 2.0),
+                        lin(k, 4.0, 8.0),
+                    ]);
+                }
+            }
+        }
+        let n = xyz.len() / 3;
+        assert_eq!(n, 125_000);
+        let points = a_cloud(xyz);
+
+        // What the viewer did BEFORE: an uncapped growth radius (the old
+        // default was the median camera spacing, metres on a walked capture).
+        let (dir, mut session) = a_session("click-uncapped");
+        session.set_scene_scale(10.0, 6.0);
+        session.set_click_params(ClickParams {
+            max_radius: 5.0,
+            ..ClickParams::default()
+        });
+        session.run_click(&a_camera(), (100.0, 100.0), &points);
+        let uncapped = session.click_selection().point_ids.len();
+        assert!(
+            uncapped > n / 2,
+            "the uncapped click was supposed to swallow the block: {uncapped} of {n}"
+        );
+
+        // What it does NOW: the growth radius comes from the click's own depth,
+        // capped at 2% of the captured area, and growth stops at a density drop.
+        session.set_click_auto(true);
+        session.run_click(&a_camera(), (100.0, 100.0), &points);
+        let capped = session.click_selection().point_ids.len();
+        #[allow(clippy::cast_precision_loss)]
+        let percent = 100.0 * capped as f64 / n as f64;
+        assert!(percent < 5.0, "one click took {percent:.3}% ({capped} of {n})");
+        assert!(capped > 0, "and it must still select the thing that was clicked");
+        assert!(
+            !session.click_selection().hit_max_points,
+            "the reach must be what stopped it, not the hard point cap"
+        );
+
+        // "grow" and "shrink" are the only two controls Simple Mode shows, and
+        // they must actually move the reach either way.
+        let reach = session.click_max_radius();
+        session.grow_click(1);
+        session.run_click(&a_camera(), (100.0, 100.0), &points);
+        assert!(session.click_max_radius() > reach);
+        assert!(session.click_selection().point_ids.len() > capped, "grow grew nothing");
+        session.grow_click(-2);
+        session.run_click(&a_camera(), (100.0, 100.0), &points);
+        assert!(session.click_max_radius() < reach);
+        assert!(session.click_selection().point_ids.len() < capped, "shrink shrank nothing");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_brush_stroke_anchors_inside_its_ring_and_cannot_jump_to_another_surface() {
+        // A wall at z = 20 filling the frame, and ONE stray point at z = 2 far
+        // off to the side. The old anchor searched a fixed 12 px catchment and
+        // took the nearest point in it; the ring is now the brush's own
+        // projected radius, so a stroke aimed at the wall anchors on the wall.
+        let mut xyz = a_wall(20.0, 12.0, 60);
+        // At z = 2 the pixel of x = 1.0 is u = 100 + 100 * 1.0 / 2 = 150, i.e.
+        // 50 px from the cursor: outside a small ring, inside a huge one.
+        xyz.extend_from_slice(&[1.0, 0.0, 2.0]);
+        let points = a_cloud(xyz);
+
+        let (dir, mut session) = a_session("brush-ring");
+        session.set_brush_settings(0.5, 1.0, Op::Fade, 0.0);
+        session.begin_brush_stroke(false);
+        session.brush_sample((100.0, 100.0));
+        session.resolve_brush(&a_camera(), &points);
+        let depth = session.brush.depth.expect("the wall is under the cursor");
+        assert!(
+            (depth - 20.0).abs() < 1e-6,
+            "the stroke anchored on the stray foreground point at z = 2: {depth}"
+        );
+
+        // ... and a later sample that DOES land on the stray point cannot drag
+        // the stroke 18 units forward: at most 1.5 radii.
+        session.brush_sample((150.0, 100.0));
+        session.resolve_brush(&a_camera(), &points);
+        let after = session.brush.depth.expect("still stroking");
+        assert!(
+            after >= 20.0 - brush::STROKE_DEPTH_JUMP_RADII * 0.5 - 1e-9,
+            "one sample moved the stroke from z = 20 to z = {after}"
+        );
+        session.end_brush_stroke_with(Some(&points));
+
+        // The tint: the stroke says which points it claims, so painting is
+        // visible whatever the op is.
+        assert!(
+            session.brush_selection_len() > 0,
+            "a painted stroke must highlight the points it claims"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_brush_ring_follows_the_pointer_before_the_first_dab() {
+        let (dir, mut session) = a_session("brush-hover");
+        session.set_scene_scale(10.0, 4.0);
+        // The radius the viewer chooses is a fraction of the view distance, not
+        // of the whole scene: 3% of 4.0, not 4% of 10.0.
+        assert!(
+            (session.brush_radius() - DEFAULT_BRUSH_VIEW_FRACTION * 4.0).abs() < 1e-9,
+            "{}",
+            session.brush_radius()
+        );
+        assert!(session.brush_cursor().is_none(), "no pointer, no ring");
+        session.set_brush_hover(Some((320.0, 240.0)), 500.0);
+        let (px, radius_px) = session.brush_cursor().expect("hovering draws a ring");
+        assert_eq!(px, (320.0, 240.0));
+        // fx * r / z with z = the view distance, because nothing has been
+        // painted yet to give the stroke a depth of its own.
+        let want = 500.0 * session.brush_radius() / 4.0;
+        assert!((radius_px - want).abs() < 1e-9, "{radius_px} vs {want}");
+        // ... and a bigger brush is a bigger ring, at the same distance.
+        session.set_brush_settings(session.brush_radius() * 2.0, 1.0, Op::Fade, 0.0);
+        session.set_brush_hover(Some((320.0, 240.0)), 500.0);
+        let (_, wider) = session.brush_cursor().expect("still hovering");
+        assert!((wider - 2.0 * want).abs() < 1e-6, "{wider}");
+        session.set_brush_hover(None, 500.0);
+        assert!(session.brush_cursor().is_none(), "pointer off the canvas, no ring");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_session_opens_in_simple_mode_and_says_when_there_is_no_splat_to_mix() {
+        let (dir, mut session) = a_session("simple-default");
+        assert!(session.simple, "the editor opens in Simple Mode");
+        // Jordan, 2026-09-08: "Mix sliders didn't seem to make any difference"
+        // — that bundle had no Gaussian block, and nothing said so.
+        let reason = session.no_splat_reason().expect("no splat by default");
+        assert_eq!(reason, "This bundle has no splat to mix. Open a combined bundle.");
+        session.set_has_splat(true);
+        assert!(session.no_splat_reason().is_none(), "a combined bundle mixes");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_controls_card_lists_six_gestures_and_no_jargon() {
+        assert_eq!(MOUSE_HELP.len(), 6, "the brief asks for the six that matter");
+        let all = MOUSE_HELP
+            .iter()
+            .map(|(a, b)| format!("{a} {b}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase();
+        for jargon in ["gizmo", "pivot", "frustum", "voxel", "pointset", "op "] {
+            assert!(!all.contains(jargon), "the card says {jargon:?}: {all}");
+        }
+        // And the word Jordan asked about is gone from every string the editor
+        // shows, not just from this card.
+        assert!(!KEYS_HELP.to_lowercase().contains("gizmo"));
+        for op in Op::ALL {
+            assert!(!op_sentence(op).to_lowercase().contains("gizmo"));
+        }
+    }
+
+    #[test]
+    fn every_op_has_one_plain_sentence_saying_what_happens_there() {
+        for op in Op::ALL {
+            let sentence = op_sentence(op);
+            assert!(sentence.starts_with(plain_op_name(op)), "{sentence}");
+            assert!(sentence.ends_with('.'), "one sentence, ending in a stop: {sentence}");
+            assert_eq!(sentence.matches(". ").count(), 0, "one sentence only: {sentence}");
+        }
+        // The three plain names are distinct, or the buttons are unusable.
+        let names: std::collections::HashSet<&str> =
+            Op::ALL.iter().map(|op| plain_op_name(*op)).collect();
+        assert_eq!(names.len(), 3);
+    }
+
     fn a_camera() -> ClickCamera {
         ClickCamera {
             r: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
@@ -3466,7 +4684,7 @@ mod tests {
             .unwrap();
             session.commit_stroke();
         }
-        session.end_brush_stroke();
+        session.end_brush_stroke_with(None);
 
         assert_eq!(session.doc.regions().len(), 1, "one stroke, one region");
         assert_eq!(session.doc.log.len(), 1, "one stroke, one undo entry");
@@ -3500,7 +4718,7 @@ mod tests {
                                 [0.0, 0.0, 4.0], 0.5, 1.0).unwrap();
         }
         session.commit_stroke();
-        session.end_brush_stroke();
+        session.end_brush_stroke_with(None);
         let after_first = match &session.doc.regions()[0].params {
             Params::Brush { cells, .. } => cells.len(),
             _ => panic!("a brush"),
@@ -3514,7 +4732,7 @@ mod tests {
                                 [2.0, 0.0, 4.0], 0.5, 1.0).unwrap();
         }
         session.commit_stroke();
-        session.end_brush_stroke();
+        session.end_brush_stroke_with(None);
 
         assert_eq!(session.doc.regions().len(), 1, "still one region");
         assert_eq!(session.doc.log.len(), 2, "two strokes, two undo steps");
@@ -3543,7 +4761,7 @@ mod tests {
             assert!(!stroke.erasing);
         }
         session.commit_stroke();
-        session.end_brush_stroke();
+        session.end_brush_stroke_with(None);
 
         session.begin_brush_stroke(true);
         {
@@ -3554,7 +4772,7 @@ mod tests {
             assert!(stroke.cells.is_empty(), "the erase cleared the dab");
         }
         session.commit_stroke();
-        session.end_brush_stroke();
+        session.end_brush_stroke_with(None);
 
         let Params::Brush { cells, .. } = &session.doc.regions()[0].params else {
             panic!("a brush")

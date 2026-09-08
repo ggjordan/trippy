@@ -34,7 +34,7 @@ use eframe::egui;
 use crate::blit::{BlitCallback, BlitResources};
 use crate::blend::{Blend, BlendMode, GATE_SCALE_MAX, GATE_SCALE_MIN};
 use crate::bundle::Bundle;
-use crate::edit_ui::{EditSession, SamGesture};
+use crate::edit_ui::{EditSession, SamGesture, MOUSE_HELP};
 use trips_viewer::edit::cluster::ClickCamera;
 use trips_viewer::edit::sam as sam_geom;
 use crate::camera::{Controller, Mode};
@@ -118,6 +118,15 @@ pub struct ViewerApp {
     /// it exists only to be painted over the render, and the session is handed
     /// the finished gesture in render pixels once the button comes up.
     sam_drag: Option<(egui::Pos2, egui::Pos2)>,
+    /// A double-clicked pixel waiting for the frame's camera: the gesture that
+    /// puts the orbit focus on whatever was clicked. Render pixels.
+    pending_focus: Option<(f64, f64)>,
+    /// Whether the "?" card listing the six mouse and key bindings is up.
+    ///
+    /// Shown on the FIRST open of a session, because a viewer whose controls
+    /// have just changed has to say so once without being asked; dismissed
+    /// with the same key or its own button, and never shown again in that run.
+    show_keys: bool,
 }
 
 impl ViewerApp {
@@ -212,6 +221,11 @@ impl ViewerApp {
         // only now (`trippy.edit.cluster.default_max_radius_from_bundle`).
         edit.init_click_defaults(&views, &renderer, controller.scene().diameter());
         edit.init_brush_defaults(controller.scene().diameter());
+        // Whether there is a Gaussian half to mix with at all. Without it every
+        // splat/TRIPS control is greyed out and says why, rather than moving
+        // and doing nothing (2026-09-08: "Mix sliders didn't seem to make any
+        // difference" — that bundle had no Gaussian block).
+        edit.set_has_splat(has_blend);
         edit.estimate_shade_depths(&renderer);
         edit.refresh_shade(&renderer);
         if let Err(e) = edit.apply(&mut renderer) {
@@ -239,6 +253,8 @@ impl ViewerApp {
             has_blend,
             edit,
             sam_drag: None,
+            pending_focus: None,
+            show_keys: true,
         })
     }
 
@@ -339,15 +355,9 @@ impl ViewerApp {
         let delta = response.drag_delta();
         // The SAM tool's marquee (`docs/EDITOR.md` §3, E5). It takes the
         // PRIMARY drag while that tool has focus, which is what "drag a box on
-        // the render" means; orbit is still one modifier away (Shift-drag) and
-        // right/middle-drag still pans, so navigation loses nothing permanent
-        // and nothing at all outside this one tool.
-        let sam_box_drag = self.edit.sam_tool_active()
-            && response.dragged_by(egui::PointerButton::Primary)
-            && !ctx.input(|i| i.modifiers.shift);
-        // The Brush tool's stroke takes the primary drag the same way, with
-        // ALT for the erase; SHIFT-drag still orbits, so navigation is one
-        // modifier away here too (`docs/EDITOR.md` §4).
+        // the render" means; the camera is never lost, because the right button
+        // still looks around and shift+left / middle still pans, so navigation
+        // gives up only the orbit and only while this one tool has focus.
         let (shift, alt, ctrl) = ctx.input(|i| {
             (
                 i.modifiers.shift,
@@ -355,6 +365,13 @@ impl ViewerApp {
                 i.modifiers.ctrl,
             )
         });
+        let sam_box_drag = self.edit.sam_tool_active()
+            && response.dragged_by(egui::PointerButton::Primary)
+            && !shift;
+        // The Brush tool's stroke takes the primary drag the same way, with
+        // ALT for the erase; SHIFT-drag pans, so the camera is one modifier
+        // away here too, and the right button still looks around
+        // (`docs/EDITOR.md` §4).
         let brush_drag = self.edit.brush_tool_active()
             && response.dragged_by(egui::PointerButton::Primary)
             && !shift;
@@ -389,18 +406,30 @@ impl ViewerApp {
                 self.edit.gizmo_drag_to(px);
             }
         } else if response.dragged_by(egui::PointerButton::Primary) {
-            self.controller.drag(delta.x, delta.y);
-        } else if response.dragged_by(egui::PointerButton::Secondary)
-            || response.dragged_by(egui::PointerButton::Middle)
-        {
+            // Brush's own binding, which is what Jordan asked for on
+            // 2026-09-08: the left button ORBITS, and holding shift makes it
+            // pan. Neither depends on a mode.
+            if shift {
+                self.controller.pan(delta.x, delta.y, viewport_height);
+            } else {
+                self.controller.drag(delta.x, delta.y);
+            }
+        } else if response.dragged_by(egui::PointerButton::Middle) {
             self.controller.pan(delta.x, delta.y, viewport_height);
+        } else if response.dragged_by(egui::PointerButton::Secondary) {
+            // The right button is first-person look. W/A/S/D/Q/E already fly
+            // every frame, so "fly while it is held" needs no extra code —
+            // what the right button adds is the ability to aim while flying.
+            self.controller.look(delta.x, delta.y);
         }
         // The gesture is finished when the button comes up; only then is it
         // worth converting, and only then is a tiny drag known to be a click.
         if !response.dragged_by(egui::PointerButton::Primary) {
             // A stroke and a gizmo drag both end with the button, and each is
             // ONE undo entry however many frames it took.
-            self.edit.end_brush_stroke();
+            // The renderer is what lets the finished stroke work out which
+            // points it claimed, for the magenta tint.
+            self.edit.end_brush_stroke_with(Some(self.renderer.base_points()));
             self.edit.end_gizmo_drag();
             if let Some((start, end)) = self.sam_drag.take() {
                 let ppp = ctx.pixels_per_point();
@@ -422,27 +451,63 @@ impl ViewerApp {
         // Shift-click selects an object (`docs/EDITOR.md` §4, E4). Read from
         // the same `response` every drag is, so a Shift-click that began on the
         // Edit window never reaches the canvas; and it is a CLICK, not a drag,
-        // so Shift-dragging still orbits and navigation loses nothing. The
+        // so shift-DRAGGING still pans and navigation loses nothing. The
         // pixel handed on is in the RENDER's own coordinates -- egui points
         // scaled by the display's `pixels_per_point` and the render-scale
         // lever -- because that is the camera the click will be projected
         // against (`ui`'s own `width`/`height`).
-        if self.edit.active && response.clicked() && ctx.input(|i| i.modifiers.shift) {
+        if self.edit.active && response.clicked() && shift {
             if let Some(pos) = response.interact_pointer_pos() {
-                let ppp = ctx.pixels_per_point();
-                let scale = self.settings.render_scale;
-                self.edit.request_click(sam_geom::render_pixel(
-                    (pos.x, pos.y),
-                    (response.rect.min.x, response.rect.min.y),
-                    ppp,
-                    scale,
-                ));
+                let px = self.render_px(response, ctx, pos);
+                self.edit.request_click(px);
+            }
+        }
+
+        // A PLAIN click, while the editor is open, is claimed by at most one of
+        // two things, in this order:
+        //
+        // 1. an armed placement — "+ box" then click the spot, which is what
+        //    "I couldn't put boxes or spheres where I wanted" needed;
+        // 2. Simple Mode's "select an object" step, where a modifier-less click
+        //    selects. Everywhere else selection is still SHIFT-click, so no
+        //    existing habit or launcher changed.
+        //
+        // Neither is reachable while a tool owns the primary drag (the brush
+        // and SAM branches above), and both are CLICKS, so dragging still
+        // orbits.
+        if self.edit.active && response.clicked() && !shift && !alt && !ctrl {
+            if let Some(pos) = response.interact_pointer_pos() {
+                let px = self.render_px(response, ctx, pos);
+                if self.edit.placing().is_some() {
+                    self.edit.request_placement(px);
+                } else if self.edit.simple_select_active() {
+                    self.edit.request_click(px);
+                }
+            }
+        }
+
+        // Double-click: put the orbit focus on what was clicked. Resolved in
+        // `ui`, against this frame's camera, exactly as every other gesture is.
+        // Never while a placement is armed — that click is already spoken for.
+        if response.double_clicked_by(egui::PointerButton::Primary)
+            && !shift
+            && self.edit.placing().is_none()
+        {
+            if let Some(pos) = response.interact_pointer_pos() {
+                self.pending_focus = Some(self.render_px(response, ctx, pos));
             }
         }
 
         // A CLICK with the Brush tool paints one dab: a drag is a stroke, and a
         // click is a stroke of one sample, which is what a paint tool does.
-        if self.edit.brush_tool_active() && response.clicked() && !shift {
+        // An armed placement outranks it — that click was already promised to
+        // the "+ box" button, and painting as well would be two edits from one
+        // gesture.
+        if self.edit.brush_tool_active()
+            && self.edit.placing().is_none()
+            && response.clicked()
+            && !shift
+        {
             if let Some(pos) = response.interact_pointer_pos() {
                 let px = self.render_px(response, ctx, pos);
                 self.edit.begin_brush_stroke(alt);
@@ -480,6 +545,7 @@ impl ViewerApp {
         // `M` is read here rather than in `EditSession::handle_keys` so it
         // works while the edit panels are hidden -- it is the key that shows them.
         let mut edit_mode_toggled = false;
+        let mut keys_toggled = false;
         ctx.input(|i| {
             if i.key_pressed(egui::Key::V) {
                 self.mode = self.mode.next();
@@ -514,6 +580,11 @@ impl ViewerApp {
             if i.key_pressed(egui::Key::M) {
                 edit_mode_toggled = true;
             }
+            // The controls card. `?` is Shift-/ on every keyboard layout eframe
+            // reports, and `F1` is the one key a Mac user tries when lost.
+            if i.key_pressed(egui::Key::Questionmark) || i.key_pressed(egui::Key::F1) {
+                keys_toggled = true;
+            }
 
             let axis = |positive: egui::Key, negative: egui::Key| -> f32 {
                 f32::from(i.key_down(positive)) - f32::from(i.key_down(negative))
@@ -527,11 +598,22 @@ impl ViewerApp {
             self.controller.fly(forward, right, up, dt);
 
             if response.hovered() && i.smooth_scroll_delta.y != 0.0 {
-                self.controller.scroll(i.smooth_scroll_delta.y / SCROLL_NOTCH);
+                let notches = i.smooth_scroll_delta.y / SCROLL_NOTCH;
+                // Brush's split: the wheel alone moves you closer or further;
+                // with SHIFT, or while the right button is held (which is when
+                // you are flying), it sets how fast W/A/S/D go.
+                if i.modifiers.shift || i.pointer.button_down(egui::PointerButton::Secondary) {
+                    self.controller.adjust_speed(notches);
+                } else {
+                    self.controller.scroll(notches);
+                }
             }
         });
         if edit_mode_toggled {
             self.edit.active = !self.edit.active;
+        }
+        if keys_toggled {
+            self.show_keys = !self.show_keys;
         }
         self.edit.handle_keys(ctx, self.controller.scene().diameter());
     }
@@ -565,6 +647,13 @@ impl ViewerApp {
     /// See `docs/USER_GUIDE.md` "Blend panel".
     fn blend_panel(&mut self, ui: &mut egui::Ui) {
         if !self.has_blend {
+            // Say it rather than just not being there. Jordan, 2026-09-08:
+            // "Mix sliders didn't seem to make any difference" — on a bundle
+            // with no Gaussian block, which is a fact about the bundle and not
+            // about the sliders. `EditSession::no_splat_reason` says the same
+            // sentence next to every greyed mix control in the editor.
+            ui.separator();
+            ui.label("This bundle has no splat to mix. Open a combined bundle.");
             return;
         }
         ui.separator();
@@ -733,7 +822,7 @@ impl ViewerApp {
 
         ui.separator();
         ui.horizontal(|ui| {
-            ui.label("navigate (F):");
+            ui.label("camera (F):");
             let mut mode = self.controller.mode();
             let mut changed = false;
             for candidate in [Mode::Orbit, Mode::Free] {
@@ -751,22 +840,22 @@ impl ViewerApp {
         // "fly 1948.53 u/s" readout could not tell anyone.
         let scene = self.controller.scene();
         ui.label(format!(
-            "{} points | capture area {:.1} u across | fly {:.3} u/s = {:.3} scene/s ({}) | \
-             pivot {:.2} u away",
+            "{} points | capture area {:.1} u across | fly {:.3} u/s = {:.3} scene/s | {} | \
+             turning point {:.2} u away",
             self.renderer.num_points(),
             scene.diameter(),
             self.controller.move_speed(),
             self.controller.speed_in_scenes(),
-            if self.controller.mode() == Mode::Free {
-                "scroll = faster"
-            } else {
-                "scroll zooms"
-            },
+            self.controller.mode().label(),
             self.controller.orbit_distance(),
         ));
+        if ui.button("? what do the mouse buttons do").clicked() {
+            self.show_keys = true;
+        }
         ui.label(
-            "left-drag orbit/look | right- or middle-drag pan | WASD move, Q/E up/down\n\
-             scroll = faster (up to 50x; in orbit mode it zooms) | F orbit-free\n\
+            "left-drag turn | right-drag look (WASD fly, Q/E down/up) | middle- or \n\
+             shift+left-drag slide | scroll closer/further (shift+scroll = faster, up to 50x)\n\
+             DOUBLE-CLICK something to turn around it | F fences the camera in / lets it out\n\
              R home view | N / P next / previous capture view | V honesty view | X exposure",
         );
 
@@ -831,7 +920,7 @@ impl ViewerApp {
         {
             ui.colored_label(
                 egui::Color32::from_rgb(255, 200, 120),
-                "at the edge of the captured area — press F to fly past it",
+                "at the edge of the photographed area — press F to fly past it",
             );
         }
 
@@ -912,8 +1001,51 @@ impl eframe::App for ViewerApp {
         let camera = self.controller.render_camera(width, height, &reference);
         let frame_index = reference.index;
 
+        // The double-click focus, resolved with this frame's camera: the depth
+        // is the nearest point projecting within the same catchment a
+        // placement click uses, and the world point that pixel and that depth
+        // un-project to becomes what a left-drag turns about. One brute-force
+        // pass over the cloud, once, on a gesture a person makes by hand — not
+        // worth an index (`edit::brush::depth_anchor_f32`'s own doc says why).
+        if let Some(px) = self.pending_focus.take() {
+            let click_camera = ClickCamera::from_render_camera(&camera);
+            match trips_viewer::edit::brush::depth_anchor_f32(
+                &click_camera,
+                &self.renderer.base_points().xyz,
+                px,
+                trips_viewer::edit::PLACEMENT_ANCHOR_PX,
+            ) {
+                Some(depth) => {
+                    let world = click_camera.unproject(px, depth);
+                    #[allow(clippy::cast_possible_truncation)]
+                    let point = glam::Vec3::new(world[0] as f32, world[1] as f32, world[2] as f32);
+                    self.controller.set_focus(point);
+                }
+                None => {
+                    self.error = Some(
+                        "nothing to look at there — double-click something in the scene, not \
+                         empty sky"
+                            .to_owned(),
+                    );
+                }
+            }
+        }
+
+        // What the editor needs to know about the scene each frame: how big it
+        // is (the click tool's growth cap) and how far away the camera is
+        // looking (the brush's default radius and its ring).
+        self.edit.set_scene_scale(
+            f64::from(self.controller.scene().diameter()),
+            f64::from(self.controller.orbit_distance()),
+        );
+        if let Some(id) = self
+            .edit
+            .resolve_placement(&ClickCamera::from_render_camera(&camera), self.renderer.base_points())
+        {
+            log::info!("placed region {id}");
+        }
         self.edit
-            .resolve_click(&ClickCamera::from_render_camera(&camera), &self.renderer);
+            .resolve_click(&ClickCamera::from_render_camera(&camera), self.renderer.base_points());
         // The SAM tool's own two steps, in the same place and for the same
         // reason: the gesture was measured in this frame's render pixels, so it
         // is mapped with this frame's camera; and the child's state machine is
@@ -934,7 +1066,15 @@ impl eframe::App for ViewerApp {
         // the drag was sampled in this frame's render pixels, so it is
         // un-projected with this frame's camera.
         let click_camera = ClickCamera::from_render_camera(&camera);
-        self.edit.resolve_brush(&click_camera, &self.renderer);
+        self.edit.resolve_brush(&click_camera, self.renderer.base_points());
+        // The brush ring follows the pointer whether or not the button is down,
+        // so "the magenta circle is how big the brush is" is true before the
+        // first dab as well as during a stroke.
+        let hover = (self.edit.brush_tool_active() && response.hovered())
+            .then(|| ctx.pointer_latest_pos())
+            .flatten()
+            .map(|pos| self.render_px(&response, ctx, pos));
+        self.edit.set_brush_hover(hover, f64::from(camera.fx));
         // The handles for the NEXT frame's hit test, and for this frame's
         // painter: projected once, used twice.
         self.edit.update_gizmo(&click_camera);
@@ -1029,6 +1169,30 @@ impl eframe::App for ViewerApp {
                 .default_width(430.0)
                 .resizable(true)
                 .show(ctx, |ui| self.edit.ui(ui, look_at, diameter, points));
+        }
+
+        if self.show_keys {
+            egui::Window::new("Controls  (?)")
+                .default_pos(rect.min + egui::vec2(rect.width() * 0.5 - 220.0, 60.0))
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    egui::Grid::new("trips-mouse-help")
+                        .num_columns(2)
+                        .spacing([16.0, 4.0])
+                        .show(ui, |ui| {
+                            for (gesture, meaning) in MOUSE_HELP {
+                                ui.label(egui::RichText::new(*gesture).strong());
+                                ui.label(*meaning);
+                                ui.end_row();
+                            }
+                        });
+                    ui.separator();
+                    ui.label("M opens the editor. TAB hides the panel. ? shows this again.");
+                    if ui.button("got it").clicked() {
+                        self.show_keys = false;
+                    }
+                });
         }
 
         if self.show_panel {

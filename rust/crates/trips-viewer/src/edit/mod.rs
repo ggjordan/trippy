@@ -92,6 +92,41 @@ pub const BRUSH_RADIUS_STEP: f64 = 1.25;
 /// — and the `edits.json` it is written into — small.
 pub const BRUSH_CELLS_PER_RADIUS: f64 = 2.0;
 
+/// Half-size of a placed box (or the radius of a placed sphere) as a fraction
+/// of the camera-space DEPTH of the point it was placed on.
+///
+/// Jordan, 2026-09-08: "I couldn't put boxes or spheres where I wanted." A new
+/// region used to be born at the camera's look-at point at
+/// [`DEFAULT_REGION_SCENE_FRACTION`] of the whole scene — one size for every
+/// scene, in a place nobody clicked. It is now born on the point that was
+/// clicked, at a size proportional to how far away that point is, so it
+/// subtends the same fraction of the frame whatever it is placed on: with a
+/// typical `fx` of about 0.8 image widths, 0.06 of the depth is a box roughly a
+/// tenth of the frame across. Big enough to see, small enough to aim.
+pub const PLACEMENT_SIZE_DEPTH_FRACTION: f64 = 0.06;
+
+/// How far from a placement click (render pixels) a point may project and still
+/// count as "what was clicked".
+///
+/// Wider than [`brush::ANCHOR_RADIUS_PX`] on purpose: a placement is a single
+/// deliberate click at a thing, not a stroke, so it should succeed on a thin
+/// or sparse target rather than report "aim at the scene" and lose the gesture.
+pub const PLACEMENT_ANCHOR_PX: f64 = 24.0;
+
+/// A placed region's size is clamped to this fraction of the scene diameter,
+/// at most — a click on a far-field environment point must not create a box
+/// the size of the sky.
+pub const PLACEMENT_MAX_SCENE_FRACTION: f64 = 0.5;
+
+/// Default brush radius as a fraction of the DISTANCE the camera is looking at.
+///
+/// Half of [`PLACEMENT_SIZE_DEPTH_FRACTION`]: a brush dab should be smaller
+/// than a placed box, because it is meant to touch part of a thing rather than
+/// enclose it. Replaces [`DEFAULT_BRUSH_SCENE_FRACTION`] as the default the
+/// viewer opens with; the scene fraction remains the fallback for a bundle
+/// with no usable view distance and for the headless `--brush` path.
+pub const DEFAULT_BRUSH_VIEW_FRACTION: f64 = 0.03;
+
 /// How far the pointer must travel (render pixels) before a drag paints again.
 ///
 /// A stroke is a path of spheres; sampling every frame would paint hundreds of
@@ -211,6 +246,9 @@ mod golden {
                     .expect("fits"),
                 knn_k: usize::try_from(case["knn_k"].as_u64().expect("knn_k")).expect("fits"),
                 depth_gap_factor: case["depth_gap_factor"].as_f64().expect("depth_gap_factor"),
+                // The fixture has no name for the viewer-only density gate, so
+                // the golden run is the ungated one the Python twin performs.
+                ..cluster::ClickParams::default()
             };
             let px = case["px"].as_array().expect("px");
             let found = cluster::click_to_cluster(

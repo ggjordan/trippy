@@ -569,6 +569,108 @@ pub fn depth_anchor(
     best
 }
 
+/// Smallest ring the depth anchor ever searches, render pixels.
+///
+/// The brush's own ring is used as the catchment (see [`ring_radius_px`]), but
+/// a brush aimed at something far away projects to a ring a fraction of a
+/// pixel across, and then nothing is ever under the cursor. This is the floor.
+pub const MIN_RING_PX: f64 = 6.0;
+
+/// Largest ring the depth anchor ever searches, render pixels.
+///
+/// The 2026-09-08 bug Jordan hit ("brushing seemed to blur the foreground and
+/// the background") was a huge default radius projecting to a ring most of the
+/// frame wide: the anchor then locked onto whatever the nearest point ANYWHERE
+/// in that ring was, so a stroke aimed at the background painted at foreground
+/// depth. Capping the catchment keeps the anchor local to the cursor even when
+/// the radius is silly.
+pub const MAX_RING_PX: f64 = 96.0;
+
+/// How far, in multiples of the brush radius, one sample of a stroke may move
+/// in depth from the previous one.
+///
+/// A stroke is meant to travel over a surface, not to jump between surfaces.
+/// Without this the anchor is free to snap from a twig in front to the hillside
+/// behind between two samples of one drag, and the region ends up spanning both
+/// — the other half of the "blurred the foreground and the background" report.
+/// 1.5 is deliberately larger than 1: a stroke crossing a genuinely sloped
+/// surface must not be stopped by its own rule.
+pub const STROKE_DEPTH_JUMP_RADII: f64 = 1.5;
+
+/// The screen radius, in render pixels, of a sphere of `radius` world units at
+/// camera-space depth `depth`, clamped to the range the anchor will search.
+///
+/// `fx * r / z` is the pinhole projection of a sphere's radius; the clamp is
+/// [`MIN_RING_PX`] / [`MAX_RING_PX`] and exists for the reasons written on
+/// those two constants. Returns [`MIN_RING_PX`] for a non-positive or
+/// non-finite depth, which is the "we have no anchor yet" bootstrap.
+#[must_use]
+pub fn ring_radius_px(fx: f64, radius: f64, depth: f64) -> f64 {
+    if !(depth > 0.0) || !depth.is_finite() || !radius.is_finite() || radius <= 0.0 {
+        return MIN_RING_PX;
+    }
+    (fx * radius / depth).clamp(MIN_RING_PX, MAX_RING_PX)
+}
+
+/// Clamp `depth` to within [`STROKE_DEPTH_JUMP_RADII`] radii of `previous`.
+///
+/// `None` for `previous` (the first sample of a stroke) accepts `depth` as it
+/// is: there is nothing yet to be consistent with.
+#[must_use]
+pub fn clamp_stroke_depth(depth: f64, previous: Option<f64>, radius: f64) -> f64 {
+    let Some(previous) = previous else {
+        return depth;
+    };
+    if !radius.is_finite() || radius <= 0.0 {
+        return depth;
+    }
+    let span = STROKE_DEPTH_JUMP_RADII * radius;
+    depth.clamp(previous - span, previous + span)
+}
+
+/// [`depth_anchor`] straight over the renderer's own `f32` positions.
+///
+/// The double-click "focus on what I clicked" gesture and the brush's hover
+/// ring both need one anchor, once, at an arbitrary moment — never the
+/// thousands of queries a drag makes — so neither is worth widening a
+/// multi-million-point cloud to `f64` for (180 MB on Karekare) nor building a
+/// [`ScreenGrid`] for. The projection arithmetic is identical: each coordinate
+/// is widened as it is read, which is what [`super::weights::widen`] does to
+/// the whole array up front.
+///
+/// # Arguments
+/// As [`depth_anchor`], with `xyz` the renderer's flat `(N, 3)` `f32` array.
+#[must_use]
+pub fn depth_anchor_f32(
+    camera: &ClickCamera,
+    xyz: &[f32],
+    px: (f64, f64),
+    radius_px: f64,
+) -> Option<f64> {
+    let r2 = radius_px * radius_px;
+    let mut best: Option<f64> = None;
+    for i in 0..xyz.len() / 3 {
+        let p = [
+            f64::from(xyz[3 * i]),
+            f64::from(xyz[3 * i + 1]),
+            f64::from(xyz[3 * i + 2]),
+        ];
+        let (u, v, z) = camera.project(p);
+        if !(z > 0.0) || !u.is_finite() || !v.is_finite() {
+            continue;
+        }
+        let du = u - px.0;
+        let dv = v - px.1;
+        if du.mul_add(du, dv * dv) > r2 {
+            continue;
+        }
+        if best.is_none_or(|b| z < b) {
+            best = Some(z);
+        }
+    }
+    best
+}
+
 /// A screen-space bucket index over a static cloud's projections through ONE
 /// camera pose, so [`depth_anchor`]'s "nearest point under the cursor" query
 /// costs candidates-in-a-few-buckets instead of every point in the cloud.
@@ -630,6 +732,17 @@ impl ScreenGrid {
             buckets.entry(key).or_default().push((u, v, z));
         }
         Self { cell_px, buckets }
+    }
+
+    /// The cell edge this index was built with, render pixels.
+    ///
+    /// [`Self::nearest`] searches exactly one ring of cells, so it is only
+    /// exact for `radius_px <= cell_px`; a caller whose search radius grew
+    /// past this (the brush's ring widens as it approaches a surface) must
+    /// rebuild rather than query.
+    #[must_use]
+    pub const fn cell_px(&self) -> f64 {
+        self.cell_px
     }
 
     /// How many buckets are occupied (a diagnostic, not used by the query).
@@ -857,6 +970,56 @@ mod tests {
         }
         assert_eq!(agreements, 500, "every query must agree with brute force");
         assert!(hits > 50, "the cloud must actually land under some queries: {hits}");
+    }
+
+    #[test]
+    fn the_f32_anchor_is_the_same_answer_as_the_f64_one() {
+        // `depth_anchor_f32` exists to avoid widening a multi-million-point
+        // cloud for one double-click; it must not be a different answer.
+        let mut rng = Xorshift(0x1234_5678_9ABC_DEF0);
+        let camera = test_camera();
+        let wide = random_cloud(&mut rng, 4_000);
+        #[allow(clippy::cast_possible_truncation)]
+        let narrow: Vec<f32> = wide.iter().map(|v| *v as f32).collect();
+        let rewidened: Vec<f64> = narrow.iter().map(|v| f64::from(*v)).collect();
+
+        let mut hits = 0;
+        for _ in 0..300 {
+            let px = (rng.next_f64() * 640.0, rng.next_f64() * 480.0);
+            let a = depth_anchor(&camera, &rewidened, px, ANCHOR_RADIUS_PX);
+            let b = depth_anchor_f32(&camera, &narrow, px, ANCHOR_RADIUS_PX);
+            assert_eq!(a, b, "f32 and f64 anchors disagree at {px:?}");
+            hits += usize::from(b.is_some());
+        }
+        assert!(hits > 20, "the cloud must land under some queries: {hits}");
+    }
+
+    #[test]
+    fn the_ring_is_the_brushs_own_projection_between_its_two_limits() {
+        // fx * r / z, which is what the on-screen circle is drawn at, so the
+        // catchment and the ring Jordan sees are the same number.
+        assert!((ring_radius_px(1000.0, 0.05, 2.0) - 25.0).abs() < 1e-9);
+        // Far away: the projection is sub-pixel, so the floor applies.
+        assert!((ring_radius_px(1000.0, 0.05, 10_000.0) - MIN_RING_PX).abs() < 1e-9);
+        // Absurdly large radius (the 2026-09-08 default on Karekare): capped,
+        // so the anchor stays local to the cursor.
+        assert!((ring_radius_px(1000.0, 50.0, 2.0) - MAX_RING_PX).abs() < 1e-9);
+        // No anchor yet, or nonsense: the floor, never a panic or a NaN.
+        assert!((ring_radius_px(1000.0, 0.05, -1.0) - MIN_RING_PX).abs() < 1e-9);
+        assert!((ring_radius_px(1000.0, 0.05, f64::NAN) - MIN_RING_PX).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_stroke_cannot_jump_more_than_one_and_a_half_radii_in_depth() {
+        // The first sample of a stroke takes whatever the anchor found.
+        assert!((clamp_stroke_depth(37.0, None, 0.5) - 37.0).abs() < 1e-12);
+        // A later sample that lands on a surface far behind is pulled back to
+        // 1.5 radii, so the painted sphere never spans both surfaces.
+        assert!((clamp_stroke_depth(37.0, Some(2.0), 0.5) - 2.75).abs() < 1e-12);
+        // ... and one far in front, likewise.
+        assert!((clamp_stroke_depth(0.1, Some(2.0), 0.5) - 1.25).abs() < 1e-12);
+        // A small step over a sloped surface is left alone.
+        assert!((clamp_stroke_depth(2.3, Some(2.0), 0.5) - 2.3).abs() < 1e-12);
     }
 
     #[test]
