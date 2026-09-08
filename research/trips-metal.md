@@ -2100,3 +2100,10 @@ the areas I want". Artefacts: `$SPLATS_ROOT/tools/gpu_queue/logs/trippy-viewer-k
 - Freed ~62 GB (22 -> 84 GB available): worktree cargo targets for blend-gate and karekare-v2 (their queued jobs are Python-only), 15 intermediate epoch checkpoints across finished runs (7.7 GB; best + latest kept everywhere; the running kkv2-2 untouched), hybrid-C renders (negative design, regenerable), uv and pip caches.
 - Kept: output/cache (undistorted image caches, queued kk-coherent/clip5923 jobs reuse them), output/depth (union jobs), editor-sam-ui target (edit-sam-4 pending), rust/target on main (test gate).
 - Fix: 50-trippy-removal-rel job pointed at the removed worktree .worktrees/relative-removal; repointed to the main repo (config_removal_rel.yaml is merged there).
+
+## 2026-09-08 17:44 — kkv2-2-full-unmasked (target scene, masks off)
+- Question: does training on the unmasked photos (kids included) change the shade result versus the masked run?
+- Job: trippy-kkv2-2-full-unmasked (prio 40, 400-min budget, epoch 105 of 300).
+- Numbers: held-out PSNR 14.63 dB (neighbour exposure; strict 13.79 dB); shade dark-mass 34.5% vs Gaussian baseline 17.3%. Masked twin at epoch 122: 15.06 dB, 34.5%.
+- Verdict: masks make no difference to the shade audit; the unmasked run is 0.4 dB lower at fewer epochs (not a fair PSNR comparison yet). Same conclusion: plain TRIPS on the full scene is not the shade fix; removal (kkv2-3, running now), shade-prune (kkv2-6) and hybrid/gate (kkv2-5/7) carry the test.
+- Artifacts: Jordan-Review 4-other/kkv2-2-full-unmasked-viewer.command (+ dolly, honesty sheet, PLY).

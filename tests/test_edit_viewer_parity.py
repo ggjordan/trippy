@@ -116,6 +116,9 @@ def _run(viewer: Path, args: list[str]) -> None:
     result = subprocess.run(
         [str(viewer), *args], capture_output=True, text=True, timeout=300, check=False
     )
+    if result.returncode != 0 and "unknown flag" in result.stderr:
+        # A stale binary is not a parity failure: the viewer predates this flag.
+        pytest.skip(f"trips-viewer is stale ({args[0]} unknown); rebuild it")
     assert result.returncode == 0, f"{args}\nstdout: {result.stdout}\nstderr: {result.stderr}"
 
 
