@@ -1,0 +1,176 @@
+# EXP-0011 FULL-RES SMOKE: the config_fullres.yaml recipe at REAL width/crop (2016/512,
+# unshrunk) on a handful of images, resuming the REAL kkv2-1-full-masked checkpoint.
+#
+# Purpose: prove rc 0 on the three things config_fullres.yaml adds over the already-proven
+# config.yaml recipe, before committing a 12 h GPU job to it:
+#   1. building a FRESH width-2016 undistortion+mask cache (this scene has never been
+#      undistorted above width 1008 -- see README "Scale"; cache validity is asserted
+#      against live COLMAP intrinsics, so a first build at a new width is exactly what
+#      config_fullres.yaml's own first run will do, just for 140 images instead of 756);
+#   2. `--resume`-ing a checkpoint whose OWN cfg says width 1008 / crop 384 into a Trainer
+#      built at width 2016 / crop 512 -- structurally proven safe by code (Trainer.resume
+#      never reads cfg.width/cfg.crop) and empirically on synthetic fixtures (see
+#      config_fullres.yaml's comment), but this is the first time it happens against the
+#      REAL 7,542,137-point checkpoint and the REAL net/camera/pose shapes, which is the
+#      one thing a synthetic-fixture check cannot cover;
+#   3. `Trainer.load_state`'s point-count resize path actually firing at this scale (the
+#      smoke's own `point_source.max_points: 300000` build is immediately discarded and
+#      replaced by the checkpoint's 7,542,137 points -- see config_fullres.yaml's note).
+#
+# `limit_images: 140` (not the full 756): sorted image names put IMG_3828.jpg-IMG_3833.jpg
+# (the kk-coherent shade group, README "The kk-coherent shade frames are a DIFFERENT shady
+# place") at indices 120-125, so 140 images is the smallest round cut that still exercises
+# the REAL forced_heldout/alternate-split code path against real forced frames (3 held out,
+# 3 pushed into training) rather than silently degrading to an empty shade group --
+# `trippy.scene.splits.split_with_forced_heldout` drops forced names absent from `names`
+# rather than raising, so a smaller cut would still return rc 0 but would prove less. The
+# 93-frame big-tree group (IMG_4032 on) sorts later and is NOT included here; that group is
+# only exercised for real once the full run's own images are all present.
+#
+# width 2016 / crop 512 are UNCHANGED from config_fullres.yaml (unlike config_smoke.yaml,
+# which halves config.yaml's width/crop to 504/192) -- shrinking either one here would mean
+# the smoke never actually builds the width-2016 cache or runs a real 512-crop step, which
+# are exactly the two things this smoke exists to de-risk.
+#
+# Run via: scripts/gpu_submit.sh --prio 15 kkv2-9-fullres-smoke -- bash -c "..." (see
+# research/trips-metal.md submission line) -- never invoked directly.
+run_dir: /Users/nzbirdranch/trippy/output/runs/EXP-0011-karekare-v2/kkv2-9-fullres-smoke
+
+scene_root: /Users/nzbirdranch/Splats/scenes/karekare/karekare-v2
+limit_images: 140
+
+masks_dir: ""
+use_masks: true
+
+width: 2016
+crop: 512
+mode: broadcast
+layers: 5
+epochs: 2
+train_factor: 0.05
+
+point_source:
+  type: gaussian
+  path: /Users/nzbirdranch/Splats/output/Training-Data/karekare/karekare-lid/kklid_20000.ply
+  min_opacity: 0.05
+  # Discarded on --resume (see config_fullres.yaml); kept small so a --resume-less
+  # invocation of this file is still a fast, well-formed smoke on its own.
+  max_points: 300000
+  size_mode: knn
+  seed: 0
+
+heldout_k: 16
+eval_every: 1
+checkpoint_every: 1
+eval_max_images: 4
+eval_exposure_mode: neighbours
+
+# Same 99-name list as config.yaml/config_fullres.yaml; only IMG_3828-3833 (indices 120-125)
+# fall inside limit_images: 140 -- see header note. The rest are silently dropped by
+# trippy.scene.splits.split_with_forced_heldout (absent-from-names entries are ignored, not
+# an error), which is deliberate here, not a bug to fix.
+forced_heldout:
+  - IMG_3828.jpg
+  - IMG_3829.jpg
+  - IMG_3830.jpg
+  - IMG_3831.jpg
+  - IMG_3832.jpg
+  - IMG_3833.jpg
+  - IMG_4032.jpg
+  - IMG_4033.jpg
+  - IMG_4034.jpg
+  - IMG_4035.jpg
+  - IMG_4036.jpg
+  - IMG_4037.jpg
+  - IMG_4039.jpg
+  - IMG_4040.jpg
+  - IMG_4041.jpg
+  - IMG_4057.jpg
+  - IMG_4058.jpg
+  - IMG_4059.jpg
+  - IMG_4060.jpg
+  - IMG_4061.jpg
+  - IMG_4062.jpg
+  - IMG_4083.jpg
+  - IMG_4084.jpg
+  - IMG_4085.jpg
+  - IMG_4116.jpg
+  - IMG_4117.jpg
+  - IMG_4118.jpg
+  - IMG_4260.jpg
+  - IMG_4261.jpg
+  - IMG_4264.jpg
+  - IMG_4265.jpg
+  - IMG_4266.jpg
+  - IMG_4267.jpg
+  - IMG_4269.jpg
+  - IMG_4270.jpg
+  - IMG_4271.jpg
+  - IMG_4272.jpg
+  - IMG_4273.jpg
+  - IMG_4274.jpg
+  - IMG_4280.jpg
+  - IMG_4281.jpg
+  - IMG_4282.jpg
+  - IMG_4283.jpg
+  - IMG_4284.jpg
+  - IMG_4292.jpg
+  - IMG_4293.jpg
+  - IMG_4294.jpg
+  - IMG_4295.jpg
+  - IMG_4296.jpg
+  - IMG_4297.jpg
+  - IMG_4298.jpg
+  - IMG_4299.jpg
+  - IMG_4300.jpg
+  - IMG_4301.jpg
+  - IMG_4302.jpg
+  - IMG_4303.jpg
+  - IMG_4304.jpg
+  - IMG_4305.jpg
+  - IMG_4309.jpg
+  - IMG_4310.jpg
+  - IMG_4311.jpg
+  - IMG_4312.jpg
+  - IMG_4313.jpg
+  - IMG_4319.jpg
+  - IMG_4320.jpg
+  - IMG_4321.jpg
+  - IMG_5540.jpg
+  - IMG_5541.jpg
+  - IMG_5542.jpg
+  - IMG_5543.jpg
+  - IMG_5544.jpg
+  - IMG_5545.jpg
+  - IMG_5546.jpg
+  - IMG_5547.jpg
+  - IMG_5548.jpg
+  - IMG_5549.jpg
+  - IMG_5550.jpg
+  - IMG_5551.jpg
+  - IMG_5552.jpg
+  - IMG_5557.jpg
+  - IMG_5558.jpg
+  - IMG_5559.jpg
+  - IMG_5560.jpg
+  - IMG_5561.jpg
+  - IMG_5646.jpg
+  - IMG_5647.jpg
+  - IMG_5648.jpg
+  - IMG_5649.jpg
+  - IMG_5650.jpg
+  - IMG_5651.jpg
+  - IMG_5652.jpg
+  - IMG_5653.jpg
+  - IMG_5654.jpg
+  - IMG_5655.jpg
+  - IMG_5656.jpg
+  - IMG_5657.jpg
+  - IMG_5658.jpg
+  - IMG_5659.jpg
+  - IMG_5660.jpg
+
+forced_heldout_mode: alternate
+
+device: mps
+seed: 0

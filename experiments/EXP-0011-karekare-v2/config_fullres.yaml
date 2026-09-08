@@ -1,0 +1,185 @@
+# EXP-0011 FULL-RES: does "fuzzy and pixelated" (Jordan's 2026-09-08 19:10 verdict on
+# kkv2-1-full-masked / kkv2-2-full-unmasked) come from training at half the native pixel
+# count, or is it a limit of TRIPS + these images?
+#
+# Jordan's verdict on the shade question was a clean pass ("no longer a cloud") but the
+# COST was "literally everything else looks worse: fuzzy and pixelated across the scene".
+# Two live explanations, not mutually exclusive: (a) the run stopped at epoch 122/300
+# (under-trained) and (b) width 1008 / crop 384 leaves a sub-pixel Gaussian footprint for
+# the U-Net to invent almost entirely (README "Scale": median projected point size 1.2-4.0
+# px even with kNN sizes, t_final ~0.93). This config isolates (b): same scene, same split,
+# same point source, same 300-epoch schedule, at width 2016 / crop 512, SEEDED from
+# kkv2-1-full-masked's own most-trained checkpoint so the comparison is "more resolution
+# from the same starting point", not "more resolution from scratch".
+#
+# width 2016 is 2x the trained width, NOT literal native resolution -- this scene's 202
+# camera models range 2160-5712 px wide natively, and SceneDataset takes one destination
+# width for every camera (height derived per-camera aspect ratio), so there is no single
+# width that is "the" native resolution across this scene. 2016 is the largest round 2x
+# step that stays BELOW the smallest native camera width (2160), so no camera is ever
+# upsampled -- see README "Full-resolution variant" for the measurement.
+#
+# SEEDING, not a fresh run: `--resume` is passed on the command line (not a config field)
+# against kkv2-1-full-masked's checkpoint_latest.pt (epoch 122, the most-trained checkpoint
+# available when this was queued -- checkpoint_best.pt is only epoch 40, the best-PSNR-SO-FAR
+# checkpoint from early in a still-improving run, which would throw away 82 epochs of
+# training for a worse starting point). `Trainer.resume`/`load_state` (trippy/train/trainer.py)
+# load point_params, pose_params, net, camera, background, optimizer and scheduler state --
+# none of it is keyed by width or crop (the U-Net is fully convolutional, no fixed-size
+# layers; PoseParams/CameraParams are keyed by image INDEX, and this config keeps the exact
+# same scene_root/forced_heldout/heldout_k/forced_heldout_mode as config.yaml so the sorted
+# 756-name index order -- and therefore every index -- is identical). Verified empirically
+# on the synthetic fixtures (`tests/test_train_helpers.py`), not just by reading the code:
+# a Trainer built at width 48/crop 24 that resumes a checkpoint saved by a Trainer at width
+# 96/crop 32 loads cleanly and takes a further real train_step + evaluate() at its OWN
+# (different) width/crop with no error. `resume()` also has NO structural width/crop check
+# to add even if this were false; a mismatch could only ever show up as garbled renders, not
+# a crash, which is exactly why config_fullres_smoke.yaml below resumes the REAL checkpoint
+# before this config's ~12 h job does.
+#
+# Run via: scripts/gpu_submit.sh --prio 40 kkv2-9-fullres -- bash -c "..." (see
+# research/trips-metal.md submission line) -- never invoked directly (AGENTS.md "GPU and
+# compute"). NOT scripts/queue_training.sh: that script hardcodes prio 70 (--train), and
+# this run needs prio 40 (target-scene band, 2026-09-07 queue policy).
+# run_dir is ABSOLUTE: queued from .worktrees/kkv2-fullres, and a relative run_dir would
+# resolve inside that worktree and be lost when it is removed.
+run_dir: /Users/nzbirdranch/trippy/output/runs/EXP-0011-karekare-v2/kkv2-9-fullres
+
+scene_root: /Users/nzbirdranch/Splats/scenes/karekare/karekare-v2
+
+# Same masking policy as config.yaml (the masked arm is the one being resumed).
+masks_dir: ""
+use_masks: true
+
+width: 2016
+crop: 512
+mode: broadcast
+layers: 5
+epochs: 300
+train_factor: 1.0
+
+point_source:
+  type: gaussian
+  path: /Users/nzbirdranch/Splats/output/Training-Data/karekare/karekare-lid/kklid_20000.ply
+  min_opacity: 0.05
+  size_mode: knn
+  # NOTE: whatever this builds is discarded the instant --resume loads kkv2-1-full-masked's
+  # checkpoint -- Trainer.load_state resizes point_params to the CHECKPOINT's own point
+  # count (7,542,137) before loading its tensors verbatim (trippy/train/trainer.py
+  # `_resize_point_params`). This section is kept byte-identical to config.yaml only so a
+  # `--resume`-less run of this file (e.g. a future arm seeded fresh) is still well-formed.
+
+# Identical split machinery to config.yaml so PoseParams/CameraParams indices line up with
+# the checkpoint being resumed: same heldout_k, same forced_heldout list, same mode.
+heldout_k: 16
+eval_every: 20
+checkpoint_every: 20
+eval_max_images: 8
+eval_exposure_mode: neighbours
+
+# --- IDENTICAL forced_heldout list to config.yaml (README "Finding the shade frames") ---
+forced_heldout:
+  - IMG_3828.jpg
+  - IMG_3829.jpg
+  - IMG_3830.jpg
+  - IMG_3831.jpg
+  - IMG_3832.jpg
+  - IMG_3833.jpg
+  - IMG_4032.jpg
+  - IMG_4033.jpg
+  - IMG_4034.jpg
+  - IMG_4035.jpg
+  - IMG_4036.jpg
+  - IMG_4037.jpg
+  - IMG_4039.jpg
+  - IMG_4040.jpg
+  - IMG_4041.jpg
+  - IMG_4057.jpg
+  - IMG_4058.jpg
+  - IMG_4059.jpg
+  - IMG_4060.jpg
+  - IMG_4061.jpg
+  - IMG_4062.jpg
+  - IMG_4083.jpg
+  - IMG_4084.jpg
+  - IMG_4085.jpg
+  - IMG_4116.jpg
+  - IMG_4117.jpg
+  - IMG_4118.jpg
+  - IMG_4260.jpg
+  - IMG_4261.jpg
+  - IMG_4264.jpg
+  - IMG_4265.jpg
+  - IMG_4266.jpg
+  - IMG_4267.jpg
+  - IMG_4269.jpg
+  - IMG_4270.jpg
+  - IMG_4271.jpg
+  - IMG_4272.jpg
+  - IMG_4273.jpg
+  - IMG_4274.jpg
+  - IMG_4280.jpg
+  - IMG_4281.jpg
+  - IMG_4282.jpg
+  - IMG_4283.jpg
+  - IMG_4284.jpg
+  - IMG_4292.jpg
+  - IMG_4293.jpg
+  - IMG_4294.jpg
+  - IMG_4295.jpg
+  - IMG_4296.jpg
+  - IMG_4297.jpg
+  - IMG_4298.jpg
+  - IMG_4299.jpg
+  - IMG_4300.jpg
+  - IMG_4301.jpg
+  - IMG_4302.jpg
+  - IMG_4303.jpg
+  - IMG_4304.jpg
+  - IMG_4305.jpg
+  - IMG_4309.jpg
+  - IMG_4310.jpg
+  - IMG_4311.jpg
+  - IMG_4312.jpg
+  - IMG_4313.jpg
+  - IMG_4319.jpg
+  - IMG_4320.jpg
+  - IMG_4321.jpg
+  - IMG_5540.jpg
+  - IMG_5541.jpg
+  - IMG_5542.jpg
+  - IMG_5543.jpg
+  - IMG_5544.jpg
+  - IMG_5545.jpg
+  - IMG_5546.jpg
+  - IMG_5547.jpg
+  - IMG_5548.jpg
+  - IMG_5549.jpg
+  - IMG_5550.jpg
+  - IMG_5551.jpg
+  - IMG_5552.jpg
+  - IMG_5557.jpg
+  - IMG_5558.jpg
+  - IMG_5559.jpg
+  - IMG_5560.jpg
+  - IMG_5561.jpg
+  - IMG_5646.jpg
+  - IMG_5647.jpg
+  - IMG_5648.jpg
+  - IMG_5649.jpg
+  - IMG_5650.jpg
+  - IMG_5651.jpg
+  - IMG_5652.jpg
+  - IMG_5653.jpg
+  - IMG_5654.jpg
+  - IMG_5655.jpg
+  - IMG_5656.jpg
+  - IMG_5657.jpg
+  - IMG_5658.jpg
+  - IMG_5659.jpg
+  - IMG_5660.jpg
+
+forced_heldout_mode: alternate
+
+device: mps
+seed: 0

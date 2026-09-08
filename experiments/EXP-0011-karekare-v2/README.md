@@ -223,12 +223,20 @@ from EXP-0010's 1M to **4M**, since this cloud is ~4× `kkc_15000`.
 | `config_removal.yaml` | `kkv2-3-removal` | + EXP-0010 arm A' point removal (`mode: relative`) |
 | `config_hybrid.yaml` | `kkv2-5-hybrid` | + design A: the `kklid_20000` render fed to the U-Net |
 | `config_hybrid_gate.yaml` | `kkv2-7-hybrid-gate` | `config_hybrid.yaml` + the **blend gate** (see below) |
+| `config_fullres_smoke.yaml` | `kkv2-9-fullres-smoke` | w2016/crop512 (unshrunk), 140 images, 2 epochs, resumes the real kkv2-1 checkpoint — proves rc 0 before the 12 h full-res run |
+| `config_fullres.yaml` | `kkv2-9-fullres` | w2016/crop512, 300 epochs, **seeded from `kkv2-1-full-masked`'s checkpoint_latest.pt (epoch 122)** via `--resume` — see "Full-resolution variant" below |
 
-All six carry `eval_exposure_mode: neighbours`, `forced_heldout_mode: alternate`, the same
+All eight carry `eval_exposure_mode: neighbours`, `forced_heldout_mode: alternate`, the same
 99-frame shade list, `heldout_k: 16`, and **absolute** `run_dir`s under
-`/Users/nzbirdranch/trippy/output/runs/EXP-0011-karekare-v2/` (these are queued from the
-`.worktrees/karekare-v2` worktree; a relative `run_dir` would resolve inside it and be lost
-when the worktree is removed — the way EXP-0005's renders were).
+`/Users/nzbirdranch/trippy/output/runs/EXP-0011-karekare-v2/` — a relative `run_dir` would
+resolve inside whatever working copy submitted the job and be lost when that copy is removed,
+the way EXP-0005's renders were. The first six were queued from the `.worktrees/karekare-v2`
+worktree (still must survive until their jobs finish, see the warning below). The two
+full-resolution jobs (`kkv2-9-fullres-smoke`, `kkv2-9-fullres`) were queued from
+`.worktrees/kkv2-fullres` but their generated job scripts `cd` into the **main** checkout
+(`/Users/nzbirdranch/trippy`) rather than that worktree, precisely so removing
+`.worktrees/kkv2-fullres` after review cannot kill them the way an early worktree removal has
+before — see "Full-resolution variant" below for the one thing that dependency requires.
 
 ### The blend-gate arm (`config_hybrid_gate.yaml`, `kkv2-7-hybrid-gate`)
 
@@ -281,6 +289,137 @@ that cached meta — the scene's 202 camera models cost it nothing. `max_hw` is 
 explicitly (never gsrender's own default of 32, which corrupts near-camera footprints).
 `missing: zeros` means a dead shard still trains rather than crashing; check the shard
 manifests before trusting the numbers.
+
+### Full-resolution variant (`kkv2-9-fullres`, `kkv2-9-fullres-smoke`)
+
+**The question.** Jordan's 2026-09-08 19:10 verdict on `kkv2-1-full-masked` /
+`kkv2-2-full-unmasked`: the shade fix passed ("no longer a cloud"), but the cost was
+"literally everything else looks worse: fuzzy and pixelated across the scene". Two live,
+non-exclusive explanations: the run stopped at epoch 122 of 300 (under-trained), or width
+1008 / crop 384 is intrinsically too coarse for this scene (README "Scale": median
+projected Gaussian footprint is only 1.2–4.0 px even with kNN sizes, so the U-Net is
+inventing ~90% of every frame from a sub-pixel signal). This variant isolates the second
+explanation: same scene, same masks, same split, same point source, same 300-epoch
+schedule, at **width 2016 / crop 512**, so a sharper or unchanged result at equal epochs
+reads directly on "is this a resolution limit or a training-time limit".
+
+**2016 is not native resolution — it is 2x the trained width.** `karekare-v2`'s 202 camera
+models range 2160–5712 px wide natively (measured via `colmap_io.load_colmap_model`,
+2026-09-08), and `SceneDataset` takes one destination width for every camera, deriving each
+one's height from its own aspect ratio — there is no single width that is "the" native
+resolution across a scene this heterogeneous. 2016 is the largest round 2x step that stays
+strictly below the smallest native camera width (2160), so undistorting at 2016 never
+upsamples any of the 756 registered photos. A literal per-camera native-resolution run
+would need a variable-width dataset, which `SceneDataset` does not support and this task
+did not add.
+
+**Seeded, not trained from scratch.** `--resume` (a CLI flag, not a config field) is passed
+against `kkv2-1-full-masked/checkpoints/checkpoint_latest.pt` — **epoch 122**, the
+most-trained checkpoint available when this was queued (2026-09-08), not `checkpoint_best.pt`
+(only epoch 40, the best-held-out-PSNR-so-far checkpoint from early in a run that kept
+improving — resuming from it would throw away 82 epochs of training for a worse starting
+point). The comparison this buys is "more resolution from the same point in training", not
+"more resolution from scratch".
+
+**Does `--resume` tolerate a different width/crop? Checked two ways, not assumed.**
+1. *By code*: `Trainer.resume`/`load_state` (`trippy/train/trainer.py`) load
+   `point_params`, `pose_params`, `net`, `camera`, `background`, `optimizer` and `scheduler`
+   state; none of it is read from, or checked against, `cfg.width`/`cfg.crop`. The U-Net
+   (`trippy/net/unet.py::MultiScaleUnet2dDecOnlySmallFixed`) is fully convolutional — no
+   `Linear`/`AdaptiveAvgPool` layer whose shape depends on input resolution — and
+   `PoseParams`/camera state are keyed by image **index**, not pixel geometry, so they only
+   line up correctly if the resumed config keeps the exact same `scene_root`,
+   `forced_heldout`, `heldout_k` and `forced_heldout_mode` as the checkpoint's own run (this
+   config does, byte-for-byte, so the sorted 756-name index order is identical).
+2. *Empirically*, on the synthetic fixtures (`tests/test_train_helpers.py`, no scene
+   imagery): a `Trainer` built at width 48 / crop 24, trained two steps and checkpointed,
+   was resumed by a **second** `Trainer` built at width 96 / crop 32 (both width *and* crop
+   changed). It loaded with no error, matched the first trainer's `point_params.xyz` and
+   `net.state_dict()["final.0.weight"]` exactly, and then ran a further real `train_step()`
+   and `evaluate()` at its own new width/crop with no error. `RESUME ACROSS WIDTH/CROP:
+   PASS` (ad hoc CPU check, 2026-09-08, not checked in as a test file — the assertions
+   above are what it proved).
+
+Point count is a separate story: `load_state` resizes `point_params` to the **checkpoint's**
+point count before loading it (`_resize_point_params`), so `kkv2-9-fullres`'s and
+`kkv2-9-fullres-smoke`'s own `point_source:` blocks are moot once `--resume` runs — they
+exist only so a future `--resume`-less arm of either file is still well-formed on its own.
+The real run inherits kkv2-1's exact 7,542,137 points.
+
+**Memory/time estimate**, from the measured 1008 numbers (`kkv2-1-full-masked-resume`:
+~3.9 min/epoch at width 1008 / crop 384 / 664 steps per epoch):
+- Steps/epoch is unchanged (`train_factor: 1.0` × 664 train images = 664 steps): the split
+  is byte-identical to `config.yaml`.
+- Per-step cost is dominated by crop area for training (points are frustum-culled to what
+  is visible in the crop; the render itself emits 4 bilinear fragments per point per layer
+  **regardless of a point's pixel footprint**, so fragment count does not scale with width
+  on its own — see the "Eval full-frame pass" table below). Crop area ratio
+  (512/384)² ≈ **1.78x**. Estimated training time: 3.9 min × 1.78 ≈ **~6.9 min/epoch**.
+- Full-frame **eval** passes (`eval_every: 20`, `eval_max_images: 8`) do scale with total
+  pixel count — the compositing buffer and the U-Net's per-pixel decode are both O(pixels)
+  — so eval frames cost roughly **4x** their 1008 figures (README "Scale" table: 0.16–1.82
+  GB fragment-array peak per frame at 1008 → an estimated 0.6–7 GB at 2016), but eval runs
+  on only 8 of 756 images once every 20 epochs, so it does not dominate the per-epoch
+  average.
+- Dataset cache: **~4x** the 1008 numbers (756 images × ~4x the pixels/image). Measured
+  1008 build was 132.6 s / 2.91 GB; estimated 2016 build **≈530 s (~9 min) one-time, ≈11.6
+  GB on disk**. This happens automatically inside the job (CPU-only `grid_sample`
+  undistortion, the same code path `SceneDataset._load_or_build_cache` always runs) —
+  no separate submission needed, and it is not "direct GPU/MPS work" (device is irrelevant
+  to that step; it always runs on CPU).
+- Point-cloud build/kNN cost is width-independent (world-space; unaffected by resolution) —
+  unchanged from the ~31 s / 4.12 GB peak RSS already measured, and moot anyway once
+  `--resume` overwrites it.
+- At ~6.9 min/epoch, the queued `--max-minutes 720` (12 h) budget advances roughly
+  **~100 epochs** from wherever the run resumes — like every other 300-epoch arm here, one
+  12 h job will not reach epoch 300 in a single shot; it is expected to need at least one
+  further `--resume` continuation (the same pattern `kkv2-1-full-masked` → `-resume` →
+  `kkv2-8-full-masked-cont` already went through).
+
+**Acceptance.** Sharper held-out PSNR/LPIPS than `kkv2-1-full-masked` **at equal epoch
+count** (compare `psnr_mean_eval`/`lpips_mean` at the same `epoch` in each run's
+`metrics.jsonl`, not at "run finished" — the two runs will not finish at the same epoch on
+the same wall-clock budget), AND shade stays shading (Jordan's viewer verdict, not the dark-
+mass audit — the 2026-09-08 19:10 verdict already retired dark-mass as a shade pass/fail
+signal on this scene). If PSNR/LPIPS improves but the viewer still calls it fuzzy, or if
+resolution alone does not move either number, the defect is more likely epoch budget or a
+genuine limit of TRIPS + these images, not pixel count — in which case the next lever is
+finishing `kkv2-8-full-masked-cont` to real epoch 300 at the *current* resolution, so the
+two variables (epochs, resolution) are not still confounded.
+
+**Queue (2026-09-07 queue policy, not the prio-70 table above).** Both jobs were submitted
+via `scripts/gpu_submit.sh` directly, not `scripts/queue_training.sh` (that script hardcodes
+`--train`, i.e. prio 70; these need the target-scene band, prio 40, and a short prio-15
+smoke):
+
+| job | prio | submit line |
+|---|---|---|
+| `trippy-kkv2-9-fullres-smoke` | 15 | `scripts/gpu_submit.sh --prio 15 kkv2-9-fullres-smoke -- trippy train --config experiments/EXP-0011-karekare-v2/config_fullres_smoke.yaml --resume <kkv2-1 checkpoints>/checkpoint_latest.pt --device mps --max-minutes 30 --report` |
+| `trippy-kkv2-9-fullres` | 40 | `scripts/gpu_submit.sh --prio 40 kkv2-9-fullres -- bash -c '<rc guard, see below>; python -m trippy.cli train --config experiments/EXP-0011-karekare-v2/config_fullres.yaml --resume <kkv2-1 checkpoints>/checkpoint_latest.pt --device mps --max-minutes 720 --report'` |
+
+The full job's guard refuses to start unless the smoke already succeeded:
+`RC=.../gpu_queue/done/trippy-kkv2-9-fullres-smoke.rc; [ -f "$RC" ] && [ "$(cat "$RC")" = "0" ]`,
+else it exits 97 without touching the GPU. `kkv2-9-fullres` sorts after every existing
+`kkv2-*` prio-40 job by filename (`8` < `9`), so it does not jump the queue.
+
+> ⚠️ **Both job scripts `cd` into the MAIN checkout (`/Users/nzbirdranch/trippy`), not this
+> worktree — which means `experiments/EXP-0011-karekare-v2/config_fullres{,_smoke}.yaml`
+> must exist in main before either job's turn comes up.** The smoke sits behind only two
+> short prio-15 jobs (`edit-sam-5-cpu`, `edit-sam-5`) when this was queued, so it could start
+> within minutes to an hour. **This branch (`exp/kkv2-fullres`) must be reviewed and merged
+> — or the two config files otherwise placed in main — before that happens**, or the smoke
+> fails immediately with a missing-config error and the guarded full job never starts either.
+> This is a deliberate change from the `.worktrees/karekare-v2` pattern above (cd into the
+> submitting worktree, keep it alive until the jobs finish): it trades "the worktree must
+> survive" for "main must have the configs first", because `.worktrees/kkv2-fullres` is a
+> short-lived review branch, not a long-queue holding pen.
+
+Both submissions also wrote their own `research/trips-metal.md` one-liner (`submitted job
+...`) directly into the **main** checkout's live file, a side effect of `gpu_submit.sh`
+always logging relative to whatever `REPO_ROOT` a job's `cd` target uses — since these jobs
+correctly `cd` into main, that line landed in main's working tree, not in this branch's
+diff. The Orchestrator should commit those two lines in main (or fold them in when merging
+this branch) rather than expect them to arrive via this PR.
 
 ---
 
@@ -369,6 +508,8 @@ _Placeholders — filled in as each run reports._
 | `kkv2-3-removal` | | | | | | | |
 | `kkv2-5-hybrid` | | | | | | | |
 | `kkv2-7-hybrid-gate` | | | | | | | |
+| `kkv2-9-fullres-smoke` | 2 | | | | | | |
+| `kkv2-9-fullres` | | | | | | | |
 
 For `kkv2-7-hybrid-gate`, also record the gate: mean and p5/p50/p95 from
 `report.json`'s `gate.held_out` block, whether the map is structured or constant, and the
