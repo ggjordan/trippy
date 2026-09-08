@@ -13,6 +13,14 @@ All notable changes to trippy. Format: Keep a Changelog. Versions: semver tags `
   0.87 px. No code changed; see `research/trips-metal.md` 2026-09-08 for the full numbers.
 
 ### Added
+- **EXP-0011 full-resolution variant** (`experiments/EXP-0011-karekare-v2/config_fullres.yaml`
+  + `config_fullres_smoke.yaml`): tests whether Jordan's "fuzzy and pixelated" verdict on the
+  full Karekare-v2 TRIPS runs is under-resolution (width 1008/crop 384) rather than a limit of
+  TRIPS + these images, by re-running the same scene/masks/split at width 2016/crop 512,
+  seeded via `--resume` from `kkv2-1-full-masked`'s epoch-122 checkpoint. Resuming a
+  checkpoint into a `Trainer` built at a different width/crop is verified empirically on
+  synthetic fixtures, not just by reading `Trainer.resume`/`load_state`. Both jobs queued
+  (`kkv2-9-fullres-smoke` prio 15, `kkv2-9-fullres` prio 40, guarded on the smoke's rc).
 - **Lid plane-normal gizmo handle** (`docs/EDITOR.md` Sec 1, Sec 6): a 4th
   handle on a `lid` region, projected along its own `up` instead of a world
   axis, drags the plane's tilt (rotating about the two in-plane axes) as one
