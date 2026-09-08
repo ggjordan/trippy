@@ -3,6 +3,7 @@
 Last updated: 2026-09-08 (feat/combined-bundle session; previous: fix/editor-followups)
 
 ## Done
+- 2026-09-08 20:50 (Jordan): the 3-day full-res run is PARKED (not worth the GPU time now; keep as an option). Job files moved to ~/Splats/tools/gpu_queue/parked-trippy/ (kkv2-9-fullres-smoke, kkv2-9-fullres, 9b, 9c); configs merged on main. kkv2-8 (half-res to 300 ep) still runs.
 - 2026-09-08 20:30 (Jordan): still wants the HIGHEST-QUALITY plain TRIPS scene for comparison. Plan: turn kkv2-9-fullres into a chained multi-day run (2016 wide, crop 512, full 300 epochs, resumable 12 h segments) at prio 42 (after the kkv2 hybrid arms, before hybrid-a), launcher at render scale 1.0 without half-net. Set up when the fullres agent reports.
 - 2026-09-08 19:40: Jordan: TRIPS looks nothing like a photo anywhere except that the clouds/fogs are gone; splat is the base. New track: TRIPS-confidence-guided cleaning of kklid_20000 (delete fog Gaussians) -> clean PLY for Brush. Full-res variant demoted below hybrids once queued.
 - 2026-09-08 19:10: JORDAN VERDICT: full-scene TRIPS (kkv2-1/2) SOLVES the big-tree shade; rest of scene fuzzy/pixelated. Shade-prune approach rejected (removes geometry) -> kkv2-6 demoted to prio 50. Requests: Brush-style mouse controls; a simpler editor; mix that actually works (needs Gaussian block in bundles). In flight: combined bundle (TRIPS+kklid splat, shade preset) and viewer simple mode.
