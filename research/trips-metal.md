@@ -2110,3 +2110,62 @@ the areas I want". Artefacts: `$SPLATS_ROOT/tools/gpu_queue/logs/trippy-viewer-k
 - 2026-09-08T06:02:40Z submitted job trippy-edit-sam-5 prio 15: bash /Users/nzbirdranch/trippy/output/edits/edit-sam-5/run.sh
 - 2026-09-08T06:02:45Z submitted job trippy-edit-sam-5-cpu prio 15: bash /Users/nzbirdranch/trippy/output/edits/edit-sam-5-cpu/run.sh
 - 2026-09-08 SAM 3 on MPS, wall 5 and the audit that should end them (`feat/editor-sam-ui`). Job `trippy-edit-sam-4` rc=1: wall 4's dict-cache fix held (the pass now reaches the *decoder*) and died one layer on, at `sam3/model/decoder.py:380` in `_get_rpb_matrix` -- `RuntimeError: Expected all tensors to be on the same device, but found at least two devices, mps:0 and cpu!`. Root cause: the SAME bug as wall 4 in a different container. `TransformerDecoder.__init__` warms `self.compilable_cord_cache`, a plain **tuple** `(coords_h, coords_w)` built on the CPU so the boxRPB cache is hot before `torch.compile`; a tuple is not a buffer, so `.to("mps")` skips it, and `_move_module_caches` only looked at `cache` DICTS. Fix: `_move_module_caches` -> `_move_stray_tensors`, which walks every module's `__dict__` (minus `_parameters`/`_buffers`/`_modules`) and moves every tensor at any depth inside dicts, lists, tuples and sets, plus `_stray_tensor_devices`, a read-only re-scan the child asserts on so a sixth container shape fails at load time naming the attribute instead of six layers into a forward. Verified without the GPU (a training holds it), three ways. (1) **Structural, against the real model**: built the real image model (`build_sam3_image_model`, architecture only, no checkpoint), enumerated every tensor reachable from it that is neither parameter nor buffer -- exactly **10**: 8 `PositionEmbeddingSine.cache` entries (256x{288,252,144,126,72,63,36,31}^2) and the 2 `compilable_cord_cache` vectors (72,). `model.to("meta")` leaves all 10 on the CPU; `_move_stray_tensors(model,"meta")` moves 10; the re-scan then reports none off-device. "meta" is not MPS but it is not the CPU either, which is the only property the bug needs. (2) **Forward path**: a `TorchFunctionMode` recording every device-less tensor factory call SAM 3 makes during a real box-prompt forward (synthetic image, random weights, CPU) found **5** sites -- `sam3_image_processor.py:54` (x2) and `:209`, `geometry_encoders.py:650`, `tokenizer_ve.py:250` and `:255` -- and every one is followed immediately by an explicit `.to(device)` in SAM 3's own code, so the forward path is clean. That mode shipped as `sam_runner --device-audit` (off by default; it is far too slow for a timing run). (3) **End to end**: `_child_main` itself, on a synthetic image, CPU, random weights: rc=0, load 3.9 s, infer 2.8 s, stray-tensor assertion passed, `info.json.device_audit` carried the 5 sites. Also confirmed by grep that the image path contains no `.numpy()`, `from_numpy`, `.cpu()` or hardcoded `device="cuda"` outside the two already-patched init-time warm-ups. `scripts/test.sh` green (1191 pytest, rust green). Submitted `trippy-edit-sam-5` (MPS) and `trippy-edit-sam-5-cpu` (same photo, same box, same code, `--device cpu`), both prio 15, both behind the running `kkv2-3-removal` training. Verdict pending; decision rule now written into `docs/EDITOR.md` Sec 3: the viewer's default device becomes `mps` only if `edit-sam-5` returns rc=0 AND its `per_view[0].segmenter.seconds` beats `edit-sam-5-cpu`'s, otherwise the default stays `cpu` at the measured seconds/view. Collect: `~/Splats/tools/gpu_queue/done/trippy-edit-sam-5{,-cpu}.rc`, logs in `.../logs/`, numbers in `output/edits/edit-sam-5{,-cpu}/summary.json` (`segmenter.{fp32_addmm,real_rope,moved_caches,seconds}`; `moved_caches` must read 10 on the MPS run -- 0 would mean SAM 3 stopped precomputing and the shim is idle).
+- 2026-09-08T08:26:52Z delivered kkv2-1-combined-viewer: Combined bundle: kkv2-1-full-masked TRIPS + kklid_20000 splat, big-tree shade region preset (mix slider demo) (/Users/nzbirdranch/trippy/output/deliver/kkv2-1-combined/OPEN_TRIPS_MAC_kkv2-1-combined.command)
+- **2026-09-08 (feat/combined-bundle) — the combined TRIPS+splat bundle Jordan has wanted from the start.**
+  *Question:* the delivered kkv2-1-full-masked bundle has no Gaussian block ("the mix sliders did
+  nothing" per Jordan's viewer verdict today) -- can one bundle carry BOTH the full-scene TRIPS
+  checkpoint (which fixed the big-tree shade) and the kklid_20000 splat (which is sharp everywhere
+  else), with a preset so the per-region mix visibly works on open? *Finding: the machinery already
+  existed, it just was never re-run.* `trippy.render.bundle.native_blend` (landed with `feat/live-splat`,
+  2026-09-07) already writes `blend.splat_ply` for ANY Gaussian-seeded run, not just hybrids -- every
+  Karekare run qualifies (`point_source.type: gaussian`, `kklid_20000.ply`). The delivered
+  kkv2-1-full-masked bundle (`output/runs/EXP-0011-karekare-v2/kkv2-1-full-masked/bundle`, written
+  2026-09-08 10:20) simply predates being re-exported with that code path: its `bundle.json` has no
+  `blend` key at all. Re-exporting the SAME checkpoint (`checkpoint_best.pt`, epoch 122, deterministic,
+  no training touched) via `trippy export-bundle` fixed it in one CPU-only step, no GPU:
+  `blend.splat_ply = /Users/nzbirdranch/Splats/output/Training-Data/karekare/karekare-lid/kklid_20000.ply`
+  (read live by the viewer's existing `brush-render` path, `blend.channels = []` since this is a plain
+  seed not a trained hybrid gate). 36.7 s wall, peak RSS 5.6 GB (well under the 28 GB `cpu_heavy.sh`
+  gate, so this ran directly, no queue). New bundle: `$TRIPPY_OUTPUT/bundles/kkv2-1-combined/bundle`
+  (7,542,137 TRIPS points, 756 views, `num_channels=4`, no gate). *Alignment, measured (never viewed,
+  numbers only):* sampled 20,000 TRIPS points, matched each to its nearest of the PLY's 8,910,382
+  Gaussian centres (3D nearest-neighbour, `cKDTree`; median 3D distance 0.0057 world units -- training
+  moved points very little, `lr_points 1e-4` over 122 epochs), then projected BOTH the TRIPS point and
+  its matched splat centre through 3 training cameras (views 0/378/755) with the bundle's own `(R, t,
+  fx, fy, cx, cy)`, no distortion (trippy-native views carry none). Per-camera in-frame median pixel
+  offset: view 0 `IMG_3703.jpg` 0.79 px (4,709 pairs in frame), view 378 `IMG_4202.jpg` 0.88 px (2,377
+  pairs), view 755 `IMG_5660.jpg` 3.01 px (432 pairs, an edge-of-capture view with fewer in-frame
+  matches). **Combined median 0.87 px across all 3 cameras (n=7,518), well under the 2 px bar** -- the
+  splat and the TRIPS points are the same coordinate frame, not a fitted-after-the-fact alignment.
+  *Edits.json preset:* `trippy edits shade-find` against the exact 93 measured big-tree shade frames
+  (`$TRIPPY_OUTPUT/scratch/shade_frames.json`'s `big_tree` list, the same 93 named in the
+  2026-09-06 19:30 entry) selected **758,178 points** (10.1% of the cloud) inside the shade audit
+  region at the tool's default thresholds (`lum<0.25 AND conf<0.5`, znear/zfar 0.05/0.5, mode
+  absolute); `EditDocument.update_region` then set it to `op=blend, mix=1.0` (full TRIPS, the brief's
+  convention: 1=TRIPS) and renamed it "Big tree shade (TRIPS)" -- the shade-finder's own default
+  (`op=fade, mix=0.0`, meant for DELETING a shade cloud) is the opposite of what this bundle needs, so
+  it was overridden via the documented `update_region(**changes)` API rather than hand-editing JSON.
+  `EditDocument.validate()` passes against the bundle's own format tag; every `point_ids` entry is
+  `< 7,542,137` (checked directly, not just trusted). Launcher opens at `BlendMode::Mix, mix=0.0` (0 =
+  splat globally, per the viewer's own Blend-panel convention), which the region's own `mix=1.0`
+  overrides on its 758k points regardless -- confirmed from `renderer.rs::compose`'s own comment ("the
+  edit override goes on the TRIPS operand FIRST, so every panel mode below sees the TRIPS frame as
+  Jordan edited it"), not just docs. *Bundle sanity, CPU-only, numbers-only (`trippy bundle-parity
+  --device cpu`, view 0, scale 0.25 -- never opened the PNG):* per-channel mean (0.50, 0.49, 0.44), no
+  saturation, no crushed black, coverage_mean 0.65 -- the combined bundle loads and renders end to end
+  with no NaN/crash. *Not measured:* fps at scale 1.0/0.75 (the viewer needs the GPU, which a training
+  holds; per the brief, skipped rather than run outside the queue). *Verdict:* PASS on every numeric
+  check available without the GPU. `scripts/test.sh` green (1226 pytest / 154+50 trips-viewer +
+  49+4+7+12+4+1 brush-pyramid/brush-unet rust, 0 failed) -- no code was changed, only CLI tools already
+  shipped by `feat/live-splat`/`feat/blend-gate`/E2 (shade-cloud finder) were run against real data; the
+  worktree's `rust/brush-trips` submodule was uninitialised (a worktree setup gap, not a code bug) and
+  `git submodule update --init` fixed it before `cargo test` would even compile. **Gap for the
+  Orchestrator:** no automated bundle-vs-viewer parity number for THIS bundle+edits combination exists
+  yet (`scripts/viewer_parity_check.sh`/`viewer_splat_check.sh` both need the GPU and the splat-check
+  script's public-scene allow-list would refuse a Karekare bundle outright even queued) -- an actual
+  fps/screenshot number needs a `scripts/gpu_submit.sh --prio 15` job once the training frees the GPU;
+  not submitted here per the brief ("do not wait"), left for the Orchestrator to queue if wanted.
+  Artifacts: bundle `$TRIPPY_OUTPUT/bundles/kkv2-1-combined/bundle`, edits
+  `$TRIPPY_OUTPUT/bundles/kkv2-1-combined/edits.json`, launcher
+  `$TRIPPY_OUTPUT/deliver/kkv2-1-combined/OPEN_TRIPS_MAC_kkv2-1-combined.command`, delivered as
+  `kkv2-1-combined-viewer` (Jordan-Review 4-other).

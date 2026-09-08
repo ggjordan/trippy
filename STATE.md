@@ -1,8 +1,27 @@
 # STATE — externalized progress (update at end of every session)
 
-Last updated: 2026-09-08 (fix/editor-followups session; previous: fix/viewer-kk)
+Last updated: 2026-09-08 (feat/combined-bundle session; previous: fix/editor-followups)
 
 ## Done
+- 2026-09-08 (feat/combined-bundle): delivered the combined TRIPS+splat bundle Jordan asked for from
+  the start -- re-exported `kkv2-1-full-masked` (same checkpoint, deterministic, CPU-only, 36.7 s) and
+  its bundle now carries `blend.splat_ply` (the `native_blend`/`feat/live-splat` machinery already did
+  this for any Gaussian-seeded run; the delivered bundle just predated being re-run through it). Added
+  an `edits.json` region "Big tree shade (TRIPS)" (758,178 points, `trippy edits shade-find` on the
+  exact 93 measured big-tree shade frames, `op=blend mix=1.0`) and a launcher that opens at global
+  `mix=0.0` (full splat) so the per-region override is visible immediately: splat everywhere, TRIPS only
+  under the tree. Alignment measured (never viewed): nearest-3D-neighbour TRIPS point vs its matching
+  splat Gaussian, reprojected into 3 training cameras, **combined median 0.87 px** (< the 2 px bar).
+  `scripts/test.sh` green, no code changed (only shipped tools run against real data). **Gap for the
+  Orchestrator:** no GPU-verified fps or viewer-vs-Python screenshot parity number exists yet for this
+  exact bundle+edits combo -- `scripts/viewer_parity_check.sh` needs the GPU (a training holds it) and
+  was not queued (brief said don't wait); `scripts/viewer_splat_check.sh`'s public-scene allow-list
+  would refuse a Karekare bundle even if queued, so that check does not apply here at all. Queue
+  `viewer_parity_check.sh` via `scripts/gpu_submit.sh --prio 15` when convenient for a real fps number.
+  Full numbers: `research/trips-metal.md` 2026-09-08 "the combined TRIPS+splat bundle" entry. Delivered
+  `kkv2-1-combined-viewer.command` (Jordan-Review 4-other) -- **REVIEW QUEUE**: open it, fly from the
+  big-tree shade (TRIPS) into the open lawn (splat) and see if the mix boundary reads as natural or as
+  a seam.
 - 2026-09-08 18:40: SAM 3 on MPS attempt 5 merged (PR #55, build-0124): generalised stray-tensor mover + start-up assertion + --device-audit. Jobs edit-sam-5 (mps) and edit-sam-5-cpu (prio 15) run after kkv2-3; default device follows the measured seconds/view (docs/EDITOR.md §3). Keep .worktrees/editor-sam-ui until both jobs finish.
 - 2026-09-08 17:44: kkv2-2-full-unmasked done (ep 105/300): PSNR 14.63 dB, shade dark-mass 34.5% (same as masked). Launcher kkv2-2-full-unmasked-viewer.command in review queue. kkv2-3-removal running.
 - 2026-09-08 11:50: disk cleanup, 22 -> 84 GB free (details in research log). removal-rel job repointed to main repo.
