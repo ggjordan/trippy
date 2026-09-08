@@ -3,6 +3,7 @@
 Last updated: 2026-09-08 (fix/editor-followups session; previous: fix/viewer-kk)
 
 ## Done
+- 2026-09-08 19:40: Jordan: TRIPS looks nothing like a photo anywhere except that the clouds/fogs are gone; splat is the base. New track: TRIPS-confidence-guided cleaning of kklid_20000 (delete fog Gaussians) -> clean PLY for Brush. Full-res variant demoted below hybrids once queued.
 - 2026-09-08 19:10: JORDAN VERDICT: full-scene TRIPS (kkv2-1/2) SOLVES the big-tree shade; rest of scene fuzzy/pixelated. Shade-prune approach rejected (removes geometry) -> kkv2-6 demoted to prio 50. Requests: Brush-style mouse controls; a simpler editor; mix that actually works (needs Gaussian block in bundles). In flight: combined bundle (TRIPS+kklid splat, shade preset) and viewer simple mode.
 - 2026-09-08 18:40: SAM 3 on MPS attempt 5 merged (PR #55, build-0124): generalised stray-tensor mover + start-up assertion + --device-audit. Jobs edit-sam-5 (mps) and edit-sam-5-cpu (prio 15) run after kkv2-3; default device follows the measured seconds/view (docs/EDITOR.md §3). Keep .worktrees/editor-sam-ui until both jobs finish.
 - 2026-09-08 17:44: kkv2-2-full-unmasked done (ep 105/300): PSNR 14.63 dB, shade dark-mass 34.5% (same as masked). Launcher kkv2-2-full-unmasked-viewer.command in review queue. kkv2-3-removal running.
