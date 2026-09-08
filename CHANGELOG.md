@@ -2,6 +2,67 @@
 All notable changes to trippy. Format: Keep a Changelog. Versions: semver tags `vX.Y.Z`. Every push also gets a `build-NNNN` tag.
 
 ## [Unreleased]
+### Changed
+- **The Mac viewer's mouse is Brush's, button for button** (`docs/USER_GUIDE.md`,
+  `camera.rs`), on Jordan's request after driving the full Karekare scene:
+  **left-drag orbits**, **right-drag is first-person look** with `W A S D Q E`
+  flying while it is held, **middle-drag or shift+left-drag pans**, **scroll
+  dollies** (shift+scroll, or scroll during a right-drag, is the fly speed) and
+  **double-clicking something puts the point you turn around on it**. `F` no
+  longer switches control schemes -- it is now only the fence that keeps the
+  camera inside the photographed area, and the old mode-dependent bindings are
+  gone rather than kept behind a flag.
+- **The editor opens in Simple Mode** (`docs/EDITOR.md` Sec 4): one panel, four
+  numbered steps -- find shade clouds / select an object / paint an area / what
+  to show here -- in plain words, with a **Simple / Advanced** switch at the top
+  that restores exactly the four panels v0.6.0 shipped. A `?` card (also `F1`)
+  lists the six mouse and key bindings and is up on the first frame.
+- **"Gizmo" is gone from every string Jordan can read**: the three coloured
+  handles are **move arrows** throughout, with a tooltip. The module and type
+  names keep the term. A unit test asserts the UI strings.
+- **A new box, ball or pool lid is placed ON the point you click**, not at the
+  camera's look-at point: press the button, then click the spot. The size comes
+  from that point's depth (6 % of it), so a region is about a tenth of the frame
+  across wherever it is put. Headless twin: `--place <box|sphere|lid> U V`.
+- **The brush's default op is `fade`, not `delete`**, and what a stroke painted
+  is highlighted magenta as soon as the button comes up (`H` toggles it). Its
+  default radius now comes from the distance the camera is looking at (3 % of
+  it) rather than from the whole scene's diameter.
+
+### Fixed
+- **One click could select the whole scene** (Jordan, on the full Karekare
+  scene). Three causes, three fixes, all of them viewer-side and all OFF on the
+  `trippy edits click` parity path so `--click` still reproduces the Python twin
+  exactly: (1) the growth cap was the bundle's median nearest-CAMERA spacing,
+  which is metres on a walked capture -- it is now
+  `cluster::depth_capped_max_radius`, the smaller of 15 % of the click's own
+  depth and 2 % of the captured area, floored at the world size of the catchment
+  disc that was clicked and scaled by the new **grow / shrink** buttons; (2)
+  nothing stopped k-NN growth in a connected cloud -- `ClickParams::density_gate`
+  now refuses a step longer than 3x the seed's own median point spacing, i.e.
+  growth stops where the cloud thins out; (3) the seed itself was a cone
+  reaching the full depth of the catchment, so no growth cap could shrink it --
+  it is now clipped to a slab one growth radius deep behind the nearest
+  candidate. **Measured** (`--click-stress`, synthetic, CPU only): on a
+  5,000,000-point block with no depth gap anywhere the old rule took 200,000
+  points and was still growing when it hit the hard cap (4.7 s); the new one
+  takes **608 points, 0.012 %** of the cloud, in 27 ms. On a 200,000-point
+  version of the same block the old rule took **82.7 %** of it.
+- **Brushing blurred the foreground and the background at once.** The depth
+  anchor took the nearest point in a fixed 12 px catchment regardless of the
+  brush size, so a stroke aimed at the background could lock onto a foreground
+  point far from the cursor; and nothing kept one stroke on one surface. The
+  anchor is now searched inside the brush's **own projected ring**
+  (`brush::ring_radius_px`, floored at 6 px and capped at 96 px) and a sample
+  may move at most **1.5 brush radii in depth** from the sample before it
+  (`brush::clamp_stroke_depth`).
+- **A Splat/TRIPS mix slider on a bundle with no Gaussian block moved and did
+  nothing.** Every such control is now disabled and carries the sentence "This
+  bundle has no splat to mix. Open a combined bundle."
+- Undo and redo now drop the brush's highlight instead of leaving a stale one,
+  which is what keeps `--brush-undo`'s frame byte-identical to a run that never
+  painted (verified again: max channel diff 0.0 over the whole frame).
+
 ### Added
 - **`trippy profile-step`**: stage-by-stage timing of a real `Trainer.train_step` on a real
   config (`--config`, `--steps`, `--epoch 0,5,50`, `--raster-cap on|off|both`, `--fused-adam`,
@@ -137,6 +198,12 @@ All notable changes to trippy. Format: Keep a Changelog. Versions: semver tags `
     only, with no photographic content (AGENTS.md Sec 6).
   - `run.py` orchestrates it and writes `summary.json`, including Splats'
     own shade audit and extent gate run on the source PLY and every variant.
+- New headless viewer flags for the above: `--place <box|sphere|lid> U V` and
+  `--place-op <op>` (the placement gesture), `--click-auto` (run the click the
+  WINDOW runs rather than the `trippy edits click` parity path), and
+  `--click-stress <n>` (build a synthetic dense cloud of `n` points with no
+  bundle, no window and no GPU, click into it the old way and the new way, and
+  print both selection sizes as a percentage).
 - **Lid plane-normal gizmo handle** (`docs/EDITOR.md` Sec 1, Sec 6): a 4th
   handle on a `lid` region, projected along its own `up` instead of a world
   axis, drags the plane's tilt (rotating about the two in-plane axes) as one

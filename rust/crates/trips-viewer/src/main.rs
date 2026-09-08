@@ -120,6 +120,25 @@ Editing (docs/EDITOR.md; press M in the window for the panels):
   --click-max-radius <f>  growth cap from the seed centroid, world units
                        (default: the bundle's median camera spacing)
   --click-max-points <n>  hard cap on the selection (default 200000)
+  --click-auto         run the click the WINDOW runs instead of the `trippy
+                       edits click` parity path: the growth cap comes from the
+                       click's own depth (min(15% of the depth, 2% of the
+                       captured area) x the grow/shrink scale) and growth stops
+                       where the cloud thins out. The other --click-* flags
+                       describe the parity path and turn this off.
+  --click-stress <n>   build a synthetic dense cloud of <n> points (no bundle,
+                       no window, no GPU) and click into its centre twice: once
+                       the old way (uncapped growth) and once the way the
+                       window now does it. Prints both selection sizes as a
+                       percentage of the cloud. The 5M-point acceptance proof
+                       for \"one click must not select the scene\".
+  --place <box|sphere|lid> <U> <V>
+                       the arm-then-click placement gesture, headlessly: put a
+                       new region ON the point under render pixel (U, V),
+                       sized to how far away it is. Prints the world centre and
+                       the size, and the region lands in the --screenshot.
+  --place-op <op>      blend | fade | delete for the placed region (default:
+                       blend, which is what the window's own button gives it)
   --sam-box <X0> <Y0> <X1> <Y1>
                        SAM 3 lift (E5): run `trippy edits sam` as a child on
                        the chosen view with this box, in that VIEW's own pixels
@@ -292,6 +311,20 @@ struct Args {
     click_max_radius: Option<f64>,
     /// See [`Self::click_radius_px`].
     click_max_points: Option<usize>,
+    /// `--click-stress <n>`: build a synthetic dense cloud of `n` points and
+    /// click into it, with no bundle, no window and no GPU.
+    click_stress: Option<usize>,
+    /// `--click-auto`: run the click the WINDOW runs — growth capped by the
+    /// click's own depth, density gate on — instead of the `trippy edits
+    /// click` parity path the other `--click-*` flags describe.
+    click_auto: bool,
+    /// `--place <box|sphere|lid> U V`: the headless twin of the arm-then-click
+    /// placement gesture, in RENDER pixels.
+    place: Option<(crate::edit_ui::Placement, (f64, f64))>,
+    /// `--place-op`: the op the placed region gets. `blend` (the window's own
+    /// default) is invisible in a screenshot of a bundle with no splat, so the
+    /// proof runs place a `delete`.
+    place_op: Option<trips_viewer::edit::Op>,
     /// `--sam-box X0 Y0 X1 Y1`: the SAM prompt, in the chosen VIEW's pixels.
     sam_box: Option<[f64; 4]>,
     /// `--sam-point U V`: the same, as a point.
@@ -445,6 +478,10 @@ fn parse_args() -> Result<Args, String> {
         click_colour_tol: None,
         click_max_radius: None,
         click_max_points: None,
+        click_auto: false,
+        click_stress: None,
+        place: None,
+        place_op: None,
         sam_box: None,
         sam_point: None,
         sam_views_around: 0,
@@ -607,6 +644,25 @@ fn parse_args() -> Result<Args, String> {
                 args.click_max_points =
                     Some(value()?.parse().map_err(|e| format!("--click-max-points: {e}"))?);
             }
+            "--click-auto" => args.click_auto = true,
+            "--click-stress" => {
+                args.click_stress =
+                    Some(value()?.parse().map_err(|e| format!("--click-stress: {e}"))?);
+            }
+            "--place" => {
+                let what = match value()?.as_str() {
+                    "box" => crate::edit_ui::Placement::Box,
+                    "sphere" | "ball" => crate::edit_ui::Placement::Sphere,
+                    "lid" => crate::edit_ui::Placement::Lid,
+                    other => {
+                        return Err(format!("--place wants box, sphere or lid, got {other:?}"))
+                    }
+                };
+                let u: f64 = value()?.parse().map_err(|e| format!("--place U: {e}"))?;
+                let v: f64 = value()?.parse().map_err(|e| format!("--place V: {e}"))?;
+                args.place = Some((what, (u, v)));
+            }
+            "--place-op" => args.place_op = Some(trips_viewer::edit::Op::parse(&value()?)?),
             "--brush" => {
                 let u: f64 = value()?.parse().map_err(|e| format!("--brush U: {e}"))?;
                 let v: f64 = value()?.parse().map_err(|e| format!("--brush V: {e}"))?;
@@ -1077,6 +1133,161 @@ fn bench_brush_anchor(bundle: &Bundle, args: &Args, count: usize) -> Result<(), 
     Ok(())
 }
 
+/// `--click-stress <n>`: click into a synthetic dense cloud of `n` points.
+///
+/// The acceptance proof for "one click must never select the scene", at a size
+/// no committed fixture can carry and no synthetic *bundle* is worth building:
+/// a solid block of points with **no depth gap anywhere**, which is the shape
+/// that made click-to-cluster swallow Karekare (dense foliage, one colour, one
+/// connected cloud). SYNTHETIC ONLY and CPU ONLY — the cloud comes from a
+/// seeded LCG, no scene is read, and no GPU device is created, so this is safe
+/// to run beside a training that holds the GPU (`AGENTS.md` §6).
+///
+/// Two clicks are made at the same pixel:
+/// 1. the pre-2026-09-08 path — an uncapped growth radius, no density gate,
+///    which is what `trippy edits click` still does;
+/// 2. the window's own path — the growth radius from the click's own depth,
+///    capped at 2% of the scene, seed clipped to the surface, density gate on.
+///
+/// # Errors
+/// Returns `Err` when `n` is zero.
+fn click_stress(n: usize) -> Result<(), String> {
+    use trips_viewer::edit::cluster::{
+        self, ClickCamera, ClickParams, PointGrid, DEFAULT_DENSITY_GATE_FACTOR,
+    };
+
+    if n == 0 {
+        return Err("--click-stress needs at least one point".to_owned());
+    }
+    // A block 8 x 8 x 12 world units, filling a 640x480 frame at f = 500.
+    let (half_xy, z_near, z_far) = (4.0_f64, 3.0_f64, 15.0_f64);
+    let mut state = 0x2545_F491_4F6C_DD1D_u64;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        #[allow(clippy::cast_precision_loss)]
+        {
+            (state >> 11) as f64 / (1_u64 << 53) as f64
+        }
+    };
+    let mut xyz = Vec::with_capacity(n * 3);
+    let mut rgb = Vec::with_capacity(n * 3);
+    for _ in 0..n {
+        xyz.push((next() * 2.0 - 1.0) * half_xy);
+        xyz.push((next() * 2.0 - 1.0) * half_xy);
+        xyz.push(z_near + next() * (z_far - z_near));
+        // One colour family, ±0.03: foliage, not a colour chart. The colour
+        // gate must not be what saves this.
+        for base in [0.34_f64, 0.42, 0.28] {
+            rgb.push(base + 0.03 * (next() * 2.0 - 1.0));
+        }
+    }
+    let camera = ClickCamera {
+        r: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+        t: [0.0, 0.0, 0.0],
+        fx: 500.0,
+        fy: 500.0,
+        cx: 320.0,
+        cy: 240.0,
+    };
+    let px = (320.0, 240.0);
+    // The scene's own diameter, as `bundle::SceneScale` would report it.
+    let scene_diameter = (4.0_f64 * half_xy * half_xy + (z_far - z_near).powi(2)).sqrt();
+
+    let started = std::time::Instant::now();
+    let grid = PointGrid::build(&xyz);
+    let index_ms = started.elapsed().as_secs_f64() * 1e3;
+
+    let uncapped = ClickParams {
+        // The pre-2026-09-08 default: the bundle's median nearest-CAMERA
+        // spacing, which on a walked capture is metres. Half the block.
+        max_radius: 0.5 * scene_diameter,
+        ..ClickParams::default()
+    };
+    let started = std::time::Instant::now();
+    let before = cluster::click_to_cluster(&grid, &xyz, &rgb, &camera, px, &uncapped);
+    let before_ms = started.elapsed().as_secs_f64() * 1e3;
+
+    // What the window runs. The depth is the nearest point under the cursor,
+    // which is what `EditSession::run_click` measures before clustering.
+    let depth = trips_viewer::edit::brush::depth_anchor(&camera, &xyz, px, uncapped.radius_px)
+        .unwrap_or(z_near);
+    let capped = ClickParams {
+        max_radius: cluster::depth_capped_max_radius(
+            depth,
+            scene_diameter,
+            uncapped.radius_px * depth / camera.fx,
+            1.0,
+        ),
+        density_gate: Some(DEFAULT_DENSITY_GATE_FACTOR),
+        ..ClickParams::default()
+    };
+    let started = std::time::Instant::now();
+    let after = cluster::click_to_cluster(&grid, &xyz, &rgb, &camera, px, &capped);
+    let after_ms = started.elapsed().as_secs_f64() * 1e3;
+
+    #[allow(clippy::cast_precision_loss)]
+    let percent = |k: usize| 100.0 * k as f64 / n as f64;
+    println!(
+        "CLICK-STRESS {n} synthetic points, block {:.0}x{:.0}x{:.0} u, scene diameter {:.2} u, \
+         click depth {depth:.3} u, index built in {index_ms:.0} ms\n  \
+         uncapped (pre-2026-09-08, reach {:.3} u): {} points = {:.3}% of the cloud, \
+         hit the point cap: {}, {:.0} ms\n  \
+         capped   (the window, reach {:.3} u):     {} points = {:.3}% of the cloud, \
+         hit the point cap: {}, {:.0} ms\n  \
+         seed {} of {} candidates | {} refused by the reach, {} by the density drop | \
+         point spacing {}",
+        2.0 * half_xy,
+        2.0 * half_xy,
+        z_far - z_near,
+        scene_diameter,
+        uncapped.max_radius,
+        before.point_ids.len(),
+        percent(before.point_ids.len()),
+        before.hit_max_points,
+        before_ms,
+        capped.max_radius,
+        after.point_ids.len(),
+        percent(after.point_ids.len()),
+        after.hit_max_points,
+        after_ms,
+        after.n_seed,
+        after.n_candidates,
+        after.n_blocked_by_radius,
+        after.n_blocked_by_density,
+        after
+            .seed_spacing
+            .map_or_else(|| "n/a".to_owned(), |s| format!("{s:.5}")),
+    );
+    if percent(after.point_ids.len()) >= 5.0 {
+        return Err(format!(
+            "one click selected {:.3}% of a {n}-point cloud; the acceptance bar is 5%",
+            percent(after.point_ids.len())
+        ));
+    }
+    Ok(())
+}
+
+/// A placed region's centre and its size across, for the `--place` readout.
+///
+/// Only the three shapes `--place` can create have either; anything else
+/// reports the origin and zero, which is a caller bug rather than a state the
+/// flag can reach.
+fn placement_geometry(params: &trips_viewer::edit::Params) -> ([f64; 3], f64) {
+    use trips_viewer::edit::Params;
+    match params {
+        Params::Box {
+            center,
+            half_extents,
+            ..
+        } => (*center, 2.0 * half_extents[0]),
+        Params::Sphere { center, radius } => (*center, 2.0 * radius),
+        Params::Lid(lid) => (lid.center, 2.0 * lid.radius),
+        _ => ([0.0; 3], 0.0),
+    }
+}
+
 /// Every region's name and id, for an error message that can be acted on.
 fn region_names(edits: &crate::edit_ui::EditSession) -> String {
     let names: Vec<String> = edits
@@ -1156,6 +1367,7 @@ fn run_headless(args: &Args, bundle: Bundle) -> Result<(), String> {
         args.edits.as_deref(),
     );
     edits.set_bundle_paths(trippy_root.as_deref(), has_scene_root);
+    edits.set_has_splat(blend_manifest.is_some());
     edits.apply(&mut renderer)?;
     if let Some((deleted, touched)) = renderer.edit_summary() {
         eprintln!(
@@ -1182,6 +1394,56 @@ fn run_headless(args: &Args, bundle: Bundle) -> Result<(), String> {
         eprintln!("camera yawed {degrees} deg off view {}", camera_view.index);
     }
     let camera = controller.render_camera(width, height, &camera_view);
+    // The two scene numbers the editor derives its defaults from, exactly as
+    // `app.rs` reports them every frame.
+    edits.set_scene_scale(
+        f64::from(controller.scene().diameter()),
+        f64::from(controller.orbit_distance()),
+    );
+
+    // `--place <what> U V`: the headless twin of "press + box, then click the
+    // spot". Same session, same `resolve_placement`, same undo log -- only the
+    // gesture is a flag instead of a click.
+    if let Some((what, px)) = args.place {
+        edits.arm_placement(what);
+        edits.request_placement(px);
+        let click_camera = trips_viewer::edit::cluster::ClickCamera::from_render_camera(&camera);
+        let Some(id) = edits.resolve_placement(&click_camera, renderer.base_points()) else {
+            return Err(format!(
+                "--place {} at ({}, {}) put nothing there: {}",
+                what.label(),
+                px.0,
+                px.1,
+                edits.last_error().unwrap_or("nothing was under that pixel")
+            ));
+        };
+        if let Some(op) = args.place_op {
+            edits
+                .doc
+                .update_region(&id, serde_json::json!({ "op": op.as_str() }))
+                .map_err(|e| format!("--place-op {}: {e}", op.as_str()))?;
+        }
+        let placed = edits
+            .doc
+            .region(&id)
+            .map(|r| (r.name.clone(), r.params.clone()));
+        match placed {
+            Some((name, params)) => {
+                let (centre, size) = placement_geometry(&params);
+                eprintln!(
+                    "placed {name} ({id}) at ({:.4}, {:.4}, {:.4}), {size:.4} world units \
+                     across, from render pixel ({}, {})",
+                    centre[0], centre[1], centre[2], px.0, px.1
+                );
+            }
+            None => {
+                return Err(format!(
+                    "--place created region {id} but it is not in the document"
+                ))
+            }
+        }
+        edits.apply(&mut renderer)?;
+    }
 
     // `--click U V`: the headless twin of a Shift-click. The selection is
     // tinted into the frame the screenshot writes -- that tint changing, and
@@ -1190,22 +1452,43 @@ fn run_headless(args: &Args, bundle: Bundle) -> Result<(), String> {
     // `--scale 1.0` on a pinned view are the capture image's own.
     if let Some(px) = args.click {
         edits.set_click_params(click_params.expect("built alongside args.click"));
+        // `--click-auto` puts back what `set_click_params` just turned off: the
+        // window's own depth-derived growth cap and density gate. Without it
+        // this path stays the exact twin of `trippy edits click`.
+        if args.click_auto {
+            edits.set_click_auto(true);
+        }
         edits.run_click(
             &trips_viewer::edit::cluster::ClickCamera::from_render_camera(&camera),
             px,
-            &renderer,
+            renderer.base_points(),
         );
         edits.set_click_preview(true);
         edits.apply(&mut renderer)?;
+        let max_radius = edits.click_max_radius();
+        let grow_scale = edits.click_grow_scale();
         let found = edits.click_selection();
+        #[allow(clippy::cast_precision_loss)]
+        let percent = if renderer.num_points() == 0 {
+            0.0
+        } else {
+            100.0 * found.point_ids.len() as f64 / renderer.num_points() as f64
+        };
         eprintln!(
-            "click ({}, {}): {} of {} points selected ({} candidates, {} seeded){}",
+            "click ({}, {}): {} of {} points selected = {percent:.3}% ({} candidates, {} seeded; \
+             reach {max_radius:.4} u x{grow_scale:.2}, {} refused by the reach, {} by the \
+             density drop, spacing {}){}",
             px.0,
             px.1,
             found.point_ids.len(),
             renderer.num_points(),
             found.n_candidates,
             found.n_seed,
+            found.n_blocked_by_radius,
+            found.n_blocked_by_density,
+            found
+                .seed_spacing
+                .map_or_else(|| "n/a".to_owned(), |s| format!("{s:.5}")),
             found
                 .warning
                 .as_ref()
@@ -1283,9 +1566,9 @@ fn run_headless(args: &Args, bundle: Bundle) -> Result<(), String> {
         }
         edits.resolve_brush(
             &trips_viewer::edit::cluster::ClickCamera::from_render_camera(&camera),
-            &renderer,
+            renderer.base_points(),
         );
-        edits.end_brush_stroke();
+        edits.end_brush_stroke_with(Some(renderer.base_points()));
         let painted = edits.doc.regions().last().map(|r| {
             (
                 r.id.clone(),
@@ -1298,11 +1581,14 @@ fn run_headless(args: &Args, bundle: Bundle) -> Result<(), String> {
         });
         match painted {
             Some((id, name, cells)) if cells > 0 || args.brush_erase => eprintln!(
-                "brush {} at ({}, {}) radius {}: region {name} ({id}), {cells} cells",
+                "brush {} at ({}, {}) radius {}: region {name} ({id}), {cells} cells, \
+                 {} of {} points highlighted",
                 if args.brush_erase { "erase" } else { "stroke" },
                 px.0,
                 px.1,
                 edits.brush_radius(),
+                edits.brush_selection_len(),
+                renderer.num_points(),
             ),
             _ => {
                 return Err(format!(
@@ -1564,6 +1850,9 @@ fn run() -> Result<(), String> {
 
     // `--brush-npz-selftest` needs no bundle at all -- dispatched before
     // `resolve_bundle` so a run needs nothing but the flag itself.
+    if let Some(n) = args.click_stress {
+        return click_stress(n);
+    }
     if let Some(dir) = &args.brush_npz_selftest {
         return brush_npz_selftest(dir);
     }

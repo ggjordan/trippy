@@ -96,6 +96,107 @@ pub const DEFAULT_MAX_RADIUS_CAMERA_FACTOR: f64 = 1.0;
 pub const FALLBACK_MAX_RADIUS_FACTOR: f64 = 50.0;
 /// `trippy.constants.CLICK_DEFAULT_MIX`.
 pub const DEFAULT_MIX: f64 = 0.5;
+
+/// How many median seed spacings one growth step may cross, when
+/// [`ClickParams::density_gate`] is on.
+///
+/// **Viewer-only; there is no Python twin.** `trippy/edit/cluster.py` grows
+/// with no density test at all, and adding one there would change what
+/// `trippy edits click` selects; the golden fixture therefore leaves the gate
+/// `None` and pins the two implementations against each other exactly as
+/// before (see [`ClickParams::density_gate`]).
+///
+/// Why three: in a locally uniform cloud of nearest-neighbour spacing `d`, the
+/// 16 nearest neighbours of a point all sit within roughly `1.6 d`, so three
+/// spacings never blocks ordinary growth across a surface — while the gap
+/// between two surfaces a click must not weld together (foreground twig,
+/// hillside behind) is many spacings wide. This is the "stop at the density
+/// drop" rule.
+pub const DEFAULT_DENSITY_GATE_FACTOR: f64 = 3.0;
+
+/// Default cap on a click's growth radius, as a fraction of the scene's own
+/// diameter (the capture cameras' box, never the point cloud's bounds).
+///
+/// Jordan, 2026-09-08, on the full Karekare scene: "Clicking to select an
+/// object seemed to just select the whole scene." The old default `max_radius`
+/// was the median nearest-CAMERA spacing, which says how far apart the
+/// photographs were taken and nothing whatever about how big the thing under
+/// the pointer is — on a walked capture it is metres. Two per cent of the
+/// captured area is a cap on "an object", and the grow/shrink buttons move it
+/// from there.
+pub const DEFAULT_MAX_RADIUS_SCENE_FRACTION: f64 = 0.02;
+
+/// Default cap on a click's growth radius, as a fraction of the CLICK's own
+/// camera-space depth.
+///
+/// The other half of [`depth_capped_max_radius`]: something twenty metres away
+/// fills less of the frame than something two metres away, so a click on it
+/// should not be allowed to grow as far in world units. 0.15 of the depth is
+/// about a sixth of a 90-degree frame's width at that depth — an object, not a
+/// scene.
+pub const DEFAULT_MAX_RADIUS_DEPTH_FRACTION: f64 = 0.15;
+
+/// What one press of "grow" multiplies the click's growth radius by. "Shrink"
+/// divides by the same number, so the two are exact inverses and a grow
+/// followed by a shrink returns to where it started.
+pub const GROW_STEP: f64 = 1.6;
+
+/// The cap a click's growth radius may be grown or shrunk to, as a multiple of
+/// its own default: ten presses of either button, roughly.
+pub const GROW_SCALE_LIMIT: f64 = 100.0;
+
+/// The growth radius one click may use: the smaller of a fraction of the
+/// click's own depth and a fraction of the captured area, never smaller than
+/// the world size of the catchment disc that was clicked, all times `scale`.
+///
+/// The floor matters on scenes where the capture cameras stood close together
+/// but the geometry is far away — the synthetic fixture is exactly that, with
+/// a camera box 0.9 u across looking at points 4 u away and 0.157 u apart, so
+/// 2 % of the camera box is 0.018 u and one click would select nothing but its
+/// own seed. "At least as far as the circle you clicked in" is the honest
+/// lower bound, and it is still a small disc on screen because `radius_px` is.
+///
+/// # Arguments
+/// - `depth`: camera-space depth of the seed, world units (the click's own
+///   `seed_depth_mean`). A non-positive or non-finite depth falls back to the
+///   scene term alone.
+/// - `scene_diameter`: the capture cameras' box diagonal, world units.
+/// - `catchment`: the click catchment's own world radius at that depth,
+///   `radius_px * depth / fx`; pass `0.0` where there is no camera to ask.
+/// - `scale`: the grow/shrink buttons' multiplier; 1.0 is the default. It
+///   multiplies the floor too, so "shrink" keeps working at the bottom.
+///
+/// # Returns
+/// A strictly positive radius. Every term degenerates only on a bundle with no
+/// scale at all, and then the caller's own fallback is a better answer than
+/// zero — so this never returns zero, it returns the positive term it has.
+#[must_use]
+pub fn depth_capped_max_radius(
+    depth: f64,
+    scene_diameter: f64,
+    catchment: f64,
+    scale: f64,
+) -> f64 {
+    let scale = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
+    let from_scene = (DEFAULT_MAX_RADIUS_SCENE_FRACTION * scene_diameter).max(0.0);
+    let from_depth = if depth.is_finite() && depth > 0.0 {
+        DEFAULT_MAX_RADIUS_DEPTH_FRACTION * depth
+    } else {
+        0.0
+    };
+    let base = match (from_scene > 0.0, from_depth > 0.0) {
+        (true, true) => from_scene.min(from_depth),
+        (true, false) => from_scene,
+        (false, true) => from_depth,
+        (false, false) => 0.0,
+    };
+    let floor = if catchment.is_finite() && catchment > 0.0 {
+        catchment
+    } else {
+        0.0
+    };
+    (base.max(floor) * scale).max(f64::MIN_POSITIVE)
+}
 /// `trippy.constants.SUMMARY_NN_SAMPLE` — the point count above which
 /// `trippy.points.knn_size.median_nn_distance` starts drawing a random
 /// subsample (and so stops having a portable twin).
@@ -530,6 +631,15 @@ pub struct ClickParams {
     pub knn_k: usize,
     /// Multiplies `max_radius` to get the depth-mode gap threshold.
     pub depth_gap_factor: f64,
+    /// Stop growing where the cloud thins out: a neighbour is only admitted
+    /// when it is within `density_gate x (the seed's own median
+    /// nearest-neighbour distance)` of the point that proposed it.
+    ///
+    /// `None` is the pre-2026-09-08 behaviour and the ONLY value the Python
+    /// twin can express, so it is what `Default` gives and what the golden
+    /// fixture runs with — the parity assertion stays exact. The viewer's own
+    /// click tool sets [`DEFAULT_DENSITY_GATE_FACTOR`].
+    pub density_gate: Option<f64>,
 }
 
 impl Default for ClickParams {
@@ -543,6 +653,9 @@ impl Default for ClickParams {
             max_points: DEFAULT_MAX_POINTS,
             knn_k: GROW_KNN_K,
             depth_gap_factor: DEFAULT_DEPTH_GAP_FACTOR,
+            // Off by default: this is the field the Python twin has no name
+            // for, and `Default` is what the golden fixture runs with.
+            density_gate: None,
         }
     }
 }
@@ -562,6 +675,16 @@ pub struct ClickSelection {
     pub seed_depth_mean: Option<f64>,
     /// Set (and the selection empty) when nothing projected near the click.
     pub warning: Option<String>,
+    /// The seed's own median nearest-neighbour distance, world units — the
+    /// scale [`ClickParams::density_gate`] is measured in. `None` when the gate
+    /// is off or the seed was too small to measure one.
+    pub seed_spacing: Option<f64>,
+    /// How many candidate neighbours the density gate refused. A large number
+    /// is the tool doing its job at a surface boundary; zero with the gate on
+    /// means the growth stopped for one of the other reasons.
+    pub n_blocked_by_density: usize,
+    /// How many candidate neighbours the `max_radius` cap refused.
+    pub n_blocked_by_radius: usize,
 }
 
 /// The boolean mask over `depth` selecting its nearest-camera contiguous run.
@@ -640,10 +763,32 @@ pub fn click_to_cluster(
         return out;
     }
 
-    let seed_mask = nearest_depth_mode_mask(
+    let mut seed_mask = nearest_depth_mode_mask(
         &candidate_depth,
         params.depth_gap_factor * params.max_radius,
     );
+    // The viewer's extra rule (skipped entirely on the Python-parity path, see
+    // `ClickParams::density_gate`): the seed is the SURFACE under the cursor,
+    // so it is clipped to a depth slab `max_radius` deep behind the nearest
+    // candidate. Without it, a click into a cloud with no depth gaps — solid
+    // foliage, a whole hillside — seeds a cone reaching the full length of the
+    // catchment, and no growth cap can shrink that back down, because the seed
+    // is selected before growth begins. That was most of "clicking to select an
+    // object seemed to just select the whole scene" (2026-09-08).
+    if params.density_gate.is_some() {
+        let nearest = candidate_depth
+            .iter()
+            .zip(&seed_mask)
+            .filter_map(|(d, keep)| keep.then_some(*d))
+            .fold(f64::INFINITY, f64::min);
+        if nearest.is_finite() {
+            let limit = nearest + params.max_radius;
+            for (keep, depth) in seed_mask.iter_mut().zip(&candidate_depth) {
+                *keep = *keep && *depth <= limit;
+            }
+        }
+    }
+    let seed_mask = seed_mask;
     let seed: Vec<usize> = candidates
         .iter()
         .zip(&seed_mask)
@@ -676,29 +821,79 @@ pub fn click_to_cluster(
     }
     out.seed_depth_mean = Some(depth_sum / count);
 
+    // The density gate's own scale, measured on the seed before any growth:
+    // the median distance from a seed point to its own nearest neighbour. This
+    // is the viewer-only half (`ClickParams::density_gate`), skipped entirely
+    // when the gate is off so the Python-parity path costs exactly what it did.
+    let k_eff = params.knn_k.min(n);
+    let density_limit = params.density_gate.and_then(|factor| {
+        let mut spacings: Vec<f64> = Vec::with_capacity(seed.len());
+        for &row in &seed {
+            let q = [xyz[3 * row], xyz[3 * row + 1], xyz[3 * row + 2]];
+            // Two neighbours: the point itself, and the nearest other one.
+            let mut best = f64::INFINITY;
+            for id in grid.nearest(xyz, q, 2.min(n)) {
+                let other = id as usize;
+                if other == row {
+                    continue;
+                }
+                let d = [
+                    xyz[3 * other] - q[0],
+                    xyz[3 * other + 1] - q[1],
+                    xyz[3 * other + 2] - q[2],
+                ];
+                best = best.min(d[0].mul_add(d[0], d[1].mul_add(d[1], d[2] * d[2])).sqrt());
+            }
+            if best.is_finite() {
+                spacings.push(best);
+            }
+        }
+        let spacing = median(&mut spacings);
+        (spacing > 0.0).then(|| {
+            out.seed_spacing = Some(spacing);
+            factor * spacing
+        })
+    });
+
     // The flood fill, frontier by frontier, exactly as the Python loop runs it:
     // every frontier point's k nearest are gathered, deduplicated, and visited
     // in ASCENDING INDEX ORDER, which is what makes the `max_points` cut-off
-    // reproducible across the two implementations.
+    // reproducible across the two implementations. The only addition is that
+    // each candidate carries the distance to the frontier point that PROPOSED
+    // it (the smallest such distance, when several did), which is what the
+    // density gate tests; with the gate off that number is simply never read.
     let mut selected: HashSet<u32> = seed
         .iter()
         .map(|i| u32::try_from(*i).unwrap_or(u32::MAX))
         .collect();
     let mut frontier: Vec<usize> = seed.clone();
     frontier.sort_unstable();
-    let k_eff = params.knn_k.min(n);
 
     'growth: while !frontier.is_empty() && selected.len() < params.max_points {
-        let mut neighbours: Vec<u32> = Vec::new();
+        let mut neighbours: Vec<(u32, f64)> = Vec::new();
         for &row in &frontier {
             let q = [xyz[3 * row], xyz[3 * row + 1], xyz[3 * row + 2]];
-            neighbours.extend(grid.nearest(xyz, q, k_eff));
+            for id in grid.nearest(xyz, q, k_eff) {
+                let other = id as usize;
+                let d = [
+                    xyz[3 * other] - q[0],
+                    xyz[3 * other + 1] - q[1],
+                    xyz[3 * other + 2] - q[2],
+                ];
+                neighbours.push((
+                    id,
+                    d[0].mul_add(d[0], d[1].mul_add(d[1], d[2] * d[2])).sqrt(),
+                ));
+            }
         }
-        neighbours.sort_unstable();
-        neighbours.dedup();
+        // Ascending id, and within an id ascending distance, so `dedup_by_key`
+        // keeps the SHORTEST step to each candidate and the visit order is the
+        // ascending-index order the Python loop uses.
+        neighbours.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.total_cmp(&b.1)));
+        neighbours.dedup_by_key(|(id, _)| *id);
 
         let mut next: Vec<usize> = Vec::new();
-        for id in neighbours {
+        for (id, step) in neighbours {
             if selected.contains(&id) {
                 continue;
             }
@@ -717,6 +912,11 @@ pub fn click_to_cluster(
                 xyz[3 * row + 2] - centroid[2],
             ];
             if (dp[0] * dp[0] + dp[1] * dp[1] + dp[2] * dp[2]).sqrt() > params.max_radius {
+                out.n_blocked_by_radius += 1;
+                continue;
+            }
+            if density_limit.is_some_and(|limit| step > limit) {
+                out.n_blocked_by_density += 1;
                 continue;
             }
             selected.insert(id);
@@ -1000,6 +1200,97 @@ mod tests {
         );
         let depth = found.seed_depth_mean.expect("a hit reports its seed depth");
         assert!((depth - 5.0).abs() < 0.2, "seed depth {depth}");
+    }
+
+    #[test]
+    fn the_density_gate_stops_where_the_cloud_thins_out() {
+        // A dense surface running into a sparse one, same colour, no gap: a
+        // chain along x at z = 5, spacing 0.005 for x in [-0.5, 0.5] and 0.03
+        // beyond it. k-NN growth crosses that step happily (0.03 is well
+        // inside the 16 nearest of the last dense point), which is Karekare's
+        // "clicking to select an object seemed to just select the whole scene"
+        // in miniature: one colour, one connected cloud, nothing but the
+        // radius to stop it.
+        let mut xyz = Vec::new();
+        for i in 0..=200 {
+            #[allow(clippy::cast_precision_loss)]
+            let x = -0.5 + i as f64 * 0.005;
+            xyz.extend_from_slice(&[x, 0.0, 5.0]);
+        }
+        let sparse_start = xyz.len() / 3;
+        for j in 1..=100 {
+            #[allow(clippy::cast_precision_loss)]
+            let x = 0.5 + j as f64 * 0.03;
+            xyz.extend_from_slice(&[x, 0.0, 5.0]);
+        }
+        let n = xyz.len() / 3;
+        let rgb: Vec<f64> = (0..n).flat_map(|_| [0.4, 0.5, 0.3]).collect();
+        let grid = PointGrid::build(&xyz);
+
+        // Ungated (what the Python twin does, and what Jordan clicked on).
+        let ungated = ClickParams {
+            max_radius: 100.0,
+            ..ClickParams::default()
+        };
+        let all = click_to_cluster(&grid, &xyz, &rgb, &camera(), (320.0, 240.0), &ungated);
+        assert_eq!(all.point_ids.len(), n, "the ungated growth takes the whole cloud");
+        assert_eq!(all.n_blocked_by_density, 0, "the gate is off");
+        assert!(all.seed_spacing.is_none(), "no spacing is measured with the gate off");
+
+        // Gated: the dense run only, and it says how it stopped.
+        let gated = ClickParams {
+            density_gate: Some(DEFAULT_DENSITY_GATE_FACTOR),
+            ..ungated
+        };
+        let dense = click_to_cluster(&grid, &xyz, &rgb, &camera(), (320.0, 240.0), &gated);
+        assert!(!dense.point_ids.is_empty());
+        assert!(
+            dense.point_ids.iter().all(|i| (*i as usize) < sparse_start),
+            "the density gate let {} points into the sparse half",
+            dense
+                .point_ids
+                .iter()
+                .filter(|i| (**i as usize) >= sparse_start)
+                .count()
+        );
+        assert_eq!(
+            dense.point_ids.len(),
+            sparse_start,
+            "and it took ALL of the dense half, not a fragment of it"
+        );
+        assert!(dense.n_blocked_by_density > 0, "the gate must report its refusals");
+        let spacing = dense.seed_spacing.expect("the gate measures a spacing");
+        assert!((spacing - 0.005).abs() < 1e-9, "seed spacing {spacing}");
+    }
+
+    #[test]
+    fn the_growth_radius_is_capped_by_the_click_depth_and_by_the_scene() {
+        // Near: the depth term is the smaller of the two, so it wins.
+        let near = depth_capped_max_radius(2.0, 100.0, 0.0, 1.0);
+        assert!((near - DEFAULT_MAX_RADIUS_DEPTH_FRACTION * 2.0).abs() < 1e-12);
+        // Far: the scene term caps it, so one click can never grow past 2% of
+        // the captured area however far away it was aimed.
+        let far = depth_capped_max_radius(1000.0, 100.0, 0.0, 1.0);
+        assert!((far - DEFAULT_MAX_RADIUS_SCENE_FRACTION * 100.0).abs() < 1e-12);
+        // Grow and shrink are exact inverses.
+        let grown = depth_capped_max_radius(2.0, 100.0, 0.0, GROW_STEP);
+        assert!((grown / GROW_STEP - near).abs() < 1e-12);
+        // A tiny camera box with the geometry far away: the catchment floor is
+        // what keeps a click from selecting nothing but its own seed.
+        let tiny_box = depth_capped_max_radius(4.0, 0.9, 0.076, 1.0);
+        assert!((tiny_box - 0.076).abs() < 1e-12, "{tiny_box}");
+        // ... and shrink still works underneath it.
+        let shrunk = depth_capped_max_radius(4.0, 0.9, 0.076, 1.0 / GROW_STEP);
+        assert!(shrunk < tiny_box);
+        // The floor never overrides a cap that is already bigger.
+        assert!((depth_capped_max_radius(2.0, 100.0, 0.01, 1.0) - near).abs() < 1e-12);
+        // Degenerate inputs never produce a zero or negative radius, which
+        // would make every click select exactly its own seed.
+        assert!(depth_capped_max_radius(f64::NAN, 100.0, 0.0, 1.0) > 0.0);
+        assert!(depth_capped_max_radius(2.0, 0.0, 0.0, 1.0) > 0.0);
+        assert!(depth_capped_max_radius(0.0, 0.0, 0.0, 1.0) > 0.0);
+        assert!(depth_capped_max_radius(2.0, 100.0, f64::NAN, 1.0) > 0.0);
+        assert!(depth_capped_max_radius(2.0, 100.0, 0.0, -5.0) > 0.0);
     }
 
     #[test]

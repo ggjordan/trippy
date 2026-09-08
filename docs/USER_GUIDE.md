@@ -81,31 +81,45 @@ It is a separate app from Brush; Brush still opens `.ply` files exactly as befor
 
 **Double-click** `OPEN_TRIPS_MAC_<name>.command` in your review folder. That's it.
 
-It opens **on a real camera of the capture**, looking at what that camera saw, and it
-starts in **orbit** mode: left-drag turns you around the scene rather than spinning you
-on the spot, and you cannot leave the area the real cameras covered. That is the mode
-for judging a scene. Press `F` when you want to fly through it instead.
+It opens **on a real camera of the capture**, looking at what that camera saw. A card
+called **Controls** is up on the first frame; press **`?`** at any time to bring it back.
 
-Controls:
+**The mouse works like Brush.** (Changed 2026-09-08, at Jordan's request. If you had
+learned the old scheme: the right button now looks around instead of panning, and the
+wheel now always moves you closer or further.)
 
 | | |
 |---|---|
-| **left-drag** | **orbit** the scene — or look around, in free mode |
-| **right-drag** or **middle-drag** | pan sideways / up and down |
-| **scroll** | **free: FASTER / slower** · orbit: move closer or further |
+| **left-drag** | **turn around** what you are looking at |
+| **right-drag** | **look around** from where you are — and `W` `A` `S` `D` `Q` `E` fly while you hold it |
+| **middle-drag**, or **shift + left-drag** | slide sideways and up/down |
+| **scroll** | move **closer / further** |
+| **shift + scroll** (or scroll while the right button is down) | fly **faster / slower** |
+| **double-click** something | **look at THAT**: the point you turn around jumps onto what you clicked |
+
+And the keys:
+
+| | |
+|---|---|
 | `W` `A` `S` `D` | move forward / left / back / right |
 | `Q` / `E` | move down / up |
 | `R` | back to the view it opened at (use this whenever you are lost) |
+| `?` or `F1` | the Controls card |
 | `N` / `P` | jump to the next / previous real camera of the capture |
-| `F` | switch between **orbit** and **free fly** |
+| `F` | fence on/off: **stay in the photographed area** or **fly anywhere** |
 | `V` | cycle the view: **network** -> **raw level-0** -> **coverage** |
 | `X` | cycle the **exposure**: auto -> this view's -> scene median -> manual |
 | `-` / `=` | render at a smaller / larger fraction of the window |
+| `M` | the editor |
 | `TAB` | hide the panel |
 
-**Too slow? Press `F`, then scroll up.** Each notch is 25% faster and the wheel goes to
-**50x** the default, which crosses a whole capture in under a second. The panel says
-`scroll = faster` while you are in free mode.
+**Too slow? Hold shift and scroll up.** Each notch is 25% faster and the wheel goes to
+**50x** the default, which crosses a whole capture in under a second.
+
+`F` is now only a **fence**, not a different set of controls. It starts on: the point
+you turn around is pinned inside the box the real cameras occupy, so you cannot get
+lost. Press `F` and you can fly out of it; the panel says so when you have, and `R`
+brings you home.
 
 **Speed is set from the scene, not guessed.** The viewer measures how far apart the real
 cameras are and flies **two of those gaps per second**, so one second of held `W` takes
@@ -118,10 +132,6 @@ fraction of the captured area per second. Scroll changes it by 25% a notch, betw
 photographs are ~0.2 world units apart, so the old default needed about two and a half
 minutes of held `W` to cross the capture. It now takes about forty seconds, and one
 scroll-up ladder takes it to under a second.)
-
-If you do fly out of the captured area in free mode, the panel says so and tells you to
-press `R`. In orbit mode you cannot: the point you are turning around is pinned inside
-the box the real cameras occupy, and the camera moves with it.
 
 The "jump to view" dropdown lists every real camera in the capture; picking one puts you
 exactly where that photograph was taken, which is the fair place to compare the render
@@ -282,16 +292,57 @@ trippy eval --checkpoint <run>/checkpoints/checkpoint_best.pt --gate-scale 0
 trippy eval --checkpoint <run>/checkpoints/checkpoint_best.pt --gate-scale 2
 ```
 
-## The Editor: regions, mix, delete, undo (press `M`)
+## The Editor (press `M`)
 
-Press **`M`** in the viewer (or launch it with `--edit` to start there). Four panels appear on the right: **Regions**,
-**Named Objects**, **Inspector** and **Tools**. Press `M` again and they are gone; nothing about the
-scene changes when they are hidden, and a bundle with no edits renders exactly the
-frame it rendered before the editor existed.
+Press **`M`** in the viewer (or launch it with `--edit` to start there). Press `M` again
+and it is gone; nothing about the scene changes while it is hidden, and a bundle with no
+edits renders exactly the frame it rendered before the editor existed.
 
-An edit is a **region** plus what to do inside it. Regions live in a file called
-`edits.json`, saved next to `bundle.json`; delete that file and the scene is back
-to untouched.
+The editor opens in **Simple Mode**. There is a **Simple / Advanced** switch at the top
+of the panel; everything the old editor had is under **Advanced**, unchanged.
+
+Everything you do is saved in a file called `edits.json`, next to `bundle.json`. Delete
+that file and the scene is back to untouched. **`Cmd-Z` undoes anything.**
+
+### Simple Mode: four steps
+
+Do them in any order. Nothing here is permanent until you press `Cmd-S`.
+
+1. **Find shade clouds.** Press **Find them**. The dark blobs of nothing that hang in
+   the shade under trees light up magenta, and the panel says how many points that is
+   and what percentage of the scene. Then **Soften them** (keep the points, fade them
+   towards the splat) or **Remove them** (take them out; the model fills the hole in).
+
+2. **Select an object.** Press **Turn on**, then **click** the thing you want — a plain
+   click, no modifier. It lights up magenta and the panel says how many points it took.
+   Use **bigger** and **smaller** until it is the thing you meant, then **Keep this as
+   an object**. One click will never take the whole scene: how far the selection can
+   spread is set from how far away the thing you clicked is, and it stops where the
+   points thin out.
+
+3. **Paint an area.** Press **Turn on**, then **drag** on the scene. A magenta circle
+   follows the cursor showing exactly how big the brush is where you are pointing, and
+   what you paint lights up magenta as soon as you let go. **Hold `ALT` to rub it out.**
+   `[` and `]` make the brush smaller and bigger. Under the buttons the panel says in
+   one sentence what will happen where you paint — **soften**, **remove** or **choose**.
+
+4. **What to show here.** Every object you have made gets a row: its name, how many
+   points it holds, a **Splat &lt;—&gt; TRIPS** slider, and the three buttons **remove /
+   soften / choose**. Uncheck the box to switch an edit off without losing it; press
+   **forget it** to delete it.
+
+   If the slider is greyed out and says *"This bundle has no splat to mix. Open a
+   combined bundle."*, that scene has no Gaussian half — the slider genuinely cannot do
+   anything, and it now says so instead of moving and having no effect.
+
+**Put a shape somewhere.** Press **+ box**, **+ ball** or **+ pool lid**, then
+**click the spot in the scene**. The shape is created *on the point you clicked*, sized
+to how far away it is (about a tenth of the frame across), never at the origin and never
+at the camera. Press the button again to cancel.
+
+**Move arrows.** A selected shape has three coloured arrows on it — red, green, blue.
+Drag one to move the shape along it; **shift-drag** to resize; **ctrl-drag** to spin a
+box. A drag anywhere else still moves the camera. (These used to be called "gizmos".)
 
 ### The three things a region can do
 
@@ -307,35 +358,37 @@ never un-delete something.
 
 ### Making one
 
-1. Fly so the thing you want is in the middle of the screen (the orbit pivot).
-2. Press `M`, then click **+ box**, **+ sphere** or **+ lid**. The new region is
-   born at the look-at point, about a twelfth of the scene across.
+1. Press `M`, then click **+ box**, **+ ball** or **+ pool lid**.
+2. **Click the spot in the scene.** The region is created *there*, on the point under
+   your click, sized to 6% of how far away that point is — so it is about a tenth of the
+   frame across wherever you put it. Press the button again to cancel instead.
 3. Drag the **mix** slider, or click **delete** for the hard version.
-4. **Drag one of the three coloured handles** (red = world X, green = Y, blue = Z)
-   to move it along that axis; **Shift-drag** a handle to resize; **Ctrl-drag**
-   one to rotate a box. A **lid** gets a **fourth, yellow handle** on its own
+4. **Drag one of the three coloured move arrows** (red = world X, green = Y, blue = Z)
+   to move it along that axis; **Shift-drag** an arrow to resize; **Ctrl-drag**
+   one to rotate a box. A **lid** gets a **fourth, yellow arrow** on its own
    plane normal — drag it to tilt the plane, instead of typing `up` by hand.
-   A drag anywhere *else* still orbits, so navigation is never taken away.
+   A drag anywhere *else* still moves the camera, so navigation is never taken away.
    The arrow keys, `PageUp`/`PageDown` and `[` / `]` still nudge and resize by
    exact steps, and the Inspector still takes typed numbers (for a lid, `up`
    can be either dragged or typed — both write the same field).
 5. **Cmd-S** writes `edits.json`. Closing and reopening the bundle restores the
    regions, the mixes AND the undo history.
 
-**+ lid** is pre-filled with the Karekare pool plane that was already fitted and
-A/B-checked, so the pool lid is one click plus one save.
+**+ pool lid** keeps the Karekare pool *plane* that was already fitted and A/B-checked
+— only where the lid sits, and how wide it is, come from your click.
 
 ### Keys
 
 | key | action |
 |---|---|
 | `M` | show/hide the editor |
-| `T` | cycle the Tools panel: Regions → shade-cloud finder → click-to-cluster → SAM 3 lift → brush |
+| `T` | cycle the Advanced Tools panel: Regions → shade-cloud finder → click-to-cluster → SAM 3 lift → brush |
 | `H` | preview highlight on/off (for whichever tool has focus) |
-| **Shift-click** on the render | select the object under the pointer (click-to-cluster) |
-| **drag** on the render | draw a box for the SAM 3 lift, or paint — *only* while that tool has focus. Shift-drag still orbits |
+| **click** on the render | place the shape you armed with **+ box** / **+ ball** / **+ pool lid**; in Simple Mode's step 2, select the object under the pointer |
+| **Shift-click** on the render | select the object under the pointer (click-to-cluster), in every mode |
+| **drag** on the render | draw a box for the SAM 3 lift, or paint — *only* while that tool has focus. Right-drag still looks around and shift+left-drag still slides |
 | **Alt-click / Alt-drag** | point prompt for the SAM 3 lift; erase, with the brush |
-| **drag a handle** | move the selected region along that axis (Shift: resize, Ctrl: rotate a box); on a lid, the 4th yellow handle tilts its plane normal |
+| **drag a move arrow** | move the selected region along that axis (Shift: resize, Ctrl: rotate a box); on a lid, the 4th yellow arrow tilts its plane normal |
 | arrows, `PageUp`/`PageDown` | nudge the selected region along world X/Z and Y |
 | `[` / `]` | shrink / grow the selected region — or the brush radius, while the brush has focus |
 | `Delete` / `Backspace` | remove the selected region |
@@ -349,9 +402,24 @@ what it did.
 
 Press `T` until the Tools panel says **brush**, then **drag on the render**. Each
 dab is a sphere of the radius in the panel, placed at the depth of the nearest
-point under your cursor — so you paint *on* the scene, not on the glass. **Alt-drag
-erases**. `[` and `]` change the radius while the tool has focus, and a magenta
-ring on screen shows how big the brush is at the depth it is painting.
+point **inside the magenta ring** under your cursor — so you paint *on* the scene, not
+on the glass. **Alt-drag erases**. `[` and `]` change the radius while the tool has
+focus, and the magenta ring shows exactly how big the brush is at the depth it is
+painting.
+
+Three things changed on 2026-09-08, after "brushing seemed to blur the foreground and
+the background":
+
+- The default op is **soften** (`fade`), not **remove** (`delete`). Painting no longer
+  takes geometry out unless you ask it to.
+- What you painted is **highlighted magenta** as soon as you let go, whatever the op is,
+  so you can see what you did. `H` turns the highlight off.
+- The stroke **stays on one surface**: the depth it paints at may move at most 1.5 brush
+  radii between two samples of one drag, and the point it anchors on has to be inside
+  the ring you can see. Before, one drag could anchor on a twig in front and then on the
+  hillside behind, and paint a sphere spanning both.
+- The default radius is **3% of how far away you are looking**, not a fixed fraction of
+  the whole scene. On Karekare the old default was metres across.
 
 - The stroke goes into a **brush region**: a sparse set of voxel cells, painted
   where you dragged. It behaves like every other region — `delete` removes the
@@ -401,9 +469,24 @@ translate handle does.
 
 ### Click an object to select it
 
-Press `T` until the Tools panel says **click-to-cluster**, then **Shift-click**
-whatever you want in the render. A plain drag still orbits; only Shift-click
-selects, so navigation is not taken away from you.
+In Simple Mode: step 2, **Turn on**, then plain-click. In Advanced: press `T` until the
+Tools panel says **click-to-cluster**, then **Shift-click** whatever you want in the
+render. A plain drag still turns the camera; only a *click* selects, so navigation is not
+taken away from you.
+
+**One click can no longer take the whole scene** (2026-09-08). How far a selection may
+spread is now the smaller of **15% of how far away the thing you clicked is** and **2% of
+the photographed area**, never less than the little circle you clicked in, times whatever
+**bigger** / **smaller** you have pressed. On top of that, growth **stops where the points
+thin out** — it will not walk from a dense object out into sparse background — and the
+seed is clipped to the surface under the cursor rather than a cone reaching through the
+whole cloud.
+
+Measured on a synthetic block of **5,000,000** points with no depth gap anywhere (the
+shape that caused the problem): the old rule took 200,000 points and was still going when
+it hit the hard cap; the new one takes **608 points, 0.012% of the cloud**, in 27 ms
+instead of 4.7 s. On a 200,000-point version of the same block the old rule took
+**82.7%** of it.
 
 What happens: every point is projected into the camera you are looking through, the
 ones landing within a few pixels of your click are collected, the group **nearest
@@ -554,14 +637,17 @@ alongside, and (if the bundle names a Gaussian `.ply`) a filtered copy of it.
 
 ### What is not built yet
 
-- No 3D drag handles on a region — use the arrow keys or type the numbers.
 - The SAM lift starts a fresh process per view, so `views around 4` loads the
   3.4 GB model five times. Use 0 unless a vote is really wanted.
 - No per-point tidy-up of what SAM returned: if the selection is slightly wrong
   at the edges, the answer today is a different box, not a brush.
 - A region with `mix < 1` needs a Gaussian splat to mix *with*. On a bundle with no
-  `blend.splat_ply`, the panel says the frame is showing unedited TRIPS there
-  rather than pretending.
+  `blend.splat_ply` the Splat/TRIPS slider is greyed out and says
+  *"This bundle has no splat to mix. Open a combined bundle."*
+- The brush's highlight is computed when you let go of the button, not while you drag.
+  During the stroke you have the ring; after it you have the magenta.
+- Simple Mode has no SAM step yet: cutting an object out with SAM 3 is still under
+  **Advanced**.
 
 ## How to open the TRIPS viewer in a web browser (Mac, v0.5.0)
 
