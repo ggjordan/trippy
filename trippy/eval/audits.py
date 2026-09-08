@@ -259,7 +259,14 @@ def cached_baseline_audit(
     cache_dir = Path(cache_root) if cache_root is not None else load_settings().trippy_output / AUDIT_CACHE_SUBDIR
 
     try:
-        cache_file = cache_dir / _cache_key(ply_path)
+        key = _cache_key(ply_path)
+        if frames:
+            # The frame list is part of what was measured: a baseline audited on
+            # kk-coherent's 6 frames must never be served for karekare-v2's 93.
+            import hashlib
+            digest = hashlib.sha1("\n".join(sorted(frames)).encode()).hexdigest()[:10]
+            key = f"{Path(key).stem}-frames{digest}{Path(key).suffix}"
+        cache_file = cache_dir / key
     except OSError as exc:
         error = {"error": f"baseline ply not readable: {exc}"}
         return {"shade_audit": error, "extent_gate": error}

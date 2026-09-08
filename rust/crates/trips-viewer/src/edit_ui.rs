@@ -281,7 +281,11 @@ pub struct SamUi {
     /// The mix it gets (ignored by `delete`).
     mix: f64,
     /// `--device`. `mps` is Jordan's own interactive GPU use, which
-    /// `AGENTS.md` §6 allows outside the queue; it is not the default.
+    /// `AGENTS.md` §6 allows outside the queue; it is now the default
+    /// (`docs/EDITOR.md` §3's decision rule: `edit-sam-5` (MPS) rc=0 at
+    /// 8.05 s/view beat `edit-sam-5-cpu`'s 9.65 s/view, 2026-09-08). `cpu`
+    /// stays selectable as a fallback -- both remain in the radio group
+    /// below.
     device: &'static str,
     /// `--fake`: synthesise the mask instead of loading SAM 3. The screenshot
     /// proof and the tests use it; the panel exposes it so a broken SAM
@@ -315,7 +319,7 @@ impl Default for SamUi {
             views_around: 0,
             op: Op::Fade,
             mix: 0.0,
-            device: "cpu",
+            device: "mps",
             fake: false,
             job: None,
             command: String::new(),
@@ -3275,6 +3279,17 @@ mod tests {
         tool = tool.next();
         assert_eq!(tool, Tool::Sam);
         assert_eq!(tool.next(), Tool::Brush);
+    }
+
+    #[test]
+    fn sam_ui_defaults_to_mps_with_cpu_still_selectable() {
+        // docs/EDITOR.md §3's decision rule was satisfied 2026-09-08: edit-sam-5
+        // (MPS) rc=0 at 8.05 s/view beat edit-sam-5-cpu's 9.65 s/view, so the
+        // viewer's SAM tool now opens on mps rather than cpu. cpu stays a real,
+        // still-supported choice in the device radio group (sam_panel).
+        let sam = SamUi::default();
+        assert_eq!(sam.device, "mps");
+        assert!(["cpu", "mps"].contains(&sam.device));
     }
 
     #[test]

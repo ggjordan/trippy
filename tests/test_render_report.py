@@ -34,11 +34,12 @@ Fixtures: only synthetic dicts (no real scene, checkpoint, or PLY --
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
 
-from trippy.constants import DOLLY_COVERAGE_STOP_THRESHOLD
+from trippy.constants import DOLLY_COVERAGE_STOP_THRESHOLD, SHADE_FRAMES_KK
 from trippy.render import report as report_mod
 from trippy.render.dolly import dolly_stop_index
 
@@ -161,6 +162,74 @@ def test_heldout_split_also_carries_the_neighbour_exposure_eval_split_when_prese
     assert split["other_eval"] == {"n": 27, "psnr": 18.2, "ssim": 0.55, "lpips": 0.28}
     # The strict split is still there too -- both live side by side.
     assert split["shade"] == {"n": 6, "psnr": 12.5, "ssim": 0.3, "lpips": 0.6}
+
+
+# --- shade_frames plumbing (this task: TrainConfig.shade_frames -> --frames) ---
+
+
+def test_resolve_shade_frames_none_is_unchanged_old_behaviour() -> None:
+    assert report_mod.resolve_shade_frames(None) is None
+
+
+def test_resolve_shade_frames_list_is_returned_verbatim() -> None:
+    frames = ["IMG_4032.jpg", "IMG_4033.jpg"]
+    assert report_mod.resolve_shade_frames(frames) is frames
+
+
+def test_resolve_shade_frames_json_bare_list(tmp_path: Path) -> None:
+    path = tmp_path / "frames.json"
+    path.write_text(json.dumps(["IMG_1.jpg", "IMG_2.jpg"]))
+    assert report_mod.resolve_shade_frames(str(path)) == ["IMG_1.jpg", "IMG_2.jpg"]
+
+
+def test_resolve_shade_frames_json_dict_big_tree_key(tmp_path: Path) -> None:
+    # Matches $TRIPPY_OUTPUT/scratch/shade_frames.json's own shape (README "Finding the
+    # shade frames") -- that exact file must be usable as a shade_frames value unchanged.
+    path = tmp_path / "shade_frames.json"
+    path.write_text(json.dumps({"big_tree": ["IMG_4032.jpg", "IMG_4033.jpg"], "kkc": ["IMG_3828.jpg"]}))
+    assert report_mod.resolve_shade_frames(str(path)) == ["IMG_4032.jpg", "IMG_4033.jpg"]
+
+
+def test_resolve_shade_frames_json_dict_frames_key(tmp_path: Path) -> None:
+    path = tmp_path / "frames.json"
+    path.write_text(json.dumps({"frames": ["IMG_9.jpg"]}))
+    assert report_mod.resolve_shade_frames(str(path)) == ["IMG_9.jpg"]
+
+
+def test_resolve_shade_frames_json_dict_with_no_usable_key_raises(tmp_path: Path) -> None:
+    path = tmp_path / "frames.json"
+    path.write_text(json.dumps({"something_else": [1, 2, 3]}))
+    with pytest.raises(ValueError):
+        report_mod.resolve_shade_frames(str(path))
+
+
+def test_resolve_shade_frames_plain_text_file_ignores_blanks_and_comments(tmp_path: Path) -> None:
+    path = tmp_path / "frames.txt"
+    path.write_text("# big-tree shade frames\nIMG_4032.jpg\n\nIMG_4033.jpg\n# trailing comment\n")
+    assert report_mod.resolve_shade_frames(str(path)) == ["IMG_4032.jpg", "IMG_4033.jpg"]
+
+
+def test_resolve_shade_frames_relative_path_resolved_against_base_dir(tmp_path: Path) -> None:
+    (tmp_path / "frames.json").write_text(json.dumps(["IMG_1.jpg"]))
+    assert report_mod.resolve_shade_frames("frames.json", base_dir=tmp_path) == ["IMG_1.jpg"]
+
+
+def test_resolve_shade_frames_missing_path_raises_file_not_found(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError):
+        report_mod.resolve_shade_frames(str(tmp_path / "does_not_exist.json"))
+
+
+def test_shade_frames_used_record_none_spells_out_the_script_default() -> None:
+    record = report_mod.shade_frames_used_record(None)
+    assert record["source"].startswith("script default")
+    assert record["frames"] == list(SHADE_FRAMES_KK)
+    assert record["count"] == len(SHADE_FRAMES_KK)
+
+
+def test_shade_frames_used_record_list_reports_config_source() -> None:
+    frames = ["IMG_4032.jpg", "IMG_4033.jpg", "IMG_4034.jpg"]
+    record = report_mod.shade_frames_used_record(frames)
+    assert record == {"source": "config shade_frames", "count": 3, "frames": frames}
 
 
 # --- comparison table ---

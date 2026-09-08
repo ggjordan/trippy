@@ -64,6 +64,7 @@ from trippy.constants import (
     CANDIDATE_REPORT_OFFPATH_DIRNAME,
     DELIVER_SUBPROCESS_TIMEOUT_S,
     SHADE_AUDIT_DARK_MASS_LUM_KEY,
+    SHADE_FRAMES_KK,
     TRAIN_CHECKPOINT_DIRNAME,
     TRAIN_CHECKPOINT_LATEST_FILENAME,
     TRAIN_EXPORT_FILENAME,
@@ -106,6 +107,80 @@ def dolly_mean_center_coverage(dolly_metrics: dict) -> float | None:
     kept = frames[: stop_index + 1] if isinstance(stop_index, int) else frames
     values = [f["coverage_mean_center"] for f in kept if "coverage_mean_center" in f]
     return float(np.mean(values)) if values else None
+
+
+def resolve_shade_frames(value: list[str] | str | None, base_dir: Path | None = None) -> list[str] | None:
+    """Turn `TrainConfig.shade_frames` into a frame-name list for `run_shade_audit`'s `--frames`.
+
+    This is the fix for the bug this task closes: `run_train_report` used to call
+    `audit_report`/`cached_baseline_audit` with `frames=None` unconditionally, so every
+    scene's shade dark-mass was measured on `depthprior_shade_audit.py`'s own default
+    (`SHADE_FRAMES_KK`, kk-coherent's IMG_3828-3833) even on scenes -- karekare-v2 chief
+    among them -- whose actual shade region is a different, measured set of frames
+    (`experiments/EXP-0011-karekare-v2/README.md` "Finding the shade frames"). Every
+    EXP-0011 config now sets `shade_frames` to that measured 93-frame big-tree list, and
+    this function is what turns the config value into the list `run_shade_audit` needs.
+
+    Args:
+        value: `TrainConfig.shade_frames` -- `None` (old/unchanged behaviour: return
+            `None`, so callers pass it straight through and the script's own default
+            applies), a `list[str]` (returned verbatim), or a `str` path to either:
+              - a `.json` file holding a bare list, or a dict with a "frames"/
+                "big_tree"/"shade_frames" list key (matches
+                `$TRIPPY_OUTPUT/scratch/shade_frames.json`'s own shape, so that exact
+                file can be pointed to directly without reshaping it), or
+              - a plain-text file, one frame name per line, blank lines and
+                `#`-prefixed comments ignored.
+        base_dir: directory a relative `value` path is resolved against (unused for an
+            already-absolute path, a list, or `None`).
+
+    Returns:
+        `None` (script default applies) or the resolved list of frame names.
+
+    Raises:
+        FileNotFoundError: `value` is a path and it does not exist.
+        ValueError: `value` is a `.json` path whose top-level shape has no usable list
+            (not a bare list, and no "frames"/"big_tree"/"shade_frames" list key).
+    """
+    if value is None or isinstance(value, list):
+        return value
+    path = Path(value)
+    if not path.is_absolute() and base_dir is not None:
+        path = base_dir / path
+    if not path.exists():
+        raise FileNotFoundError(f"shade_frames path not found: {path}")
+    text = path.read_text()
+    if path.suffix == ".json":
+        data = json.loads(text)
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            for key in ("frames", "big_tree", "shade_frames"):
+                if isinstance(data.get(key), list):
+                    return data[key]
+        raise ValueError(
+            f"{path}: expected a JSON list, or a dict with a 'frames'/'big_tree'/'shade_frames' list key"
+        )
+    return [line.strip() for line in text.splitlines() if line.strip() and not line.strip().startswith("#")]
+
+
+def shade_frames_used_record(resolved: list[str] | None) -> dict:
+    """`report.json["shade_frames"]`: which frames the shade audit actually used.
+
+    Written unconditionally (not only when `TrainConfig.shade_frames` is set) so a report
+    is never ambiguous about which shade region its dark-mass numbers describe -- the bug
+    this task closes was exactly this ambiguity going unrecorded (a karekare-v2 report
+    silently carrying kk-coherent's frame list). `resolved=None` means
+    `depthprior_shade_audit.py`'s own default applied (`SHADE_FRAMES_KK`); that default is
+    spelled out explicitly here rather than left as a bare `null`.
+    """
+    if resolved is None:
+        return {
+            "source": "script default (trippy.constants.SHADE_FRAMES_KK, kk-coherent)",
+            "count": len(SHADE_FRAMES_KK),
+            "frames": list(SHADE_FRAMES_KK),
+        }
+    return {"source": "config shade_frames", "count": len(resolved), "frames": resolved}
 
 
 def _first_shade_result(shade_audit: dict | None) -> dict | None:
@@ -597,8 +672,16 @@ def _deliveries_markdown(deliveries: list[dict]) -> str:
 # --- orchestration ---
 
 
-def _baseline_ply_audits(cfg, sparse_txt_dir: Path) -> dict:
-    """`cached_baseline_audit` on `cfg.point_source`'s own PLY, or a recorded error for other types."""
+def _baseline_ply_audits(cfg, sparse_txt_dir: Path, frames: list[str] | None = None) -> dict:
+    """`cached_baseline_audit` on `cfg.point_source`'s own PLY, or a recorded error for other types.
+
+    Args:
+        frames: forwarded to `cached_baseline_audit`/`run_shade_audit` -- the resolved
+            `TrainConfig.shade_frames` (`resolve_shade_frames`), or `None` for the script's
+            own default. Must be the SAME list the candidate export was audited with, or
+            the baseline-vs-candidate comparison table would be measuring two different
+            regions (this task's brief).
+    """
     point_source = cfg.point_source
     if point_source.type != "gaussian" or not point_source.path:
         error = {
@@ -608,7 +691,7 @@ def _baseline_ply_audits(cfg, sparse_txt_dir: Path) -> dict:
             )
         }
         return {"shade_audit": error, "extent_gate": error}
-    return cached_baseline_audit(point_source.path, sparse_txt_dir, frames=None)
+    return cached_baseline_audit(point_source.path, sparse_txt_dir, frames=frames)
 
 
 def _ensure_run_readme(run_dir: Path) -> Path:
@@ -632,7 +715,11 @@ def run_train_report(trainer: Trainer, held_out_metrics: dict) -> dict:
     Returns:
         `{"checkpoint", "device", "scene_root", "export_ply", "epoch",
         "held_out", "heldout_split": {"shade", "other"}, "dolly", "offpath",
-        "audits": {"candidate", "baseline"}, "bundle": {"bundle_dir",
+        "audits": {"candidate", "baseline"}, "shade_frames":
+        {"source", "count", "frames"} (`shade_frames_used_record` -- which
+        frames the shade audit above actually used: `trainer.cfg.shade_frames`
+        resolved, or the script's own default spelled out explicitly),
+        "bundle": {"bundle_dir",
         "viewer"}, "summary_line", "deliveries"}` (`deliveries[0]` is always
         the Mac viewer launcher), plus `"gate"` on a blend-gate run
         (`gate_summary`) -- also written
@@ -675,9 +762,18 @@ def run_train_report(trainer: Trainer, held_out_metrics: dict) -> dict:
         write_video_files=False,
     )
 
+    # Bug this task closes: this used to be a hardcoded `frames=None` on both calls below,
+    # so every scene's shade dark-mass was measured on depthprior_shade_audit.py's own
+    # default (SHADE_FRAMES_KK, kk-coherent's IMG_3828-3833) even on karekare-v2, whose
+    # measured shade region is a different, 93-frame group (`shade_frames:` in
+    # experiments/EXP-0011-karekare-v2/*.yaml -- README "Finding the shade frames").
+    # `resolve_shade_frames` turns the config value into the actual list (or leaves it
+    # `None`, unchanged old behaviour, when the config has no `shade_frames` key).
+    shade_frames = resolve_shade_frames(trainer.cfg.shade_frames)
+
     sparse_txt_dir = scene_root / _SPARSE_TXT_DIRNAME
-    candidate_audits = audit_report([str(export_path)], sparse_txt_dir, frames=None)
-    baseline_audits = _baseline_ply_audits(trainer.cfg, sparse_txt_dir)
+    candidate_audits = audit_report([str(export_path)], sparse_txt_dir, frames=shade_frames)
+    baseline_audits = _baseline_ply_audits(trainer.cfg, sparse_txt_dir, frames=shade_frames)
 
     run_name = run_dir.name
     line = summary_line(run_name, epoch, held_out_metrics, candidate_audits, baseline_audits)
@@ -728,6 +824,7 @@ def run_train_report(trainer: Trainer, held_out_metrics: dict) -> dict:
         "dolly": dolly_metrics,
         "offpath": offpath_metrics,
         "audits": {"candidate": candidate_audits, "baseline": baseline_audits},
+        "shade_frames": shade_frames_used_record(shade_frames),
         "bundle": {"bundle_dir": bundle_result["bundle_dir"], "viewer": bundle_result["viewer"]},
         "summary_line": line,
         "deliveries": deliveries,

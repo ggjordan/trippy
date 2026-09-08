@@ -2201,3 +2201,82 @@ the areas I want". Artefacts: `$SPLATS_ROOT/tools/gpu_queue/logs/trippy-viewer-k
 **Artifact**: none yet (queued). `experiments/EXP-0011-karekare-v2/README.md` "Full-resolution variant" section has the full method/estimate; results row placeholders added to that README's Results table.
 - 2026-09-08T08:22:58Z submitted job trippy-kkv2-9-fullres-smoke prio 15 (logged directly to main's research/trips-metal.md by gpu_submit.sh, since the job correctly cds into main — not duplicated here): trippy train --config experiments/EXP-0011-karekare-v2/config_fullres_smoke.yaml --resume /Users/nzbirdranch/trippy/output/runs/EXP-0011-karekare-v2/kkv2-1-full-masked/checkpoints/checkpoint_latest.pt --device mps --max-minutes 30 --report
 - 2026-09-08T08:23:40Z submitted job trippy-kkv2-9-fullres prio 40 (same note — logged to main directly): bash -c '<rc guard against trippy-kkv2-9-fullres-smoke.rc>; python -m trippy.cli train --config experiments/EXP-0011-karekare-v2/config_fullres.yaml --resume .../checkpoint_latest.pt --device mps --max-minutes 720 --report'
+- 2026-09-08T20:10:14Z submitted job trippy-shade-audit-rerun prio 15: python /Users/nzbirdranch/trippy/output/scratch/shade_audit_rerun/reconstruct_and_audit.py
+
+## 2026-09-09 — `trippy train --report`'s shade dark-mass was measured on the wrong frames
+
+**Question.** Every karekare-v2 report (`kkv2-1-full-masked`, `kkv2-2-full-unmasked`,
+`kkv2-3-removal`) quotes a shade dark-mass fraction against the `kklid_20000` Gaussian
+baseline. Which frames define "the shade region" those numbers are measured over?
+
+**Bug, found by the splat-clean agent and confirmed here.** `trippy.render.report.
+run_train_report` called `trippy.eval.audits.audit_report`/`cached_baseline_audit` with
+`frames=None` unconditionally, so `depthprior_shade_audit.py` always fell back to its own
+default (`trippy.constants.SHADE_FRAMES_KK`, kk-coherent's `IMG_3828-3833`, 6 frames) --
+even on karekare-v2, whose actual shade region is a different, MEASURED 93-frame group
+under the big tree (`experiments/EXP-0011-karekare-v2/README.md` "Finding the shade
+frames": 9 contiguous dark runs, camera centroids within 2.5 world units of one spot, mean
+luminance 99.50 vs the scene's 121.31, EXIF ISO corroborating). The 6 kk-coherent frames
+ARE registered in karekare-v2 and ARE genuinely dark, so the audit ran and returned a
+plausible-looking number for the wrong place -- 5.79 world units from the big tree.
+
+**Fix.** New optional `TrainConfig.shade_frames: list[str] | str | None` (default `None` =
+old, unchanged behaviour). `trippy.render.report.resolve_shade_frames` turns it into the
+frame list `run_shade_audit`'s `--frames` gets, for BOTH the candidate export and the
+baseline PLY (same region on both sides of the comparison table, or the two columns would
+describe different places). `report.json` now always carries a `"shade_frames"` block
+(`shade_frames_used_record`) recording exactly which frames were used, even on the old
+default path (spelled out as `SHADE_FRAMES_KK`, not left a bare `null`). Every EXP-0011
+config (`config.yaml`, `config_unmasked.yaml`, `config_removal.yaml`, `config_hybrid.yaml`,
+`config_hybrid_gate.yaml`, `config_shade_prune.yaml`, `config_fullres.yaml`) now sets
+`shade_frames` to the measured 93-frame big-tree list (`$TRIPPY_OUTPUT/scratch/
+shade_frames.json`'s `"big_tree"` key). Verified with a fake stand-in for
+`depthprior_shade_audit.py` that echoes back whatever `--frames` it received
+(`tests/test_cli_train_report.py`), plus unit tests for `resolve_shade_frames` (JSON list,
+JSON dict with `big_tree`/`frames` keys, plain-text file, missing-key/-path errors) and
+`shade_frames_used_record` (`tests/test_render_report.py`).
+
+**Also found, NOT fixed here (out of this task's file-edit scope, `trippy/eval/audits.py`)**:
+`cached_baseline_audit`'s on-disk cache key (`_cache_key`) is `<ply stem>-<mtime>-<size>`,
+with NO dependence on the `frames` argument. `$TRIPPY_OUTPUT/audits/
+kklid_20000-1788274406583788664-2102851769.json` was confirmed to hold the WRONG-frame
+result (17.26% dark-mass on `IMG_3828-3833`, matching the old "17.3%" number) and has been
+deleted so the next baseline audit against this exact PLY recomputes -- but the underlying
+bug remains: two configs against the same baseline PLY with different `shade_frames` would
+still collide on one cache slot. Flagged for the Orchestrator; a one-line fix (fold `frames`
+into `_cache_key`) is needed in a future task with `trippy/eval/audits.py` in scope.
+
+**Re-audit of the three existing exports + baseline, on the correct 93 frames.** Two of the
+three run directories (`kkv2-1-full-masked`, `kkv2-2-full-unmasked`) had their `export.ply`
+already deleted in the 2026-09-08 11:50 disk cleanup; both were reconstructed bit-for-bit
+from their still-present `bundle/points.npz` + `export.ply.provenance.npy` sidecars (same
+values `Trainer.export_ply` itself writes -- `xyz`, post-activation `size()`/`conf()`, and
+`clip(feat[:, :3], 0, 1)` for rgb -- confirmed by reading both write paths, not assumed).
+`kkv2-3-removal/export.ply` and the `kklid_20000.ply` baseline needed no reconstruction.
+
+Script: `output/scratch/shade_audit_rerun/reconstruct_and_audit.py` (not part of the
+package; a one-off repair/re-measurement tool). It could not be run directly: free memory
+was 12-16 GB (`vm_stat`, the same free+inactive+speculative formula `scripts/cpu_heavy.sh`
+uses) against AGENTS.md's `>=28 GB` guard, with `kkv2-5-hybrid` (prio 40, up to a 420-minute
+budget) actively training. Queued instead: `scripts/gpu_submit.sh --prio 15
+shade-audit-rerun -- python .../reconstruct_and_audit.py` -> job `trippy-shade-audit-rerun`
+(`15-trippy-shade-audit-rerun.sh`; done-file `~/Splats/tools/gpu_queue/done/
+trippy-shade-audit-rerun.rc`; log `~/Splats/tools/gpu_queue/logs/trippy-shade-audit-rerun.log`).
+The queue runner itself refused to start it early ("only 16 GB free now; the runner will
+wait for >=28 GB"), confirming the guard is doing its job.
+
+**Numbers**: PENDING -- job queued behind `kkv2-1-combined-parity2` (prio 15) and the
+currently-running `kkv2-5-hybrid` (prio 40, ~55 min into a possible 420). Old (WRONG-frame)
+numbers for reference, all measured on kk-coherent's `IMG_3828-3833`: `kkv2-1-full-masked`
+34.5%, `kkv2-2-full-unmasked` 34.5%, `kkv2-3-removal` 34.9%, `kklid_20000` baseline 17.3%.
+Corrected numbers land in this file (append a follow-up entry) and in `docs/RESULTS.md`
+once `trippy-shade-audit-rerun.rc` exists.
+
+**Verdict**: Fix implemented and tested; re-measurement PENDING (queued, not run --
+AGENTS.md's CPU memory guard, not a code question). `scripts/test.sh`'s Python suite green
+(1223 passed, 10 pre-existing skips, plus this task's new tests); Rust `cargo test` not run
+in this worktree (no `rust/target` yet, <16 GB free, active training -- same guard) and
+deferred to the Orchestrator/main per this task's own brief.
+
+**Artifact**: `output/scratch/shade_audit_rerun/reconstruct_and_audit.py` (reconstruction +
+audit script), `output/scratch/shade_audit_rerun/*.shade_audit.json` (once the job runs).

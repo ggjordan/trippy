@@ -44,10 +44,24 @@ Invariants:
     - Mask polarity is fixed and asserted in `info.json`: `True` = the
       prompted object, `False` = everything else, shape `(H, W)` of the
       photo's OWN pixel size, `dtype=bool`.
-    - `--device mps` is GPU work: only ever inside a `scripts/gpu_submit.sh`
-      job. The default is `cpu` so an accidental direct call cannot touch
-      the GPU. The child never enables an MPS fallback of its own; if an op
-      is missing on MPS the job fails loudly.
+    - `--device mps` used to be GPU-queue-only; `docs/EDITOR.md` §3 also
+      documents Jordan's own INTERACTIVE SAM 3 lift (the viewer's "run SAM
+      lift" button, or a one-off `trippy edits sam` from a terminal), which
+      `AGENTS.md` §6 explicitly allows outside the queue. That interactive
+      path's default is now `mps` (`Sam3Segmenter.device`, the viewer's
+      `SamUi::default()`) -- `docs/EDITOR.md` §3's decision rule was
+      satisfied 2026-09-08: `edit-sam-5` (MPS) rc=0 at 8.05 s/view beat
+      `edit-sam-5-cpu`'s 9.65 s/view. `--device cpu` remains a fully
+      supported fallback everywhere this default applies. The CHILD
+      process's own bare-argparse default (`_child_parser`, used only when
+      this file is run by hand with no `--device` at all, never by
+      `sam3_command`/`run_sam3`/`Sam3Segmenter`, which always pass one
+      explicitly) is deliberately left at `cpu`: that one guards a literal
+      accidental direct invocation of this script, a different concern from
+      "which device the feature defaults to". A batch of automated lifts is
+      still queue-only, same as any other GPU work.
+    - The child never enables an MPS fallback of its own; if an op is
+      missing on MPS the job fails loudly.
     - The child NEVER downloads anything: `build_sam3_image_model` is called
       with `load_from_HF=False` and an explicit local `checkpoint_path`.
 Units: prompt coordinates are pixels of the photo file itself (origin at
@@ -354,13 +368,19 @@ class Sam3Segmenter:
     testable on CPU with a fake (docs/EDITOR.md Sec 3; tests/test_edit_sam.py).
 
     Attributes:
-        device: "cpu" or "mps" (`mps` = GPU work, queue only).
+        device: "cpu" or "mps". Default `"mps"`: this is Jordan's own
+            interactive GPU use (`AGENTS.md` §6 allows that outside the
+            queue), and `docs/EDITOR.md` §3's decision rule is now satisfied
+            -- job `edit-sam-5` (MPS) rc=0 at 8.05 s/view beat
+            `edit-sam-5-cpu`'s 9.65 s/view, 2026-09-08. `"cpu"` remains a
+            fully-supported fallback (`SAM3_DEVICES`), just no longer the
+            default a caller gets by not specifying one.
         work_dir: keep each view's `mask.npy`/`info.json` under this
             directory instead of a temporary one (arrays only, never images).
         options: extra `sam3_command` kwargs (python/repo/weights/...).
     """
 
-    device: str = "cpu"
+    device: str = "mps"
     work_dir: str | Path | None = None
     options: dict[str, Any] = field(default_factory=dict)
 
