@@ -14,6 +14,12 @@ This is the experiment and milestone tracking index for the trippy project. Each
 | EXP-0008-distill | design B (docs/SPEC.md D2) | pipeline built, render+brush-train queued | Pipeline proof against the weak `EXP-0003-kk-trips-train/full1-broadcast` checkpoint (40 epochs, 14.42 dB): `trippy distill` (`trippy/distill/{cameras,colmap_writer,render_set,brush_runner,compare}.py`) built and CPU-tested; Brush `brush-cli` release binary built (`scripts/cpu_heavy.sh`, rc=0, 2m44s); render stage submitted prio 15 (`distill-render-full1-broadcast`); Brush training (prio 70, 6000 iters) to follow, behind the existing prio-70 queue | `experiments/EXP-0008-distill/README.md`; `output/runs/EXP-0008-distill/full1-broadcast/` once the render job returns |
 | EXP-0008-distill | design B (docs/SPEC.md D2) | done | Pipeline proof against the weak `EXP-0003-kk-trips-train/full1-broadcast` checkpoint (40 epochs, 14.42 dB): render rc=0 (3m10s, 422 frames) -> Brush training rc=0 (14m17s, 6000 iters, 5,995,586 final splats) -> audit compare, all in one pipeline, no manual stitching. Shade dark-mass 19.9% (baseline) / 36.2% (TRIPS export) / 37.0% (distilled) -- checkpoint already worse than its own Gaussian baseline before distillation (matches the pre-existing EXP-0003 review-queue finding); distilled PLY carries the same defect through, as expected for a distillation of an already-weak checkpoint. Extent max grew past both other clouds (161.36 vs baseline 133.35). Delivered as an explicit pipeline proof, not a scene-quality candidate | `experiments/EXP-0008-distill/README.md`; `output/runs/EXP-0008-distill/full1-broadcast/brush_out/distilled_6000.ply` (delivered) |
 
+## Upstream tools reviewed
+
+| Review | Date | Verdict | Where |
+|---|---|---|---|
+| SuperSplat Editor 3.0 (PlayCanvas, MIT, WebGPU) | 2026-09-09 | **Adopt, self-hosted on 127.0.0.1** as THE plain-Gaussian editor for the cleaned PLYs; trippy keeps only what SuperSplat cannot do (TRIPS render, per-region splat-vs-TRIPS mix, TRIPS-guided fog deletion, SAM 3 lift, shade finder, honesty views). Privacy: no telemetry, no analytics dependency, no startup network call; the only outbound path is the opt-in Publish button, which cannot authenticate when self-hosted. Hosted `superspl.at/editor` is **not** sanctioned for Jordan's scenes. | `docs/decisions/ADR-0008-supersplat.md` |
+
 ## Parked ideas (never culled for effort)
 
 Ideas that are out of scope for the current milestones but valuable for future work. These are not forgotten; they remain in the backlog unless explicitly closed with a note.
@@ -22,6 +28,7 @@ Ideas that are out of scope for the current milestones but valuable for future w
 - **A2: EWA footprints per level**: Extend trilinear splatting with elliptical weighted average (EWA) footprints. Improves sharpness on high-curvature surfaces.
 - **Low-coverage point spawning**: Detect regions with <0.3 coverage (inferred vs. photographed) and spawn new points from monocular depth to fill holes. Reduces U-Net hallucination.
 - **Distortion refinement**: COLMAP distortion parameters are applied once during dataset loading. Refining them during training (joint pose + distortion optimization) could improve geometry.
+- **Port PlayCanvas's portable GPU radix sort into `trips-web`**: the PlayCanvas engine (MIT, 2.22.0) ships both a OneSweep radix sort and a **portable 4-bit** one, which is why SuperSplat 3.0 renders in Safari 26+. Our own WebGPU sort needs subgroups and therefore cannot run in Safari at all (`docs/QUEST.md`, `docs/WEB_VIEWER.md`). Estimated 3-5 agent-days; parked because Chrome works on Jordan's machine. See `docs/decisions/ADR-0008-supersplat.md` §5 task 10.
 - **Training the U-Net inside Brush (Burn backward)**: v0.4.0 ports the U-Net to Burn (inference only). A future milestone could add full backward passes to Burn, enabling training directly in the Brush viewer app (called "Burn backward" in the backlog).
 
 ## Running log
