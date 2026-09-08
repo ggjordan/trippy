@@ -1802,3 +1802,79 @@ SAM_FAKE_ENV = "TRIPPY_SAM_FAKE"
 # bundles carry (1008 px wide views), and the same number the neighbour-view
 # prompts get, so a fake `--views-around N` run still exercises the vote.
 SAM_FAKE_POINT_RADIUS_PX = 24.0
+
+# --- clean/ : Design B, deleting fog Gaussians from a splat using a trained
+# TRIPS model (docs/SPEC.md D2, trippy.clean's package docstring) ----
+
+# Rows per read/write call when streaming a 3DGS PLY through
+# `trippy.clean.ply_filter`. kklid_20000.ply is 8,910,382 rows x 236 bytes
+# = 2.1 GB, and this machine OOM'd on 2026-09-05 (AGENTS.md Sec 6), so the
+# filter never holds more than this many rows at once: 500k rows is ~118 MB
+# for that file and ~40 read/write round trips over it.
+CLEAN_PLY_CHUNK_ROWS = 500_000
+
+# Largest per-point |init_conf - sigmoid(ply.opacity)| that still counts as
+# "this really is the Gaussian that seeded this point"
+# (`trippy.clean.mapping.recover_mapping`). A correct mapping scores
+# exactly 0 -- `PointParams.init_conf` is a copy of the same float32 the
+# source computed -- so this is not a fitting tolerance; it exists only to
+# absorb the EXPORT_OPACITY_CLAMP_EPS logit/sigmoid round trip a resumed
+# pre-PR#37 checkpoint reconstructs its init_conf through.
+CLEAN_MAPPING_FINGERPRINT_TOL = 1e-6
+
+# `GaussianPointMapping.method` values: the deterministic reconstruction of
+# GaussianPlySource's own opacity filter, and the geometric fallback used
+# when training removed points and the 1:1 correspondence no longer holds.
+CLEAN_MAPPING_METHOD_OPACITY = "opacity-filter"
+CLEAN_MAPPING_METHOD_NEAREST = "nearest-neighbour"
+
+# The three shipped aggressiveness levels (`trippy.clean.select.VARIANTS`).
+# 0.05 is where the confidence histogram of a trained Karekare run has its
+# fog shoulder (12.9% of points on kkv2-1-full-masked at epoch 122, against
+# 0% of the seed cloud -- every seeded point started at or above the
+# source's min_opacity of 0.05); 0.15 roughly doubles the catch and exists
+# so Jordan can see the trade rather than be given one answer.
+CLEAN_VARIANT_SHADE_THRESHOLD = 0.05
+CLEAN_VARIANT_ALL_005_THRESHOLD = 0.05
+CLEAN_VARIANT_ALL_015_THRESHOLD = 0.15
+
+# `trippy.clean.freespace`: a point at or above this confidence counts as
+# "surface TRIPS believes in" when the first-hit depth buffer is built.
+# 0.5 is the midpoint of the sigmoid, and is also TRIPS's own shipped
+# removal_confidence_cutoff (configs/train_normalnet.ini, see
+# trippy.train.prune's module docstring) -- i.e. the value TRIPS's authors
+# picked as the line between a point that is carrying the image and one
+# that is not.
+CLEAN_FREESPACE_SURFACE_CONF = 0.5
+
+# A deletion candidate within this fraction of the frame's own median
+# observed depth `d` of the first-hit surface counts as sitting ON the
+# surface rather than in front of it. 2% of d is a few centimetres at
+# Karekare's scale -- wide enough to absorb the depth-buffer quantisation
+# and the point's own radius, narrow enough that a fog cloud metres in
+# front of the ground never lands in it.
+CLEAN_FREESPACE_SURFACE_TOL_FRAC = 0.02
+
+# Divisor on the image size for that depth buffer. The classification is a
+# population statistic over millions of points, not a render, so a 1/8
+# buffer (126 x 94 on a 1008 x 756 frame) is ample and keeps 93 views of a
+# 7.5M-point cloud inside a couple of minutes of CPU.
+CLEAN_FREESPACE_DEPTH_SCALE = 8
+
+# `trippy.clean.heatmap`: grid resolution per side, the normalisation
+# percentile for both panels, the gap between them, and the minimum number
+# of Gaussians a cell needs before its deleted-FRACTION is drawn at all (a
+# 1-of-1 cell is 100% and means nothing).
+CLEAN_HEATMAP_CELLS = 512
+CLEAN_HEATMAP_PERCENTILE = 99.5
+CLEAN_HEATMAP_GUTTER_PX = 8
+CLEAN_HEATMAP_MIN_CELL_POINTS = 20
+
+# Default key `trippy splat-clean --frames-json` reads when the file holds a
+# dict of named lists. `$TRIPPY_OUTPUT/scratch/shade_frames.json` carries
+# `big_tree` (the measured 93-frame Karekare-v2 region), `kkc` (the six
+# IMG_3828-3833 frames, a DIFFERENT shady place 5.79 world units away --
+# see experiments/EXP-0011-karekare-v2/README.md "The kk-coherent shade
+# frames are a *different* shady place") and `forced`. `big_tree` is the
+# one docs/SPEC.md's stage gate is measured on, so it is the default here.
+CLEAN_DEFAULT_FRAMES_KEY = "big_tree"

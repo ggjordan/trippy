@@ -18,7 +18,7 @@ If all three point sources fail to remove the shade, we write the negative plain
 | # | Decision |
 |---|---|
 | D1 | Targets per brief: Mac viewer, desktop web viewer, Quest measured honestly. No iPhone app. |
-| D2 | Goal: kill the shade cloud. A plain splat that incorporates TRIPS learning (Design B) is a valid fallback path, not the primary deliverable. |
+| D2 | Goal: kill the shade cloud. A plain splat that incorporates TRIPS learning (Design B) is a valid fallback path, not the primary deliverable. **Status 2026-09-08: Design B is BUILT and is now the leading path** — Jordan's 19:10 verdict was that full-scene TRIPS solves the big-tree shade but looks nothing like a photo elsewhere, while the splat "felt like being in the scene", so the splat is the base and TRIPS is the cloud-removal tool (`trippy splat-clean`, docs/USER_GUIDE.md "Cleaning a splat with TRIPS"). |
 | D3 | No separate Stage 0 gate. Forward rasteriser is the first checkpoint of the training port. No author-scene fps report unless free. |
 | D4 | Point sources are pluggable: (1) trained Gaussian centres, (2) monocular depth (DepthPro/MoGe), (3) union, (4) Revisit iPhone LiDAR later. Run 1/2/3 as experiments. Nothing to add to Revisit. |
 | D5 | Governance copied from `~/revisit/AGENTS.md`: Architect+Reviewer+Orchestrator, lower-tier subagents, retry ladder effort↑ → model↑ → both↑ → stop and ask, subagents never commit/push, ADHD output shaping on every reply, STATE.md, ADRs. |
