@@ -3,6 +3,24 @@ All notable changes to trippy. Format: Keep a Changelog. Versions: semver tags `
 
 ## [Unreleased]
 ### Changed
+- **Splat editing moves to a self-hosted SuperSplat Editor 3.0**
+  (`docs/decisions/ADR-0008-supersplat.md`, docs only -- no code yet). PlayCanvas's
+  MIT, WebGPU-rebuilt splat editor is adopted, **cloned at a pinned tag and served
+  on 127.0.0.1**, as the tool Jordan cleans the TRIPS-cleaned PLYs in. trippy stops
+  building plain-Gaussian editing UX (lasso/polygon/flood/eyedropper selection,
+  select-by-value histograms, colour grading, geometry transform gizmos, orient and
+  measure tools, compressed SOG/SPZ export, splat-only camera timelines, splat-only
+  web and VR viewing) and keeps only what SuperSplat cannot do: the TRIPS render,
+  the per-region splat-vs-TRIPS mix, TRIPS-guided fog deletion, the shade-cloud
+  finder, SAM 3 lift, click-to-cluster and the honesty views. **Privacy verdict:
+  safe when self-hosted** -- no analytics or error-reporting dependency in
+  `package.json`, no tracking script in `index.html`, no network call at startup in
+  `index.ts`/`main.ts`, and the only outbound path (`src/publish.ts`) derives its
+  origin from `location.origin` and is fetched on demand from the Publish button,
+  so it cannot authenticate against a local server. The hosted `superspl.at/editor`
+  is **not** sanctioned for Jordan's scenes. The TRIPS fog mask reaches SuperSplat
+  as a second **layer** (a `-fog.ply` beside the `-keep.ply`), which its scene panel
+  already gives show / hide / solo.
 - **The Mac viewer's mouse is Brush's, button for button** (`docs/USER_GUIDE.md`,
   `camera.rs`), on Jordan's request after driving the full Karekare scene:
   **left-drag orbits**, **right-drag is first-person look** with `W A S D Q E`

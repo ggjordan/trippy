@@ -182,6 +182,15 @@ what is still open.
 sections below; this document is the detailed spec the milestones in §6
 implement, in order.
 
+**Scope narrowed 2026-09-09 — see `docs/decisions/ADR-0008-supersplat.md`:**
+plain-Gaussian editing UX (lasso/polygon/flood/eyedropper selection,
+select-by-value histograms, colour grading, geometry transform gizmos, orient
+and measure tools, compressed export formats, splat-only camera timelines and
+web/VR viewing) is **dropped in favour of a self-hosted SuperSplat Editor 3.0**
+on 127.0.0.1. This document keeps everything SuperSplat cannot do: the TRIPS
+render, per-region splat-vs-TRIPS mix, TRIPS-guided fog deletion, the
+shade-cloud finder, SAM 3 lift, click-to-cluster and the honesty views.
+
 Jordan's request (2026-09-07 09:45, `STATE.md`): a per-region/per-object
 splat-vs-TRIPS mix, smart object selection with masks, the Karekare pool
 "lid" as an edit, a tool that finds and lets him deal with floating shade
