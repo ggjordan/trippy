@@ -2803,3 +2803,4 @@ per AGENTS.md Sec 6): `$TRIPPY_OUTPUT/fixtures/synthetic-splat-privacy/` (the sy
 bundle), `/tmp/ss_privacy_probe.py` (the CDP driver, stdlib only), net-logs were written to
 `/tmp` and deleted after this entry was written (nothing in them but Chrome's own platform
 traffic and the eight 127.0.0.1 URLs quoted above).
+- 2026-09-09T01:17:20Z submitted job trippy-kkv2-5b-hybrid-resume prio 45: bash -c PYTHONPATH=. TRIPPY_OUTPUT=/Users/nzbirdranch/trippy/output /Users/nzbirdranch/trippy/.venv/bin/python -m trippy.cli train --config experiments/EXP-0011-karekare-v2/config_hybrid.yaml --resume /Users/nzbirdranch/trippy/output/runs/EXP-0011-karekare-v2/kkv2-5-hybrid/checkpoints/checkpoint_latest.pt --device mps --max-minutes 420 --report

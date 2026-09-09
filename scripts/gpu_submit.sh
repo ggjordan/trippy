@@ -1,8 +1,9 @@
 #!/bin/bash
 # gpu_submit.sh — submit a self-contained job to Splats' GPU queue.
 # Usage: scripts/gpu_submit.sh [--prio N | --train] [--wait] [--dry-run] <name> -- <command...>
-#   Default prio 15 (trippy short jobs live at 10-19). --train sets prio 70 (behind Splats' 60).
-#   Trainings from 2026-09-07: --prio 40 (target scene), 45 (hybrids), 50 (other trippy runs).
+#   From 2026-09-09 (Jordan): Splats' Hunua runs sit at prio 30 and trippy must NEVER jump them.
+#   Every trippy job lives in 40-60: short checks 40 (default), target-scene trainings 45,
+#   hybrids 50, other trippy trainings 55. --train sets 45.
 #   --wait  block until done and print the log (execs scripts/gpu_wait.sh).
 #   --dry-run  write and print the job file only; skip all queue/runner/memory checks and never
 #              calls Splats' submit.sh or writes to research/trips-metal.md.
@@ -34,7 +35,7 @@ NAME=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --prio) PRIO=${2:-}; shift 2 ;;
-    --train) PRIO=70; shift ;;
+    --train) PRIO=45; shift ;;
     --wait) WAIT=1; shift ;;
     --dry-run) DRYRUN=1; shift ;;
     --) shift; break ;;
@@ -55,11 +56,9 @@ esac
 # manages the queue, so trainings use 40 (target-scene runs), 45 (hybrids) and 50 (other).
 # 70 is kept because every job queued before that change sits there and must stay valid.
 PRIO_OK=0
-if [ "$PRIO" -ge 10 ] && [ "$PRIO" -le 19 ]; then PRIO_OK=1; fi
-if [ "$PRIO" -ge 40 ] && [ "$PRIO" -le 59 ]; then PRIO_OK=1; fi
-if [ "$PRIO" -eq 70 ]; then PRIO_OK=1; fi
+if [ "$PRIO" -ge 40 ] && [ "$PRIO" -le 60 ]; then PRIO_OK=1; fi
 if [ "$PRIO_OK" -ne 1 ]; then
-  echo "✗ prio must be 10-19 (trippy short jobs), 40-59 (trainings: 40 target scene," >&2
+  echo "✗ prio must be 40-60 (Jordan 2026-09-09: Splats runs at 30 and trippy never jumps it; 40 short checks, 45 target scene, 50 hybrids, 55 other)" >&2
   echo "  45 hybrids, 50 other) or 70 (pre-2026-09-07 trainings, behind Splats' 60)." >&2
   echo "  Jordan can override this by editing the scripts/gpu_submit.sh call." >&2
   exit 2
