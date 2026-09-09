@@ -417,3 +417,8 @@ useful "what do I click" reference for a first session.
   task 10 addresses.
 - `STATE.md` 2026-09-08 entries — the verdicts ("splat is the base", "too
   complex") that make this decision the right one now and not a week ago.
+
+
+## Decision record 2026-09-09
+
+Jordan picked **self-host now, fork later**. A fork of SuperSplat with TRIPS added is permitted by MIT (keep the PlayCanvas copyright notice) and is estimated at 3-5 agent-weeks: embed the trips-web WebGPU/wasm renderer as a render pass and port the fog-mask, shade-finder and per-region mix panels. It starts only if the two-app workflow (trippy exports keep/fog layers, SuperSplat edits) proves annoying in use. Stage 3 (SOG + WebXR viewer for the Quest) proceeds now.

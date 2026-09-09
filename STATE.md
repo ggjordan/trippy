@@ -3,6 +3,7 @@
 Last updated: 2026-09-09 (feat/supersplat-selfhost session; previous: fix/report-shade-frames)
 
 ## Done
+- 2026-09-09 13:50 (Jordan): editor direction = self-host SuperSplat now, fork later only if the two-app workflow annoys. Stage 3 (SOG + self-hosted WebXR viewer for the Quest) started. Fork estimate recorded in ADR-0008 (3-5 agent-weeks; MIT permits it).
 - 2026-09-09 13:20 (Jordan): Splats Hunua at prio 30; trippy stays in 40-60 (short 40, kkv2 45, hybrids 50, other 55). Queue files renamed; gpu_submit bands updated. kkv2-5-hybrid was killed at ep 60 (Killed: 9, 10:23) -> resubmitted as kkv2-5b-hybrid-resume (45). shade-audit-rerun failed (pointed at a removed worktree) -> rerun2 at 40 from main. combined parity rc=5 (out-dir inside repo) -> resubmitted with an outside dir. SuperSplat Stage 1 merged (build-0132): supersplat.command launcher + keep/fog layer PLYs in 2-open-in-brush.
 - 2026-09-09 (feat/supersplat-selfhost, worktree `.worktrees/supersplat-selfhost`):
   **ADR-0008-supersplat.md Stage 1 implemented and delivered** -- SuperSplat 3.0 is now a
