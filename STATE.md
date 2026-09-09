@@ -1,8 +1,44 @@
 # STATE — externalized progress (update at end of every session)
 
-Last updated: 2026-09-09 (feat/supersplat-selfhost session; previous: fix/report-shade-frames)
+Last updated: 2026-09-10 (feat/supersplat-quest session; previous: feat/supersplat-selfhost)
 
 ## Done
+- 2026-09-10 (feat/supersplat-quest, worktree `.worktrees/supersplat-quest`):
+  **ADR-0008 Stage 3 tooling built and tested: SOG export + a self-hosted WebXR viewer for
+  the Quest.** `scripts/sog_export.sh` (PLY -> `.sog` + `.compressed.ply`, round-trip
+  Gaussian-count verified, `@playcanvas/splat-transform@3.3.3` pinned local install) and
+  `scripts/quest_viewer_bootstrap.sh` (`.sog` -> a self-hosted static viewer bundle via
+  splat-transform's own `.html --unbundled` output, which calls `@playcanvas/supersplat-
+  viewer`'s `renderViewerHtml` directly -- confirmed by reading splat-transform 3.3.3's
+  `package.json`, so no second clone-and-build pipeline was needed for the two literal
+  options the ADR named). `scripts/open_quest_viewer.sh` writes a `127.0.0.1` Mac-preview
+  launcher and an `_ON_QUEST` launcher (self-signed HTTPS on the LAN, required because
+  WebXR needs a secure context a bare LAN IP doesn't get, and the URL always carries
+  `?webgl` because the viewer's VR button only appears under the WebGL renderer). Both
+  launchers can be generated wired to a not-yet-built bundle path and refuse to open
+  ("Not ready yet") until the SOG is actually there -- verified for real against the two
+  launchers below, right now, before their jobs land. 24 new tests (`tests/test_sog_export_
+  script.py`, `tests/test_quest_viewer_bootstrap_script.py`,
+  `tests/test_open_quest_viewer_script.py`), `ruff check` clean.
+  **Found live and fixed**: a direct CPU-only conversion (`-g cpu`) on the real
+  8.5M-point `kklid-tripsclean-shade-keep.ply` hung 14 hours with no progress (scratch
+  `.tmp` static at 78 MB) -- killed, and both scripts gained a `--gpu n|cpu` passthrough
+  (default `cpu`, safe for direct use; `--gpu 0` = native WebGPU/Dawn, only from inside a
+  GPU-queue slot) so the conversions could move to `scripts/gpu_submit.sh --prio 40`
+  instead. **REVIEW QUEUE for Jordan (works right now, refuses cleanly until the jobs
+  below land): `4-other/quest-viewer-shade-keep-preview.command` /
+  `-quest.command`, `4-other/quest-viewer-kklid20000-preview.command` / `-quest.command`.**
+  **PENDING**: GPU-queue jobs `trippy-quest-sog-shade-keep` and `trippy-quest-sog-
+  kklid20000` (prio 40) are queued behind a running training (`kkv2-5b-hybrid-resume`)
+  with free memory near zero at submit time; once their `.rc` files show `0`, fill in
+  `docs/QUEST.md`'s "the two real conversions" section with real sizes/round-trip counts.
+  **This worktree (`.worktrees/supersplat-quest`) must stay until both jobs finish**
+  (their job files `cd` into it). Full narrative in `research/trips-metal.md`'s
+  2026-09-10 entry. `scripts/build.sh`'s Rust half and the full pytest suite were NOT
+  run this session (near-zero free memory with a live training running -- only
+  `compileall`/`ruff`/`import trippy` and the three new test files, all green, plus the
+  pre-existing 24 tests specific to this change); a full `scripts/test.sh` should be run
+  once memory frees up, before merge.
 - 2026-09-09 13:20 (Jordan): Splats Hunua at prio 30; trippy stays in 40-60 (short 40, kkv2 45, hybrids 50, other 55). Queue files renamed; gpu_submit bands updated. kkv2-5-hybrid was killed at ep 60 (Killed: 9, 10:23) -> resubmitted as kkv2-5b-hybrid-resume (45). shade-audit-rerun failed (pointed at a removed worktree) -> rerun2 at 40 from main. combined parity rc=5 (out-dir inside repo) -> resubmitted with an outside dir. SuperSplat Stage 1 merged (build-0132): supersplat.command launcher + keep/fog layer PLYs in 2-open-in-brush.
 - 2026-09-09 (feat/supersplat-selfhost, worktree `.worktrees/supersplat-selfhost`):
   **ADR-0008-supersplat.md Stage 1 implemented and delivered** -- SuperSplat 3.0 is now a
@@ -149,6 +185,15 @@ Last updated: 2026-09-08 (feat/splat-clean session; previous: fix/editor-followu
 - Jordan set the goal (2026-09-05 ~22:50): finish all stages autonomously; anything needing Jordan goes in the review queue below.
 
 ## In flight
+- **ADR-0008 Stage 3 real conversion (2026-09-10, `.worktrees/supersplat-quest`)**: GPU-queue
+  jobs `trippy-quest-sog-shade-keep` and `trippy-quest-sog-kklid20000` (prio 40) convert
+  Jordan's two splats to SOG + build the Quest viewer bundle; queued behind
+  `kkv2-5b-hybrid-resume` with free memory near zero at submit time. **This worktree must
+  stay until both `~/Splats/tools/gpu_queue/done/trippy-quest-sog-{shade-keep,kklid20000}.rc`
+  appear** (their job files `cd` into it). Once done, update `docs/QUEST.md`'s "the two real
+  conversions" section with sizes/round-trip counts, then run the full `scripts/test.sh`
+  (deferred this session for memory reasons) before merge. Four launchers are already
+  delivered and safe to leave in the review queue meanwhile (they refuse to open until ready).
 - **perf/train-step (2026-09-09, `.worktrees/train-perf`): a Karekare-v2 step is 129 ms, and
   2x at exact parity is not available on it.** MEASURED (jobs `trippy-train-perf-baseline`,
   `-gputests`, `-sweep`, all rc 0). Steady-state step **129.2 ms = 1.43 min/epoch**; the split is
@@ -228,6 +273,12 @@ Last updated: 2026-09-08 (feat/splat-clean session; previous: fix/editor-followu
 - None.
 
 ## Open questions for Jordan (review queue; nothing blocks on these)
+- **NOT READY YET (2026-09-10): Quest viewer launchers, `4-other/quest-viewer-*.command`.**
+  Four launchers (shade-keep and kklid_20000, each preview + on-quest) are delivered and
+  will refuse to open with a plain message until their GPU-queue conversion jobs finish
+  (see "In flight" above). Nothing to do yet -- they'll work once the jobs land; this row
+  can come off the list once `docs/QUEST.md` has real numbers and Jordan has tried the
+  headset.
 - **REVIEW FIRST (2026-09-08 21:10): the three TRIPS-cleaned splats.** `2-open-in-brush/kklid-tripsclean-shade.ply` (least aggressive), `-005`, `-015`. These are YOUR splat with fog subtracted, not a TRIPS render -- everything that survives is bit-identical to `kklid_20000`. Question for you: is the canopy shade cloud gone, and did anything you wanted disappear with it? The measurable risk is thin/background coverage: 1.07% / 4.49% / 10.74% of covered pixels in the 93 shade views lose their last point.
 - **Decision needed: is `depthprior_shade_audit.py`'s `--frames` default wrong everywhere?** `trippy.render.report` never passes `--frames`, so every kkv2 run report measured the six kk-coherent frames instead of the measured 93-frame big-tree list, despite `experiments/EXP-0011-karekare-v2/README.md` requiring the latter for the SPEC stage gate. Fixing it re-bases the whole leaderboard column (untouched splat 17.3% -> 26.71%). Not fixed in `feat/splat-clean` -- out of that branch's file list.
 - **A second, independent reading of the exposure effect (2026-09-06).** `IMG_3830` is a held-out shade frame whose EXIF was valid, so none of the exposure fixes touched it -- and its viewer render still goes **12.30 -> 15.46 dB** when tone mapped with the scene median instead of its own never-trained EV. That is the same conclusion `eval-calib-1` reached by fitting the exposure per image (shade 8.49 -> 15.32 dB), reached instead from a screenshot. Two methods, one answer: a held-out frame's exposure is never brought to the scale the U-Net learned on the training frames.

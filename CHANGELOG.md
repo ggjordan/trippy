@@ -3,6 +3,30 @@ All notable changes to trippy. Format: Keep a Changelog. Versions: semver tags `
 
 ## [Unreleased]
 ### Added
+- **ADR-0008 Stage 3 tooling: SOG export + a self-hosted WebXR viewer for the Quest.**
+  `scripts/sog_export.sh` compresses a Gaussian-splat PLY to `.sog` (+ a `.compressed.ply`
+  second artefact) via a locally-installed, pinned `@playcanvas/splat-transform@3.3.3`
+  (`$TRIPPY_OUTPUT/tools/splat-transform`, gitignored, never global), verifying the SOG
+  round-trips by converting it back to a scratch PLY and comparing `numGaussians` across
+  every stage. `scripts/quest_viewer_bootstrap.sh` builds a self-contained static viewer
+  bundle from that `.sog` using splat-transform's own `.html --unbundled` output (generated,
+  at splat-transform's build time, by calling `@playcanvas/supersplat-viewer`'s
+  `renderViewerHtml` directly -- one pinned tool instead of a second clone-and-build
+  pipeline). `scripts/open_quest_viewer.sh` writes two double-click launchers per bundle: a
+  `127.0.0.1`-only Mac preview, and an `_ON_QUEST` launcher serving HTTPS (self-signed
+  certificate, generated and cached on the fly, regenerated only when the Mac's LAN IP
+  changes) on the LAN with the printed URL including `?webgl` -- required because the
+  built-in viewer defaults to WebGPU and only shows its VR entry button under WebGL, and
+  because WebXR itself needs a secure context that a bare LAN IP does not get for free.
+  Both launchers can be generated before the bundle exists (wired to a path a queued
+  `scripts/gpu_submit.sh` job will populate) and refuse to open with a plain "Not ready
+  yet" message until the SOG and `index.html` are actually there. 24 new tests (bash `-n`
+  syntax, guard clauses, `--check` toolchain-only modes, and for `open_quest_viewer.sh`
+  real functional round trips: an actual `http.server` and an actual self-signed-HTTPS
+  server, both started, fetched from and torn down inside the test). **Real conversion
+  for Jordan's two splats is queued, not yet landed** (a CPU-only first attempt hung 14h
+  and was killed; GPU-queue jobs `trippy-quest-sog-shade-keep` / `trippy-quest-sog-kklid20000`
+  replaced it) -- see `docs/QUEST.md` and `research/trips-metal.md`'s 2026-09-10 entry.
 - **ADR-0008 Stage 1 implemented: self-hosted SuperSplat is real, not just decided.**
   `scripts/supersplat_bootstrap.sh` clones `playcanvas/supersplat` at the pinned
   `SUPERSPLAT_PIN="v3.0.0"` into `$TRIPPY_OUTPUT/tools/supersplat` (gitignored, never

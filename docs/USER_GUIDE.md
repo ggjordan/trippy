@@ -847,6 +847,15 @@ the exact request list. (Chrome itself makes its own background requests to Goog
 same as it would for any website you open — that's the browser, not SuperSplat, and
 none of it carries your scene's data.)
 
+## Viewing a cleaned splat on the Quest headset
+
+For putting a cleaned (or untouched) splat on the Quest in VR, see **`docs/QUEST.md`**, section
+"Stage 3: SOG export + self-hosted WebXR viewer". Short version: two double-click launchers land
+in `~/Splats/output/Jordan-Review/4-other/` per splat — one for a quick Mac-browser preview, and
+one (`..._ON_QUEST.command`) that serves the splat over HTTPS on your home Wi-Fi for the Quest
+browser to open. The HTTPS is required (WebXR needs it off `localhost`); the launcher explains the
+one-time certificate warning to accept on the headset.
+
 ## How to ask for a release
 
 When a milestone is ready to ship (e.g., v0.1.0 complete), ask:
