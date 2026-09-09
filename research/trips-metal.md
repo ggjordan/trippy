@@ -2815,3 +2815,53 @@ traffic and the eight 127.0.0.1 URLs quoted above).
 - shade-audit-rerun2 rc=1: karekare-v2 has no sparse_txt (its COLMAP models are binary under scenes/karekare/karekare-v2/sparse/<n>/), so every kkv2 report's audit silently used the DEFAULT scene (kk-coherent sparse_txt) as well as the default frames. Corrected numbers still pending; fix in flight (convert the trained model to text under TRIPPY_OUTPUT, point the report at it).
 - Splats' Hunua batch drained overnight; kkv2-5b-hybrid-resume started 04:16 at prio 45.
 - SOG export of kklid-tripsclean-shade-keep on CPU: 14 h and still writing (tmp file static at 78 MB) -> switching the conversion to a GPU queue job at prio 40.
+- 2026-09-09T16:27:23Z submitted job trippy-quest-sog-shade-keep prio 40: bash -c set -eu; cd "$TRIPPY_ROOT" && scripts/sog_export.sh --gpu 0 --name kklid-tripsclean-shade-keep "/Users/nzbirdranch/Splats/output/Jordan-Review/2-open-in-brush/kklid-tripsclean-shade-keep.ply" && scripts/quest_viewer_bootstrap.sh --gpu 0 "$TRIPPY_OUTPUT/sog/kklid-tripsclean-shade-keep/kklid-tripsclean-shade-keep.sog" kklid-tripsclean-shade-keep
+- 2026-09-09T16:27:29Z submitted job trippy-quest-sog-kklid20000 prio 40: bash -c set -eu; cd "$TRIPPY_ROOT" && scripts/sog_export.sh --gpu 0 --name kklid_20000 "/Users/nzbirdranch/Splats/output/Training-Data/karekare/karekare-lid/kklid_20000.ply" && scripts/quest_viewer_bootstrap.sh --gpu 0 "$TRIPPY_OUTPUT/sog/kklid_20000/kklid_20000.sog" kklid_20000
+- 2026-09-09T16:30:30Z delivered quest-viewer-shade-keep-preview: Mac preview (127.0.0.1) of the TRIPS-cleaned (shade-keep) splat viewer, compressed to SOG (/Users/nzbirdranch/trippy/output/deliver/quest-viewer-kklid-tripsclean-shade-keep/OPEN_KKLID_TRIPSCLEAN_SHADE_KEEP.command)
+- 2026-09-09T16:30:30Z delivered quest-viewer-shade-keep-quest: Self-hosted WebXR viewer for the Quest (LAN + HTTPS, this network only) -- TRIPS-cleaned shade-keep splat (/Users/nzbirdranch/trippy/output/deliver/quest-viewer-kklid-tripsclean-shade-keep/OPEN_KKLID_TRIPSCLEAN_SHADE_KEEP_ON_QUEST.command)
+- 2026-09-09T16:30:37Z delivered quest-viewer-kklid20000-preview: Mac preview (127.0.0.1) of the untouched kklid_20000 splat viewer, compressed to SOG (comparison baseline) (/Users/nzbirdranch/trippy/output/deliver/quest-viewer-kklid_20000/OPEN_KKLID_20000.command)
+- 2026-09-09T16:30:37Z delivered quest-viewer-kklid20000-quest: Self-hosted WebXR viewer for the Quest (LAN + HTTPS, this network only) -- untouched kklid_20000 splat, for comparison (/Users/nzbirdranch/trippy/output/deliver/quest-viewer-kklid_20000/OPEN_KKLID_20000_ON_QUEST.command)
+- 2026-09-10 ADR-0008 Stage 3 (SOG export + Quest viewer): tooling built and tested, real
+  conversion queued but not landed by end of session. **What ran**: `scripts/sog_export.sh`
+  and `scripts/quest_viewer_bootstrap.sh` both verified end to end on a synthetic 500-point
+  PLY (`trippy.train.export.write_gaussian_ply`) with `@playcanvas/splat-transform@3.3.3`
+  (pinned, matches SuperSplat 3.0.0's own devDependency): PLY -> .sog -> .compressed.ply ->
+  round-trip PLY, `numGaussians` 500 at every stage, both with `-g cpu` and `-g 0` (native
+  WebGPU/Dawn, `--list-gpus` enumerates "Apple M3 Ultra" without approving the tool's blocked
+  npm postinstall script). `scripts/open_quest_viewer.sh` verified with real running servers
+  in pytest: a plain `http.server` on 127.0.0.1 and a self-signed-HTTPS server (openssl-
+  generated cert, cached, regenerated only on LAN-IP change), both fetched from and torn down
+  (an `exec` fix was needed in the generated launcher -- without it, `bash -c` wrapping the
+  python server left an orphaned process on SIGTERM, which leaked a listening socket across
+  test runs on the deterministic hashed port until found and fixed).
+  **What broke and was fixed live**: the first real attempt, direct CPU-only
+  (`sog_export.sh` with `-g cpu`, no queue) on `kklid-tripsclean-shade-keep.ply`
+  (2,016,542,793 bytes, 8,544,666 Gaussians, read from
+  `~/Splats/output/Jordan-Review/2-open-in-brush/`), ran **14 hours with its scratch
+  `.tmp` file static at 78 MB** -- no progress, presumably a hang in splat-transform's
+  pure-JS SH-compression path at this point count/SH-degree combination on CPU only.
+  Killed (pid 78171), `.tmp` removed. Root cause not chased further: Splats' Hunua batch
+  had drained by then, so the fix was to move both conversions onto the now-idle GPU
+  queue with `--gpu 0` instead of diagnosing the CPU hang. `sog_export.sh` and
+  `quest_viewer_bootstrap.sh` gained a `--gpu n|cpu` passthrough flag (default `cpu`,
+  safe for direct/interactive use; `--gpu 0` only ever passed from inside a
+  `scripts/gpu_submit.sh` slot) to make this possible without a code fork.
+  **Resubmitted** via `scripts/gpu_submit.sh --prio 40` (the 40-60 short-checks/target-
+  scene band; see submission log lines above this entry for the exact `bash -c` job
+  commands) as `trippy-quest-sog-shade-keep` and `trippy-quest-sog-kklid20000`, each
+  chaining `sog_export.sh --gpu 0` then `quest_viewer_bootstrap.sh --gpu 0` in one job.
+  **Four launchers were generated and delivered BEFORE either job finished**, wired to
+  the exact paths the jobs will populate (`open_quest_viewer.sh` gained the ability to
+  generate against a not-yet-existing bundle directory; each generated `.command` checks
+  for `index.html` + `index.sog`/`index.compressed.ply` at run time and refuses with
+  "Not ready yet" -- verified for real: `echo "" | bash OPEN_..._preview.command` prints
+  exactly that and exits 1, right now, before the jobs land).
+  **Verdict**: tooling PASS (24 new tests green, `ruff check` clean, ported to the GPU
+  path after a real CPU-path failure found live). Real numbers PENDING: both jobs are
+  queued behind a running training (`kkv2-5b-hybrid-resume`, up to 420 min budget) with
+  free memory near zero at submit time (95G used / <100M unused observed twice). Once
+  `~/Splats/tools/gpu_queue/done/trippy-quest-sog-{shade-keep,kklid20000}.rc` show `0`,
+  fill in `docs/QUEST.md`'s "The two real conversions" section with `.sog`/`.compressed.ply`
+  sizes and round-trip counts for both splats. Artifacts: the four launchers above (already
+  delivered); `.worktrees/supersplat-quest` must stay until both jobs finish (their job
+  files `cd` into it).

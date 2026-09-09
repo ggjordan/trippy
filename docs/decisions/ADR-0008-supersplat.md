@@ -1,7 +1,8 @@
 # ADR-0008: SuperSplat Editor 3.0 — self-host it as the splat editor, keep trippy's editor for what only trippy can do
 
 Date: 2026-09-09 · Status: Accepted; **Stage 1 done 2026-09-09** (self-host SuperSplat,
-two-layer export, privacy proof); Stage 2 deferred per plan; Stage 3 next (see `docs/QUEST.md`).
+two-layer export, privacy proof); Stage 2 deferred per plan; **Stage 3 tooling built
+2026-09-10, real conversion queued** (see `docs/QUEST.md`).
 
 ## Context
 
@@ -360,20 +361,47 @@ useful "what do I click" reference for a first session.
 
 ### Stage 3 — delivery and Quest (target: 2 agent-days)
 
-8. **SOG export without the browser** (1 d). Use `@playcanvas/splat-transform`
-   as a local CLI (`npx @playcanvas/splat-transform in.ply out.sog`) from
-   `scripts/`, pinned to the same version SuperSplat 3.0.0 uses (**3.3.3**),
-   installed into a gitignored local `node_modules` — never a global install
+**Tooling built 2026-09-10; real conversion queued, not yet landed.** Both items below are
+implemented as scripts with tests; the actual SOG/bundle for Jordan's two splats is running
+through `scripts/gpu_submit.sh` (see `docs/QUEST.md`'s "The two real conversions" for job
+names, sizes and the CPU-hang-then-GPU-requeue story).
+
+8. **SOG export without the browser** (1 d). **Done.** `scripts/sog_export.sh` calls
+   the locally-installed `@playcanvas/splat-transform` CLI, pinned to the same
+   version SuperSplat 3.0.0 uses (**3.3.3**, confirmed by reading its
+   `package.json`), installed into a gitignored local `node_modules` under
+   `$TRIPPY_OUTPUT/tools/splat-transform` — never a global install
    (`AGENTS.md` §6's "no installing outside ./.venv" has the same spirit here).
-   Verify the SOG round-trips by loading it back in the self-hosted editor.
-   Confirm its licence at pin time (§3).
-9. **Self-hosted viewer package for the Quest** (1 d). Export the ZIP viewer
-   package from the self-hosted editor (or build `@playcanvas/supersplat-viewer`
-   directly), serve it via a `deliver.sh`-generated `OPEN_*.command` on
-   127.0.0.1, and have Jordan open it on the Quest browser over the LAN. This is
-   the concrete answer `docs/QUEST.md`'s "what ships to the Quest instead"
-   section was pointing at; update that document with the measured result.
-   **Privacy note:** LAN-only, our own machine serving; nothing leaves the house.
+   Verifies the SOG round-trips (converts it back to a scratch PLY and compares
+   `numGaussians` across input / `.sog` / `.compressed.ply` / round-trip) rather
+   than trusting a zero exit code. Licence confirmed MIT at pin time (§3).
+   **Deviation, recorded**: a direct CPU-only run (`-g cpu`) on the real
+   8.5M-point shade-keep PLY hung for 14 hours with no progress (its scratch
+   `.tmp` file static at 78 MB) and was killed; `--gpu n` (native WebGPU/Dawn,
+   confirmed usable without approving the tool's blocked npm postinstall
+   script) is the working path, run only from inside a `scripts/gpu_submit.sh`
+   queue slot, never against the GPU directly.
+9. **Self-hosted viewer package for the Quest** (1 d). **Done** as
+   `scripts/quest_viewer_bootstrap.sh` + `scripts/open_quest_viewer.sh`.
+   **Deviation, recorded**: rather than separately cloning and building
+   `@playcanvas/supersplat-viewer` (this task's two literal options), the
+   bundle is built via splat-transform's own `.html --unbundled` output, which
+   is generated at splat-transform's build time by calling that exact npm
+   package's `renderViewerHtml` (confirmed: splat-transform 3.3.3's
+   `package.json` devDependency-pins `"@playcanvas/supersplat-viewer":
+   "1.30.2"`). One pinned tool, one install, no second build pipeline — both
+   packages are MIT either way. Two launchers per bundle
+   (`open_quest_viewer.sh`'s own header documents the split): a `127.0.0.1`
+   Mac preview, and an `_ON_QUEST` launcher serving **HTTPS with a locally
+   generated self-signed certificate on the LAN** — not plain http as this
+   item's text originally said, because the WebXR Device API is only exposed
+   in a secure context per spec, and a LAN IP (unlike `127.0.0.1`) does not
+   qualify; plain http would load the viewer with no way to enter VR at all.
+   Both launchers can be generated before the bundle exists, wired to the path
+   a queued conversion job will populate, and refuse to open with a plain
+   "Not ready yet" message until it does. **Privacy note:** LAN-only, self-
+   signed, this machine serving; nothing leaves the house. Update
+   `docs/QUEST.md` with the measured sizes/counts once the queued jobs land.
 
 ### Parked, never culled (`AGENTS.md` §7)
 
