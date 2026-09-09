@@ -1,6 +1,7 @@
 # ADR-0008: SuperSplat Editor 3.0 — self-host it as the splat editor, keep trippy's editor for what only trippy can do
 
-Date: 2026-09-09 · Status: Accepted (decision); implementation not started
+Date: 2026-09-09 · Status: Accepted; **Stage 1 done 2026-09-09** (self-host SuperSplat,
+two-layer export, privacy proof); Stage 2 deferred per plan; Stage 3 next (see `docs/QUEST.md`).
 
 ## Context
 
@@ -288,6 +289,20 @@ region model — those are the TRIPS edit layer, and SuperSplat has no equivalen
 ## 5. Task list for the chosen option
 
 ### Stage 1 — self-host (target: 2 agent-days, no GPU queue, no network at run time)
+
+**Done 2026-09-09**, all five items below. Pinned tag: `v3.0.0` (verified against
+`git ls-remote --tags` at implementation time — matches the tag this ADR's audit read).
+Delivered: `OPEN_SUPERSPLAT.command`, four layer PLYs (`kklid-tripsclean-{shade,005}-{keep,fog}`,
+counts matching the existing `splat-clean` variants exactly: shade 365,716 / 8,910,382 fog,
+005 972,630 / 8,910,382 fog). Privacy proof: PASS, zero non-127.0.0.1 hosts from SuperSplat's
+own code (`research/trips-metal.md` 2026-09-09 entry has the full request list and the
+`about:blank` control that isolates Chrome's own background traffic from SuperSplat's).
+Docs landed as "Editing the cleaned splat in SuperSplat" in `docs/USER_GUIDE.md` (named to
+sit next to, not collide with, the existing "Cleaning a splat with TRIPS" section) —
+covers the four selection tools and the opacity histogram range-select rather than the
+`N`/`M` shortcut pair item 5 originally named, since those two toggle depth/footprint testing
+during a selection rather than being tools in their own right; the four-tool table is the more
+useful "what do I click" reference for a first session.
 
 1. **`scripts/supersplat_bootstrap.sh`** (0.5 d). Idempotent, Bash 3.2 safe,
    `set -u` clean. Clones `https://github.com/playcanvas/supersplat` into

@@ -2732,3 +2732,74 @@ deferred to the Orchestrator/main per this task's own brief.
 
 **Artifact**: `output/scratch/shade_audit_rerun/reconstruct_and_audit.py` (reconstruction +
 audit script), `output/scratch/shade_audit_rerun/*.shade_audit.json` (once the job runs).
+- 2026-09-08T21:30:32Z delivered kklid-tripsclean-shade-keep: SuperSplat layer 1/2 (shade variant): survivors after deleting the least-believed points inside the measured shade volume only -- open together with -shade-fog in SuperSplat (/Users/nzbirdranch/trippy/output/clean/kklid-tripsclean-layers/kklid-tripsclean-shade-keep.ply)
+- 2026-09-08T21:30:32Z delivered kklid-tripsclean-shade-fog: SuperSplat layer 2/2 (shade variant): the 365,716 Gaussians (4.10%) TRIPS stopped believing in, inside the shade volume only -- solo this layer to inspect the fog mask (/Users/nzbirdranch/trippy/output/clean/kklid-tripsclean-layers/kklid-tripsclean-shade-fog.ply)
+- 2026-09-08T21:30:32Z delivered kklid-tripsclean-005-keep: SuperSplat layer 1/2 (005 variant): survivors after deleting the least-believed points scene-wide -- open together with -005-fog in SuperSplat (/Users/nzbirdranch/trippy/output/clean/kklid-tripsclean-layers/kklid-tripsclean-005-keep.ply)
+- 2026-09-08T21:30:32Z delivered kklid-tripsclean-005-fog: SuperSplat layer 2/2 (005 variant): the 972,630 Gaussians (10.92%) TRIPS stopped believing in, scene-wide -- solo this layer to inspect the fog mask (/Users/nzbirdranch/trippy/output/clean/kklid-tripsclean-layers/kklid-tripsclean-005-fog.ply)
+- 2026-09-08T21:30:39Z delivered supersplat: Self-hosted SuperSplat 3.0 splat editor (127.0.0.1 only) -- drag in a -keep/-fog layer pair, never click Publish (/Users/nzbirdranch/trippy/output/deliver/supersplat/OPEN_SUPERSPLAT.command)
+
+## 2026-09-09: ADR-0008-supersplat.md Stage 1 -- self-host SuperSplat, two-layer export, privacy proof
+
+**Question**: does self-hosting SuperSplat 3.0 on 127.0.0.1 (per ADR-0008 Sec 3's source-code
+audit) actually contact anything off this machine when you load a scene, edit it, and export
+it -- the "airplane-mode test" and "DevTools Network-tab test" the ADR asked for, run for real
+instead of just analytically.
+
+**Setup**: `scripts/supersplat_bootstrap.sh` clones `playcanvas/supersplat` (pinned
+`SUPERSPLAT_PIN="v3.0.0"`, verified via `git ls-remote --tags`) into
+`$TRIPPY_OUTPUT/tools/supersplat` (outside the repo, gitignored via the existing `output/`
+rule), runs `npm ci && npm run build` (10.3 s), and is idempotent (second run: "dist/ and
+node_modules/ already present -- skipping npm ci/build", exit 0). `scripts/open_supersplat.sh`
+generates `OPEN_SUPERSPLAT.command` (fixed port 8877, `python3 -m http.server --bind
+127.0.0.1`, the File > Publish warning in its header). Both scripts are Bash 3.2 / `set -u`
+safe (no arrays, quoted expansions).
+
+**Privacy proof, run for real**: a SYNTHETIC ply only (`tools/make_synthetic_splat_bundle.py
+--out $TRIPPY_OUTPUT/fixtures/synthetic-splat-privacy`, 4000 generated Gaussians, no Karekare
+data anywhere near this). Chrome headless (152.0.7977.83, `--headless=new`, own
+`--user-data-dir`, `--enable-unsafe-webgpu` -- WebGPU needs real GPU access, so plain
+`--disable-gpu` breaks SuperSplat's boot entirely: `window.scene` stays undefined) with
+`--log-net-log=<file> --net-log-capture-mode=IncludeSensitive`, driven over the DevTools
+Protocol via a ~150-line stdlib-only websocket client (no playwright/selenium installed, per
+this task's "do not install new global tools"; `/tmp/ss_privacy_probe.py`, not part of the
+repo). Steps executed inside the real page: navigate to
+`http://127.0.0.1:8877/index.html?load=privacy-test.ply&filename=privacy-test.ply` (the
+synthetic ply copied next to `dist/`, removed afterwards), confirm `window.scene.events`
+exists, fire `select.all` + `select.delete` (an actual edit -- removes every Gaussian, an
+`edit-history` op), then invoke `scene.write('ply', {...})` directly (the same function
+`scene.export`'s UI popup calls, invoked headlessly since there is no user to click "OK" in
+a screenshot-free run) -- result `"export-ok"`.
+
+**Every URL requested that has anything to do with the page, the ply, the edit, or the
+export**: all eight are `http://127.0.0.1:8877/*` -- `/`, `/index.html?...`, `/index.css`,
+`/index.js`, `/manifest.json`, `/privacy-test.ply`, `/static/icons/logo-192.png`,
+`/static/locales/en.json`. Nothing else in the entire net-log references the ply's contents,
+the exported filename, or anything page-specific.
+
+**Everything else in the net-log is Chrome's OWN platform background traffic, not
+SuperSplat's**, and a control run proves it: launching the *same* headless Chrome profile
+pointed at `about:blank`, with SuperSplat never loaded at all, produces the identical core
+host set (`accounts.google.com`, `android.clients.google.com`, `clients2.google.com`,
+`clients2.googleusercontent.com`, `clientservices.googleapis.com`, `mtalk.google.com`,
+`r3---sn-uo1-53ar.gvt1.com`, `redirector.gvt1.com`, `www.google.com`, `www.googleapis.com`,
+`www.gstatic.com`). These are the Chrome Web Store extension updater/verifier, Safe Browsing,
+the variations/field-trial seed fetch, GCM checkin/registration, account-list and NTP/omnibox
+calls, and (SuperSplat-run only, still page-independent) the Optimization Guide model
+downloader and content-autofill ML model fetch -- all keyed by Chrome's own public API key
+(`AIzaSyDr2Ux...`, visible in Chromium's public source, not a trippy or SuperSplat secret) and
+generic browser/extension IDs, never by the ply's bytes, the exported filename, or anything
+scene-derived. A real double-click launch (Jordan's own already-configured, non-headless
+Chrome) will show the same category of background traffic that ANY website he opens shows
+today; it is not a leak this ADR could plug even if it wanted to, and it carries none of the
+opened file's content.
+
+**Verdict**: PASS. Zero non-127.0.0.1 hosts were contacted by SuperSplat's own code during
+load + edit + export of the synthetic ply. Confirms ADR-0008 Sec 3's static source-code audit
+empirically. The launcher is delivered (see the four rows above this entry plus the
+`OPEN_SUPERSPLAT.command` row).
+
+**Artifacts** (not committed; ply/netlogs are synthetic-only but still kept out of the repo
+per AGENTS.md Sec 6): `$TRIPPY_OUTPUT/fixtures/synthetic-splat-privacy/` (the synthetic
+bundle), `/tmp/ss_privacy_probe.py` (the CDP driver, stdlib only), net-logs were written to
+`/tmp` and deleted after this entry was written (nothing in them but Chrome's own platform
+traffic and the eight 127.0.0.1 URLs quoted above).

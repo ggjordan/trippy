@@ -2530,6 +2530,42 @@ def build_parser() -> argparse.ArgumentParser:
     )
     splat_clean.set_defaults(func=_cmd_splat_clean)
 
+    export_splat_layers = sub.add_parser(
+        "export-splat-layers",
+        help="write a <name>-keep.ply / <name>-fog.ply pair for one splat-clean variant, for SuperSplat",
+    )
+    export_splat_layers.add_argument("--checkpoint", required=True, help="trained TRIPS checkpoint (.pt) whose confidences judge")
+    export_splat_layers.add_argument("--ply", required=True, help="the 3DGS PLY that checkpoint was seeded from")
+    export_splat_layers.add_argument("--out", required=True, help="output directory for the two PLYs and the manifest")
+    export_splat_layers.add_argument(
+        "--variant",
+        required=True,
+        choices=[v.name for v in CLEAN_VARIANTS],
+        help="which splat-clean variant's threshold to apply (same rule as `trippy splat-clean`)",
+    )
+    export_splat_layers.add_argument("--name", default=None, help="output file-name prefix (default: the source ply's stem)")
+    export_splat_layers.add_argument("--scene", default=None, help="COLMAP model dir for the shade region (only needed by the 'shade' variant)")
+    export_splat_layers.add_argument("--frames", nargs="*", default=None, help="shade-region frame names")
+    export_splat_layers.add_argument(
+        "--frames-json",
+        default=None,
+        help="JSON file of frame names (a list, or a dict of named lists -- see --frames-key)",
+    )
+    export_splat_layers.add_argument(
+        "--frames-key",
+        default=CLEAN_DEFAULT_FRAMES_KEY,
+        help="key to read from --frames-json when it holds a dict of lists",
+    )
+    export_splat_layers.add_argument("--znear-frac", type=float, default=SHADE_PRUNE_DEFAULT_ZNEAR_FRAC, help="shade region near plane, as a fraction of each frame's median observed depth")
+    export_splat_layers.add_argument("--zfar-frac", type=float, default=SHADE_PRUNE_DEFAULT_ZFAR_FRAC, help="shade region far plane, same units")
+    export_splat_layers.add_argument(
+        "--min-opacity",
+        type=float,
+        default=None,
+        help="the training config's point_source.min_opacity (default: read it out of the checkpoint)",
+    )
+    export_splat_layers.set_defaults(func=_cmd_export_splat_layers)
+
     return parser
 
 
@@ -2581,6 +2617,53 @@ def _cmd_splat_clean(args: argparse.Namespace) -> int:
             f"{name}: deleted {entry['n_deleted']:,} of {summary['n_ply']:,} Gaussians "
             f"({100 * entry['deleted_fraction']:.2f}%) -> {entry['ply']}"
         )
+    return 0
+
+
+def _cmd_export_splat_layers(args: argparse.Namespace) -> int:
+    """`trippy export-splat-layers`: one splat-clean variant as a keep/fog PLY pair.
+
+    ADR-0008-supersplat.md Stage 1 task 3. Delegates the judging to
+    `trippy.clean.layers.export_splat_layers` (which reuses
+    `trippy.clean`'s own scoring/mapping/selection verbatim); this only
+    resolves the frame list and turns an expected failure into an exit code.
+    """
+    from trippy.clean.layers import export_splat_layers
+    from trippy.clean.run import load_frames
+    from trippy.clean.select import variant_by_name
+
+    frames = None
+    if args.frames or args.frames_json:
+        try:
+            frames = load_frames(args.frames, args.frames_json, args.frames_key)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            print(f"trippy export-splat-layers: could not read the frame list: {exc}", file=sys.stderr)
+            return 2
+
+    try:
+        result = export_splat_layers(
+            checkpoint=args.checkpoint,
+            ply=args.ply,
+            out_dir=args.out,
+            variant=variant_by_name(args.variant),
+            name=args.name,
+            sparse_dir=args.scene,
+            frames=frames,
+            znear_frac=args.znear_frac,
+            zfar_frac=args.zfar_frac,
+            min_opacity=args.min_opacity,
+        )
+    except (FileNotFoundError, KeyError, ValueError) as exc:
+        print(f"trippy export-splat-layers: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 2
+
+    print(
+        f"{result['variant']}: kept {result['n_kept']:,} / fog {result['n_fog']:,} of "
+        f"{result['n_ply']:,} Gaussians"
+    )
+    print(f"  keep -> {result['keep_ply']}")
+    print(f"  fog  -> {result['fog_ply']}")
+    print(f"  manifest -> {result['layers_txt']}")
     return 0
 
 
