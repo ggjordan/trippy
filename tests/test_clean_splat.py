@@ -15,6 +15,11 @@ Invariants under test:
   - `trippy.clean.freespace` calls a point in front of a surface "front"
     and a point on it "on", on a scene whose geometry is known by
     construction.
+  - `trippy.clean.layers.export_splat_layers` (ADR-0008-supersplat.md Stage 1
+    task 3) partitions the source PLY into `-keep.ply` / `-fog.ply` such that
+    every planted fog row lands in `-fog.ply`, every other row lands in
+    `-keep.ply` (byte for byte, same as `filter_ply`), and the two counts
+    sum to the source row count.
 Fixture: a synthetic Gaussian set with planted low-confidence "fog" points
     plus a hand-built `point_params` checkpoint (AGENTS.md: test fixtures
     must be synthetic; nothing here reads a scene, a photo or a real PLY).
@@ -30,6 +35,7 @@ import pytest
 import torch
 
 from trippy.clean.freespace import classify_against_surface, first_hit_depth
+from trippy.clean.layers import export_splat_layers
 from trippy.clean.mapping import recover_mapping
 from trippy.clean.ply_filter import filter_ply, read_columns, read_ply_layout, rewrite_header
 from trippy.clean.run import clean_splat, load_frames
@@ -375,3 +381,100 @@ def test_variant_names_and_thresholds_are_the_three_shipped_levels():
     assert [v.shade_only for v in VARIANTS] == [True, False, False]
     with pytest.raises(KeyError, match="unknown clean variant"):
         variant_by_name("nope")
+
+
+def test_export_splat_layers_partitions_keep_and_fog_byte_for_byte(synthetic_splat):
+    """ADR-0008-supersplat.md Stage 1 task 3: fog rows land in -fog.ply, everything
+    else in -keep.ply, every survivor byte-identical to its source row, and the two
+    files' row counts sum to the source PLY's."""
+    out_dir = synthetic_splat["tmp_path"] / "layers"
+    result = export_splat_layers(
+        checkpoint=synthetic_splat["checkpoint"],
+        ply=synthetic_splat["ply"],
+        out_dir=out_dir,
+        variant=variant_by_name("005"),
+        name="synthetic",
+    )
+
+    assert result["variant"] == "005"
+    assert result["n_ply"] == N_SURFACE + N_FOG + N_WEAK
+    assert result["n_fog"] == N_FOG
+    assert result["n_kept"] == N_SURFACE + N_WEAK
+    assert result["n_kept"] + result["n_fog"] == result["n_ply"]
+    assert result["mapping"]["method"] == "opacity-filter"
+
+    keep_path = Path(result["keep_ply"])
+    fog_path = Path(result["fog_ply"])
+    layers_txt = Path(result["layers_txt"])
+    assert keep_path.name == "synthetic-005-keep.ply"
+    assert fog_path.name == "synthetic-005-fog.ply"
+    assert layers_txt.exists()
+
+    keep = read_ply_layout(keep_path)
+    fog = read_ply_layout(fog_path)
+    assert keep.count == N_SURFACE + N_WEAK
+    assert fog.count == N_FOG
+
+    src_layout = read_ply_layout(synthetic_splat["ply"])
+    src_rows = np.fromfile(synthetic_splat["ply"], dtype=src_layout.dtype, offset=src_layout.data_offset)
+    is_fog = synthetic_splat["kind"] == 1
+
+    keep_rows = np.fromfile(keep_path, dtype=keep.dtype, offset=keep.data_offset)
+    fog_rows = np.fromfile(fog_path, dtype=fog.dtype, offset=fog.data_offset)
+    assert np.array_equal(keep_rows, src_rows[~is_fog])
+    assert np.array_equal(fog_rows, src_rows[is_fog])
+    # Byte equality on the one property trippy never interprets, proving the
+    # partition copies whole rows verbatim, not a recomputation.
+    assert np.array_equal(np.sort(keep_rows[EXTRA_PROP]), np.sort(synthetic_splat["tag"][~is_fog]))
+    assert np.array_equal(np.sort(fog_rows[EXTRA_PROP]), np.sort(synthetic_splat["tag"][is_fog]))
+
+    manifest = layers_txt.read_text()
+    assert "005" in manifest
+    assert "synthetic-005-keep.ply" in manifest
+    assert "synthetic-005-fog.ply" in manifest
+
+
+def test_export_splat_layers_shade_variant_needs_a_region(synthetic_splat):
+    with pytest.raises(ValueError, match="needs --scene"):
+        export_splat_layers(
+            checkpoint=synthetic_splat["checkpoint"],
+            ply=synthetic_splat["ply"],
+            out_dir=synthetic_splat["tmp_path"] / "nope",
+            variant=variant_by_name("shade"),
+        )
+
+
+def test_export_splat_layers_default_name_is_the_ply_stem(synthetic_splat):
+    result = export_splat_layers(
+        checkpoint=synthetic_splat["checkpoint"],
+        ply=synthetic_splat["ply"],
+        out_dir=synthetic_splat["tmp_path"] / "layers2",
+        variant=variant_by_name("015"),
+    )
+    assert Path(result["keep_ply"]).name == "synthetic-015-keep.ply"
+    assert Path(result["fog_ply"]).name == "synthetic-015-fog.ply"
+
+
+def test_the_export_splat_layers_cli(synthetic_splat, capsys):
+    """End-to-end acceptance: `trippy export-splat-layers` writes both files and reports counts."""
+    out_dir = synthetic_splat["tmp_path"] / "cli-layers"
+    rc = cli_main(
+        [
+            "export-splat-layers",
+            "--checkpoint", str(synthetic_splat["checkpoint"]),
+            "--ply", str(synthetic_splat["ply"]),
+            "--out", str(out_dir),
+            "--variant", "005",
+            "--name", "kklid_test",
+        ]
+    )  # fmt: skip
+    assert rc == 0
+
+    keep = out_dir / "kklid_test-005-keep.ply"
+    fog = out_dir / "kklid_test-005-fog.ply"
+    assert keep.exists() and fog.exists()
+    assert (out_dir / "kklid_test-005-layers.txt").exists()
+
+    out = capsys.readouterr().out
+    assert f"kept {N_SURFACE + N_WEAK:,}" in out
+    assert f"fog {N_FOG:,}" in out

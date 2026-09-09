@@ -3,6 +3,10 @@
 The brief asked for an honest answer, measured before promised. Nothing has been measured on a
 headset yet; everything below is what the desktop numbers and Meta's own release notes bound.
 
+**Update 2026-09-09**: `docs/decisions/ADR-0008-supersplat.md` Stage 1 (self-hosted SuperSplat)
+is done; next up is that ADR's Stage 3 — SOG export + the self-hosted `supersplat-viewer`
+package, which is the concrete answer to "what ships to the Quest instead" below.
+
 ## What we know
 - The full TRIPS frame (pyramid + U-Net + camera) costs ~34 ms at 1440x810 on the M3 Ultra in the
   native viewer (29 fps) and ~55 ms in Chrome on the same machine (18 fps) after the wasm fixes.

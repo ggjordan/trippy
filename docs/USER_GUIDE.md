@@ -788,6 +788,65 @@ check.
 - `audits` — Splats' own shade audit and extent gate, run on the original splat and
   on every variant, so the numbers sit in the same column as every training run's.
 
+## Editing the cleaned splat in SuperSplat
+
+**What it is.** SuperSplat is a free, open-source (MIT) 3D Gaussian splat editor built
+by PlayCanvas. It has selection and cleanup tools trippy doesn't try to duplicate, so
+instead of building a second splat editor, trippy just produces the cleaned files and
+hands them to this one. It runs entirely in your browser, but self-hosted on this
+Mac — see "Privacy" below.
+
+**How to open it.**
+
+1. Double-click `OPEN_SUPERSPLAT.command` in `~/Splats/output/Jordan-Review/4-other/`.
+2. It starts a local server and opens SuperSplat in your browser.
+3. Drag in **both** files of a cleaned pair from
+   `~/Splats/output/Jordan-Review/2-open-in-brush/`:
+   - `kklid-tripsclean-<variant>-keep.ply` — everything TRIPS kept.
+   - `kklid-tripsclean-<variant>-fog.ply` — everything TRIPS flagged as fog.
+4. They appear as two separate layers in the Scene panel on the right, each with its
+   own show/hide/**solo** icon.
+
+**Why two files instead of one.** SuperSplat doesn't have a way to mark points as
+"maybe delete this" inside a single file — but it does have layers. Opening the fog
+points as their own layer means you can **solo** it (hide everything else) to see
+exactly what TRIPS flagged, hide it once you've checked it, or delete individual
+points back out of it if TRIPS was too aggressive somewhere.
+
+**The four selection tools worth knowing** (there are more in the toolbar, but these
+cover most cleanup):
+
+| tool | what it does |
+|---|---|
+| Rect / box select | drag a rectangle on screen |
+| Sphere select | click and drag a sphere in 3D |
+| `Shift+B` sphere brush | paint a selection by dragging over the surface, like an airbrush |
+| Eyedropper / colour match | click a point, select everything a similar colour |
+
+Once something is selected: `Delete` removes it (with undo), or use the Scene panel's
+hide/solo icons to check your work before committing. The Data panel's opacity
+histogram lets you drag a range to select by confidence directly, if the fog layer
+missed something or caught too much.
+
+**Exporting when you're done.** File → Export → **PLY** (plain) or **SOG**
+(compressed, much smaller — good for sharing or for the Quest later). Both stay on
+this machine; nothing is uploaded.
+
+**Privacy — the one thing to know.**
+
+> ⚠️ **Never click File → Publish.** It sits right next to Export in the same menu,
+> but Publish tries to upload your scene to PlayCanvas's servers. Self-hosted like
+> this it goes nowhere (it 404s), but don't rely on that — just don't click it.
+
+Everything else — opening a file, editing, exporting — runs entirely in the browser
+on this machine. This was checked for real (not just read from the source): a
+synthetic test scene was loaded, edited and exported inside a scripted browser
+session with full network logging on, and the only requests made by SuperSplat
+itself were to `127.0.0.1` — see `research/trips-metal.md`'s 2026-09-09 entry for
+the exact request list. (Chrome itself makes its own background requests to Google,
+same as it would for any website you open — that's the browser, not SuperSplat, and
+none of it carries your scene's data.)
+
 ## How to ask for a release
 
 When a milestone is ready to ship (e.g., v0.1.0 complete), ask:

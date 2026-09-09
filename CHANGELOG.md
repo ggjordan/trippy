@@ -2,6 +2,31 @@
 All notable changes to trippy. Format: Keep a Changelog. Versions: semver tags `vX.Y.Z`. Every push also gets a `build-NNNN` tag.
 
 ## [Unreleased]
+### Added
+- **ADR-0008 Stage 1 implemented: self-hosted SuperSplat is real, not just decided.**
+  `scripts/supersplat_bootstrap.sh` clones `playcanvas/supersplat` at the pinned
+  `SUPERSPLAT_PIN="v3.0.0"` into `$TRIPPY_OUTPUT/tools/supersplat` (gitignored, never
+  vendored), builds it with `npm ci && npm run build`, and is idempotent (a second run
+  skips the build). `scripts/open_supersplat.sh` generates `OPEN_SUPERSPLAT.command`
+  (`python3 -m http.server` bound to `127.0.0.1:8877` only, never `0.0.0.0`, with the
+  "never click File > Publish" warning in its header), delivered to Jordan-Review.
+  New `trippy export-splat-layers` (`trippy/clean/layers.py`) reuses `trippy.clean`'s
+  own scoring/mapping/selection verbatim to write a `<name>-keep.ply` /
+  `<name>-fog.ply` partition of a source PLY for one `splat-clean` variant (byte-for-byte
+  row copies, every row in exactly one file), plus a `<name>-layers.txt` manifest;
+  opening both in SuperSplat gives an inspectable, toggleable fog mask via its
+  layer show/hide/solo, with zero new file-format work. Run for real on
+  `kklid_20000.ply`'s `shade` and `005` thresholds -- deletion counts match the
+  existing `splat-clean` output exactly (365,716 / 8,910,382 and 972,630 / 8,910,382),
+  delivered as four PLYs. **Privacy proof run for real** (not just read from source):
+  headless Chrome with full network logging drove a SYNTHETIC ply (never Karekare)
+  through load, an edit and an export; every request touching the page, the ply or
+  the export was `127.0.0.1`-only, and a `about:blank` control run isolated Chrome's
+  own background traffic (Safe Browsing, Chrome Web Store, GCM, optimization guide)
+  as pre-existing browser noise unrelated to SuperSplat's own code (full request list
+  in `research/trips-metal.md`'s 2026-09-09 entry). New docs section
+  "Editing the cleaned splat in SuperSplat" in `docs/USER_GUIDE.md`; `docs/QUEST.md`
+  now points at Stage 3 (SOG export + the self-hosted viewer package) as next.
 ### Changed
 - **Splat editing moves to a self-hosted SuperSplat Editor 3.0**
   (`docs/decisions/ADR-0008-supersplat.md`, docs only -- no code yet). PlayCanvas's

@@ -1,8 +1,39 @@
 # STATE — externalized progress (update at end of every session)
 
-Last updated: 2026-09-09 (fix/report-shade-frames session; previous: feat/combined-bundle)
+Last updated: 2026-09-09 (feat/supersplat-selfhost session; previous: fix/report-shade-frames)
 
 ## Done
+- 2026-09-09 (feat/supersplat-selfhost, worktree `.worktrees/supersplat-selfhost`):
+  **ADR-0008-supersplat.md Stage 1 implemented and delivered** -- SuperSplat 3.0 is now a
+  real, self-hosted tool, not just a decision. `scripts/supersplat_bootstrap.sh` clones
+  `playcanvas/supersplat` at pinned tag `v3.0.0` into `$TRIPPY_OUTPUT/tools/supersplat`
+  (gitignored, never vendored), builds it (`npm ci && npm run build`, 10.3 s), idempotent
+  on re-run (verified twice). `scripts/open_supersplat.sh` generates
+  `OPEN_SUPERSPLAT.command` (127.0.0.1:8877 only, "never click Publish" warning) --
+  **REVIEW QUEUE for Jordan: 4-other/supersplat.command**. New `trippy export-splat-layers`
+  (`trippy/clean/layers.py`, 4 new tests, all passing) writes a `<name>-keep.ply` /
+  `<name>-fog.ply` byte-for-byte partition for one `splat-clean` variant, reusing
+  `trippy.clean`'s own scoring/mapping/selection verbatim. Run for real on
+  `kklid_20000.ply`'s `shade` and `005` thresholds (CPU direct, ~12 GB free, fast: 3.6 s /
+  15.4 s -- no GPU queue needed, well under the task's 10 GB caution line); deletion counts
+  match the existing `splat-clean` variants exactly (365,716 and 972,630 of 8,910,382).
+  **REVIEW QUEUE: 2-open-in-brush/kklid-tripsclean-{shade,005}-{keep,fog}.ply** -- open all
+  four (or just one pair) via the SuperSplat launcher above; the fog layer is soloable.
+  **Privacy proof run for real, not just read from source: PASS.** Headless Chrome +
+  full network logging drove a SYNTHETIC ply (never Karekare) through load, an edit
+  (select-all + delete) and an export; every request tied to the page/ply/export was
+  127.0.0.1-only. A `about:blank` control run on the identical Chrome profile proved the
+  only other hosts seen (Google Safe Browsing / Chrome Web Store / GCM / optimization
+  guide) are Chrome's own background traffic, present with no page loaded at all -- not
+  something SuperSplat's code does. Full request list: `research/trips-metal.md`
+  2026-09-09 entry. Docs: `docs/USER_GUIDE.md` "Editing the cleaned splat in SuperSplat",
+  `docs/QUEST.md` points at Stage 3 next. `scripts/test.sh`'s Python suite green (1275
+  passed, 10 skipped, the same pre-existing 10 `test_web_build_script.py` failures as the
+  prior session -- `rust/brush-trips` submodule still not initialised on this machine,
+  confirmed via `git submodule status`; `cargo check`/`cargo test` not run for the same
+  reason, unrelated to this task's Python/scripts-only changes). Stage 2 (deferred by the
+  ADR itself -- wait for Jordan's first two sessions) and Stage 3 (SOG export + the
+  self-hosted viewer package for the Quest) are next, not started.
 - 2026-09-09 07:50: merged splat-clean, viewer Simple Mode + Brush camera, perf harness (build pending). REVIEW QUEUE for Jordan: (1) 2-open-in-brush/kklid-tripsclean-shade.ply then -005 and -015 (your splat minus TRIPS-identified fog; open in Brush); (2) 4-other/kkv2-1-combined-viewer.command (splat + TRIPS under the tree, mix slider works); (3) 4-other/kkv2-3-removal-viewer.command (removal arm, 15.04 dB). Viewer Simple Mode lands in every launcher once the binary rebuilds in the next GPU gap. SAM default -> mps (8.0 s vs 9.6 s CPU). Perf: no exact-parity 2x exists (see research log); queue hold was not executed (permission layer) and is moot.
 - 2026-09-09 (fix/report-shade-frames): two fixes, worktree `.worktrees/report-frames`.
   **(1) Shade-frame bug**: `trippy train --report` always audited shade dark-mass on
