@@ -2805,3 +2805,7 @@ bundle), `/tmp/ss_privacy_probe.py` (the CDP driver, stdlib only), net-logs were
 traffic and the eight 127.0.0.1 URLs quoted above).
 - 2026-09-09T01:17:20Z submitted job trippy-kkv2-5b-hybrid-resume prio 45: bash -c PYTHONPATH=. TRIPPY_OUTPUT=/Users/nzbirdranch/trippy/output /Users/nzbirdranch/trippy/.venv/bin/python -m trippy.cli train --config experiments/EXP-0011-karekare-v2/config_hybrid.yaml --resume /Users/nzbirdranch/trippy/output/runs/EXP-0011-karekare-v2/kkv2-5-hybrid/checkpoints/checkpoint_latest.pt --device mps --max-minutes 420 --report
 - 2026-09-09T01:19:23Z submitted job trippy-kkv2-1-combined-parity3 prio 40: bash -c scripts/viewer_parity_check.sh --scale 1.0 --label kkv2-1-combined /Users/nzbirdranch/trippy/output/bundles/kkv2-1-combined/bundle /Users/nzbirdranch/Splats/output/trippy-parity/kkv2-1-combined
+
+## 2026-09-09 14:40 — disk cleanup #3 (Jordan's request)
+- Removed: 13 checkpoints (8.4 GB: epoch files of kkv2-2/3/5 and the EXP-0003 broadcast dead ends; best+latest kept for every live run, kkv2-5b resumes from checkpoint_latest), Homebrew and npm caches, a 2.6 GB python URL cache. 76 -> ~90 GB available.
+- Kept on purpose: output/clean (9 GB: the three cleaned PLYs + keep/fog layers in Jordan's review queue), output/hybrid-v2 (splat renders the hybrid runs read), output/cache (undistorted image caches), rust/target (test gate), output/scratch/shade_audit_rerun (inputs of the queued corrected audit), Hugging Face weights.
