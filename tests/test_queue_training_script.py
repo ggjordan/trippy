@@ -65,7 +65,7 @@ def test_valid_config_dry_run_submits_train_prio_with_report_flag(tmp_path: Path
 
     result = _run(str(config), "--dry-run")
     assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
-    assert "prio=70" in result.stdout
+    assert "prio=45" in result.stdout
     assert "name=trippy-queue_test_run" in result.stdout
     assert "trippy.cli train" in result.stdout
     assert "--report" in result.stdout

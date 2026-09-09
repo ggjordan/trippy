@@ -13,7 +13,7 @@
 #        - `run_dir:` given a `-masked` suffix on its final path component, so the masked
 #          run gets its own output dir and its own GPU-queue job name (queue_training.sh
 #          names the job after run_dir's basename) instead of colliding with the original.
-#   2. Submits the sibling via scripts/queue_training.sh (prio 70, `trippy train --report`,
+#   2. Submits the sibling via scripts/queue_training.sh (prio 45, `trippy train --report`,
 #      same as every other trippy training job -- see that script's header).
 #
 # --dry-run: the sibling config is written to a SCRATCH file under $TRIPPY_OUTPUT/tmp/ (never

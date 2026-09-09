@@ -15,7 +15,7 @@ Invariants under test:
     - Config with no top-level `run_dir:` key -> exit 2.
     - A valid kk-coherent config + `--dry-run`:
         - exits 0 and reports the sibling's `masks_dir:` and `-masked` run_dir.
-        - forwards --dry-run all the way to gpu_submit.sh (prio=70, job name
+        - forwards --dry-run all the way to gpu_submit.sh (prio=45, job name
           `trippy-<run_dir-basename>-masked`, `trippy.cli train ... --report`), matching
           queue_training.sh's own --train + --report contract.
         - writes its scratch sibling under $TRIPPY_OUTPUT/tmp/, NEVER next to the original
@@ -113,7 +113,7 @@ def test_valid_config_dry_run_reports_masks_dir_and_masked_run_dir(tmp_path: Pat
     assert f"masks_dir: {_DEFAULT_MASKS_DIR}" in result.stdout
     assert "run_dir:   output/runs/EXP-TEST/full1-masked" in result.stdout
     # Forwarded through queue_training.sh --dry-run to gpu_submit.sh --dry-run.
-    assert "prio=70" in result.stdout
+    assert "prio=45" in result.stdout
     assert "name=trippy-full1-masked" in result.stdout
     assert "trippy.cli train" in result.stdout
     assert "--report" in result.stdout
