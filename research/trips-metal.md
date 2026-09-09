@@ -2809,3 +2809,9 @@ traffic and the eight 127.0.0.1 URLs quoted above).
 ## 2026-09-09 14:40 — disk cleanup #3 (Jordan's request)
 - Removed: 13 checkpoints (8.4 GB: epoch files of kkv2-2/3/5 and the EXP-0003 broadcast dead ends; best+latest kept for every live run, kkv2-5b resumes from checkpoint_latest), Homebrew and npm caches, a 2.6 GB python URL cache. 76 -> ~90 GB available.
 - Kept on purpose: output/clean (9 GB: the three cleaned PLYs + keep/fog layers in Jordan's review queue), output/hybrid-v2 (splat renders the hybrid runs read), output/cache (undistorted image caches), rust/target (test gate), output/scratch/shade_audit_rerun (inputs of the queued corrected audit), Hugging Face weights.
+
+## 2026-09-10 04:25 — overnight
+- kkv2-1-combined-parity3 rc=0: viewer vs PyTorch on the combined bundle at scale 1.0, 77.86 dB (f32). Combined launcher is verified.
+- shade-audit-rerun2 rc=1: karekare-v2 has no sparse_txt (its COLMAP models are binary under scenes/karekare/karekare-v2/sparse/<n>/), so every kkv2 report's audit silently used the DEFAULT scene (kk-coherent sparse_txt) as well as the default frames. Corrected numbers still pending; fix in flight (convert the trained model to text under TRIPPY_OUTPUT, point the report at it).
+- Splats' Hunua batch drained overnight; kkv2-5b-hybrid-resume started 04:16 at prio 45.
+- SOG export of kklid-tripsclean-shade-keep on CPU: 14 h and still writing (tmp file static at 78 MB) -> switching the conversion to a GPU queue job at prio 40.
