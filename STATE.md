@@ -3,6 +3,7 @@
 Last updated: 2026-09-10 (feat/supersplat-quest session; previous: feat/supersplat-selfhost)
 
 ## Done
+- 2026-09-10 12:26: kkv2-5-hybrid done (ep 139): PSNR 16.85 dB, best full-scene number so far (plain TRIPS 15.06). REVIEW QUEUE: 4-other/kkv2-5-hybrid-viewer.command. Next on GPU: two Quest SOG conversions, corrected audit, then kkv2-7 hybrid-gate.
 - 2026-09-09 14:40: disk cleanup #3, ~14 GB freed (details in research log).
 - 2026-09-09 13:50 (Jordan): editor direction = self-host SuperSplat now, fork later only if the two-app workflow annoys. Stage 3 (SOG + self-hosted WebXR viewer for the Quest) started. Fork estimate recorded in ADR-0008 (3-5 agent-weeks; MIT permits it).
 - 2026-09-10 (feat/supersplat-quest, worktree `.worktrees/supersplat-quest`):

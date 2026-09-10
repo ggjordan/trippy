@@ -2870,3 +2870,9 @@ traffic and the eight 127.0.0.1 URLs quoted above).
 - 2026-09-10T00:20:46Z delivered kkv2-5-hybrid-honesty: trippy train report kkv2-5-hybrid: epoch 139, held-out PSNR 16.85 dB (neighbours-exposure) (strict, own exposure: 14.80 dB), shade dark-mass n/a vs baseline n/a (/Users/nzbirdranch/trippy/output/runs/EXP-0011-karekare-v2/kkv2-5-hybrid/report/dolly/honesty_sheet.png)
 - 2026-09-10T00:20:48Z delivered kkv2-5-hybrid-export: trippy train report kkv2-5-hybrid: epoch 139, held-out PSNR 16.85 dB (neighbours-exposure) (strict, own exposure: 14.80 dB), shade dark-mass n/a vs baseline n/a (/Users/nzbirdranch/trippy/output/runs/EXP-0011-karekare-v2/kkv2-5-hybrid/export.ply)
 - 2026-09-10T00:20:51Z delivered trips-leaderboard: One table of every TRIPS run so far vs the Gaussian baseline: held-out PSNR, shade dark-mass, extent, coverage. Regenerated after every training. (/Users/nzbirdranch/trippy/output/leaderboard/leaderboard.png)
+
+## 2026-09-10 12:26 — kkv2-5-hybrid (hybrid A on the full scene: Gaussian render channels + TRIPS)
+- Job: trippy-kkv2-5b-hybrid-resume (resumed from the killed run's epoch 60; ended at epoch 139 by budget).
+- Numbers: held-out PSNR **16.85 dB** (neighbour exposure; strict 14.80 dB) vs plain TRIPS 15.06 (kkv2-1) and 14.63 (kkv2-2) at similar epochs. Largest PSNR gain of any full-scene arm. Dark-mass n/a in this report (audit scene fix landed after the job started; corrected audit job covers it).
+- Artifact: 4-other/kkv2-5-hybrid-viewer.command. Bundle: 
+- Verdict pending Jordan (shade as shading? sharpness closer to the splat?).
