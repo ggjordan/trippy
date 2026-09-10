@@ -2939,3 +2939,7 @@ Artifacts (not committed; scratch, kept out of the repo per AGENTS.md Sec 6):
 `~/Splats/tools/gpu_queue/logs/trippy-shade-audit-rerun3.log`.
 - 2026-09-10T00:42:22Z submitted job trippy-kkv2-5-hybrid-audit prio 40: bash -c /Users/nzbirdranch/trippy/.venv/bin/python /Users/nzbirdranch/Splats/tools/depthprior_shade_audit.py --scene /Users/nzbirdranch/trippy/output/scenes/karekare-v2/sparse_txt --frames $(/Users/nzbirdranch/trippy/.venv/bin/python -c "import json;d=json.load(open('output/scratch/shade_frames.json'));print(' '.join(d if isinstance(d,list) else d['frames']))") output/runs/EXP-0011-karekare-v2/kkv2-5-hybrid/export.ply
 - 2026-09-10T00:43:05Z submitted job trippy-kkv2-5-hybrid-audit2 prio 40: bash /Users/nzbirdranch/trippy/output/jobs-src/audit_kkv2_5.sh
+
+## 2026-09-10 20:07 — kkv2-7-hybrid-gate (learned gate g: final = g*splat + (1-g)*TRIPS, full scene)
+- Numbers: epoch 103, held-out PSNR **16.94 dB** (neighbour exposure), **strict 16.62 dB** (own exposure). The strict number is the story: plain TRIPS 13.97, hybrid A 14.80, gate 16.62. The gate makes the result robust to per-view exposure because the splat carries the colour where TRIPS is uncertain. Dark-mass n/a in-report (old scene bug; corrected audit for this export to be queued).
+- Artifact: 4-other/kkv2-7-hybrid-gate-viewer.command. Verdict pending Jordan.
