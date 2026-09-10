@@ -169,6 +169,19 @@ class TrainConfig:
 
     # --- scene / io ---
     scene_root: str = ""
+    # Override for the COLMAP TEXT sparse model `trippy train --report` and
+    # `trippy candidate-report` hand to Splats' shade/extent audits
+    # (`trippy.eval.audits.run_shade_audit`/`run_extent_gate` need
+    # cameras.txt/images.txt/points3D.txt, not a binary `sparse/0`). ""
+    # (the default) auto-resolves via `trippy.render.report.resolve_sparse_txt_dir`:
+    # `<scene_root>/sparse_txt` if present, else auto-convert `<scene_root>/sparse/0`
+    # (binary) into `$TRIPPY_OUTPUT/scenes/<scene_root.name>/sparse_txt` with
+    # `colmap model_converter` -- never into `$SPLATS_ROOT/scenes/` (AGENTS.md
+    # "never copy/write into Splats' scene dirs"). Set this explicitly when a
+    # scene's `sparse/0` is NOT the model its point source was built from (Splats
+    # scenes can have many numbered sparse/<n> sub-models; see EXP-0011's README
+    # "Finding the shade frames" -- karekare-v2's is sparse/0, 756 registered images).
+    sparse_txt: str = ""
     cache_root: str | None = None  # None => `<TRIPPY_OUTPUT>/cache` (trippy.config.load_settings)
     run_dir: str = "output/runs/default"
     width: int = TRAIN_DEFAULT_WIDTH

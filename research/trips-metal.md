@@ -2809,3 +2809,62 @@ traffic and the eight 127.0.0.1 URLs quoted above).
 ## 2026-09-09 14:40 — disk cleanup #3 (Jordan's request)
 - Removed: 13 checkpoints (8.4 GB: epoch files of kkv2-2/3/5 and the EXP-0003 broadcast dead ends; best+latest kept for every live run, kkv2-5b resumes from checkpoint_latest), Homebrew and npm caches, a 2.6 GB python URL cache. 76 -> ~90 GB available.
 - Kept on purpose: output/clean (9 GB: the three cleaned PLYs + keep/fog layers in Jordan's review queue), output/hybrid-v2 (splat renders the hybrid runs read), output/cache (undistorted image caches), rust/target (test gate), output/scratch/shade_audit_rerun (inputs of the queued corrected audit), Hugging Face weights.
+- 2026-09-09T16:27:34Z submitted job trippy-shade-audit-rerun3 prio 40: /Users/nzbirdranch/trippy/.venv/bin/python /Users/nzbirdranch/trippy/output/scratch/shade_audit_rerun/reconstruct_and_audit.py
+
+## 2026-09-10 — karekare-v2 shade audit: corrected scene AND correct 93 frames (result)
+Question: what is the real dark-mass fraction for kkv2-1/2/3 and the kklid_20000 Gaussian
+baseline, once both bugs are fixed -- the scene's own COLMAP model (not kk-coherent's) and the
+scene's own measured 93-frame big-tree shade region (not kk-coherent's 6 IMG_3828-3833 frames)?
+
+Root cause (second bug, on top of the frame-list bug fixed 2026-09-09): `trippy train --report`
+hardcoded `<scene_root>/sparse_txt` for the Splats shade/extent audits. karekare-v2 has no
+`sparse_txt` at all -- only 16 binary `sparse/<n>` sub-models under
+`~/Splats/scenes/karekare/karekare-v2/sparse/`. `trippy-shade-audit-rerun2` (prio 40, 2026-09-09)
+hit exactly this: `FileNotFoundError: .../karekare-v2/sparse_txt/cameras.txt`. Checked all 16
+sub-models' registered-image counts (`images.bin` header, `struct.unpack('<Q', ...)`
+`num_reg_images`): sparse/0 has 756 (matches config.yaml's own comment, "Jordan's best splat,
+trained on exactly this COLMAP model (756 registered images)"); the rest range 10-139. sparse/0
+converted to TEXT with `colmap model_converter --output_type TXT` into
+`$TRIPPY_OUTPUT/scenes/karekare-v2/sparse_txt` (never written into `~/Splats/scenes/`).
+
+Fix: `trippy.render.report.resolve_sparse_txt_dir` (new) auto-converts a scene's binary
+`sparse/0` into `$TRIPPY_OUTPUT/scenes/<name>/sparse_txt` when no native `sparse_txt` exists,
+caching the conversion on disk (checked via the presence of `cameras.txt`); `TrainConfig.sparse_txt`
+is a new override field, set explicitly on every EXP-0011 config to the converted path.
+`report.json` now records `sparse_txt_dir` alongside `shade_frames`. 7 new unit tests
+(`tests/test_render_report.py`) cover override/native/auto-convert/cache/missing-colmap paths
+with a fake `colmap` shell script on PATH.
+
+Job: `trippy-shade-audit-rerun3` (prio 40, `scripts/gpu_submit.sh --wait`, CPU only, ~17 GB free
+at submit time, ran once memory cleared). Ran the fixed `reconstruct_and_audit.py`
+(`$TRIPPY_OUTPUT/scratch/shade_audit_rerun/`) against `sparse/0`'s TEXT conversion and the same
+93-frame big-tree list (`$TRIPPY_OUTPUT/scratch/shade_frames.json`, key `big_tree`) used for the
+2026-09-09 frame fix.
+
+Numbers (dark_mass_lum0.25 / mass_in_region, `SHADE_AUDIT_DARK_MASS_LUM_KEY`; scene =
+`$TRIPPY_OUTPUT/scenes/karekare-v2/sparse_txt`, `sparse/0`, 93 frames):
+
+| candidate | n points | n in shade region | dark-mass fraction |
+|---|---|---|---|
+| kkv2-1-full-masked | 7,542,137 | 2,992,174 | **37.3%** |
+| kkv2-2-full-unmasked | 7,542,137 | 2,992,612 | **37.4%** |
+| kkv2-3-removal | 5,961,206 | 2,388,376 | **37.2%** |
+| kklid_20000 (Gaussian baseline) | 8,910,382 | 3,531,271 | **26.7%** |
+
+Extent gate (`extent_gate.py`, same four PLYs, re-checked separately since the rerun script only
+called the shade audit): radius p99/p999/max and scene diagonal are consistent across all four
+(diagonal 69.7-70.1, p99 12.9-13.1, p999 21.2-21.5, max 33.0-34.4) -- no sprawl, all four floats
+finite (`non_finite_means`/`non_finite_scales` both 0 for every PLY). Gate: PASS for all four.
+
+Verdict: the shade-solved verdict from Jordan's viewer stands (dark mass sits above the Gaussian
+baseline either way -- 37.2-37.4% vs 26.7%, all TRIPS runs measuring within 0.2 points of each
+other regardless of masked/unmasked/point-removal). The corrected baseline (26.7%) is higher than
+the earlier wrong-scene/wrong-frame 17.3% number, and the corrected TRIPS numbers (37.2-37.4%) are
+close to but slightly below the earlier wrong numbers (34.5-34.9%) -- both bugs together roughly
+cancelled out in the TRIPS rows but not in the baseline row, which is why the two independent bugs
+both needed fixing rather than assuming one fix would self-correct the other's error.
+
+Artifacts (not committed; scratch, kept out of the repo per AGENTS.md Sec 6):
+`$TRIPPY_OUTPUT/scratch/shade_audit_rerun/{kkv2-1-full-masked,kkv2-2-full-unmasked,kkv2-3-removal,kklid_20000-baseline}.shade_audit.json`,
+`$TRIPPY_OUTPUT/scenes/karekare-v2/sparse_txt/` (the TEXT conversion), log:
+`~/Splats/tools/gpu_queue/logs/trippy-shade-audit-rerun3.log`.

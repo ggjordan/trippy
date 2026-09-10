@@ -1,8 +1,34 @@
 # STATE — externalized progress (update at end of every session)
 
-Last updated: 2026-09-09 (feat/supersplat-selfhost session; previous: fix/report-shade-frames)
+Last updated: 2026-09-10 (fix/audit-sparse-v2 session; previous: feat/supersplat-selfhost)
 
 ## Done
+- 2026-09-10 (fix/audit-sparse-v2, worktree `.worktrees/audit-sparse`): second bug in the
+  karekare-v2 shade audit, on top of the 2026-09-09 frame-list fix. `trippy train --report`/
+  `trippy-shade-audit-rerun2` hardcoded `<scene_root>/sparse_txt`, which does not exist for
+  karekare-v2 (only 16 binary `sparse/<n>` sub-models) -- the rerun job failed outright with
+  `FileNotFoundError`. Confirmed `sparse/0` is the 756-registered-image model (via `images.bin`
+  header parse; matches config.yaml's own comment) and converted it to TEXT with
+  `colmap model_converter` into `$TRIPPY_OUTPUT/scenes/karekare-v2/sparse_txt` (never written
+  into `~/Splats/scenes/`). New `trippy.render.report.resolve_sparse_txt_dir` auto-converts a
+  binary `sparse/0` the same way for any scene lacking `sparse_txt`, caching the conversion;
+  new `TrainConfig.sparse_txt` override, set explicitly on every EXP-0011 config;
+  `report.json` now records `sparse_txt_dir` used. 7 new unit tests with a fake `colmap` on
+  PATH (`tests/test_render_report.py`); full Python suite green (1281 passed, 10 skipped, same
+  pre-existing 10 `test_web_build_script.py` npm/wasm-pack failures as prior sessions,
+  unrelated). Re-ran the corrected audit (`trippy-shade-audit-rerun3`, prio 40, `--wait`):
+  **corrected dark-mass numbers, sparse/0 + the correct 93 big-tree frames**: kkv2-1 37.3%,
+  kkv2-2 37.4%, kkv2-3 37.2%, kklid_20000 baseline 26.7% (previously wrong-scene numbers never
+  landed for the candidates; the baseline's earlier wrong-scene/wrong-frame number was 17.3%).
+  Extent gate re-checked on the same four PLYs: PASS, no sprawl, consistent across all four.
+  `docs/RESULTS.md` and `research/trips-metal.md` updated with the corrected table and full
+  root-cause writeup (both bugs). Files touched: `trippy/render/report.py`,
+  `trippy/train/config.py`, `trippy/constants.py`, `experiments/EXP-0011-karekare-v2/*.yaml`,
+  `tests/test_render_report.py`. Not touched (out of file scope for this task, still has the
+  same hardcoded `sparse_txt` literal): `trippy/cli.py`'s `_cmd_candidate_report` -- a
+  follow-up should route it through `resolve_sparse_txt_dir` too. Not committed (per this
+  task's Forbidden list) -- worktree `.worktrees/audit-sparse`, branch `fix/audit-sparse-v2`,
+  awaiting Orchestrator review.
 - 2026-09-09 14:40: disk cleanup #3, ~14 GB freed (details in research log).
 - 2026-09-09 13:50 (Jordan): editor direction = self-host SuperSplat now, fork later only if the two-app workflow annoys. Stage 3 (SOG + self-hosted WebXR viewer for the Quest) started. Fork estimate recorded in ADR-0008 (3-5 agent-weeks; MIT permits it).
 - 2026-09-09 13:20 (Jordan): Splats Hunua at prio 30; trippy stays in 40-60 (short 40, kkv2 45, hybrids 50, other 55). Queue files renamed; gpu_submit bands updated. kkv2-5-hybrid was killed at ep 60 (Killed: 9, 10:23) -> resubmitted as kkv2-5b-hybrid-resume (45). shade-audit-rerun failed (pointed at a removed worktree) -> rerun2 at 40 from main. combined parity rc=5 (out-dir inside repo) -> resubmitted with an outside dir. SuperSplat Stage 1 merged (build-0132): supersplat.command launcher + keep/fog layer PLYs in 2-open-in-brush.
@@ -51,12 +77,11 @@ Last updated: 2026-09-09 (feat/supersplat-selfhost session; previous: fix/report
   `trippy.eval.audits.cached_baseline_audit`'s cache key ignores `frames` entirely --
   the stale `kklid_20000` cache entry (wrong-frame result, matched the old 17.3% number)
   was deleted, but the underlying key bug needs a follow-up touching
-  `trippy/eval/audits.py`. **Re-audit PENDING**: job `trippy-shade-audit-rerun` (prio 15)
-  queued behind `kkv2-5-hybrid` (training, up to 420 min) -- machine had 12-16 GB free
-  (AGENTS.md wants >=28 GB), so it was queued rather than run directly. Old wrong numbers
-  (34.5% / 34.5% / 34.9% vs Gaussian baseline 17.3%) marked PENDING in `docs/RESULTS.md`
-  and `research/trips-metal.md`'s 2026-09-09 entry with the explanation; corrected numbers
-  to be filled in once the job's `.rc`/log land.
+  `trippy/eval/audits.py`. **Re-audit DONE (2026-09-10, fix/audit-sparse-v2)**: the first
+  rerun attempt (`trippy-shade-audit-rerun`/`-rerun2`) hit a SECOND bug -- `sparse_txt` was
+  hardcoded and karekare-v2 has no such directory -- see that session's entry above for the
+  fix and the final corrected numbers (kkv2-1 37.3%, kkv2-2 37.4%, kkv2-3 37.2%, baseline
+  26.7%), now in `docs/RESULTS.md` and `research/trips-metal.md`.
   **(2) SAM 3 default device flipped `cpu` -> `mps`** (`docs/EDITOR.md` §3's decision rule
   satisfied: `edit-sam-5` MPS rc=0 at 8.05 s/view beat `edit-sam-5-cpu`'s 9.65 s/view).
   Changed: viewer's `SamUi::default()` and headless `--sam-device` default

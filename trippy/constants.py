@@ -1205,6 +1205,19 @@ SHADE_AUDIT_DARK_MASS_LUM_KEY = "dark_mass_lum0.25"
 # under `$TRIPPY_OUTPUT/<this>/`.
 AUDIT_CACHE_SUBDIR = "audits"
 
+# `trippy.render.report.resolve_sparse_txt_dir`: when a scene has no
+# `<scene_root>/sparse_txt` (Splats scenes are usually binary-only,
+# `sparse/0/*.bin` -- COLMAP never writes both by default and trippy must
+# not write into `$SPLATS_ROOT/scenes/` per AGENTS.md "Disk and delivery"),
+# the binary model is auto-converted with `colmap model_converter` into
+# `$TRIPPY_OUTPUT/<this>/<scene_root.name>/sparse_txt` instead, once per
+# scene name (re-used on every later report for the same scene).
+AUDIT_SPARSE_TXT_CACHE_SUBDIR = "scenes"
+# `colmap model_converter` on a multi-million-point sparse model
+# (karekare-v2's sparse/0 is 756 images / ~7M points) took ~30s measured;
+# generous headroom for a much larger scene.
+AUDIT_MODEL_CONVERTER_TIMEOUT_S = 600.0
+
 # --- train/prune.py : TRIPS point removal + trippy's audit-aligned shade prune ---
 # TRIPS's own rule, from source (third_party/TRIPS @ a59a65b6):
 #   src/apps/train.cpp:846-851  indices_to_remove =
