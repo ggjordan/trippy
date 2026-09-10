@@ -2876,3 +2876,5 @@ traffic and the eight 127.0.0.1 URLs quoted above).
 - Numbers: held-out PSNR **16.85 dB** (neighbour exposure; strict 14.80 dB) vs plain TRIPS 15.06 (kkv2-1) and 14.63 (kkv2-2) at similar epochs. Largest PSNR gain of any full-scene arm. Dark-mass n/a in this report (audit scene fix landed after the job started; corrected audit job covers it).
 - Artifact: 4-other/kkv2-5-hybrid-viewer.command. Bundle: 
 - Verdict pending Jordan (shade as shading? sharpness closer to the splat?).
+
+- 2026-09-10 12:35 Quest SOGs: trippy-quest-sog-kklid20000 rc=0 (8,910,382 -> .sog 119 MB, .compressed.ply 546 MB, round trip exact); trippy-quest-sog-shade-keep rc=0 (8,544,666 -> .sog 114 MB, round trip exact). GPU path took minutes; the CPU path had made no progress in 14 h. Launchers quest-viewer-{shade-keep,kklid20000}-quest are live.

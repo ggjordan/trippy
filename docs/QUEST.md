@@ -95,15 +95,14 @@ repo never needs when running CPU-only). Both conversions were resubmitted throu
 - `trippy-quest-sog-shade-keep` — log: `~/Splats/tools/gpu_queue/logs/trippy-quest-sog-shade-keep.log`
 - `trippy-quest-sog-kklid20000` — log: `~/Splats/tools/gpu_queue/logs/trippy-quest-sog-kklid20000.log`
 
-**PENDING as of 2026-09-10**: both jobs are queued behind a running training
-(`kkv2-5b-hybrid-resume`, up to 420 min budget) and free memory was near zero at submit time; the
-runner will start them once ≥28 GB frees up. Four launchers were generated and delivered to
-`4-other/` ahead of the jobs finishing (`quest-viewer-shade-keep-preview/-quest`,
-`quest-viewer-kklid20000-preview/-quest`) — they refuse to open until each job's bundle exists.
-Once `~/Splats/tools/gpu_queue/done/trippy-quest-sog-{shade-keep,kklid20000}.rc` show `0`, fill in
-here: `.sog` and `.compressed.ply` sizes for both splats, the round-trip Gaussian counts, and
-whether the untouched `kklid_20000.ply` (8,910,382 Gaussians per `STATE.md`) compresses to
-roughly the same ratio as the cleaned one.
+**Done 2026-09-10 12:35** (both jobs rc=0, run on the GPU in minutes after a CPU attempt made no progress in 14 h):
+
+| splat | Gaussians in | `.sog` | `.compressed.ply` | round trip |
+|---|---:|---:|---:|---:|
+| kklid_20000 (untouched) | 8,910,382 | 119 MB | 546 MB | 8,910,382 |
+| kklid-tripsclean-shade-keep | 8,544,666 | 114 MB | ~520 MB | 8,544,666 |
+
+Both `quest-viewer-*-quest` launchers in Jordan-Review/4-other are live now.
 
 ## What we know
 - The full TRIPS frame (pyramid + U-Net + camera) costs ~34 ms at 1440x810 on the M3 Ultra in the
