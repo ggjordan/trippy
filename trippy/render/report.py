@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -57,6 +58,8 @@ import numpy as np
 
 from trippy.config import load_settings
 from trippy.constants import (
+    AUDIT_MODEL_CONVERTER_TIMEOUT_S,
+    AUDIT_SPARSE_TXT_CACHE_SUBDIR,
     CANDIDATE_HONESTY_SHEET_FILENAME,
     CANDIDATE_NET_VIDEO_FILENAME,
     CANDIDATE_REPORT_DOLLY_DIRNAME,
@@ -107,6 +110,94 @@ def dolly_mean_center_coverage(dolly_metrics: dict) -> float | None:
     kept = frames[: stop_index + 1] if isinstance(stop_index, int) else frames
     values = [f["coverage_mean_center"] for f in kept if "coverage_mean_center" in f]
     return float(np.mean(values)) if values else None
+
+
+def _convert_sparse_bin_to_txt(bin_dir: Path, out_dir: Path) -> None:
+    """`colmap model_converter --output_type TXT`, `bin_dir` -> `out_dir` (created if needed).
+
+    Raises:
+        FileNotFoundError: no `colmap` binary on PATH.
+        RuntimeError: the subprocess exited non-zero.
+    """
+    colmap = shutil.which("colmap")
+    if colmap is None:
+        raise FileNotFoundError("colmap not found on PATH (needed to convert a binary sparse model to TEXT)")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        colmap,
+        "model_converter",
+        "--input_path",
+        str(bin_dir),
+        "--output_path",
+        str(out_dir),
+        "--output_type",
+        "TXT",
+    ]
+    result = subprocess.run(
+        cmd, capture_output=True, text=True, timeout=AUDIT_MODEL_CONVERTER_TIMEOUT_S, check=False
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"colmap model_converter failed (exit {result.returncode}):\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+
+
+def resolve_sparse_txt_dir(scene_root: Path, override: str = "") -> Path:
+    """Pick the COLMAP TEXT sparse dir the Splats shade/extent audits read.
+
+    Bug this closes: `run_train_report`/`_cmd_candidate_report` used to hardcode
+    `<scene_root>/sparse_txt` unconditionally. Every karekare-v2 (EXP-0011) audit
+    silently fell back to `depthprior_shade_audit.py`'s OWN default scene
+    (`~/Splats/scenes/karekare/kk-coherent/sparse_txt`) once that path raised
+    `FileNotFoundError` deeper in `trippy.eval.audits._run` -- no, it did not even
+    get that far in some paths; see `trippy-shade-audit-rerun2` job log -- so every
+    reported dark-mass number was measured against the WRONG scene's sparse model
+    and the wrong (kk-coherent, 6-frame) shade region. karekare-v2 has no
+    `sparse_txt` at all, only 16 binary `sparse/<n>` models (COLMAP writes text
+    only when asked); `trippy.scene.dataset.resolve_sparse_dir` already prefers
+    `sparse/0` for training for this reason.
+
+    Args:
+        scene_root: the scene's root directory (`<scene_root>/sparse/0` and/or
+            `<scene_root>/sparse_txt`).
+        override: `TrainConfig.sparse_txt`. "" (default) auto-resolves per below;
+            any other value is returned as-is (Path(override)), letting a config
+            pin a specific converted directory or a non-default sparse sub-model.
+
+    Returns:
+        `Path(override)` when non-empty; else `<scene_root>/sparse_txt` if that
+        already exists; else, when `<scene_root>/sparse/0` is a binary model,
+        the path to an on-disk TEXT conversion of it under
+        `$TRIPPY_OUTPUT/<AUDIT_SPARSE_TXT_CACHE_SUBDIR>/<scene_root.name>/sparse_txt`
+        (converted once with `colmap model_converter`, re-used on every later
+        call for the same scene name -- never written into `scene_root` itself,
+        per AGENTS.md "never write into Splats' scene dirs"); else
+        `<scene_root>/sparse_txt` unchanged (old behaviour: a missing path,
+        left for the caller/subprocess to raise on).
+
+    Raises:
+        FileNotFoundError: `<scene_root>/sparse/0` is binary but `colmap` is not
+            on PATH.
+        RuntimeError: the `colmap model_converter` subprocess exited non-zero.
+    """
+    if override:
+        return Path(override)
+
+    scene_root = Path(scene_root)
+    native_txt = scene_root / _SPARSE_TXT_DIRNAME
+    if native_txt.exists():
+        return native_txt
+
+    bin_dir = scene_root / "sparse" / "0"
+    if (bin_dir / "cameras.bin").exists() and (bin_dir / "images.bin").exists():
+        cache_dir = load_settings().trippy_output / AUDIT_SPARSE_TXT_CACHE_SUBDIR / scene_root.name / _SPARSE_TXT_DIRNAME
+        marker = cache_dir / "cameras.txt"
+        if not marker.exists():
+            _convert_sparse_bin_to_txt(bin_dir, cache_dir)
+        return cache_dir
+
+    return native_txt
 
 
 def resolve_shade_frames(value: list[str] | str | None, base_dir: Path | None = None) -> list[str] | None:
@@ -771,7 +862,13 @@ def run_train_report(trainer: Trainer, held_out_metrics: dict) -> dict:
     # `None`, unchanged old behaviour, when the config has no `shade_frames` key).
     shade_frames = resolve_shade_frames(trainer.cfg.shade_frames)
 
-    sparse_txt_dir = scene_root / _SPARSE_TXT_DIRNAME
+    # `resolve_sparse_txt_dir`: another bug this task closes -- `sparse_txt_dir` used to be
+    # a hardcoded `<scene_root>/sparse_txt` literal, which does not exist for karekare-v2
+    # (only binary `sparse/<n>` models). That FileNotFoundError previously escaped from
+    # deep inside `trippy.eval.audits._run`; now the binary `sparse/0` model (the one
+    # karekare-v2's point source/trainings were built from, 756 registered images) is
+    # auto-converted once into `$TRIPPY_OUTPUT/scenes/<name>/sparse_txt` and reused.
+    sparse_txt_dir = resolve_sparse_txt_dir(scene_root, trainer.cfg.sparse_txt)
     candidate_audits = audit_report([str(export_path)], sparse_txt_dir, frames=shade_frames)
     baseline_audits = _baseline_ply_audits(trainer.cfg, sparse_txt_dir, frames=shade_frames)
 
@@ -824,6 +921,7 @@ def run_train_report(trainer: Trainer, held_out_metrics: dict) -> dict:
         "dolly": dolly_metrics,
         "offpath": offpath_metrics,
         "audits": {"candidate": candidate_audits, "baseline": baseline_audits},
+        "sparse_txt_dir": str(sparse_txt_dir),
         "shade_frames": shade_frames_used_record(shade_frames),
         "bundle": {"bundle_dir": bundle_result["bundle_dir"], "viewer": bundle_result["viewer"]},
         "summary_line": line,

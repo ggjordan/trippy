@@ -1574,7 +1574,9 @@ def _cmd_candidate_report(args: argparse.Namespace) -> int:
         edits_path=args.edits,
     )
 
-    audits = audit_report([str(export_path)], scene_root / "sparse_txt", frames=None)
+    from trippy.render.report import resolve_sparse_txt_dir
+
+    audits = audit_report([str(export_path)], resolve_sparse_txt_dir(scene_root), frames=None)
 
     report = {
         "checkpoint": str(args.checkpoint),

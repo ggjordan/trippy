@@ -35,6 +35,7 @@ Fixtures: only synthetic dicts (no real scene, checkpoint, or PLY --
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -419,3 +420,121 @@ def test_default_bundle_out_dir_falls_back_to_alongside_the_checkpoint(tmp_path:
     loose_checkpoint = tmp_path / "some_checkpoint.pt"
     loose_checkpoint.write_bytes(b"")
     assert report_mod.default_bundle_out_dir(loose_checkpoint) == tmp_path / "bundle"
+
+
+# --- resolve_sparse_txt_dir ---
+#
+# Bug this covers: `run_train_report`/`_cmd_candidate_report` used to hardcode
+# `<scene_root>/sparse_txt`, which does not exist for karekare-v2 (only binary
+# `sparse/<n>` sub-models) -- every EXP-0011 shade-audit report silently fell back to
+# depthprior_shade_audit.py's own default scene/frames. A fake `colmap` script on PATH
+# stands in for the real binary so this suite stays green on a machine without COLMAP
+# installed (AGENTS.md "this repo must stay green on a machine without ~/Splats"-style
+# isolation) while still exercising the real subprocess.run call and its argv shape.
+
+
+def _install_fake_colmap(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, calls_log: Path) -> None:
+    """A fake `colmap` on PATH: `model_converter --output_path X` writes X/cameras.txt.
+
+    Appends one line per invocation to `calls_log` so tests can assert call count
+    (cache re-use) without parsing stdout.
+    """
+    bin_dir = tmp_path / "fakebin"
+    bin_dir.mkdir(exist_ok=True)
+    fake_colmap = bin_dir / "colmap"
+    fake_colmap.write_text(
+        "#!/bin/sh\n"
+        f'echo "$@" >> "{calls_log}"\n'
+        'out=""\n'
+        'while [ "$#" -gt 0 ]; do\n'
+        '  if [ "$1" = "--output_path" ]; then out="$2"; fi\n'
+        "  shift\n"
+        "done\n"
+        'mkdir -p "$out"\n'
+        'echo "fake" > "$out/cameras.txt"\n'
+        'echo "fake" > "$out/images.txt"\n'
+        'echo "fake" > "$out/points3D.txt"\n'
+    )
+    fake_colmap.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ.get('PATH', '')}")
+
+
+def _make_binary_sparse_model(scene_root: Path) -> Path:
+    bin_dir = scene_root / "sparse" / "0"
+    bin_dir.mkdir(parents=True)
+    (bin_dir / "cameras.bin").write_bytes(b"")
+    (bin_dir / "images.bin").write_bytes(b"")
+    return bin_dir
+
+
+def test_resolve_sparse_txt_dir_override_returned_verbatim_no_filesystem_check(tmp_path: Path) -> None:
+    scene_root = tmp_path / "scene"  # deliberately does not exist
+    result = report_mod.resolve_sparse_txt_dir(scene_root, override=str(tmp_path / "somewhere/sparse_txt"))
+    assert result == tmp_path / "somewhere/sparse_txt"
+
+
+def test_resolve_sparse_txt_dir_prefers_native_sparse_txt_when_present(tmp_path: Path) -> None:
+    scene_root = tmp_path / "scene"
+    native = scene_root / "sparse_txt"
+    native.mkdir(parents=True)
+    (native / "cameras.txt").write_text("fake")
+    _make_binary_sparse_model(scene_root)  # present too, but native_txt wins
+    assert report_mod.resolve_sparse_txt_dir(scene_root) == native
+
+
+def test_resolve_sparse_txt_dir_neither_present_returns_unchanged_native_path(tmp_path: Path) -> None:
+    scene_root = tmp_path / "scene"
+    scene_root.mkdir()
+    assert report_mod.resolve_sparse_txt_dir(scene_root) == scene_root / "sparse_txt"
+
+
+def test_resolve_sparse_txt_dir_binary_only_auto_converts_with_colmap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scene_root = tmp_path / "scene"
+    _make_binary_sparse_model(scene_root)
+    trippy_output = tmp_path / "trippy_output"
+    monkeypatch.setenv("TRIPPY_OUTPUT", str(trippy_output))
+    calls_log = tmp_path / "calls.log"
+    _install_fake_colmap(tmp_path, monkeypatch, calls_log)
+
+    result = report_mod.resolve_sparse_txt_dir(scene_root)
+
+    expected = trippy_output / "scenes" / scene_root.name / "sparse_txt"
+    assert result == expected
+    assert (expected / "cameras.txt").exists()
+    assert calls_log.read_text().count("\n") == 1  # exactly one colmap invocation
+    call_args = calls_log.read_text().strip()
+    assert "model_converter" in call_args
+    assert str(scene_root / "sparse" / "0") in call_args
+    assert str(expected) in call_args
+    assert "TXT" in call_args
+
+
+def test_resolve_sparse_txt_dir_binary_conversion_is_cached_across_calls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scene_root = tmp_path / "scene"
+    _make_binary_sparse_model(scene_root)
+    monkeypatch.setenv("TRIPPY_OUTPUT", str(tmp_path / "trippy_output"))
+    calls_log = tmp_path / "calls.log"
+    _install_fake_colmap(tmp_path, monkeypatch, calls_log)
+
+    first = report_mod.resolve_sparse_txt_dir(scene_root)
+    second = report_mod.resolve_sparse_txt_dir(scene_root)
+
+    assert first == second
+    assert calls_log.read_text().count("\n") == 1  # second call reused the cached conversion
+
+
+def test_resolve_sparse_txt_dir_binary_only_no_colmap_on_path_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scene_root = tmp_path / "scene"
+    _make_binary_sparse_model(scene_root)
+    monkeypatch.setenv("TRIPPY_OUTPUT", str(tmp_path / "trippy_output"))
+    monkeypatch.setenv("PATH", str(tmp_path / "empty_bin"))  # no colmap here
+    (tmp_path / "empty_bin").mkdir()
+
+    with pytest.raises(FileNotFoundError, match="colmap"):
+        report_mod.resolve_sparse_txt_dir(scene_root)

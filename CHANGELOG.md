@@ -97,6 +97,20 @@ All notable changes to trippy. Format: Keep a Changelog. Versions: semver tags `
   it) rather than from the whole scene's diameter.
 
 ### Fixed
+- **karekare-v2 shade-audit dark-mass numbers were measured against the wrong COLMAP
+  scene**, a second bug found while re-running the 2026-09-09 wrong-frames fix:
+  `trippy train --report`/`_cmd_candidate_report` hardcoded `<scene_root>/sparse_txt`,
+  which does not exist for karekare-v2 (only binary `sparse/<n>` sub-models) --
+  `trippy-shade-audit-rerun2` failed outright. New `trippy.render.report.resolve_sparse_txt_dir`
+  auto-converts a scene's binary `sparse/0` into `$TRIPPY_OUTPUT/scenes/<name>/sparse_txt`
+  with `colmap model_converter` when no native `sparse_txt` exists (cached on disk); new
+  `TrainConfig.sparse_txt` override, set explicitly on every EXP-0011 config to the
+  converted `sparse/0` (756 registered images -- confirmed via `images.bin`'s header, the
+  model this scene's point source and every training run were built from).
+  `report.json` now records `sparse_txt_dir` alongside `shade_frames`. Corrected dark-mass
+  numbers (scene AND frames both fixed): kkv2-1 37.3%, kkv2-2 37.4%, kkv2-3 37.2%,
+  kklid_20000 Gaussian baseline 26.7% -- see `docs/RESULTS.md` and `research/trips-metal.md`
+  2026-09-10 entry.
 - **One click could select the whole scene** (Jordan, on the full Karekare
   scene). Three causes, three fixes, all of them viewer-side and all OFF on the
   `trippy edits click` parity path so `--click` still reproduces the Python twin

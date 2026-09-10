@@ -19,6 +19,12 @@
 run_dir: /Users/nzbirdranch/trippy/output/runs/EXP-0011-karekare-v2/kkv2-1-full-masked
 
 scene_root: /Users/nzbirdranch/Splats/scenes/karekare/karekare-v2
+# COLMAP TEXT sparse model for the Splats shade/extent audits (trippy.render.report.resolve_sparse_txt_dir). karekare-v2 has no sparse_txt of its own, only binary
+# sparse/<n> sub-models; sparse/0 (756 registered images) is the one this scene's
+# point source and every EXP-0011 training run were built from (see README "Finding
+# the shade frames"). Pinned explicitly rather than left to auto-convert so a stale
+# $TRIPPY_OUTPUT cache path is never silently swapped for a different sub-model.
+sparse_txt: /Users/nzbirdranch/trippy/output/scenes/karekare-v2/sparse_txt
 
 # Person masks. "" auto-discovers <scene_root>/masks (1376 PNGs, BLACK = person,
 # WHITE = keep -- verified numerically, see README "Masks"). ON here because the
