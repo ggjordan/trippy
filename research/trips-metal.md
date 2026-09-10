@@ -2937,3 +2937,5 @@ Artifacts (not committed; scratch, kept out of the repo per AGENTS.md Sec 6):
 `$TRIPPY_OUTPUT/scratch/shade_audit_rerun/{kkv2-1-full-masked,kkv2-2-full-unmasked,kkv2-3-removal,kklid_20000-baseline}.shade_audit.json`,
 `$TRIPPY_OUTPUT/scenes/karekare-v2/sparse_txt/` (the TEXT conversion), log:
 `~/Splats/tools/gpu_queue/logs/trippy-shade-audit-rerun3.log`.
+- 2026-09-10T00:42:22Z submitted job trippy-kkv2-5-hybrid-audit prio 40: bash -c /Users/nzbirdranch/trippy/.venv/bin/python /Users/nzbirdranch/Splats/tools/depthprior_shade_audit.py --scene /Users/nzbirdranch/trippy/output/scenes/karekare-v2/sparse_txt --frames $(/Users/nzbirdranch/trippy/.venv/bin/python -c "import json;d=json.load(open('output/scratch/shade_frames.json'));print(' '.join(d if isinstance(d,list) else d['frames']))") output/runs/EXP-0011-karekare-v2/kkv2-5-hybrid/export.ply
+- 2026-09-10T00:43:05Z submitted job trippy-kkv2-5-hybrid-audit2 prio 40: bash /Users/nzbirdranch/trippy/output/jobs-src/audit_kkv2_5.sh
