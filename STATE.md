@@ -3,6 +3,7 @@
 Last updated: 2026-09-10 (feat/supersplat-quest session; previous: feat/supersplat-selfhost)
 
 ## Done
+- 2026-09-11 08:20: hybrid audits corrected: hybrid A 34.1%, gate 32.6% (TRIPS 37.3, Gaussians 26.7). kkv2-8 killed at ep 259 during wrap-up -> kkv2-8b-finish queued (45). hybrid-a-all-levels-bc running (50).
 - 2026-09-10 20:07: kkv2-7-hybrid-gate done (ep 103): PSNR 16.94 dB, strict 16.62 dB (best of everything). REVIEW QUEUE: 4-other/kkv2-7-hybrid-gate-viewer.command. Then kkv2-8 continuation, then the 50/55 runs.
 - 2026-09-10 12:35: Quest SOGs done (119 MB untouched, 114 MB cleaned; counts round-trip exactly). REVIEW QUEUE: 4-other/quest-viewer-shade-keep-quest.command (put on the headset, open the printed URL) and quest-viewer-kklid20000-quest.command to compare. Corrected audit runs next, then kkv2-7 hybrid-gate.
 - 2026-09-10 12:26: kkv2-5-hybrid done (ep 139): PSNR 16.85 dB, best full-scene number so far (plain TRIPS 15.06). REVIEW QUEUE: 4-other/kkv2-5-hybrid-viewer.command. Next on GPU: two Quest SOG conversions, corrected audit, then kkv2-7 hybrid-gate.

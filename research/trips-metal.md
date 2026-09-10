@@ -2945,3 +2945,7 @@ Artifacts (not committed; scratch, kept out of the repo per AGENTS.md Sec 6):
 - Artifact: 4-other/kkv2-7-hybrid-gate-viewer.command. Verdict pending Jordan.
 - 2026-09-10T08:11:39Z submitted job trippy-kkv2-hybrids-audit prio 40: bash /Users/nzbirdranch/trippy/output/jobs-src/audit_hybrids.sh
 - 2026-09-10T20:12:22Z submitted job trippy-kkv2-8b-full-masked-finish prio 45: bash -c PYTHONPATH=. TRIPPY_OUTPUT=/Users/nzbirdranch/trippy/output /Users/nzbirdranch/trippy/.venv/bin/python -m trippy.cli train --config experiments/EXP-0011-karekare-v2/config.yaml --resume /Users/nzbirdranch/trippy/output/runs/EXP-0011-karekare-v2/kkv2-1-full-masked/checkpoints/checkpoint_latest.pt --device mps --max-minutes 300 --report
+
+## 2026-09-11 08:20 — corrected audits for the hybrids; kkv2-8 killed at epoch 259
+- trippy-kkv2-hybrids-audit rc=0 (karekare-v2 sparse/0 text copy, 93 big-tree frames, the report's lum0.25 threshold): hybrid A (kkv2-5) 34.1%, hybrid gate (kkv2-7) 32.6%, plain TRIPS 37.3%, Gaussians 26.7%. Both hybrids sit between TRIPS and the splat on this density indicator; the gate is closest to the splat. (Other thresholds in output/scratch/hybrid_audit.json.)
+- kkv2-8-full-masked-cont: Killed: 9 at 08:07 (12 h after start) with checkpoint_ep0259 already saved; the kill hit the wrap-up (report/export), not training. Resubmitted as kkv2-8b-full-masked-finish (prio 45, 300-min budget, resumes at ep 259, --report) to reach epoch 300 and deliver the launcher.

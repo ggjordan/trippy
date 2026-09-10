@@ -64,4 +64,4 @@ Full Karekare-v2 (the scene with the big tree): masked, unmasked, point removal,
 v0.4.0 released. Native Mac viewer 29.5 fps at 1080p; browser viewer 18 fps in Chrome (Safari unsupported:
 no WebGPU subgroups). Rust and Python renderers agree to 115 dB on the public scene.
 
-| karekare-v2 (full, masked) | Hybrid gate (g*splat + (1-g)*TRIPS), ep 103 | 16.94 (strict 16.62) | – | pending | 4-other/kkv2-7-hybrid-gate-viewer.command | best strict PSNR of all arms; verdict pending |
+| karekare-v2 (full, masked) | Hybrid gate (g*splat + (1-g)*TRIPS), ep 103 | 16.94 (strict 16.62) | – | 32.6% (Gaussians 26.7%) | 4-other/kkv2-7-hybrid-gate-viewer.command | best strict PSNR of all arms; verdict pending |
