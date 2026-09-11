@@ -3,6 +3,7 @@
 Last updated: 2026-09-10 (feat/supersplat-quest session; previous: feat/supersplat-selfhost)
 
 ## Done
+- 2026-09-11 14:16: plain TRIPS full scene at 300 epochs: 14.78 dB (worse than 15.06 at ep 122) -> longer plain training does not help; hybrids are the path. kkv2-1-full-masked launcher now = epoch 299. Remaining GPU: hybrid-a-all-levels (50) then the 55s.
 - 2026-09-11 12:22: hybrid-a-all-levels-bc (kk-coherent) done: 17.45 dB, strict 16.39. kkv2-8b-finish running (45).
 - 2026-09-11 08:20: hybrid audits corrected: hybrid A 34.1%, gate 32.6% (TRIPS 37.3, Gaussians 26.7). kkv2-8 killed at ep 259 during wrap-up -> kkv2-8b-finish queued (45). hybrid-a-all-levels-bc running (50).
 - 2026-09-10 20:07: kkv2-7-hybrid-gate done (ep 103): PSNR 16.94 dB, strict 16.62 dB (best of everything). REVIEW QUEUE: 4-other/kkv2-7-hybrid-gate-viewer.command. Then kkv2-8 continuation, then the 50/55 runs.

@@ -20,6 +20,7 @@ Last updated 2026-09-10 (shade-audit sparse-scene bug fix; karekare-v2 dark-mass
 | + audit-aligned shade prune (EXP-0010 B) — **walk this one** | **17.75** | **15.59** | **24.1%** |
 | Alternating shade hold-out (trained on 3 of the 6 shade frames; scored on the other 3) | 17.94 | 16.79 | 36.7% |
 | karekare-v2 (full, masked) | TRIPS plain, ep 122/300 | 15.06 | – | **37.3%** (Gaussians baseline 26.7%, corrected scene+frames -- was 34.5%/17.3%, WRONG SCENE AND FRAMES, see note) | kkv2-1-full-masked-viewer.command | JORDAN: shade SOLVED; rest of scene fuzzy (undertrained?) |
+| karekare-v2 (full, masked) | TRIPS plain, ep 299 | 14.78 (strict 13.01) | – | 37.5% (Gaussians 26.7%) | kkv2-1-full-masked-viewer.command (now ep 299) | more epochs made it worse: plain TRIPS peaks ~ep 120 |
 | karekare-v2 (full, unmasked) | TRIPS plain, ep 105/300 | 14.63 | – | **37.4%** (Gaussians baseline 26.7%, corrected scene+frames -- was 34.5%/17.3%, WRONG SCENE AND FRAMES, see note) | kkv2-2-full-unmasked-viewer.command | JORDAN: shade solved too; same fuzziness |
 | karekare-v2 (point removal) | TRIPS + point removal, ep 104/300 (400 min budget) | 15.04 (strict 14.12) | – | **37.2%** (Gaussians baseline 26.7%, corrected scene+frames -- was 34.9%/17.3%, WRONG SCENE AND FRAMES, see note) | kkv2-3-removal-viewer.command | overnight run, splat-clean agent found the frame bug here first |
 
