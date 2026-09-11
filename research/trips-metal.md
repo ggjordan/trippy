@@ -2972,3 +2972,6 @@ Artifacts (not committed; scratch, kept out of the repo per AGENTS.md Sec 6):
 - 2026-09-11T07:22:13Z delivered hybrid-a-all-levels-honesty: trippy train report hybrid-a-all-levels: epoch 87, held-out PSNR 17.26 dB (neighbours-exposure) (strict, own exposure: 16.88 dB), shade dark-mass 38.0% vs baseline 19.9% (/Users/nzbirdranch/trippy/output/runs/EXP-0009-hybrid-a/hybrid-a-all-levels/report/dolly/honesty_sheet.png)
 - 2026-09-11T07:22:15Z delivered hybrid-a-all-levels-export: trippy train report hybrid-a-all-levels: epoch 87, held-out PSNR 17.26 dB (neighbours-exposure) (strict, own exposure: 16.88 dB), shade dark-mass 38.0% vs baseline 19.9% (/Users/nzbirdranch/trippy/output/runs/EXP-0009-hybrid-a/hybrid-a-all-levels/export.ply)
 - 2026-09-11T07:22:20Z delivered trips-leaderboard: One table of every TRIPS run so far vs the Gaussian baseline: held-out PSNR, shade dark-mass, extent, coverage. Regenerated after every training. (/Users/nzbirdranch/trippy/output/leaderboard/leaderboard.png)
+
+## 2026-09-11 19:25 — hybrid-a-all-levels (kk-coherent, trips mode, Gaussian channels at every level)
+- Numbers: epoch 87 (budget), held-out PSNR 17.26 dB, strict 16.88 dB (best strict on the small scene), dark-mass 38.0% vs Gaussians 19.9%. Twin of the broadcast arm (17.45 / 16.39 at ep 251) at a third of the epochs. Supporting evidence only; launcher self-delivered.
