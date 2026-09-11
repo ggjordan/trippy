@@ -2980,3 +2980,6 @@ Artifacts (not committed; scratch, kept out of the repo per AGENTS.md Sec 6):
 - 2026-09-11T12:29:03Z delivered full3-alt-honesty: trippy train report full3-alt: epoch 86, held-out PSNR 17.89 dB (neighbours-exposure) (strict, own exposure: 17.06 dB), shade dark-mass 37.2% vs baseline 19.9% (/Users/nzbirdranch/trippy/output/runs/EXP-0003-kk-trips-train/full3-alt/report/dolly/honesty_sheet.png)
 - 2026-09-11T12:29:05Z delivered full3-alt-export: trippy train report full3-alt: epoch 86, held-out PSNR 17.89 dB (neighbours-exposure) (strict, own exposure: 17.06 dB), shade dark-mass 37.2% vs baseline 19.9% (/Users/nzbirdranch/trippy/output/runs/EXP-0003-kk-trips-train/full3-alt/export.ply)
 - 2026-09-11T12:29:10Z delivered trips-leaderboard: One table of every TRIPS run so far vs the Gaussian baseline: held-out PSNR, shade dark-mass, extent, coverage. Regenerated after every training. (/Users/nzbirdranch/trippy/output/leaderboard/leaderboard.png)
+
+## 2026-09-12 00:35 — full3-alt (kk-coherent, trips mode, alternating hold-out; continuation)
+- Numbers: epoch 86 (budget), held-out PSNR 17.89 dB, strict 17.06 dB, dark-mass 37.2% vs Gaussians 19.9%. Strict 17.06 is the best strict number of any plain-TRIPS run (alternating hold-out gives every view a trained exposure). Supporting evidence for the small scene; launcher self-delivered.
