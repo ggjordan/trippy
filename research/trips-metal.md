@@ -2996,3 +2996,6 @@ Artifacts (not committed; scratch, kept out of the repo per AGENTS.md Sec 6):
 - 2026-09-12T00:26:23Z delivered removal-rel-honesty: trippy train report removal-rel: epoch 299, held-out PSNR 17.69 dB (neighbours-exposure) (strict, own exposure: 16.52 dB), shade dark-mass 36.6% vs baseline 19.9% (/Users/nzbirdranch/trippy/output/runs/EXP-0010-point-removal/removal-rel/report/dolly/honesty_sheet.png)
 - 2026-09-12T00:26:24Z delivered removal-rel-export: trippy train report removal-rel: epoch 299, held-out PSNR 17.69 dB (neighbours-exposure) (strict, own exposure: 16.52 dB), shade dark-mass 36.6% vs baseline 19.9% (/Users/nzbirdranch/trippy/output/runs/EXP-0010-point-removal/removal-rel/export.ply)
 - 2026-09-12T00:26:29Z delivered trips-leaderboard: One table of every TRIPS run so far vs the Gaussian baseline: held-out PSNR, shade dark-mass, extent, coverage. Regenerated after every training. (/Users/nzbirdranch/trippy/output/leaderboard/leaderboard.png)
+
+## 2026-09-12 12:33 — removal-rel (kk-coherent, relative point removal, 300 epochs)
+- Numbers: epoch 299, held-out PSNR 17.69 dB, strict 16.52 dB, dark-mass 36.6% vs Gaussians 19.9%. Sits with the other small-scene plain-TRIPS arms (17.67 TRIPS-rule removal, 17.75 shade-prune, 17.94 alternating); relative removal is not a differentiator. Launcher self-delivered.

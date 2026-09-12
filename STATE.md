@@ -3,6 +3,7 @@
 Last updated: 2026-09-10 (feat/supersplat-quest session; previous: feat/supersplat-selfhost)
 
 ## Done
+- 2026-09-12 12:33: removal-rel (kk-coherent) done: 17.69 dB, strict 16.52; no differentiator. GPU: union-broadcast (55) now, then union-trips; queue then empty.
 - 2026-09-12 07:44: kkv2-6-shade-prune done (15.06 dB, dark-mass 31.9%): not a candidate (deletes geometry). GPU: removal-rel (55) now, then union x2; queue then empty.
 - 2026-09-12 00:35: full3-alt (kk-coherent, alternating hold-out) done: 17.89 dB, strict 17.06. GPU: kkv2-6-shade-prune (55) now, then removal-rel, union x2.
 - 2026-09-11 19:25: hybrid-a-all-levels (kk-coherent, trips mode) done: 17.26 dB, strict 16.88 at ep 87. GPU now on the 55s: full3-alt, then kkv2-6-shade-prune, removal-rel, union x2.
