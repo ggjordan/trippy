@@ -1,3 +1,21 @@
+# STATE
+
+## Review queue for Jordan (2026-09-12 22:30; all in ~/Splats/output/Jordan-Review; nothing blocks on these)
+1. 4-other/kkv2-7-hybrid-gate-viewer.command — learned splat/TRIPS gate on the full scene. Best numbers of the project: 16.94 dB, strict 16.62. Question: shade still shading, and closer to your splat than plain TRIPS?
+2. 4-other/kkv2-5-hybrid-viewer.command — hybrid A on the full scene (16.85 dB). Compare with 1; mix slider works in both.
+3. 2-open-in-brush/kklid-tripsclean-shade.ply, then -005 and -015 — your splat minus the fog TRIPS identified (4/11/23% of Gaussians deleted, survivors byte-identical). Open in Brush. Verdict decides the default threshold.
+4. 4-other/supersplat.command + 2-open-in-brush/kklid-tripsclean-shade-{keep,fog}.ply — SuperSplat 3.0 served from this Mac only; drag both layers in, hide the fog layer, edit with their tools. Never press File > Publish.
+5. 4-other/quest-viewer-shade-keep-quest.command (and -kklid20000-quest to compare) — cleaned splat as a 114 MB SOG in a WebXR viewer served over your LAN to the Quest. Report how it feels.
+6. 4-other/kkv2-1-combined-viewer.command — epoch-122 TRIPS under the big tree only, your splat everywhere else.
+Verdict recap so far: full-scene TRIPS solved the big-tree shade (your eyes), plain TRIPS looks nothing like a photo elsewhere, shade pruning rejected, splat is the base. Longer plain training made it worse (14.78 dB at ep 299). Dark-mass is a density indicator only.
+
+## Current state (2026-09-12)
+- Done: all queued trippy experiments have run (full-scene: masked/unmasked/removal/hybrid/gate/shade-prune/300-ep; small scene: hybrid A x2, alternating, removal-rel, union x2). v0.7.0 released. Editor Simple Mode, SuperSplat stages 1+3, splat-clean, corrected audits, perf harness all merged.
+- In flight: kkv2-7b-hybrid-gate-cont and kkv2-5c-hybrid-cont queued at prio 50 (behind Splats at 30).
+- Next: act on Jordan's verdicts (default launcher, fog threshold, SuperSplat fork decision). Parked: 3-day full-res plain run (weakened by the 300-ep result), SuperSplat fork (3-5 agent-weeks).
+- Blocked: nothing.
+
+## History (newest first; older sections below are the running log)
 # STATE — externalized progress (update at end of every session)
 
 Last updated: 2026-09-10 (feat/supersplat-quest session; previous: feat/supersplat-selfhost)
