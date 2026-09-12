@@ -57,6 +57,14 @@ otherwise-successful training run (`trippy train`'s exit code reflects
 `trippy.render.report.build_mac_viewer_launcher` records it in
 `<run_dir>/report/VIEWER_LAUNCHER_FAILED.txt` instead and the rest of the
 report still completes.
+
+That wrap-up runs as a stage list (`trippy.render.report.REPORT_STAGES`) with
+the finished `Trainer` already released, one stage at a time, writing a
+partial result per stage -- see docs/ARCHITECTURE.md "Wrap-up memory" for why
+(two full-scene runs were killed by the kernel mid-report). `report-from-checkpoint
+<run_dir>` runs exactly that path against an already-trained run directory: the
+recovery command for a killed wrap-up, and the way to (re)build a report without
+retraining.
 `points-build` builds any `trippy.train.config.PointSourceConfig`-described
 source (gaussian/colmap/union/npz, the same schema as a TrainConfig YAML's
 `point_source:` block, taken as the document root here) and writes it to
@@ -343,25 +351,30 @@ def _cmd_not_implemented(name: str):
     return _run
 
 
-def _run_train_report_safely(trainer: Trainer, metrics: dict) -> None:
-    """Run `trippy.render.report.run_train_report`, never letting it fail the training run.
+def _run_report_stages_safely(ctx, metrics: dict) -> None:
+    """Run the staged wrap-up for `ctx`, never letting it fail the training run.
 
-    Requirement 1 of this task's brief: `--report` must not crash a run
-    that trained successfully. Any exception here (a broken audit tool, a
-    missing scene sparse dir, deliver.sh refusing an artifact, ...) is
+    Requirement 1 of the original `--report` brief: `--report` must not crash
+    a run that trained successfully. Any exception here (a broken audit tool,
+    a missing scene sparse dir, deliver.sh refusing an artifact, ...) is
     caught, logged to stderr, and recorded in `<run_dir>/REPORT_FAILED.txt`
     -- `trippy train`'s own exit code is unaffected either way.
+
+    Takes a `trippy.render.report.ReportContext`, NOT a `Trainer`: by the time
+    this runs the Trainer has already been released and dropped
+    (`_train_and_report_context`), which is the 2026-09-13 memory fix -- see
+    `trippy.render.report`'s "the staged, low-peak-memory wrap-up" note.
     """
     # Deferred import: pulls in the render/audit stack `trippy train` without
     # `--report` has no need for.
-    from trippy.render.report import run_train_report
+    from trippy.render.report import run_report_stages
 
     try:
-        report = run_train_report(trainer, metrics)
-        print(f"trippy train: report -> {trainer.run_dir / TRAIN_REPORT_DIRNAME}")
+        report = run_report_stages(ctx, held_out_metrics=metrics)
+        print(f"trippy train: report -> {ctx.run_dir / TRAIN_REPORT_DIRNAME}")
         print(f"trippy train: {report['summary_line']}")
     except Exception as exc:  # noqa: BLE001 -- deliberately broad, see docstring
-        failed_path = Path(trainer.run_dir) / TRAIN_REPORT_FAILED_FILENAME
+        failed_path = Path(ctx.run_dir) / TRAIN_REPORT_FAILED_FILENAME
         failed_path.write_text(
             "trippy train --report failed after a successful training run.\n"
             f"error: {exc!r}\n\n{traceback.format_exc()}"
@@ -383,6 +396,28 @@ def _cmd_train(args: argparse.Namespace) -> int:
         cfg.device = args.device
     if args.run_dir is not None:
         cfg.run_dir = args.run_dir
+    # The Trainer is built, used and DROPPED inside this helper, so that by the time the
+    # wrap-up starts nothing of the training run is resident. See `_train_and_report_context`.
+    ctx, metrics = _train_and_report_context(args, cfg)
+    if ctx is not None:
+        _run_report_stages_safely(ctx, metrics)
+    return 0
+
+
+def _train_and_report_context(args: argparse.Namespace, cfg: TrainConfig):
+    """Train, print the run's headline numbers, and return `(ReportContext | None, metrics)`.
+
+    A separate function purely so the `Trainer` is a LOCAL of a frame that
+    has returned before the wrap-up begins. On the full karekare-v2 scene the
+    finished Trainer is a 7.5M-point cloud plus its Adam state plus a 756-image
+    dataset, and the wrap-up rebuilds all of that from the checkpoint anyway;
+    holding both at once is what got two runs killed by the kernel an hour into
+    their reports (`trippy.render.report`, "the staged, low-peak-memory
+    wrap-up"). `Trainer.release_for_report` drops the big attributes and this
+    frame's return drops the object itself.
+
+    Returns `(None, metrics)` when `--report` was not asked for.
+    """
     trainer = Trainer(cfg)
     if args.resume is not None:
         trainer.resume(args.resume)
@@ -390,9 +425,16 @@ def _cmd_train(args: argparse.Namespace) -> int:
     print(f"trippy train: run_dir={trainer.run_dir} final_epoch={trainer.epoch}")
     if metrics:
         print(f"trippy train: last eval psnr_mean={metrics.get('psnr_mean')} ssim_mean={metrics.get('ssim_mean')}")
-    if args.report:
-        _run_train_report_safely(trainer, metrics)
-    return 0
+    if not getattr(args, "report", False):
+        return None, metrics
+
+    from trippy.render.report import REPORT_MEMORY_FILENAME, report_context_from_trainer
+    from trippy.train.memlog import MemoryLog
+
+    ctx = report_context_from_trainer(trainer, metrics)
+    ctx.out_dir.mkdir(parents=True, exist_ok=True)
+    trainer.release_for_report(MemoryLog(ctx.out_dir / REPORT_MEMORY_FILENAME, log=print))
+    return ctx, metrics
 
 
 def _cmd_eval(args: argparse.Namespace) -> int:
@@ -1613,6 +1655,34 @@ def _cmd_candidate_report(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_report_from_checkpoint(args: argparse.Namespace) -> int:
+    """Run ONLY the post-training wrap-up for an already-trained run directory.
+
+    The recovery path for a run whose `trippy train --report` was killed
+    after training finished (`Killed: 9` -- a macOS memory kill; see
+    `trippy.render.report`'s "the staged, low-peak-memory wrap-up"). Needs
+    nothing but `<run_dir>/checkpoints/checkpoint_latest.pt` and
+    `<run_dir>/export.ply`; reuses any stage already completed at that
+    checkpoint's epoch, so re-running after a kill costs only the lost stage.
+
+    Unlike `trippy train --report`, this NEVER swallows its own errors: it is
+    invoked deliberately, so a failure must be visible in the exit code
+    rather than buried in REPORT_FAILED.txt.
+    """
+    from trippy.render.report import report_from_checkpoint
+
+    report = report_from_checkpoint(
+        args.run_dir,
+        device=args.device,
+        force=args.force,
+        stages=args.stage or None,
+        memory_log=args.memory_log,
+    )
+    print(f"report-from-checkpoint: {report['summary_line']}")
+    print(f"report-from-checkpoint: report -> {Path(args.run_dir) / TRAIN_REPORT_DIRNAME}")
+    return 0
+
+
 def _cmd_distill(args: argparse.Namespace) -> int:
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -2441,6 +2511,36 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     candidate_report.set_defaults(func=_cmd_candidate_report)
+
+    report_from_checkpoint_p = sub.add_parser(
+        "report-from-checkpoint",
+        help="run only the post-training wrap-up (eval/dolly/off-path/audits/bundle/deliver) for a run dir",
+    )
+    report_from_checkpoint_p.add_argument("run_dir", help="training run directory (must contain checkpoints/ and export.ply)")
+    report_from_checkpoint_p.add_argument(
+        "--device", choices=["cpu", "mps"], default=None, help="override the checkpoint's own device"
+    )
+    report_from_checkpoint_p.add_argument(
+        "--force", action="store_true", help="recompute stages that already have a result for this epoch"
+    )
+    report_from_checkpoint_p.add_argument(
+        "--stage",
+        action="append",
+        default=None,
+        # Not `choices=`: the stage list lives in trippy.render.report (REPORT_STAGES) and
+        # importing that module just to build the parser would pull the whole render/audit
+        # stack into every `trippy` invocation. `run_report_stages` rejects an unknown name.
+        help=(
+            "run only this stage (repeatable): eval, dolly, offpath, audits, bundle, finalize; "
+            "stored results are used for the rest"
+        ),
+    )
+    report_from_checkpoint_p.add_argument(
+        "--memory-log",
+        default=None,
+        help="JSONL path for stage-boundary RSS/MPS samples (default <run_dir>/report/memory.jsonl)",
+    )
+    report_from_checkpoint_p.set_defaults(func=_cmd_report_from_checkpoint)
 
     distill = sub.add_parser(
         "distill",

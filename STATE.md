@@ -9,6 +9,13 @@
 6. 4-other/kkv2-1-combined-viewer.command — epoch-122 TRIPS under the big tree only, your splat everywhere else.
 Verdict recap so far: full-scene TRIPS solved the big-tree shade (your eyes), plain TRIPS looks nothing like a photo elsewhere, shade pruning rejected, splat is the base. Longer plain training made it worse (14.78 dB at ep 299). Dark-mass is a density indicator only.
 
+## Current state (2026-09-13)
+- Done: `trippy train --report`'s post-training wrap-up no longer holds the finished Trainer while it rebuilds one from the checkpoint; it now runs as a resumable stage list with memory logging (fix/report-wrapup-memory). New `trippy report-from-checkpoint <run_dir>` recovers a killed wrap-up.
+- In flight: job `trippy-kkv2-5-hybrid-report` (prio 40) — kkv2-5-hybrid's missing epoch-244 report; queued behind kkv2-7b-hybrid-gate-cont (prio 50, ~9 h to go). Its `report/memory.jsonl` fills in the PENDING rows of docs/ARCHITECTURE.md "Wrap-up memory".
+- Next: read that memory log, finish the ARCHITECTURE table; if kkv2-7b is killed in its own wrap-up (it runs from `.worktrees/blend-gate` with the old code already imported, so the fix cannot reach it), recover it with `trippy report-from-checkpoint`.
+- Blocked: nothing.
+- Known gap, deliberately out of this task's file list: `trippy/render/candidate.py` accumulates `net_frames` + `raw_frames` for every pose even when `write_video_files=False`; the 198-pose off-path stage therefore builds ~0.9 GB of buffers it discards. One-line guard, constant in training length.
+
 ## Current state (2026-09-12)
 - Done: all queued trippy experiments have run (full-scene: masked/unmasked/removal/hybrid/gate/shade-prune/300-ep; small scene: hybrid A x2, alternating, removal-rel, union x2). v0.7.0 released. Editor Simple Mode, SuperSplat stages 1+3, splat-clean, corrected audits, perf harness all merged.
 - In flight: kkv2-7b-hybrid-gate-cont and kkv2-5c-hybrid-cont queued at prio 50 (behind Splats at 30).

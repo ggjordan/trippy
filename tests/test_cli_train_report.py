@@ -22,8 +22,8 @@ Invariants under test:
       scripts/deliver.sh -- this repo's forbidden list ("no GPU jobs";
       AGENTS.md "never write into ~/Splats/output/Jordan-Review") and this
       task's brief both require CPU tests to never call deliver.sh for real.
-    - `trippy.cli._run_train_report_safely` (requirement 1: "--report never
-      crashes the run") catches an exception from `run_train_report` and
+    - `trippy.cli._run_report_stages_safely` (requirement 1: "--report never
+      crashes the run") catches an exception from `run_report_stages` and
       writes `<run_dir>/REPORT_FAILED.txt` instead of propagating it, and
       never touches sys.exit itself (the caller, `_cmd_train`, always
       returns 0 once `fit()` has succeeded).
@@ -173,21 +173,23 @@ def test_cli_train_report_failure_writes_report_failed_but_never_raises(
     import trippy.render.report as report_mod
     from trippy import cli
 
-    def _boom(trainer, metrics):
+    def _boom(ctx, held_out_metrics=None, **kwargs):
         raise RuntimeError("audit tool exploded")
 
-    monkeypatch.setattr(report_mod, "run_train_report", _boom)
+    monkeypatch.setattr(report_mod, "run_report_stages", _boom)
 
     run_dir = tmp_path / "run"
     run_dir.mkdir()
 
-    class _FakeTrainer:
+    # Only `.run_dir` is read on the failure path (the REPORT_FAILED.txt location);
+    # the real object is a `trippy.render.report.ReportContext`, which holds no Trainer.
+    class _FakeContext:
         pass
 
-    fake_trainer = _FakeTrainer()
-    fake_trainer.run_dir = run_dir
+    fake_ctx = _FakeContext()
+    fake_ctx.run_dir = run_dir
 
-    cli._run_train_report_safely(fake_trainer, {"epoch": 3})  # must not raise
+    cli._run_report_stages_safely(fake_ctx, {"epoch": 3})  # must not raise
 
     failed_path = run_dir / TRAIN_REPORT_FAILED_FILENAME
     assert failed_path.exists()
@@ -273,3 +275,61 @@ def test_cli_train_report_no_shade_frames_key_falls_back_to_the_script_default(t
     assert report["audits"]["candidate"]["shade_audit"]["frames"] is None
     assert report["shade_frames"]["source"].startswith("script default")
     assert report["shade_frames"]["frames"] == list(SHADE_FRAMES_KK)
+
+
+def test_cli_report_from_checkpoint_produces_the_same_report_without_retraining(tmp_path: Path) -> None:
+    """`trippy report-from-checkpoint <run_dir>` is the recovery path for a killed wrap-up.
+
+    Trains WITHOUT `--report` (so the run dir has a checkpoint, an export.ply
+    and an eval directory but no report at all -- exactly the state the two
+    killed karekare-v2 runs were left in), then builds the whole report from
+    that directory alone. Also asserts the two things the fix is for: a
+    per-stage partial result on disk, and a memory log with a sample at every
+    stage boundary.
+    """
+    scene_root, point_set = build_synthetic_scene(tmp_path)
+    ply_path = build_synthetic_ply(tmp_path, point_set)
+    run_dir = tmp_path / "run"
+    cfg = tiny_train_config(scene_root, ply_path, run_dir, tmp_path / "cache")
+    config_path = cfg.save_yaml(tmp_path / "config.yaml")
+
+    splats_root = tmp_path / "fake_splats"
+    _write_fake_shade_audit_tool(splats_root)
+
+    env = dict(os.environ)
+    env["TRIPPY_DELIVER_DRY_RUN"] = "1"
+    env["TRIPPY_OUTPUT"] = str(tmp_path / "trippy_output")
+    env["SPLATS_ROOT"] = str(splats_root)
+
+    train_argv = [
+        sys.executable, "-m", "trippy.cli", "train",
+        "--config", str(config_path), "--device", "cpu",
+    ]  # fmt: skip
+    trained = subprocess.run(train_argv, capture_output=True, text=True, timeout=180, env=env, check=False)
+    assert trained.returncode == 0, f"stdout:\n{trained.stdout}\nstderr:\n{trained.stderr}"
+    assert not (run_dir / "report" / "report.json").exists()
+
+    report_argv = [
+        sys.executable, "-m", "trippy.cli", "report-from-checkpoint", str(run_dir), "--device", "cpu",
+    ]  # fmt: skip
+    result = subprocess.run(report_argv, capture_output=True, text=True, timeout=300, env=env, check=False)
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+
+    report = json.loads((run_dir / "report" / "report.json").read_text())
+    assert report["epoch"] == cfg.epochs - 1
+    assert len(report["deliveries"]) == 4
+    assert report["deliveries"][0]["name"] == f"{run_dir.name}-viewer"
+    assert "## Report: epoch" in (run_dir / "README.md").read_text()
+
+    # Partial outputs: one file per stage, so a kill costs at most one stage.
+    from trippy.render.report import REPORT_STAGES
+
+    for stage in REPORT_STAGES:
+        assert (run_dir / "report" / "stages" / f"{stage}.json").exists(), stage
+
+    # The memory log the ARCHITECTURE wrap-up table is built from.
+    memory_lines = [json.loads(line) for line in (run_dir / "report" / "memory.jsonl").read_text().splitlines()]
+    labels = [record["label"] for record in memory_lines]
+    assert "wrapup:begin" in labels and "wrapup:end" in labels
+    for stage in REPORT_STAGES:
+        assert f"{stage}:begin" in labels and f"{stage}:end" in labels

@@ -51,8 +51,10 @@ import json
 import os
 import shutil
 import subprocess
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
@@ -70,6 +72,8 @@ from trippy.constants import (
     SHADE_FRAMES_KK,
     TRAIN_CHECKPOINT_DIRNAME,
     TRAIN_CHECKPOINT_LATEST_FILENAME,
+    TRAIN_EVAL_DIRNAME_FMT,
+    TRAIN_EVAL_METRICS_FILENAME,
     TRAIN_EXPORT_FILENAME,
     TRAIN_REPORT_BUNDLE_DIRNAME,
     TRAIN_REPORT_DIRNAME,
@@ -81,6 +85,7 @@ from trippy.render.bundle import export_bundle
 from trippy.render.candidate import render_candidate
 from trippy.render.dolly import shade_dolly_poses
 from trippy.render.offpath import offpath_poses
+from trippy.train import memlog as memlog_mod
 
 if TYPE_CHECKING:
     from trippy.train.trainer import Trainer
@@ -792,154 +797,570 @@ def _ensure_run_readme(run_dir: Path) -> Path:
     return readme_path
 
 
-def run_train_report(trainer: Trainer, held_out_metrics: dict) -> dict:
-    """Build and deliver the self-report for a finished `Trainer.fit()` run.
+# --- the staged, low-peak-memory wrap-up ---
+#
+# Why this is staged rather than one straight-line function (2026-09-13):
+# `trippy train --report` ran the entire wrap-up with the finished `Trainer` -- point
+# cloud, dataset, U-Net, Adam state -- still resident, while `render_candidate` built a
+# SECOND Trainer from the same checkpoint for each of its two pose sets. On the full
+# karekare-v2 scene (7.5M points, 756 images, ~10 h of training behind it) the kernel
+# killed two such runs about an hour in (`Killed: 9`, a macOS jetsam memory kill;
+# Splats' queue runner has no timeout, so nothing else could have): kkv2-8-full-masked-cont
+# (epoch 259, 2026-09-11) and kkv2-5c-hybrid-cont (epoch 244, 2026-09-13). Shorter runs
+# (400-420 min budgets) on the same scene survived the same wrap-up, which is what makes
+# this a memory-growth story rather than a broken stage.
+#
+# Three properties follow, and every one of them is the reason for a piece of code below:
+#   1. Nothing here touches a live Trainer. Every stage is rebuilt from
+#      `checkpoint_latest.pt` / `export.ply`, so `Trainer.release_for_report` can drop
+#      the whole training object -- optimizer state included -- before stage 1 starts.
+#   2. Stages run one at a time with `trippy.train.memlog.release()` (gc +
+#      `torch.mps.empty_cache()`) between them, and each boundary is logged, so
+#      peak memory is one stage's peak rather than the sum of all of them.
+#   3. Every stage writes its own result to `<run_dir>/report/stages/<stage>.json`
+#      before the next one starts, and a re-run reuses any stage file recorded at the
+#      same epoch. A kill therefore costs at most the stage that was running, and
+#      `trippy report-from-checkpoint <run_dir>` picks up where it stopped.
+
+#: Per-stage partial results live here, one JSON file per stage, under `<run_dir>/report/`.
+_REPORT_STAGES_DIRNAME = "stages"
+
+#: Memory samples (JSONL, `trippy.train.memlog`) for one wrap-up, under `<run_dir>/report/`.
+REPORT_MEMORY_FILENAME = "memory.jsonl"
+
+#: Stage order. `finalize` consumes every earlier stage's result, so it must stay last.
+REPORT_STAGES: tuple[str, ...] = ("eval", "dolly", "offpath", "audits", "bundle", "finalize")
+
+
+@dataclass
+class ReportContext:
+    """Everything the wrap-up needs about a finished run, and nothing that holds memory.
+
+    Deliberately all plain scalars/paths plus the run's `TrainConfig`: it is
+    built either from a live `Trainer` (`report_context_from_trainer`, which
+    reads these fields and then lets the caller drop the Trainer) or straight
+    from a checkpoint on disk (`report_context_from_run_dir`). The two paths
+    produce the same object, which is what makes `trippy train --report` and
+    `trippy report-from-checkpoint` literally the same code.
+
+    Attributes:
+        run_dir: the training run directory (`<run_dir>/report/` is written).
+        checkpoint_path: `<run_dir>/checkpoints/checkpoint_latest.pt`.
+        export_path: `<run_dir>/export.ply`.
+        cfg: the run's `TrainConfig` (scene_root, width, shade_frames, ...).
+        device: torch device string the renders should run on ("mps"/"cpu").
+        epoch: the epoch this report describes; also the cache key for the
+            per-stage partial results (a stage file from a different epoch is
+            ignored, never reused).
+        dolly_pose_name: anchor image for the shade dolly path.
+        offpath_names: images to build off-path honesty pairs for.
+    """
+
+    run_dir: Path
+    checkpoint_path: Path
+    export_path: Path
+    cfg: Any
+    device: str
+    epoch: int
+    dolly_pose_name: str
+    offpath_names: list[str]
+
+    @property
+    def out_dir(self) -> Path:
+        """`<run_dir>/report` -- where every artifact and `report.json` land."""
+        return self.run_dir / TRAIN_REPORT_DIRNAME
+
+    @property
+    def stages_dir(self) -> Path:
+        """`<run_dir>/report/stages` -- one JSON file per completed stage."""
+        return self.out_dir / _REPORT_STAGES_DIRNAME
+
+
+def _first_registered_image_name(cfg) -> str:
+    """The first image of the run's dataset, without building a `SceneDataset`.
+
+    `SceneDataset.names` is `sorted(colmap images_by_name)` truncated by
+    `cfg.limit_images`, so reading the COLMAP model directly gives the same
+    first name for a fraction of the memory (the dataset would also open the
+    whole undistorted image cache). Only needed for a run with no
+    `forced_heldout` -- every karekare-v2 config has one.
+    """
+    from trippy.scene import colmap_io
+    from trippy.scene.dataset import resolve_sparse_dir
+
+    scene = colmap_io.load_colmap_model(resolve_sparse_dir(Path(cfg.scene_root)))
+    names = sorted(scene.images_by_name().keys())
+    if not names:
+        raise ValueError(f"no registered images under {cfg.scene_root}")
+    return names[0]
+
+
+def _pose_names_for(cfg) -> tuple[str, list[str]]:
+    """`(dolly_pose_name, offpath_names)` -- `cfg.forced_heldout`, else the first image."""
+    forced = list(cfg.forced_heldout)
+    if forced:
+        return forced[0], forced
+    first = _first_registered_image_name(cfg)
+    return first, [first]
+
+
+def report_context_from_trainer(trainer: Trainer, held_out_metrics: dict) -> ReportContext:
+    """Snapshot a finished `Trainer` into a `ReportContext`, holding no reference to it.
+
+    Read this BEFORE `Trainer.release_for_report()`; afterwards the Trainer's
+    dataset and parameters are gone. The returned object keeps only the run's
+    `TrainConfig` and a handful of scalars, so dropping the Trainer right
+    after this call frees everything training needed.
+    """
+    return ReportContext(
+        run_dir=Path(trainer.run_dir),
+        checkpoint_path=trainer.checkpoint_dir / TRAIN_CHECKPOINT_LATEST_FILENAME,
+        export_path=Path(trainer.run_dir) / TRAIN_EXPORT_FILENAME,
+        cfg=trainer.cfg,
+        device=str(trainer.device),
+        epoch=int(held_out_metrics.get("epoch", trainer.epoch)),
+        dolly_pose_name=(
+            next(iter(trainer.cfg.forced_heldout)) if trainer.cfg.forced_heldout else trainer.dataset.names[0]
+        ),
+        offpath_names=(
+            list(trainer.cfg.forced_heldout) if trainer.cfg.forced_heldout else [trainer.dataset.names[0]]
+        ),
+    )
+
+
+def report_context_from_run_dir(run_dir: str | Path, device: str | None = None) -> ReportContext:
+    """Build a `ReportContext` from `<run_dir>/checkpoints/checkpoint_latest.pt` alone.
+
+    The checkpoint is loaded with `map_location="cpu"` purely to read its
+    `cfg` and `epoch`, and the payload is dropped before this returns -- the
+    trained tensors are never moved to a device here (the stages that need
+    them load the checkpoint themselves, one at a time).
 
     Args:
-        trainer: the `Trainer` after `fit()` has returned (its final
-            checkpoint and `export.ply` must already exist -- `Trainer.fit`
-            guarantees both).
-        held_out_metrics: `fit()`'s return value (the most recent `evaluate()`
-            call's metrics dict; may be `{}` if a `max_minutes` budget
-            expired before the first eval).
+        run_dir: a training run directory.
+        device: override the run's own `cfg.device` (e.g. "cpu" to build the
+            report on a machine with no MPS); None keeps it.
 
-    Returns:
-        `{"checkpoint", "device", "scene_root", "export_ply", "epoch",
-        "held_out", "heldout_split": {"shade", "other"}, "dolly", "offpath",
-        "audits": {"candidate", "baseline"}, "shade_frames":
-        {"source", "count", "frames"} (`shade_frames_used_record` -- which
-        frames the shade audit above actually used: `trainer.cfg.shade_frames`
-        resolved, or the script's own default spelled out explicitly),
-        "bundle": {"bundle_dir",
-        "viewer"}, "summary_line", "deliveries"}` (`deliveries[0]` is always
-        the Mac viewer launcher), plus `"gate"` on a blend-gate run
-        (`gate_summary`) -- also written
-        to `<run_dir>/report/report.json`, with the comparison table,
-        summary line, and deliveries list (launcher first) appended to
-        `<run_dir>/README.md`, and the bundle itself written to
-        `<run_dir>/bundle/`.
+    Raises:
+        FileNotFoundError: no `checkpoint_latest.pt` under `run_dir`.
     """
-    run_dir = Path(trainer.run_dir)
-    out_dir = run_dir / TRAIN_REPORT_DIRNAME
-    out_dir.mkdir(parents=True, exist_ok=True)
+    from trippy.train import checkpoint_io
+    from trippy.train.config import TrainConfig
 
-    checkpoint_path = trainer.checkpoint_dir / TRAIN_CHECKPOINT_LATEST_FILENAME
-    export_path = run_dir / TRAIN_EXPORT_FILENAME
-    scene_root = Path(trainer.cfg.scene_root)
-    device = str(trainer.device)
-    width = trainer.cfg.width
-    epoch = int(held_out_metrics.get("epoch", trainer.epoch))
+    run_dir = Path(run_dir)
+    checkpoint_path = run_dir / TRAIN_CHECKPOINT_DIRNAME / TRAIN_CHECKPOINT_LATEST_FILENAME
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"no {TRAIN_CHECKPOINT_LATEST_FILENAME} under {run_dir}")
+    payload = checkpoint_io.load_checkpoint(checkpoint_path, map_location="cpu")
+    cfg = TrainConfig.from_dict(payload["cfg"])
+    epoch = int(payload.get("epoch", 0))
+    # Everything else in `payload` is the trained state; a stage that needs it reloads it.
+    del payload
+    memlog_mod.release()
+    if device is not None:
+        cfg.device = device
+    dolly_pose_name, offpath_names = _pose_names_for(cfg)
+    return ReportContext(
+        run_dir=run_dir,
+        checkpoint_path=checkpoint_path,
+        export_path=run_dir / TRAIN_EXPORT_FILENAME,
+        cfg=cfg,
+        device=str(cfg.device),
+        epoch=epoch,
+        dolly_pose_name=dolly_pose_name,
+        offpath_names=offpath_names,
+    )
 
-    forced = list(trainer.cfg.forced_heldout)
-    dolly_pose_name = forced[0] if forced else trainer.dataset.names[0]
-    offpath_names = forced if forced else [trainer.dataset.names[0]]
 
-    dolly_poses = shade_dolly_poses(scene_root, pose_name=dolly_pose_name, width=width)
-    offpath_pose_list = offpath_poses(scene_root, offpath_names, width=width)
+def heldout_metrics_on_disk(run_dir: str | Path, epoch: int) -> dict:
+    """This epoch's already-written `<run_dir>/eval_ep<NNNN>/metrics.json`, or `{}`.
 
-    dolly_metrics = render_candidate(
-        checkpoint_path,
-        dolly_poses,
-        out_dir / CANDIDATE_REPORT_DOLLY_DIRNAME,
-        device=device,
+    `Trainer.fit` always evaluates the epoch it stops on before saving the
+    final checkpoint, so for a run that completed its budget the held-out
+    numbers are already on disk and the wrap-up's `eval` stage is free. This
+    is what lets `trippy report-from-checkpoint` finish a killed run's report
+    without re-rendering 92 full-frame held-out views.
+
+    Only the exact epoch's directory is accepted: silently reporting an older
+    eval's PSNR under a newer epoch's heading would be exactly the kind of
+    quietly-wrong number AGENTS.md's honesty rule forbids.
+    """
+    path = Path(run_dir) / TRAIN_EVAL_DIRNAME_FMT.format(epoch=int(epoch)) / TRAIN_EVAL_METRICS_FILENAME
+    if not path.exists():
+        return {}
+    try:
+        loaded = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def evaluate_heldout_lean(ctx: ReportContext) -> dict:
+    """Re-run the held-out eval from the checkpoint, with nothing else resident.
+
+    Used only when `heldout_metrics_on_disk` finds nothing (a run killed
+    before its last eval). Builds a Trainer from the checkpoint, evaluates,
+    then releases it -- so the eval's peak does not stack with any later
+    stage's. `Trainer.evaluate` already walks the held-out views one at a
+    time under `torch.no_grad()`, and caps the contact sheet at
+    `cfg.eval_max_images` frames, so the per-frame cost does not grow with
+    the number of held-out views.
+    """
+    from trippy.train.eval import build_trainer_from_checkpoint
+
+    trainer = build_trainer_from_checkpoint(ctx.checkpoint_path, device=ctx.device)
+    try:
+        return trainer.evaluate(epoch=ctx.epoch)
+    finally:
+        trainer.release_for_report()
+        del trainer
+        memlog_mod.release()
+
+
+# --- stage bodies: each one takes (ctx, earlier stage results) and returns a small dict ---
+
+
+def _stage_eval(ctx: ReportContext, state: dict) -> dict:
+    held_out = state.get("held_out_override")
+    if held_out:
+        return {"held_out": held_out, "source": "fit"}
+    held_out = heldout_metrics_on_disk(ctx.run_dir, ctx.epoch)
+    if held_out:
+        return {"held_out": held_out, "source": "eval_dir"}
+    return {"held_out": evaluate_heldout_lean(ctx), "source": "recomputed"}
+
+
+def _stage_dolly(ctx: ReportContext, state: dict) -> dict:
+    poses = shade_dolly_poses(Path(ctx.cfg.scene_root), pose_name=ctx.dolly_pose_name, width=ctx.cfg.width)
+    return render_candidate(
+        ctx.checkpoint_path,
+        poses,
+        ctx.out_dir / CANDIDATE_REPORT_DOLLY_DIRNAME,
+        device=ctx.device,
         write_video_files=True,
         stop_at_low_coverage=True,
     )
-    offpath_metrics = render_candidate(
-        checkpoint_path,
-        offpath_pose_list,
-        out_dir / CANDIDATE_REPORT_OFFPATH_DIRNAME,
-        device=device,
+
+
+def _stage_offpath(ctx: ReportContext, state: dict) -> dict:
+    poses = offpath_poses(Path(ctx.cfg.scene_root), ctx.offpath_names, width=ctx.cfg.width)
+    return render_candidate(
+        ctx.checkpoint_path,
+        poses,
+        ctx.out_dir / CANDIDATE_REPORT_OFFPATH_DIRNAME,
+        device=ctx.device,
         write_video_files=False,
     )
 
-    # Bug this task closes: this used to be a hardcoded `frames=None` on both calls below,
-    # so every scene's shade dark-mass was measured on depthprior_shade_audit.py's own
-    # default (SHADE_FRAMES_KK, kk-coherent's IMG_3828-3833) even on karekare-v2, whose
-    # measured shade region is a different, 93-frame group (`shade_frames:` in
-    # experiments/EXP-0011-karekare-v2/*.yaml -- README "Finding the shade frames").
-    # `resolve_shade_frames` turns the config value into the actual list (or leaves it
-    # `None`, unchanged old behaviour, when the config has no `shade_frames` key).
-    shade_frames = resolve_shade_frames(trainer.cfg.shade_frames)
 
-    # `resolve_sparse_txt_dir`: another bug this task closes -- `sparse_txt_dir` used to be
-    # a hardcoded `<scene_root>/sparse_txt` literal, which does not exist for karekare-v2
-    # (only binary `sparse/<n>` models). That FileNotFoundError previously escaped from
-    # deep inside `trippy.eval.audits._run`; now the binary `sparse/0` model (the one
-    # karekare-v2's point source/trainings were built from, 756 registered images) is
-    # auto-converted once into `$TRIPPY_OUTPUT/scenes/<name>/sparse_txt` and reused.
-    sparse_txt_dir = resolve_sparse_txt_dir(scene_root, trainer.cfg.sparse_txt)
-    candidate_audits = audit_report([str(export_path)], sparse_txt_dir, frames=shade_frames)
-    baseline_audits = _baseline_ply_audits(trainer.cfg, sparse_txt_dir, frames=shade_frames)
+def _stage_audits(ctx: ReportContext, state: dict) -> dict:
+    # See `resolve_shade_frames`/`resolve_sparse_txt_dir`: the candidate and the baseline
+    # must be audited over the SAME frames and the same COLMAP model, or the comparison
+    # table's two columns describe two different places.
+    shade_frames = resolve_shade_frames(ctx.cfg.shade_frames)
+    sparse_txt_dir = resolve_sparse_txt_dir(Path(ctx.cfg.scene_root), ctx.cfg.sparse_txt)
+    return {
+        "candidate": audit_report([str(ctx.export_path)], sparse_txt_dir, frames=shade_frames),
+        "baseline": _baseline_ply_audits(ctx.cfg, sparse_txt_dir, frames=shade_frames),
+        "sparse_txt_dir": str(sparse_txt_dir),
+        "shade_frames": shade_frames_used_record(shade_frames),
+    }
 
-    run_name = run_dir.name
-    line = summary_line(run_name, epoch, held_out_metrics, candidate_audits, baseline_audits)
-    table = comparison_table_markdown(held_out_metrics, candidate_audits, baseline_audits, dolly_metrics)
 
-    # Jordan: "fixed dolly paths are hard to judge, I want to navigate freely" -- export
-    # a free-navigation bundle + Mac viewer launcher from this same final checkpoint,
-    # alongside the existing dolly/honesty artifacts (this task's brief, requirements
-    # 1-3). Never raises past this point regardless of whether the viewer binary has
-    # been built (`build_mac_viewer_launcher`'s own contract); `export_bundle` failing
-    # for some other reason is a real failure and propagates like any other step here.
-    bundle_result = export_bundle_and_viewer_launcher(
-        checkpoint_path,
-        run_dir / TRAIN_REPORT_BUNDLE_DIRNAME,
-        run_name,
+def _stage_bundle(ctx: ReportContext, state: dict) -> dict:
+    """Bundle export + Mac viewer launcher + its delivery (Jordan's free-navigation path).
+
+    The summary line is not available yet (it needs the audits AND this
+    stage's own result is independent of it), so the delivery "why" is built
+    from the numbers already in hand -- `summary_line` over the eval and
+    audit stages, which are both complete by the time this runs.
+    """
+    line = summary_line(
+        ctx.run_dir.name,
+        ctx.epoch,
+        state["eval"]["held_out"],
+        state["audits"]["candidate"],
+        state["audits"]["baseline"],
+    )
+    result = export_bundle_and_viewer_launcher(
+        ctx.checkpoint_path,
+        ctx.run_dir / TRAIN_REPORT_BUNDLE_DIRNAME,
+        ctx.run_dir.name,
         why_base=line,
     )
-    if bundle_result["viewer"]["status"] != "ok":
-        (out_dir / VIEWER_LAUNCHER_FAILED_FILENAME).write_text(bundle_result["viewer"]["note"] + "\n")
+    if result["viewer"]["status"] != "ok":
+        (ctx.out_dir / VIEWER_LAUNCHER_FAILED_FILENAME).write_text(result["viewer"]["note"] + "\n")
+    return result
 
-    dolly_mp4 = out_dir / CANDIDATE_REPORT_DOLLY_DIRNAME / CANDIDATE_NET_VIDEO_FILENAME
-    honesty_sheet = out_dir / CANDIDATE_REPORT_DOLLY_DIRNAME / CANDIDATE_HONESTY_SHEET_FILENAME
-    # Viewer launcher goes first (requirement 4: Jordan wants free navigation front and
-    # centre); the dolly/honesty/export deliveries stay too -- they are cheap.
+
+def _stage_finalize(ctx: ReportContext, state: dict) -> dict:
+    """Compose every earlier stage into `report.json`, the README section and the deliveries."""
+    held_out = state["eval"]["held_out"]
+    dolly_metrics = state["dolly"]
+    audits = state["audits"]
+    bundle_result = state["bundle"]
+    run_name = ctx.run_dir.name
+
+    line = summary_line(run_name, ctx.epoch, held_out, audits["candidate"], audits["baseline"])
+    table = comparison_table_markdown(held_out, audits["candidate"], audits["baseline"], dolly_metrics)
+
+    dolly_mp4 = ctx.out_dir / CANDIDATE_REPORT_DOLLY_DIRNAME / CANDIDATE_NET_VIDEO_FILENAME
+    honesty_sheet = ctx.out_dir / CANDIDATE_REPORT_DOLLY_DIRNAME / CANDIDATE_HONESTY_SHEET_FILENAME
+    # Viewer launcher first: Jordan wants free navigation front and centre, not buried
+    # under the fixed-path dolly video. The other three stay -- they are cheap.
     deliveries = [
         bundle_result["delivery"],
         _deliver(dolly_mp4, f"{run_name}-dolly", line),
         _deliver(honesty_sheet, f"{run_name}-honesty", line),
-        _deliver(export_path, f"{run_name}-export", line),
+        _deliver(ctx.export_path, f"{run_name}-export", line),
     ]
 
-    gate = gate_summary(held_out_metrics, dolly_metrics)
-    readme_path = _ensure_run_readme(run_dir)
+    gate = gate_summary(held_out, dolly_metrics)
+    readme_path = _ensure_run_readme(ctx.run_dir)
     with open(readme_path, "a") as f:
         f.write(
-            f"\n## Report: epoch {epoch}\n\n{line}\n\n{_deliveries_markdown(deliveries)}\n\n"
+            f"\n## Report: epoch {ctx.epoch}\n\n{line}\n\n{_deliveries_markdown(deliveries)}\n\n"
             f"{table}\n{gate_markdown(gate)}"
         )
 
     report = {
-        "checkpoint": str(checkpoint_path),
-        "device": device,
-        "scene_root": str(scene_root),
-        "export_ply": str(export_path),
-        "epoch": epoch,
-        "held_out": held_out_metrics,
-        "heldout_split": heldout_split(held_out_metrics),
+        "checkpoint": str(ctx.checkpoint_path),
+        "device": ctx.device,
+        "scene_root": str(ctx.cfg.scene_root),
+        "export_ply": str(ctx.export_path),
+        "epoch": ctx.epoch,
+        "held_out": held_out,
+        "heldout_split": heldout_split(held_out),
         "dolly": dolly_metrics,
-        "offpath": offpath_metrics,
-        "audits": {"candidate": candidate_audits, "baseline": baseline_audits},
-        "sparse_txt_dir": str(sparse_txt_dir),
-        "shade_frames": shade_frames_used_record(shade_frames),
+        "offpath": state["offpath"],
+        "audits": {"candidate": audits["candidate"], "baseline": audits["baseline"]},
+        "sparse_txt_dir": audits["sparse_txt_dir"],
+        "shade_frames": audits["shade_frames"],
         "bundle": {"bundle_dir": bundle_result["bundle_dir"], "viewer": bundle_result["viewer"]},
         "summary_line": line,
         "deliveries": deliveries,
     }
     if gate is not None:
         report["gate"] = gate
-    (out_dir / CANDIDATE_REPORT_JSON_FILENAME).write_text(json.dumps(report, indent=2) + "\n")
+    (ctx.out_dir / CANDIDATE_REPORT_JSON_FILENAME).write_text(json.dumps(report, indent=2) + "\n")
 
     # Jordan always has one up-to-date "trips-leaderboard" sheet: rebuild it from every
     # run's report.json/metrics.jsonl (this one now included) and re-deliver under the
-    # same fixed name (scripts/deliver.sh's ln -sfn replaces the symlink each time, per
-    # docs/EXPERIMENTS.md "Leaderboard"). Deferred import (same reason as cli.py's own
-    # deferred `run_train_report` import: this pulls in PIL/yaml, no need for `trippy
-    # train` runs without --report to pay that cost) and never allowed to turn an
-    # otherwise-successful report into a REPORT_FAILED.txt (see
-    # `regenerate_and_deliver_safely`'s own docstring).
+    # same fixed name (scripts/deliver.sh's `ln -sfn` replaces the symlink each time,
+    # per docs/EXPERIMENTS.md "Leaderboard"). Deferred import (this pulls in PIL/yaml)
+    # and never allowed to turn an otherwise-successful report into a REPORT_FAILED.txt
+    # (see `regenerate_and_deliver_safely`'s own docstring).
     from trippy.render.leaderboard import regenerate_and_deliver_safely
 
     report["leaderboard"] = regenerate_and_deliver_safely()
     return report
+
+
+_STAGE_FUNCTIONS: dict[str, Callable[[ReportContext, dict], dict]] = {
+    "eval": _stage_eval,
+    "dolly": _stage_dolly,
+    "offpath": _stage_offpath,
+    "audits": _stage_audits,
+    "bundle": _stage_bundle,
+    "finalize": _stage_finalize,
+}
+
+
+def _stage_path(ctx: ReportContext, stage: str) -> Path:
+    return ctx.stages_dir / f"{stage}.json"
+
+
+def load_stage_result(ctx: ReportContext, stage: str) -> dict | None:
+    """A previously completed stage's result, or None if absent/stale/unreadable.
+
+    "Stale" means recorded at a different epoch than `ctx.epoch`: reusing an
+    older epoch's dolly metrics under a newer epoch's report would be a
+    silently wrong number, which AGENTS.md's honesty rule forbids outright.
+    """
+    path = _stage_path(ctx, stage)
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict) or int(payload.get("epoch", -1)) != int(ctx.epoch):
+        return None
+    result = payload.get("result")
+    return result if isinstance(result, dict) else None
+
+
+def save_stage_result(ctx: ReportContext, stage: str, result: dict) -> Path:
+    """Write `<run_dir>/report/stages/<stage>.json` -- the partial output a kill may not lose."""
+    ctx.stages_dir.mkdir(parents=True, exist_ok=True)
+    path = _stage_path(ctx, stage)
+    path.write_text(
+        json.dumps({"stage": stage, "epoch": int(ctx.epoch), "result": result}, indent=2, default=str) + "\n"
+    )
+    return path
+
+
+def run_report_stages(
+    ctx: ReportContext,
+    held_out_metrics: dict | None = None,
+    memlog: memlog_mod.MemoryLog | None = None,
+    force: bool = False,
+    stages: Sequence[str] | None = None,
+) -> dict:
+    """Run the wrap-up stage by stage, releasing memory and writing a partial result between each.
+
+    Args:
+        ctx: the run to report on (`report_context_from_trainer` or
+            `report_context_from_run_dir`). No `Trainer` may be alive when
+            this is called -- that is the whole point.
+        held_out_metrics: `Trainer.fit()`'s return value when this is called
+            straight after training, so the `eval` stage is a no-op. None (or
+            `{}`) makes the `eval` stage read `<run_dir>/eval_ep<NNNN>/
+            metrics.json`, and only re-run the eval if that is missing too.
+        memlog: where stage-boundary memory samples go; None creates one
+            writing `<run_dir>/report/memory.jsonl` and echoing to stdout.
+        force: recompute every stage even if a result for this epoch exists.
+            False (default) reuses completed stages, which is what makes a
+            killed wrap-up resumable.
+        stages: subset of `REPORT_STAGES` to run, in `REPORT_STAGES` order
+            (e.g. `["bundle", "finalize"]` to redo just the viewer export and
+            re-publish). A named stage is always recomputed, stored result or
+            not. Stages NOT listed still have their stored results loaded, so
+            `finalize` always sees a complete picture; a stage whose
+            dependency has neither run nor a stored result raises.
+
+    Returns:
+        `finalize`'s report dict -- the same document written to
+        `<run_dir>/report/report.json` (see `run_train_report` for its shape).
+    """
+    ctx.out_dir.mkdir(parents=True, exist_ok=True)
+    ctx.stages_dir.mkdir(parents=True, exist_ok=True)
+    if memlog is None:
+        memlog = memlog_mod.MemoryLog(ctx.out_dir / REPORT_MEMORY_FILENAME, log=print)
+    # An explicitly named stage is always recomputed: `--stage bundle` means "redo the
+    # bundle", not "reuse the bundle you already have".
+    explicit = stages is not None
+    selected = list(REPORT_STAGES) if stages is None else [s for s in REPORT_STAGES if s in set(stages)]
+    unknown = sorted(set(stages or ()) - set(REPORT_STAGES))
+    if unknown:
+        raise ValueError(f"unknown report stage(s) {unknown}; known stages are {list(REPORT_STAGES)}")
+
+    state: dict = {}
+    if held_out_metrics:
+        state["held_out_override"] = held_out_metrics
+    memlog.sample("wrapup:begin", run_dir=str(ctx.run_dir), epoch=ctx.epoch)
+    for stage in REPORT_STAGES:
+        if stage not in selected:
+            stored = load_stage_result(ctx, stage)
+            if stored is not None:
+                state[stage] = stored
+            continue
+        if not force and not explicit:
+            stored = load_stage_result(ctx, stage)
+            # `finalize` is never reused: it appends to README.md and re-delivers, both of
+            # which must happen exactly once per actual report run.
+            if stored is not None and stage != "finalize":
+                state[stage] = stored
+                memlog.sample(f"{stage}:reused")
+                continue
+        missing = [name for name in _STAGE_DEPENDENCIES[stage] if name not in state]
+        if missing:
+            raise RuntimeError(
+                f"report stage {stage!r} needs stage(s) {missing}, which have neither run "
+                f"nor a stored result under {ctx.stages_dir}"
+            )
+        with memlog.stage(stage):
+            result = _STAGE_FUNCTIONS[stage](ctx, state)
+        state[stage] = result
+        save_stage_result(ctx, stage, result)
+    memlog.sample("wrapup:end")
+    if "finalize" not in state:
+        raise RuntimeError("report wrap-up did not reach the 'finalize' stage")
+    return state["finalize"]
+
+
+#: What each stage needs from earlier ones. `eval` reads only `ctx`; the renders are
+#: independent of each other; `bundle` needs the numbers for its delivery line.
+_STAGE_DEPENDENCIES: dict[str, tuple[str, ...]] = {
+    "eval": (),
+    "dolly": (),
+    "offpath": (),
+    "audits": (),
+    "bundle": ("eval", "audits"),
+    "finalize": ("eval", "dolly", "offpath", "audits", "bundle"),
+}
+
+
+def report_from_checkpoint(
+    run_dir: str | Path,
+    device: str | None = None,
+    force: bool = False,
+    stages: Sequence[str] | None = None,
+    memory_log: str | Path | None = None,
+) -> dict:
+    """Run ONLY the post-training wrap-up for an already-trained run directory.
+
+    The recovery path for a run whose `--report` was killed: it needs nothing
+    but `<run_dir>/checkpoints/checkpoint_latest.pt` and `<run_dir>/export.ply`,
+    both of which `Trainer.fit` writes before the wrap-up starts. Stages
+    already completed at this epoch are reused, so re-running after a kill
+    costs only what was lost.
+
+    Args:
+        run_dir: a training run directory.
+        device: override the checkpoint's own device.
+        force: recompute completed stages too.
+        stages: subset of `REPORT_STAGES` to run.
+        memory_log: JSONL path for the stage-boundary memory samples; None
+            uses `<run_dir>/report/memory.jsonl`.
+
+    Returns:
+        The report dict, as `run_train_report`.
+    """
+    ctx = report_context_from_run_dir(run_dir, device=device)
+    path = Path(memory_log) if memory_log is not None else ctx.out_dir / REPORT_MEMORY_FILENAME
+    memlog = memlog_mod.MemoryLog(path, log=print)
+    return run_report_stages(ctx, held_out_metrics=None, memlog=memlog, force=force, stages=stages)
+
+
+def run_train_report(trainer: Trainer, held_out_metrics: dict) -> dict:
+    """Build and deliver the self-report for a finished `Trainer.fit()` run.
+
+    Thin wrapper over the staged wrap-up: snapshot the Trainer into a
+    `ReportContext`, drop the Trainer's own memory
+    (`Trainer.release_for_report` -- optimizer state, point cloud, dataset,
+    network), then run `run_report_stages`. Callers that still hold their own
+    reference to `trainer` should drop it too; `trippy.cli._cmd_train` does.
+
+    Args:
+        trainer: the `Trainer` after `fit()` has returned (its final
+            checkpoint and `export.ply` must already exist -- `Trainer.fit`
+            guarantees both). **Unusable after this call** (see
+            `Trainer.release_for_report`).
+        held_out_metrics: `fit()`'s return value (the most recent `evaluate()`
+            call's metrics dict; may be `{}` if a `max_minutes` budget
+            expired before the first eval, in which case the `eval` stage
+            falls back to `<run_dir>/eval_ep<NNNN>/metrics.json` and then to
+            re-running the eval from the checkpoint).
+
+    Returns:
+        `{"checkpoint", "device", "scene_root", "export_ply", "epoch",
+        "held_out", "heldout_split": {"shade", "other"}, "dolly", "offpath",
+        "audits": {"candidate", "baseline"}, "shade_frames":
+        {"source", "count", "frames"} (`shade_frames_used_record`),
+        "bundle": {"bundle_dir", "viewer"}, "summary_line", "deliveries"}`
+        (`deliveries[0]` is always the Mac viewer launcher), plus `"gate"` on
+        a blend-gate run (`gate_summary`) -- also written to
+        `<run_dir>/report/report.json`, with the comparison table, summary
+        line, and deliveries list (launcher first) appended to
+        `<run_dir>/README.md`, the bundle written to `<run_dir>/bundle/`, and
+        per-stage partial results under `<run_dir>/report/stages/`.
+    """
+    ctx = report_context_from_trainer(trainer, held_out_metrics)
+    memlog = memlog_mod.MemoryLog(ctx.out_dir / REPORT_MEMORY_FILENAME, log=print)
+    ctx.out_dir.mkdir(parents=True, exist_ok=True)
+    if hasattr(trainer, "release_for_report"):
+        trainer.release_for_report(memlog)
+    del trainer
+    memlog_mod.release()
+    return run_report_stages(ctx, held_out_metrics=held_out_metrics, memlog=memlog)

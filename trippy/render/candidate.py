@@ -356,8 +356,9 @@ def render_candidate(
             )
             save_png(frame_dir / CANDIDATE_HONESTY_FRAME_FILENAME, honesty)
 
-            net_frames.append(net_u8)
-            raw_frames.append(raw_u8)
+            if write_video_files:  # otherwise ~0.9 GB of frames would be built and never used
+                net_frames.append(net_u8)
+                raw_frames.append(raw_u8)
             if len(frame_metrics) < max_sheet_frames:
                 sheet_images += [raw_u8, net_outlined_u8, coverage_color]
                 sheet_labels += [f"{pose.name}:raw", f"{pose.name}:net", f"{pose.name}:coverage"]
