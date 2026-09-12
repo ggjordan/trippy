@@ -3004,3 +3004,6 @@ Artifacts (not committed; scratch, kept out of the repo per AGENTS.md Sec 6):
 - 2026-09-12T05:13:37Z delivered union-broadcast-honesty: trippy train report union-broadcast: epoch 299, held-out PSNR 17.25 dB (neighbours-exposure) (strict, own exposure: 16.19 dB), shade dark-mass 36.3% vs baseline n/a (/Users/nzbirdranch/trippy/output/runs/EXP-0006-union/union-broadcast/report/dolly/honesty_sheet.png)
 - 2026-09-12T05:13:39Z delivered union-broadcast-export: trippy train report union-broadcast: epoch 299, held-out PSNR 17.25 dB (neighbours-exposure) (strict, own exposure: 16.19 dB), shade dark-mass 36.3% vs baseline n/a (/Users/nzbirdranch/trippy/output/runs/EXP-0006-union/union-broadcast/export.ply)
 - 2026-09-12T05:13:44Z delivered trips-leaderboard: One table of every TRIPS run so far vs the Gaussian baseline: held-out PSNR, shade dark-mass, extent, coverage. Regenerated after every training. (/Users/nzbirdranch/trippy/output/leaderboard/leaderboard.png)
+
+## 2026-09-12 17:17 — union-broadcast (kk-coherent, Gaussian centres + monodepth points, broadcast mode, 300 epochs)
+- Numbers: epoch 299, held-out PSNR 17.25 dB, strict 16.19 dB, dark-mass 36.3%. Densifying with monocular depth points did not beat the Gaussian-only source (17.67-17.94 on this scene). Point source 3 (union): no gain. Launcher self-delivered.
