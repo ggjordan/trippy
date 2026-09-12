@@ -691,6 +691,77 @@ This design avoids any need for atomic operations and runs efficiently on both M
   - **Total ≈ 500 MB per batch:** well within 96 GB.
 - **GPU queue enforces 28 GB guard** to prevent OOM on other jobs.
 
+## Wrap-up memory: why `--report` got killed, and the staged fix (fix/report-wrapup-memory, 2026-09-13)
+
+**Symptom.** Two full-scene karekare-v2 runs trained their whole budget, wrote
+`checkpoint_latest.pt` and `export.ply` cleanly, and were then killed about an hour later,
+mid-report, with `Killed: 9` -- a macOS jetsam memory kill (Splats' queue runner has no
+timeout, so nothing else could have done it):
+
+| Run | Epoch | Died | Last artifact written |
+|---|---|---|---|
+| kkv2-8-full-masked-cont | 259 | 2026-09-11 08:07 | (report never completed) |
+| kkv2-5c-hybrid-cont | 244 | 2026-09-13 09:30 | `report/dolly/{dolly.mp4,honesty_sheet.png}` at 08:36 |
+
+Shorter runs (400-420 min budgets) on the same scene, same config, finished the same
+wrap-up. kkv2-5c's timestamps pin the stage exactly: the dolly stage completed at 08:36 and
+`report/offpath/` was never rewritten, so it died inside the off-path candidate render, ~54
+minutes in.
+
+**Cause.** The wrap-up ran with the finished `Trainer` fully resident -- 7.5M-point cloud,
+its Adam state, the 756-image dataset, the U-Net -- because nothing ever told it to let go.
+`trippy.render.candidate.render_candidate` then builds a **second** `Trainer` from the same
+checkpoint for *each* of its two pose sets (the run log shows the Trainer-construction
+banner -- "person masks: ON ... hybrid design A ... exposure init" -- printed twice *after*
+`exported 7542137 points`), plus a live gsrender of the Gaussian PLY for poses no
+precomputed render exists for. The MPS allocator cache grown over a 10-hour training is
+never handed back either, which is the part that scales with training length and explains
+why only the long runs died.
+
+Measured on CPU with synthetic point clouds (`feature_channels=4`; params + grads + Adam
+state only, i.e. the part `release_for_report` returns):
+
+| Points | Params | Adam state | Params + grads + Adam |
+|---|---|---|---|
+| 100k | 0.003 G | 0.007 G | 0.014 G |
+| 400k | 0.014 G | 0.027 G | 0.054 G |
+| 1.6M | 0.054 G | 0.108 G | 0.215 G |
+
+Linear in point count, so ~1.0 G at karekare-v2's 7.5M points for that component alone, and
+that is only the part that is easy to attribute. **The MPS driver-allocated figure for the
+real scene is PENDING** -- job `trippy-kkv2-5-hybrid-report` (prio 40, queued 2026-09-12
+21:58) writes `<run_dir>/report/memory.jsonl`, and this table gets a measured
+stage-by-stage row set when it lands.
+
+**Fix.** Three changes, all in the wrap-up, none in the training loop:
+
+1. `Trainer.release_for_report()` drops optimizer, scheduler, loss, point params, network,
+   camera and dataset, then `gc.collect()` + `torch.mps.empty_cache()`. Nothing in the
+   wrap-up needs them: every stage is rebuilt from the checkpoint. `trippy.cli`'s
+   `_train_and_report_context` additionally builds/uses/returns the Trainer inside a frame
+   that has *returned* before the wrap-up starts, so the object itself is collectable.
+2. The wrap-up is a **stage list** (`trippy.render.report.REPORT_STAGES`: `eval`, `dolly`,
+   `offpath`, `audits`, `bundle`, `finalize`), run one at a time with a release and a
+   memory sample at every boundary (`trippy.train.memlog`). Peak is one stage's peak
+   instead of the sum.
+3. Each stage writes `<run_dir>/report/stages/<stage>.json` before the next begins, so a
+   kill costs at most the running stage, and `trippy report-from-checkpoint <run_dir>`
+   resumes from there. That command is also the **recovery path** for a run already killed:
+   it needs nothing but `checkpoints/checkpoint_latest.pt` and `export.ply`, and reuses the
+   epoch's existing `eval_ep<NNNN>/metrics.json` rather than re-running a 92-view held-out
+   eval.
+
+`trippy train --report` and `trippy report-from-checkpoint` are the same code
+(`run_report_stages` over a `ReportContext` built either from a live Trainer or from a run
+directory), so the recovery path can never drift from the one training uses.
+
+**Not fixed here (out of scope for this task's file list):**
+`render_candidate` accumulates a full-size uint8 RGB frame in `net_frames` *and*
+`raw_frames` for every pose, even when `write_video_files=False`. The off-path stage passes
+`False` and renders `2 x len(forced_heldout)` = 198 poses at width 1008, i.e. ~0.9 GB of
+buffers that are then discarded unused. That cost is constant in training length, so it is
+not the kill's cause, but it is ~0.9 GB of the peak for a one-line guard.
+
 ## Later: Brush fork mapping (v0.4.0 onward)
 
 When TRIPS training is complete and we port the design to Rust/Burn/CubeCL:

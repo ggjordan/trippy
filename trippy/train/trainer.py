@@ -96,6 +96,7 @@ from trippy.scene import splits
 from trippy.scene.dataset import SceneDataset, resolve_sparse_dir
 from trippy.scene.dataset import crop as dataset_crop
 from trippy.train import checkpoint_io, export, prune, retention, steptimer
+from trippy.train import memlog as memlog_mod
 from trippy.train.config import TrainConfig
 from trippy.train.params import PointParams, PoseParams
 
@@ -2068,6 +2069,67 @@ class Trainer:
         export.write_gaussian_ply(path, xyz, rgb, conf, size, provenance=provenance)
         self._log(f"exported {len(self.point_params)} points to {path}")
         return path
+
+    def release_for_report(self, memlog: memlog_mod.MemoryLog | None = None) -> dict:
+        """Free everything training needed, before the post-training wrap-up runs.
+
+        Why this exists: `trippy train --report` used to run the whole
+        wrap-up (final eval, dolly/off-path candidate renders, audits,
+        bundle export, deliveries) with the fully-built `Trainer` still
+        alive -- optimizer state included -- while
+        `trippy.render.candidate.render_candidate` built a SECOND Trainer
+        from the same checkpoint for each of its two pose sets. On the full
+        karekare-v2 scene (7.5M points, 756 images) that is two point
+        clouds, two datasets and two live Gaussian renderers resident at the
+        same time, on top of an MPS allocator cache grown over a 10-hour
+        training. Two such runs were killed by the kernel about an hour into
+        the wrap-up (`Killed: 9`); shorter runs on the same scene survived.
+
+        Nothing the wrap-up does needs this object: every stage is rebuilt
+        from `checkpoint_latest.pt` and `export.ply`, both of which
+        `fit()` has already written. So the cheapest correct fix is to give
+        all of it back first. **This Trainer is unusable afterwards** --
+        `net`, `camera`, `point_params`, `dataset`, `optimizer` and friends
+        are gone. Call it only after the final checkpoint and PLY exist, and
+        read anything you still need (run_dir, cfg, epoch) off it BEFORE
+        calling (`trippy.render.report.report_context_from_trainer` does
+        exactly that).
+
+        Args:
+            memlog: optional `trippy.train.memlog.MemoryLog`; when given,
+                a `release_for_report` stage is recorded around the drop so
+                the run log shows what it actually returned.
+
+        Returns:
+            `{"before": <sample>, "after": <sample>}` (see
+            `trippy.train.memlog.sample`), for the report's memory record.
+        """
+        log = memlog if memlog is not None else memlog_mod.MemoryLog(log=self._log)
+        before = log.sample("release_for_report:begin")
+        # Optimizer first: Adam holds two exp_avg buffers per parameter, i.e. ~2x the
+        # entire point cloud on its own, and it is the single largest thing here.
+        for attr in (
+            "optimizer",
+            "scheduler",
+            "_scaler",
+            "loss_fn",
+            "_eval_lpips",
+            "hybrid",
+            "gaussian_provider",
+            "point_params",
+            "pose_params",
+            "background",
+            "net",
+            "camera",
+            "dataset",
+            "_shade_views",
+        ):
+            if hasattr(self, attr):
+                setattr(self, attr, None)
+        self._released_for_report = True
+        memlog_mod.release()
+        after = log.sample("release_for_report:end")
+        return {"before": before, "after": after}
 
     # --- logging ---
 

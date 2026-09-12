@@ -2,6 +2,30 @@
 All notable changes to trippy. Format: Keep a Changelog. Versions: semver tags `vX.Y.Z`. Every push also gets a `build-NNNN` tag.
 
 ## [Unreleased]
+### Fixed
+- **`trippy train --report` no longer gets the process killed on the full Karekare-v2 scene.**
+  Two runs (kkv2-8-full-masked-cont epoch 259, kkv2-5c-hybrid-cont epoch 244) trained to
+  budget, saved `checkpoint_latest`/`export.ply`, then died `Killed: 9` about an hour into
+  the wrap-up, losing the whole report; shorter runs on the same config survived. The
+  wrap-up held the finished `Trainer` (7.5M points + Adam state + 756-image dataset) while
+  `render_candidate` built a second Trainer from the same checkpoint for each of its two
+  pose sets. Now: `Trainer.release_for_report()` gives all of that back first, the wrap-up
+  runs as a stage list (`eval`, `dolly`, `offpath`, `audits`, `bundle`, `finalize`) with
+  `gc` + `torch.mps.empty_cache()` between stages, and every stage writes
+  `<run_dir>/report/stages/<stage>.json` before the next starts, so a kill costs at most
+  one stage. See docs/ARCHITECTURE.md "Wrap-up memory".
+
+### Added
+- **`trippy report-from-checkpoint <run_dir>`** -- runs ONLY the post-training wrap-up for
+  an already-trained run directory, reusing any stage already completed at that epoch and
+  the epoch's existing `eval_ep<NNNN>/metrics.json`. The recovery path for a run whose
+  `--report` was killed, and the same code `trippy train --report` itself uses
+  (`trippy.render.report.run_report_stages` over a `ReportContext`). `--stage` re-runs one
+  stage, `--force` re-runs all, `--memory-log` picks the sample file.
+- **`trippy.train.memlog`** -- best-effort RSS / peak-RSS / `torch.mps.current_allocated_memory`
+  / `driver_allocated_memory` samples written to `<run_dir>/report/memory.jsonl` at every
+  wrap-up stage boundary. No new dependency (`resource` + one `ps` call), and it never
+  raises: a diagnostic must not be able to fail the job it is diagnosing.
 
 ## [v0.7.0] - 2026-09-12
 ### Added
