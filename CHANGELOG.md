@@ -2,6 +2,8 @@
 All notable changes to trippy. Format: Keep a Changelog. Versions: semver tags `vX.Y.Z`. Every push also gets a `build-NNNN` tag.
 
 ## [Unreleased]
+
+## [v0.7.0] - 2026-09-12
 ### Added
 - **ADR-0008 Stage 3 tooling: SOG export + a self-hosted WebXR viewer for the Quest.**
   `scripts/sog_export.sh` compresses a Gaussian-splat PLY to `.sog` (+ a `.compressed.ply`
