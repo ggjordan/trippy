@@ -3044,3 +3044,9 @@ Artifacts (not committed; scratch, kept out of the repo per AGENTS.md Sec 6):
 - 2026-09-13T08:35:38Z delivered kkv2-5-hybrid-honesty: trippy train report kkv2-5-hybrid: epoch 244, held-out PSNR 16.92 dB (neighbours-exposure) (strict, own exposure: 14.15 dB), shade dark-mass 33.4% vs baseline n/a (/Users/nzbirdranch/trippy/output/runs/EXP-0011-karekare-v2/kkv2-5-hybrid/report/dolly/honesty_sheet.png)
 - 2026-09-13T08:35:38Z delivered kkv2-5-hybrid-export: trippy train report kkv2-5-hybrid: epoch 244, held-out PSNR 16.92 dB (neighbours-exposure) (strict, own exposure: 14.15 dB), shade dark-mass 33.4% vs baseline n/a (/Users/nzbirdranch/trippy/output/runs/EXP-0011-karekare-v2/kkv2-5-hybrid/export.ply)
 - 2026-09-13T08:35:42Z delivered trips-leaderboard: One table of every TRIPS run so far vs the Gaussian baseline: held-out PSNR, shade dark-mass, extent, coverage. Regenerated after every training. (/Users/nzbirdranch/trippy/output/leaderboard/leaderboard.png)
+
+## 2026-09-13 20:36 — hybrid A ep 244 report (new lean wrap-up) + gate ep 225 audit
+- trippy-kkv2-5-hybrid-report rc=0 (report-from-checkpoint, first real run of the staged wrap-up): epoch 244, held-out PSNR 16.92 dB (16.85 at ep 139), strict 14.15 (14.80 at ep 139), dark-mass 33.4% (corrected scene+frames). Same story as the gate: neighbour PSNR flat, strict drifts down. Launcher kkv2-5-hybrid-viewer.command now = ep 244.
+- Wrap-up memory (memory.jsonl): peak RSS 7.4 GB over the whole wrap-up, 1.0 GB between stages, MPS driver 0 after release. The old path died with the whole Trainer plus a second one resident; the lean path is safe by a wide margin.
+- trippy-kkv2-7-gate225-audit rc=0: gate ep 225 dark-mass 30.9% (ep 103: 32.6%; Gaussians 26.7%).
+- GPU queue empty. Full-scene leaderboard (strict PSNR): gate ep103 16.62 > hybrid A ep139 14.80 > hybrid A ep244 14.15 ≈ TRIPS ep122 13.97 > TRIPS ep299 13.01.

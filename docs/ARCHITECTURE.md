@@ -729,7 +729,7 @@ state only, i.e. the part `release_for_report` returns):
 
 Linear in point count, so ~1.0 G at karekare-v2's 7.5M points for that component alone, and
 that is only the part that is easy to attribute. **The MPS driver-allocated figure for the
-real scene is PENDING** -- job `trippy-kkv2-5-hybrid-report` (prio 40, queued 2026-09-12
+real scene is 7.4 GB peak RSS / 1.0 GB between stages (kkv2-5-hybrid ep 244, 2026-09-13)** -- job `trippy-kkv2-5-hybrid-report` (prio 40, queued 2026-09-12
 21:58) writes `<run_dir>/report/memory.jsonl`, and this table gets a measured
 stage-by-stage row set when it lands.
 
