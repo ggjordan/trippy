@@ -3069,3 +3069,7 @@ Artifacts (not committed; scratch, kept out of the repo per AGENTS.md Sec 6):
 - 2026-09-13T09:46:35Z delivered trips-leaderboard: One table of every TRIPS run so far vs the Gaussian baseline: held-out PSNR, shade dark-mass, extent, coverage. Regenerated after every training. (/Users/nzbirdranch/trippy/.worktrees/best-launchers/output/leaderboard/leaderboard.png)
 - 2026-09-13T09:50:51Z delivered kkv2-7-hybrid-gate-ep120-viewer: Gate at its best epoch (120): 17.01 dB, strict 16.59, the project's best strict result; the un-tagged gate launcher shows the drifted ep 225 (/Users/nzbirdranch/trippy/output/deliver/kkv2-7-hybrid-gate-ep120/OPEN_TRIPS_MAC_kkv2-7-hybrid-gate-ep120.command)
 - 2026-09-13T09:51:03Z submitted job trippy-kkv2-7-gate120-audit prio 40: bash /Users/nzbirdranch/trippy/output/jobs-src/audit_gate120.sh
+
+## 2026-09-13 22:30 — gate best epoch delivered
+- trippy-kkv2-7-gate-best-report2 rc=0: gate at epoch 120: 17.01 dB, strict 16.59 (project best strict, matching the ep-103 report's 16.62). The job's own delivery step failed (it ran from the removed best-launchers worktree), so the launcher was generated and delivered by hand: 4-other/kkv2-7-hybrid-gate-ep120-viewer.command (scale 1.0). Corrected audit for the ep-120 export queued.
+- Lesson (third time): subagents must invoke gpu_submit.sh from the MAIN repo dir so job files never reference a worktree. Added to AGENTS.md.

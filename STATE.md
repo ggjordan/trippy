@@ -1,6 +1,7 @@
 # STATE
 
-## Review queue for Jordan (2026-09-13, updated; all in ~/Splats/output/Jordan-Review; nothing blocks on these)
+## Review queue for Jordan (2026-09-13 22:30; all in ~/Splats/output/Jordan-Review; nothing blocks on these)
+0. 4-other/kkv2-7-hybrid-gate-ep120-viewer.command — THE candidate: gate at its best epoch, strict PSNR 16.59, full scale. Then kkv2-5-hybrid-ep140-viewer.command (hybrid A at its best). The un-tagged gate/hybrid launchers show later, drifted epochs.
 1. 4-other/kkv2-7-hybrid-gate-ep120-viewer.command — the gate run's BEST epoch (checkpoint_best.pt, ep 120; strict PSNR 16.62, best of the project). The un-tagged `kkv2-7-hybrid-gate-viewer.command` (item 3 below) was re-exported by a later continuation and now shows the WORSE, drifted epoch 225 (strict 15.95) -- this one restores the peak without touching that launcher.
 2. 4-other/kkv2-5-hybrid-ep140-viewer.command — hybrid A's BEST epoch (checkpoint_best.pt, ep 140; strict PSNR 14.80). Same story: the un-tagged `kkv2-5-hybrid-viewer.command` (item 4) now shows epoch 244's drifted strict 14.15.
 3. 4-other/kkv2-7-hybrid-gate-viewer.command — learned splat/TRIPS gate on the full scene, now epoch 225 (strict 15.95, was 16.62 at ep 103/120). Superseded by item 1 for "best strict result"; kept for the neighbour-exposure number, which crept UP (17.03) over the same training.
