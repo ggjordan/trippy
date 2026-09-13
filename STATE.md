@@ -24,7 +24,8 @@ Verdict recap so far: full-scene TRIPS solved the big-tree shade (your eyes), pl
 - Next: act on Jordan's verdicts (default launcher, fog threshold, SuperSplat fork decision). Parked: 3-day full-res plain run (weakened by the 300-ep result), SuperSplat fork (3-5 agent-weeks).
 - Blocked: nothing.
 
-## History (newest first; older sections below are the running log)
+## History - 2026-09-13 21:46: kkv2-5-hybrid-ep140-viewer.command delivered (strict 14.79). Gate best-epoch report requeued against main (first attempt ran in the stale blend-gate worktree).
+(newest first; older sections below are the running log)
 # STATE — externalized progress (update at end of every session)
 
 Last updated: 2026-09-10 (feat/supersplat-quest session; previous: feat/supersplat-selfhost)
