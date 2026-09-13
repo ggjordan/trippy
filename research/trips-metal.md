@@ -3073,3 +3073,4 @@ Artifacts (not committed; scratch, kept out of the repo per AGENTS.md Sec 6):
 ## 2026-09-13 22:30 — gate best epoch delivered
 - trippy-kkv2-7-gate-best-report2 rc=0: gate at epoch 120: 17.01 dB, strict 16.59 (project best strict, matching the ep-103 report's 16.62). The job's own delivery step failed (it ran from the removed best-launchers worktree), so the launcher was generated and delivered by hand: 4-other/kkv2-7-hybrid-gate-ep120-viewer.command (scale 1.0). Corrected audit for the ep-120 export queued.
 - Lesson (third time): subagents must invoke gpu_submit.sh from the MAIN repo dir so job files never reference a worktree. Added to AGENTS.md.
+- 2026-09-13 23:10 gate ep120 corrected audit: dark-mass 32.3% (ep 103: 32.6, ep 225: 30.9, Gaussians 26.7).
