@@ -18,7 +18,7 @@ Verdict recap so far: full-scene TRIPS solved the big-tree shade (your eyes), pl
 
 ## Current state (2026-09-12)
 - Done: all queued trippy experiments have run (full-scene: masked/unmasked/removal/hybrid/gate/shade-prune/300-ep; small scene: hybrid A x2, alternating, removal-rel, union x2). v0.7.0 released. Editor Simple Mode, SuperSplat stages 1+3, splat-clean, corrected audits, perf harness all merged.
-- In flight: kkv2-7b-hybrid-gate-cont and kkv2-5c-hybrid-cont queued at prio 50 (behind Splats at 30).
+- In flight: kkv2-5-hybrid report-from-checkpoint (ep 244) running at 40; gate ep-225 audit queued. Both continuations done: gate 17.03 / strict 15.95 at ep 225 (strict fell from 16.62) -> hybrids also drift late; stop ~ep 100-120.
 - Next: act on Jordan's verdicts (default launcher, fog threshold, SuperSplat fork decision). Parked: 3-day full-res plain run (weakened by the 300-ep result), SuperSplat fork (3-5 agent-weeks).
 - Blocked: nothing.
 

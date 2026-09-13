@@ -3034,3 +3034,8 @@ Artifacts (not committed; scratch, kept out of the repo per AGENTS.md Sec 6):
 - Verdict: PENDING (the job's own memory log is the measurement).
 - Note: kkv2-7b-hybrid-gate-cont runs from `.worktrees/blend-gate` with its imports already loaded, so this fix cannot reach it. If it is killed in its wrap-up too, recover with `trippy report-from-checkpoint <run_dir>`.
 - Artifact path: `/Users/nzbirdranch/trippy/output/runs/EXP-0011-karekare-v2/kkv2-5-hybrid/report/` (report.json, stages/, memory.jsonl) + the four deliveries.
+
+## 2026-09-13 20:11 — kkv2-7b-hybrid-gate-cont (gate continued 103 -> 225 epochs)
+- Numbers: epoch 225, held-out PSNR 17.03 dB (was 16.94 at ep 103), strict 15.95 dB (was 16.62). The neighbour-exposure number crept up; the strict number fell 0.7 dB, the same late-training drift plain TRIPS showed. Wrap-up survived this time (old code path; it finished in 40 min). Launcher re-exported at the same path (kkv2-7-hybrid-gate-viewer.command now = ep 225; the ep-103 bundle is gone unless Jordan already opened it). Audit for the ep-225 export queued.
+- Reading: hybrids should be trained ~100-120 epochs and stopped; the ep-103 gate remains the best strict result of the project. Follow-up idea (parked): early stopping on strict held-out PSNR.
+- 2026-09-13T08:12:28Z submitted job trippy-kkv2-7-gate225-audit prio 40: bash /Users/nzbirdranch/trippy/output/jobs-src/audit_gate225.sh
