@@ -1677,9 +1677,12 @@ def _cmd_report_from_checkpoint(args: argparse.Namespace) -> int:
         force=args.force,
         stages=args.stage or None,
         memory_log=args.memory_log,
+        checkpoint=args.checkpoint,
+        report_dir=args.report_dir,
     )
+    report_dir = Path(args.report_dir) if args.report_dir else Path(args.run_dir) / TRAIN_REPORT_DIRNAME
     print(f"report-from-checkpoint: {report['summary_line']}")
-    print(f"report-from-checkpoint: report -> {Path(args.run_dir) / TRAIN_REPORT_DIRNAME}")
+    print(f"report-from-checkpoint: report -> {report_dir}")
     return 0
 
 
@@ -2538,7 +2541,26 @@ def build_parser() -> argparse.ArgumentParser:
     report_from_checkpoint_p.add_argument(
         "--memory-log",
         default=None,
-        help="JSONL path for stage-boundary RSS/MPS samples (default <run_dir>/report/memory.jsonl)",
+        help="JSONL path for stage-boundary RSS/MPS samples (default <report-dir>/memory.jsonl)",
+    )
+    report_from_checkpoint_p.add_argument(
+        "--checkpoint",
+        default=None,
+        help=(
+            "explicit checkpoint path instead of checkpoints/checkpoint_latest.pt "
+            "(e.g. checkpoints/checkpoint_best.pt, when later epochs drifted below it); "
+            "the launcher/bundle name then carries the checkpoint's own epoch "
+            "(<run_dir.name>-ep<N>) so it cannot be confused with the latest-epoch report"
+        ),
+    )
+    report_from_checkpoint_p.add_argument(
+        "--report-dir",
+        default=None,
+        help=(
+            "write the report/bundle here instead of <run_dir>/report and <run_dir>/bundle "
+            "(e.g. <run_dir>/report_best) -- use this whenever --checkpoint is given, so the "
+            "recovered epoch's report cannot overwrite the run's normal latest-epoch report"
+        ),
     )
     report_from_checkpoint_p.set_defaults(func=_cmd_report_from_checkpoint)
 

@@ -2,6 +2,18 @@
 All notable changes to trippy. Format: Keep a Changelog. Versions: semver tags `vX.Y.Z`. Every push also gets a `build-NNNN` tag.
 
 ## [Unreleased]
+### Added
+- **`trippy report-from-checkpoint --checkpoint <path> --report-dir <path>`** -- report
+  against a NON-latest checkpoint (e.g. `checkpoint_best.pt`) into a separate report/bundle
+  directory, without touching the run's normal `report/`/`bundle/`. Needed because two
+  full-scene hybrid runs' continuations overwrote their launchers at a worse, later epoch
+  than `checkpoint_best.pt` (gate: ep120 strict 16.62 vs the ep225 launcher's 15.95; hybrid
+  A: ep140 strict 14.80 vs the ep244 launcher's 14.15). The launcher/bundle/delivery name
+  carries the epoch (`<run>-ep<N>-viewer`) so it can never be confused with the latest-epoch
+  report, and a fresh `export_ep<N>.ply` is built from the given checkpoint rather than
+  reusing the stale top-level `export.ply` (which describes whatever epoch the run's LATEST
+  checkpoint left).
+
 ### Fixed
 - **`trippy train --report` no longer gets the process killed on the full Karekare-v2 scene.**
   Two runs (kkv2-8-full-masked-cont epoch 259, kkv2-5c-hybrid-cont epoch 244) trained to
