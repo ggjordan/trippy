@@ -333,3 +333,97 @@ def test_cli_report_from_checkpoint_produces_the_same_report_without_retraining(
     assert "wrapup:begin" in labels and "wrapup:end" in labels
     for stage in REPORT_STAGES:
         assert f"{stage}:begin" in labels and f"{stage}:end" in labels
+
+
+def test_cli_report_from_checkpoint_with_checkpoint_and_report_dir_does_not_overwrite_latest(
+    tmp_path: Path,
+) -> None:
+    """`--checkpoint`/`--report-dir`: recover a BEST-epoch report without touching the
+    normal latest-epoch one.
+
+    Task: two full-scene hybrid runs' `checkpoint_best.pt` measured a better strict
+    PSNR than the later continuation that overwrote their launchers
+    (research/trips-metal.md 2026-09-13). The fix is a way to report against
+    `checkpoint_best.pt` into a SEPARATE report dir, with the epoch baked into the
+    launcher name so Jordan can tell the two apart.
+
+    This test cannot make training produce a `checkpoint_best.pt` at an epoch other
+    than the latest on a 2-epoch synthetic run (both would score identically), so it
+    exercises the mechanism itself: `--checkpoint` points at a COPY of
+    `checkpoint_latest.pt` under a different path (forcing the override code path,
+    since the check is "not the same file", not "not the same epoch"), and asserts
+    the override report/bundle land in `--report-dir` untouched from the first
+    (latest-epoch, default-path) `--report` run, with the epoch in every generated
+    name.
+    """
+    scene_root, point_set = build_synthetic_scene(tmp_path)
+    ply_path = build_synthetic_ply(tmp_path, point_set)
+    run_dir = tmp_path / "run"
+    cfg = tiny_train_config(scene_root, ply_path, run_dir, tmp_path / "cache")
+    config_path = cfg.save_yaml(tmp_path / "config.yaml")
+
+    splats_root = tmp_path / "fake_splats"
+    _write_fake_shade_audit_tool(splats_root)
+
+    env = dict(os.environ)
+    env["TRIPPY_DELIVER_DRY_RUN"] = "1"
+    env["TRIPPY_OUTPUT"] = str(tmp_path / "trippy_output")
+    env["SPLATS_ROOT"] = str(splats_root)
+
+    # First: the normal path, `train --report`, produces <run_dir>/report and
+    # <run_dir>/bundle at the latest epoch -- the thing that must survive untouched.
+    train_argv = [
+        sys.executable, "-m", "trippy.cli", "train",
+        "--config", str(config_path), "--device", "cpu", "--report",
+    ]  # fmt: skip
+    trained = subprocess.run(train_argv, capture_output=True, text=True, timeout=180, env=env, check=False)
+    assert trained.returncode == 0, f"stdout:\n{trained.stdout}\nstderr:\n{trained.stderr}"
+
+    latest_report_json = run_dir / "report" / "report.json"
+    assert latest_report_json.exists()
+    latest_report_before = latest_report_json.read_text()
+    latest_bundle_json = run_dir / "bundle" / "bundle.json"
+    assert latest_bundle_json.exists()
+    latest_bundle_before = latest_bundle_json.read_text()
+
+    # A stand-in "best" checkpoint: a byte-copy of checkpoint_latest.pt at a different
+    # path, so report_context_from_run_dir's override path (a different file) fires
+    # even though this synthetic run only ever had one epoch worth reporting on.
+    latest_checkpoint = run_dir / "checkpoints" / "checkpoint_latest.pt"
+    assert latest_checkpoint.exists()
+    best_checkpoint = run_dir / "checkpoints" / "checkpoint_best.pt"
+    best_checkpoint.write_bytes(latest_checkpoint.read_bytes())
+
+    report_dir = run_dir / "report_best"
+    report_argv = [
+        sys.executable, "-m", "trippy.cli", "report-from-checkpoint", str(run_dir),
+        "--device", "cpu",
+        "--checkpoint", str(best_checkpoint),
+        "--report-dir", str(report_dir),
+    ]  # fmt: skip
+    result = subprocess.run(report_argv, capture_output=True, text=True, timeout=300, env=env, check=False)
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    assert str(report_dir) in result.stdout
+
+    # The latest-epoch report/bundle are byte-identical to before this ran.
+    assert latest_report_json.read_text() == latest_report_before
+    assert latest_bundle_json.read_text() == latest_bundle_before
+
+    # The override report landed under --report-dir, not <run_dir>/report.
+    best_report = json.loads((report_dir / "report.json").read_text())
+    epoch = best_report["epoch"]
+    expected_label = f"{run_dir.name}-ep{epoch}"
+
+    assert best_report["deliveries"][0]["name"] == f"{expected_label}-viewer"
+    assert best_report["bundle"]["bundle_dir"] == str(report_dir / "bundle")
+    assert (report_dir / "bundle" / "bundle.json").exists()
+    # <run_dir>/bundle (the latest-epoch bundle) is untouched -- a different directory.
+    assert not (report_dir / "bundle").samefile(run_dir / "bundle")
+
+    # A fresh, epoch-tagged export.ply was built (never the stale <run_dir>/export.ply,
+    # which describes whatever epoch the LATEST checkpoint left, not this one).
+    assert best_report["export_ply"] == str(report_dir / f"export_ep{epoch}.ply")
+    assert Path(best_report["export_ply"]).exists()
+
+    # <run_dir>/report (the latest-epoch report dir) never gained a report_best subtree.
+    assert not (run_dir / "report" / "report_best").exists()

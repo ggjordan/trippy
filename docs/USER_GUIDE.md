@@ -708,6 +708,8 @@ trippy bundle-launcher --checkpoint <checkpoint> --name <name>
 
 That's the same export + launcher + delivery, for any checkpoint on demand.
 
+To get a launcher for a run's **best** epoch when later training continued past it and drifted (the ep-number goes into the launcher's name so it can't be confused with the latest one): `trippy report-from-checkpoint <run_dir> --checkpoint <run_dir>/checkpoints/checkpoint_best.pt --report-dir <run_dir>/report_best` — this never touches the run's existing `report/`/`bundle/`.
+
 ## How to change GPU priority
 
 If a job is running too slowly (bogging down other work) or too fast (starving training for GPU time), you can re-prioritise it by asking:

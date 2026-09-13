@@ -1,18 +1,20 @@
 # STATE
 
-## Review queue for Jordan (2026-09-12 22:30; all in ~/Splats/output/Jordan-Review; nothing blocks on these)
-1. 4-other/kkv2-7-hybrid-gate-viewer.command — learned splat/TRIPS gate on the full scene. Best numbers of the project: 16.94 dB, strict 16.62. Question: shade still shading, and closer to your splat than plain TRIPS?
-2. 4-other/kkv2-5-hybrid-viewer.command — hybrid A on the full scene (16.85 dB). Compare with 1; mix slider works in both.
-3. 2-open-in-brush/kklid-tripsclean-shade.ply, then -005 and -015 — your splat minus the fog TRIPS identified (4/11/23% of Gaussians deleted, survivors byte-identical). Open in Brush. Verdict decides the default threshold.
-4. 4-other/supersplat.command + 2-open-in-brush/kklid-tripsclean-shade-{keep,fog}.ply — SuperSplat 3.0 served from this Mac only; drag both layers in, hide the fog layer, edit with their tools. Never press File > Publish.
-5. 4-other/quest-viewer-shade-keep-quest.command (and -kklid20000-quest to compare) — cleaned splat as a 114 MB SOG in a WebXR viewer served over your LAN to the Quest. Report how it feels.
-6. 4-other/kkv2-1-combined-viewer.command — epoch-122 TRIPS under the big tree only, your splat everywhere else.
-Verdict recap so far: full-scene TRIPS solved the big-tree shade (your eyes), plain TRIPS looks nothing like a photo elsewhere, shade pruning rejected, splat is the base. Longer plain training made it worse (14.78 dB at ep 299). Dark-mass is a density indicator only.
+## Review queue for Jordan (2026-09-13, updated; all in ~/Splats/output/Jordan-Review; nothing blocks on these)
+1. 4-other/kkv2-7-hybrid-gate-ep120-viewer.command — the gate run's BEST epoch (checkpoint_best.pt, ep 120; strict PSNR 16.62, best of the project). The un-tagged `kkv2-7-hybrid-gate-viewer.command` (item 3 below) was re-exported by a later continuation and now shows the WORSE, drifted epoch 225 (strict 15.95) -- this one restores the peak without touching that launcher.
+2. 4-other/kkv2-5-hybrid-ep140-viewer.command — hybrid A's BEST epoch (checkpoint_best.pt, ep 140; strict PSNR 14.80). Same story: the un-tagged `kkv2-5-hybrid-viewer.command` (item 4) now shows epoch 244's drifted strict 14.15.
+3. 4-other/kkv2-7-hybrid-gate-viewer.command — learned splat/TRIPS gate on the full scene, now epoch 225 (strict 15.95, was 16.62 at ep 103/120). Superseded by item 1 for "best strict result"; kept for the neighbour-exposure number, which crept UP (17.03) over the same training.
+4. 4-other/kkv2-5-hybrid-viewer.command — hybrid A on the full scene, now epoch 244 (strict 14.15, was 14.80 at ep 139/140). Superseded by item 2 for "best strict result".
+5. 2-open-in-brush/kklid-tripsclean-shade.ply, then -005 and -015 — your splat minus the fog TRIPS identified (4/11/23% of Gaussians deleted, survivors byte-identical). Open in Brush. Verdict decides the default threshold.
+6. 4-other/supersplat.command + 2-open-in-brush/kklid-tripsclean-shade-{keep,fog}.ply — SuperSplat 3.0 served from this Mac only; drag both layers in, hide the fog layer, edit with their tools. Never press File > Publish.
+7. 4-other/quest-viewer-shade-keep-quest.command (and -kklid20000-quest to compare) — cleaned splat as a 114 MB SOG in a WebXR viewer served over your LAN to the Quest. Report how it feels.
+8. 4-other/kkv2-1-combined-viewer.command — epoch-122 TRIPS under the big tree only, your splat everywhere else.
+Verdict recap so far: full-scene TRIPS solved the big-tree shade (your eyes), plain TRIPS looks nothing like a photo elsewhere, shade pruning rejected, splat is the base. Longer plain training made it worse (14.78 dB at ep 299); hybrids show the same late-training strict-PSNR drift, hence items 1-2. Dark-mass is a density indicator only.
 
-## Current state (2026-09-13)
-- Done: `trippy train --report`'s post-training wrap-up no longer holds the finished Trainer while it rebuilds one from the checkpoint; it now runs as a resumable stage list with memory logging (fix/report-wrapup-memory). New `trippy report-from-checkpoint <run_dir>` recovers a killed wrap-up.
-- In flight: job `trippy-kkv2-5-hybrid-report` (prio 40) — kkv2-5-hybrid's missing epoch-244 report; queued behind kkv2-7b-hybrid-gate-cont (prio 50, ~9 h to go). Its `report/memory.jsonl` fills in the PENDING rows of docs/ARCHITECTURE.md "Wrap-up memory".
-- Next: read that memory log, finish the ARCHITECTURE table; if kkv2-7b is killed in its own wrap-up (it runs from `.worktrees/blend-gate` with the old code already imported, so the fix cannot reach it), recover it with `trippy report-from-checkpoint`.
+## Current state (2026-09-13, later)
+- Done: `trippy report-from-checkpoint` gained `--checkpoint <path>` and `--report-dir <path>` (feat/best-epoch-launchers, worktree `.worktrees/best-launchers`) so a run's `checkpoint_best.pt` can be reported into a SEPARATE `report_best/`/`bundle` without touching the existing `report/`/`bundle/` -- the launcher/bundle/delivery name carries the epoch (`<run>-ep<N>-viewer`) and a fresh `export_ep<N>.ply` is built from that checkpoint rather than reusing the stale top-level `export.ply`. Jobs `trippy-kkv2-7-gate-best-report` and `trippy-kkv2-5-hybrid-best-report` (prio 40) queued to produce items 1-2 above. New unit test in `tests/test_cli_train_report.py`.
+- In flight: the two prio-40 jobs above; also whatever was already queued behind them (see `research/trips-metal.md`).
+- Next: once those jobs land, review + merge `feat/best-epoch-launchers` to main (the job commands reference `/Users/nzbirdranch/trippy`, i.e. main's checkout -- **they will fail with "unrecognized arguments: --checkpoint" until this branch is actually merged**, since GPU jobs always run against main, never a worktree). Read the wrap-up memory log, finish the ARCHITECTURE table (carried over from the prior session, still open).
 - Blocked: nothing.
 - Known gap, deliberately out of this task's file list: `trippy/render/candidate.py` accumulates `net_frames` + `raw_frames` for every pose even when `write_video_files=False`; the 198-pose off-path stage therefore builds ~0.9 GB of buffers it discards. One-line guard, constant in training length.
 

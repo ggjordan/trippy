@@ -854,6 +854,16 @@ class ReportContext:
             ignored, never reused).
         dolly_pose_name: anchor image for the shade dolly path.
         offpath_names: images to build off-path honesty pairs for.
+        report_dir: override for `out_dir` (default `<run_dir>/report`).
+            Set by `report_context_from_run_dir`'s `--checkpoint`/
+            `--report-dir` path so a non-latest checkpoint's report cannot
+            land in and overwrite the run's normal `report/`.
+        report_name: override for the bundle/launcher/delivery label
+            (default `run_dir.name`). Set alongside `report_dir` to
+            `<run_dir.name>-ep<epoch>` so the epoch survives into the
+            launcher filename (`OPEN_TRIPS_MAC_<name>.command`) instead of
+            being silently overwritten by a later epoch's report under the
+            same name.
     """
 
     run_dir: Path
@@ -864,16 +874,39 @@ class ReportContext:
     epoch: int
     dolly_pose_name: str
     offpath_names: list[str]
+    report_dir: Path | None = None
+    report_name: str | None = None
 
     @property
     def out_dir(self) -> Path:
-        """`<run_dir>/report` -- where every artifact and `report.json` land."""
-        return self.run_dir / TRAIN_REPORT_DIRNAME
+        """`<run_dir>/report` -- where every artifact and `report.json` land.
+
+        Overridden to `self.report_dir` when set, so a report built from a
+        non-default checkpoint can be written next to, rather than on top
+        of, the run's normal report.
+        """
+        return self.report_dir if self.report_dir is not None else self.run_dir / TRAIN_REPORT_DIRNAME
 
     @property
     def stages_dir(self) -> Path:
-        """`<run_dir>/report/stages` -- one JSON file per completed stage."""
+        """`<out_dir>/stages` -- one JSON file per completed stage."""
         return self.out_dir / _REPORT_STAGES_DIRNAME
+
+    @property
+    def label(self) -> str:
+        """Bundle/launcher/delivery name: `report_name` if set, else `run_dir.name`."""
+        return self.report_name if self.report_name is not None else self.run_dir.name
+
+    @property
+    def bundle_dir(self) -> Path:
+        """Viewer bundle output directory.
+
+        Default `<run_dir>/bundle` (unchanged, matches `default_bundle_out_dir`);
+        `<report_dir>/bundle` when `report_dir` is overridden, so a best-epoch
+        report never overwrites the run's normal bundle.
+        """
+        base = self.report_dir if self.report_dir is not None else self.run_dir
+        return base / TRAIN_REPORT_BUNDLE_DIRNAME
 
 
 def _first_registered_image_name(cfg) -> str:
@@ -928,8 +961,44 @@ def report_context_from_trainer(trainer: Trainer, held_out_metrics: dict) -> Rep
     )
 
 
-def report_context_from_run_dir(run_dir: str | Path, device: str | None = None) -> ReportContext:
-    """Build a `ReportContext` from `<run_dir>/checkpoints/checkpoint_latest.pt` alone.
+def _ensure_export_ply(checkpoint_path: Path, export_path: Path, device: str) -> Path:
+    """A fresh PLY exported from `checkpoint_path`, for a report against a non-latest checkpoint.
+
+    `report_context_from_run_dir`'s default path reuses `<run_dir>/export.ply`,
+    which `Trainer.fit` writes for whichever epoch training stopped on. A
+    `--checkpoint` override (e.g. `checkpoints/checkpoint_best.pt`) points at
+    a different epoch, whose points are not on disk anywhere yet -- reusing
+    the stale top-level `export.ply` for its shade audit or its "-export"
+    delivery would silently describe the wrong epoch, which AGENTS.md's
+    honesty rule forbids. This builds a `Trainer` from the given checkpoint
+    just long enough to export, then releases it -- no Trainer is resident
+    across stage boundaries, same contract as `Trainer.release_for_report`.
+
+    Idempotent: an existing file at `export_path` is reused as-is (a retried
+    `report-from-checkpoint --checkpoint ... --report-dir ...` call costs
+    nothing here on its second run).
+    """
+    if export_path.exists():
+        return export_path
+    from trippy.train.eval import build_trainer_from_checkpoint
+
+    export_path.parent.mkdir(parents=True, exist_ok=True)
+    trainer = build_trainer_from_checkpoint(checkpoint_path, device=device)
+    try:
+        trainer.export_ply(export_path)
+    finally:
+        del trainer
+        memlog_mod.release()
+    return export_path
+
+
+def report_context_from_run_dir(
+    run_dir: str | Path,
+    device: str | None = None,
+    checkpoint: str | Path | None = None,
+    report_dir: str | Path | None = None,
+) -> ReportContext:
+    """Build a `ReportContext` from a run directory, defaulting to its latest checkpoint.
 
     The checkpoint is loaded with `map_location="cpu"` purely to read its
     `cfg` and `epoch`, and the payload is dropped before this returns -- the
@@ -940,17 +1009,31 @@ def report_context_from_run_dir(run_dir: str | Path, device: str | None = None) 
         run_dir: a training run directory.
         device: override the run's own `cfg.device` (e.g. "cpu" to build the
             report on a machine with no MPS); None keeps it.
+        checkpoint: an explicit checkpoint path (e.g.
+            `<run_dir>/checkpoints/checkpoint_best.pt`) instead of
+            `checkpoint_latest.pt`. When given and different from the
+            default, the returned context also gets a fresh `export_path`
+            (`_ensure_export_ply`) and a `report_name` carrying the epoch
+            (`<run_dir.name>-ep<epoch>`), so the report this builds cannot
+            be confused with -- or silently overwrite -- the run's normal
+            latest-epoch report.
+        report_dir: where `out_dir`/`bundle_dir` should live instead of
+            `<run_dir>/report` and `<run_dir>/bundle`. Typically paired with
+            `checkpoint` (e.g. `<run_dir>/report_best`) so recovering an
+            earlier epoch's report never touches the latest one.
 
     Raises:
-        FileNotFoundError: no `checkpoint_latest.pt` under `run_dir`.
+        FileNotFoundError: the checkpoint (explicit or default
+            `checkpoint_latest.pt`) does not exist.
     """
     from trippy.train import checkpoint_io
     from trippy.train.config import TrainConfig
 
     run_dir = Path(run_dir)
-    checkpoint_path = run_dir / TRAIN_CHECKPOINT_DIRNAME / TRAIN_CHECKPOINT_LATEST_FILENAME
+    default_checkpoint_path = run_dir / TRAIN_CHECKPOINT_DIRNAME / TRAIN_CHECKPOINT_LATEST_FILENAME
+    checkpoint_path = Path(checkpoint) if checkpoint is not None else default_checkpoint_path
     if not checkpoint_path.exists():
-        raise FileNotFoundError(f"no {TRAIN_CHECKPOINT_LATEST_FILENAME} under {run_dir}")
+        raise FileNotFoundError(f"no checkpoint at {checkpoint_path}")
     payload = checkpoint_io.load_checkpoint(checkpoint_path, map_location="cpu")
     cfg = TrainConfig.from_dict(payload["cfg"])
     epoch = int(payload.get("epoch", 0))
@@ -960,15 +1043,26 @@ def report_context_from_run_dir(run_dir: str | Path, device: str | None = None) 
     if device is not None:
         cfg.device = device
     dolly_pose_name, offpath_names = _pose_names_for(cfg)
+    report_dir_path = Path(report_dir) if report_dir is not None else None
+    is_override = checkpoint_path.resolve() != default_checkpoint_path.resolve()
+    if is_override:
+        export_path = (report_dir_path if report_dir_path is not None else run_dir) / f"export_ep{epoch}.ply"
+        _ensure_export_ply(checkpoint_path, export_path, device=str(cfg.device))
+        report_name = f"{run_dir.name}-ep{epoch}"
+    else:
+        export_path = run_dir / TRAIN_EXPORT_FILENAME
+        report_name = None
     return ReportContext(
         run_dir=run_dir,
         checkpoint_path=checkpoint_path,
-        export_path=run_dir / TRAIN_EXPORT_FILENAME,
+        export_path=export_path,
         cfg=cfg,
         device=str(cfg.device),
         epoch=epoch,
         dolly_pose_name=dolly_pose_name,
         offpath_names=offpath_names,
+        report_dir=report_dir_path,
+        report_name=report_name,
     )
 
 
@@ -1076,7 +1170,7 @@ def _stage_bundle(ctx: ReportContext, state: dict) -> dict:
     audit stages, which are both complete by the time this runs.
     """
     line = summary_line(
-        ctx.run_dir.name,
+        ctx.label,
         ctx.epoch,
         state["eval"]["held_out"],
         state["audits"]["candidate"],
@@ -1084,8 +1178,8 @@ def _stage_bundle(ctx: ReportContext, state: dict) -> dict:
     )
     result = export_bundle_and_viewer_launcher(
         ctx.checkpoint_path,
-        ctx.run_dir / TRAIN_REPORT_BUNDLE_DIRNAME,
-        ctx.run_dir.name,
+        ctx.bundle_dir,
+        ctx.label,
         why_base=line,
     )
     if result["viewer"]["status"] != "ok":
@@ -1099,7 +1193,7 @@ def _stage_finalize(ctx: ReportContext, state: dict) -> dict:
     dolly_metrics = state["dolly"]
     audits = state["audits"]
     bundle_result = state["bundle"]
-    run_name = ctx.run_dir.name
+    run_name = ctx.label
 
     line = summary_line(run_name, ctx.epoch, held_out, audits["candidate"], audits["baseline"])
     table = comparison_table_markdown(held_out, audits["candidate"], audits["baseline"], dolly_metrics)
@@ -1297,6 +1391,8 @@ def report_from_checkpoint(
     force: bool = False,
     stages: Sequence[str] | None = None,
     memory_log: str | Path | None = None,
+    checkpoint: str | Path | None = None,
+    report_dir: str | Path | None = None,
 ) -> dict:
     """Run ONLY the post-training wrap-up for an already-trained run directory.
 
@@ -1306,18 +1402,30 @@ def report_from_checkpoint(
     already completed at this epoch are reused, so re-running after a kill
     costs only what was lost.
 
+    `checkpoint`/`report_dir` are also how to report on a checkpoint OTHER
+    than the latest (e.g. `checkpoint_best.pt`, when later training epochs
+    drifted below it) without touching that run's normal `report/`/`bundle/`:
+    see `report_context_from_run_dir` for exactly what changes.
+
     Args:
         run_dir: a training run directory.
         device: override the checkpoint's own device.
         force: recompute completed stages too.
         stages: subset of `REPORT_STAGES` to run.
         memory_log: JSONL path for the stage-boundary memory samples; None
-            uses `<run_dir>/report/memory.jsonl`.
+            uses `<out_dir>/memory.jsonl`.
+        checkpoint: an explicit checkpoint path instead of
+            `checkpoints/checkpoint_latest.pt` (e.g. `checkpoint_best.pt`).
+        report_dir: where the report/bundle should be written instead of
+            `<run_dir>/report` and `<run_dir>/bundle` (e.g.
+            `<run_dir>/report_best`) -- required in practice whenever
+            `checkpoint` is given, so the recovered epoch's report cannot
+            overwrite the latest one.
 
     Returns:
         The report dict, as `run_train_report`.
     """
-    ctx = report_context_from_run_dir(run_dir, device=device)
+    ctx = report_context_from_run_dir(run_dir, device=device, checkpoint=checkpoint, report_dir=report_dir)
     path = Path(memory_log) if memory_log is not None else ctx.out_dir / REPORT_MEMORY_FILENAME
     memlog = memlog_mod.MemoryLog(path, log=print)
     return run_report_stages(ctx, held_out_metrics=None, memlog=memlog, force=force, stages=stages)
