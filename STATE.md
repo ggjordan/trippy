@@ -1,5 +1,21 @@
 # STATE
 
+## PROJECT SUNSET 2026-09-14
+Jordan ended the project: "I just don't understand it well enough to continue to devote time to it and I need the drive space back."
+All local data (122 GB: training runs, caches, bundles, deliverables) was deleted on 2026-09-14. The code, docs, ADRs and the full
+running log in `research/trips-metal.md` remain here on GitHub and are enough to restart: `scripts/bootstrap.sh`, then the EXP-0011
+configs. Kept on the machine: the de-fogged copy of Jordan's own Karekare splat (`kklid_20000-tripsclean-shade.ply`) and its Quest
+SOG, both in `~/Splats`, neither of which needs trippy to open.
+
+Where it got to: TRIPS on Apple Silicon worked end to end (Metal rasteriser, trainer, Rust/wgpu viewer, web viewer, editor,
+SuperSplat integration, Quest path). On Jordan's target scene the full-scene TRIPS runs DID remove the dark shade cloud under the
+big tree -- his own verdict, against the metric -- but plain TRIPS looked "nothing like a photo" everywhere else, and the
+splat-plus-TRIPS gate (best result: epoch 120, strict held-out PSNR 16.59 dB) never closed that gap enough to be worth more of
+his time. Open leads if anyone returns: early stopping on strict PSNR (every arm drifted after ~120 epochs), the parked
+full-resolution run, and the TRIPS-guided fog deletion (`trippy splat-clean`), which was the one piece that improved his
+Gaussian splat directly.
+
+
 ## Review queue for Jordan (2026-09-13 22:30; all in ~/Splats/output/Jordan-Review; nothing blocks on these)
 0. 4-other/kkv2-7-hybrid-gate-ep120-viewer.command — THE candidate: gate at its best epoch, strict PSNR 16.59, full scale. Then kkv2-5-hybrid-ep140-viewer.command (hybrid A at its best). The un-tagged gate/hybrid launchers show later, drifted epochs.
 1. 4-other/kkv2-7-hybrid-gate-ep120-viewer.command — the gate run's BEST epoch (checkpoint_best.pt, ep 120; strict PSNR 16.62, best of the project). The un-tagged `kkv2-7-hybrid-gate-viewer.command` (item 3 below) was re-exported by a later continuation and now shows the WORSE, drifted epoch 225 (strict 15.95) -- this one restores the peak without touching that launcher.
